@@ -43,7 +43,7 @@ class HomeScreen(Screen):
                 yield LogViewer(id="log-viewer")
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self._update_status()
         lv = self.query_one(LogViewer)
         self._log_callback = lambda e: self.app.call_from_thread(
@@ -51,23 +51,23 @@ class HomeScreen(Screen):
         )
         self.server.logs_engine.subscribe(self._log_callback)
         if get_settings().auto_start_server:
-            self._start_server()
+            await self._start_server()
 
     def on_unmount(self) -> None:
         if self._log_callback:
             self.server.logs_engine.unsubscribe(self._log_callback)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id
         if btn_id == "btn-start":
-            self._start_server()
+            await self._start_server()
         elif btn_id == "btn-stop":
-            self._stop_server()
+            await self._stop_server()
         elif btn_id == "btn-restart":
-            self._restart_server()
+            await self._restart_server()
 
     async def _start_server(self) -> None:
-        self.query_one("#btn-start",Button).disabled = True
+        self.query_one("#btn-start", Button).disabled = True
         await self.server.start()
         self._update_status()
         self.query_one("#btn-stop", Button).disabled = False
