@@ -119,13 +119,12 @@ class MCPServer:
     async def start(self) -> None:
         """Start the MCP server via streamable-HTTP transport."""
         self.logs_engine.log("Starting FastMCP server", level="info", category="server")
-        # FastMCP 3.x removed sse_server(); use run_http_async() instead.
+        # FastMCP HTTP transport uses the Streamable HTTP protocol at /mcp.
         self._task = asyncio.create_task(
-            mcp.run_http_async(
+            mcp.run_async(
                 transport="http",
                 host=self.host,
                 port=self.port,
-                show_banner=False,
             )
         )
 
