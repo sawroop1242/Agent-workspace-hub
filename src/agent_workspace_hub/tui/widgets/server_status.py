@@ -7,6 +7,6 @@ class ServerStatus(Static):
 
     def update_status(self, running: bool, host: str = "127.0.0.1", port: int = 8765) -> None:
         if running:
-            self.update(f"RUNNING @ http://{host}:{port}/sse")
+            self.update(f"RUNNING @ http://{host}:{port}/mcp")
         else:
             self.update("STOPPED")
