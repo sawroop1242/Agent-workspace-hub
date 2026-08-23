@@ -30,21 +30,21 @@ class SkillsScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        it = self.query_one("#installed-table",DataTable)
+        it = self.query_one("#installed-table", DataTable)
         it.add_columns("ID", "Name", "Version", "Risk")
         se = SkillsEngine(get_settings().workspace_path)
         for s in se.list_global_skills():
             it.add_row(s.id, s.name, s.version, s.risk_level)
 
-        ot = self.query_one("#online-table",DataTable)
+        ot = self.query_one("#online-table", DataTable)
         ot.add_columns("ID", "Name", "Description", "Install")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-search":
-            query = self.query_one("#search-input",Input).value
+            query = self.query_one("#search-input", Input).value
             if query:
                 results = await search_skills(query)
-                ot = self.query_one("#online-table",DataTable)
+                ot = self.query_one("#online-table", DataTable)
                 ot.clear()
                 for r in results:
                     if "error" in r:
