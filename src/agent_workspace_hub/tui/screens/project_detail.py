@@ -45,8 +45,8 @@ class ProjectDetailScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#tasks-table",DataTable).add_columns("ID", "Title", "Status", "Priority", "Assigned")
-        self.query_one("#memory-table",DataTable).add_columns("Time", "Type", "Agent", "Message")
+        self.query_one("#tasks-table", DataTable).add_columns("ID", "Title", "Status", "Priority", "Assigned")
+        self.query_one("#memory-table", DataTable).add_columns("Time", "Type", "Agent", "Message")
         self._load_all()
 
     def _load_all(self) -> None:
@@ -62,7 +62,7 @@ class ProjectDetailScreen(Screen):
             pass
 
     def _load_tasks(self) -> None:
-        t = self.query_one("#tasks-table",DataTable)
+        t = self.query_one("#tasks-table", DataTable)
         t.clear()
         try:
             te = TaskEngine(get_settings().workspace_path, self.project_name)
@@ -72,7 +72,7 @@ class ProjectDetailScreen(Screen):
             pass
 
     def _load_memory(self) -> None:
-        t = self.query_one("#memory-table",DataTable)
+        t = self.query_one("#memory-table", DataTable)
         t.clear()
         try:
             mem = MemoryEngine(get_settings().workspace_path, self.project_name)
