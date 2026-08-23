@@ -4,7 +4,7 @@
 
 set -e
 
-REPO="YOUR_USERNAME/agent-workspace-hub"
+REPO="sawroop1242/Agent-workspace-hub"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 
 echo "=========================================="
