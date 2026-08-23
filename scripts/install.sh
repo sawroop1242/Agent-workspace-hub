@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Agent Workspace Hub — One-line installer
-# Usage: curl -fsSL https://github.com/YOUR_USERNAME/agent-workspace-hub/releases/latest/download/install.sh | bash
+# Usage: curl -fsSL https://github.com/sawroop1242/Agent-workspace-hub/releases/latest/download/install.sh | bash
 
 set -e
 
@@ -27,7 +27,6 @@ done
 
 if [ -z "$PYTHON_CMD" ]; then
     echo "Error: Python 3.11+ is required but not found."
-    echo "Please install Python 3.11 or higher and try again."
     exit 1
 fi
 
@@ -40,26 +39,25 @@ WHEEL_URL=$(echo "$RELEASE_JSON" | grep -o '"browser_download_url": "[^"]*\.whl"
 VERSION=$(echo "$RELEASE_JSON" | grep -o '"tag_name": "[^"]*"' | head -1 | cut -d'"' -f4)
 
 if [ -z "$WHEEL_URL" ]; then
-    echo "Error: Could not find wheel in latest release."
-    echo "Falling back to pip install from source..."
+    echo "Error: Could not find wheel. Installing from source..."
     $PYTHON_CMD -m pip install --user "git+https://github.com/${REPO}.git#egg=agent-workspace-hub[composio]"
-    echo ""
-    echo "Installed from source. Launch with: awh"
+    echo "Done. Launch with: awh"
     exit 0
 fi
 
 echo "Latest version: $VERSION"
 echo "Downloading..."
 
-# Create temp dir
-TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
+# Use safe temp dir (avoid TMPDIR env var conflict)
+INSTALL_TMP="${HOME}/.awh-install-tmp"
+mkdir -p "$INSTALL_TMP"
+trap "rm -rf $INSTALL_TMP" EXIT
 
-# Download wheel
-curl -fsSL -o "$TMPDIR/awh.whl" "$WHEEL_URL"
+WHEEL_FILE="$INSTALL_TMP/agent_workspace_hub.whl"
+curl -fsSL -o "$WHEEL_FILE" "$WHEEL_URL"
 
 echo "Installing..."
-$PYTHON_CMD -m pip install --user "$TMPDIR/awh.whl"
+$PYTHON_CMD -m pip install --user "$WHEEL_FILE"
 
 echo ""
 echo "=========================================="
@@ -68,9 +66,11 @@ echo "=========================================="
 echo ""
 echo "Launch with: awh"
 echo ""
+echo "If 'awh' not found, run:"
+echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+echo ""
 echo "First time setup:"
 echo "  1. Run: awh"
-echo "  2. Go to Settings"
-echo "  3. Add your Composio API key"
-echo "  4. Start the MCP server from Home screen"
+echo "  2. Go to Settings, add Composio API key"
+echo "  3. Start MCP server from Home screen"
 echo ""
