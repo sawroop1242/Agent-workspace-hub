@@ -4,8 +4,8 @@ from __future__ import annotations
 from textual.app import App
 from textual.binding import Binding
 
-from ...config.settings import get_settings
-from ...mcp.server import MCPServer
+from ..config.settings import get_settings
+from ..mcp.server import MCPServer
 from .screens.approvals import ApprovalsScreen
 from .screens.files import FilesScreen
 from .screens.git_screen import GitScreen
