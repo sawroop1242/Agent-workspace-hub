@@ -23,6 +23,7 @@ from ..core import (
 from ..models.approval import ApprovalRequest
 from ..models.project import Checkpoint, Project, Task
 from ..models.skill import SkillManifest
+from .prompts.agent_bootstrap import agent_bootstrap
 from .tools import (
     approvals,
     context,
@@ -39,12 +40,16 @@ from .tools import (
 mcp = FastMCP("AgentWorkspaceHub")
 
 
-# --- Register all tools ---
+# --- Register prompts and tools ---
+
+mcp.prompt()(agent_bootstrap)
+
 
 # Projects
 mcp.tool()(projects.create_project)
 mcp.tool()(projects.list_projects)
 mcp.tool()(projects.get_project_summary)
+mcp.tool()(projects.get_agent_handoff)
 mcp.tool()(projects.open_project)
 mcp.tool()(projects.delete_project)
 

@@ -29,25 +29,28 @@ from .workspace import Workspace
 
 AGENT_MD_TEMPLATE = """# Agent Workspace Hub — Project Instructions
 
-You are connected to Agent Workspace Hub.
+You are connected to Agent Workspace Hub. Use the hub as the source of truth so a new
+AI agent can resume the project without the user repeating the original prompt.
 
 Before doing any work:
-1. Call `get_project_summary`.
-2. Read active tasks.
-3. Read relevant skills.
-4. Read relevant decisions.
-5. Only modify required files.
+1. Call `get_agent_handoff` for the continuation brief.
+2. Call `get_project_summary` when you need the full context, active tasks, memory,
+   enabled skills, and Composio-backed plugins.
+3. Read active tasks and choose the highest-priority unfinished task.
+4. Read relevant enabled skills before applying them.
+5. Use enabled plugins/connectors only when the current task needs external actions.
+6. Only inspect or modify files required for the task.
 
-After doing work:
-1. Update context.
-2. Append memory.
-3. Update tasks.
-4. Create checkpoint if important.
+After meaningful work:
+1. Update context with current goal, constraints, recent progress, and next step.
+2. Append memory for durable decisions, progress, blockers, and handoff notes.
+3. Update or complete tasks.
+4. Create a checkpoint if file changes are important.
 
 Rules:
-- Do not delete context.
+- Do not delete context; append or replace only with a more complete version.
 - Do not store secrets.
-- Prefer append-only memory.
+- Prefer append-only memory for historical facts.
 - Ask before destructive actions.
 """
 
