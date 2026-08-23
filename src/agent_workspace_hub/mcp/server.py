@@ -117,10 +117,17 @@ class MCPServer:
         self.logs_engine = LogsEngine(self._workspace.root)
 
     async def start(self) -> None:
-        """Start the MCP server via SSE transport."""
+        """Start the MCP server via streamable-HTTP transport."""
         self.logs_engine.log("Starting FastMCP server", level="info", category="server")
-        # FastMCP 2.0 uses sse_server() for async serving
-        self._task = asyncio.create_task(mcp.sse_server(host=self.host, port=self.port))
+        # FastMCP 3.x removed sse_server(); use run_http_async() instead.
+        self._task = asyncio.create_task(
+            mcp.run_http_async(
+                transport="http",
+                host=self.host,
+                port=self.port,
+                show_banner=False,
+            )
+        )
 
     async def stop(self) -> None:
         """Stop the MCP server."""
@@ -142,5 +149,5 @@ class MCPServer:
             "running": self.is_running,
             "host": self.host,
             "port": self.port,
-            "url": f"http://{self.host}:{self.port}/sse" if self.is_running else None,
+            "url": f"http://{self.host}:{self.port}/mcp" if self.is_running else None,
         }
