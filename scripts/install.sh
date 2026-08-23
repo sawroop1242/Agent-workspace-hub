@@ -118,25 +118,17 @@ find_python() {
 
 pip_install_user() {
     local spec="$1"
-    local root_action_args=()
-
-    if [ "$(id -u 2>/dev/null || printf '1')" = "0" ]; then
-        root_action_args=(--root-user-action ignore)
-    fi
-
     log "Installing with pip --user..."
-    "$PYTHON_CMD" -m pip install --user --upgrade "${root_action_args[@]}" pip >/dev/null
-    "$PYTHON_CMD" -m pip install --user --upgrade "${root_action_args[@]}" "$spec"
+    "$PYTHON_CMD" -m pip install --user --upgrade pip >/dev/null
+    "$PYTHON_CMD" -m pip install --user --upgrade "$spec"
 }
 
 pipx_install() {
     local spec="$1"
     if command -v pipx >/dev/null 2>&1; then
         log "Installing isolated CLI with pipx..."
-        if pipx install --force "$spec"; then
-            return 0
-        fi
-        log "pipx install failed; falling back to pip --user..."
+        pipx install --force "$spec"
+        return 0
     fi
     return 1
 }
@@ -165,7 +157,7 @@ install_from_source() {
 }
 
 install_from_release() {
-    local release_json wheel_url version install_tmp wheel_name wheel_file spec
+    local release_json wheel_url version install_tmp wheel_file spec
 
     require_cmd curl
     log "Fetching latest release metadata..."
@@ -186,16 +178,9 @@ install_from_release() {
 
     log "Latest release: ${version:-unknown}"
     install_tmp="$(mktemp -d 2>/dev/null || mktemp -d -t awh-install)"
-    trap "rm -rf '${install_tmp}'" EXIT
+    trap 'rm -rf "$install_tmp"' EXIT
 
-    wheel_name="${wheel_url%%\?*}"
-    wheel_name="${wheel_name##*/}"
-    case "$wheel_name" in
-        *.whl) ;;
-        *) wheel_name="agent_workspace_hub-${version:-latest}-py3-none-any.whl" ;;
-    esac
-
-    wheel_file="${install_tmp}/${wheel_name}"
+    wheel_file="${install_tmp}/agent_workspace_hub.whl"
     log "Downloading wheel..."
     curl -fsSL -o "$wheel_file" "$wheel_url"
 
