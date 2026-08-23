@@ -40,8 +40,8 @@ class GitScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#git-status-table",DataTable).add_columns("File", "Status")
-        self.query_one("#checkpoints-table",DataTable).add_columns("ID", "Message", "Agent", "Hash", "Date")
+        self.query_one("#git-status-table", DataTable).add_columns("File", "Status")
+        self.query_one("#checkpoints-table", DataTable).add_columns("ID", "Message", "Agent", "Hash", "Date")
         self._load_status()
         self._load_checkpoints()
 
@@ -60,7 +60,7 @@ class GitScreen(Screen):
             self._do_pull()
 
     def _load_status(self) -> None:
-        t = self.query_one("#git-status-table",DataTable)
+        t = self.query_one("#git-status-table", DataTable)
         t.clear()
         try:
             git = GitEngine(get_settings().workspace_path, self.project_name)
@@ -75,7 +75,7 @@ class GitScreen(Screen):
             t.add_row(str(e), "error")
 
     def _load_checkpoints(self) -> None:
-        t = self.query_one("#checkpoints-table",DataTable)
+        t = self.query_one("#checkpoints-table", DataTable)
         t.clear()
         try:
             git = GitEngine(get_settings().workspace_path, self.project_name)
