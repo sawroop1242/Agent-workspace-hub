@@ -1,76 +1,240 @@
 #!/usr/bin/env bash
-# Agent Workspace Hub — One-line installer
-# Usage: curl -fsSL https://github.com/sawroop1242/Agent-workspace-hub/releases/latest/download/install.sh | bash
+# Agent Workspace Hub — one-line installer
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash
+# Optional:
+#   curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --source source --with-composio
 
-set -e
+set -Eeuo pipefail
 
-REPO="sawroop1242/Agent-workspace-hub"
+REPO="${AWH_REPO:-sawroop1242/Agent-workspace-hub}"
+REF="${AWH_REF:-main}"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+SOURCE_URL="git+https://github.com/${REPO}.git@${REF}#egg=agent-workspace-hub"
+RAW_URL="https://raw.githubusercontent.com/${REPO}/${REF}/scripts/install.sh"
+INSTALL_SOURCE="release"
+WITH_COMPOSIO="0"
+PYTHON_CMD="${PYTHON:-}"
 
-echo "=========================================="
-echo "  Agent Workspace Hub Installer"
-echo "=========================================="
+usage() {
+    cat <<EOF
+Agent Workspace Hub installer
 
-# Detect Python
-PYTHON_CMD=""
-for cmd in python3.13 python3.12 python3.11 python3; do
-    if command -v "$cmd" &> /dev/null; then
-        VERSION=$($cmd --version 2>&1 | awk '{print $2}' | cut -d. -f1,2)
-        MAJOR=$(echo "$VERSION" | cut -d. -f1)
-        MINOR=$(echo "$VERSION" | cut -d. -f2)
-        if [ "$MAJOR" -gt 3 ] || ([ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge 11 ]); then
-            PYTHON_CMD=$cmd
-            break
-        fi
-    fi
+Usage:
+  curl -fsSL ${RAW_URL} | bash
+  curl -fsSL ${RAW_URL} | bash -s -- [options]
+
+Options:
+  --source release|source  Install latest release wheel first, or install from Git source. Default: release
+  --with-composio          Install optional Composio dependencies too
+  --repo owner/name        GitHub repository to install from. Default: ${REPO}
+  --ref git-ref            Git ref for source installs and raw installer URL. Default: ${REF}
+  --python path            Python 3.11+ executable to use
+  -h, --help               Show this help
+
+Environment overrides:
+  AWH_REPO, AWH_REF, PYTHON
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --source)
+            INSTALL_SOURCE="${2:-}"
+            shift 2
+            ;;
+        --with-composio)
+            WITH_COMPOSIO="1"
+            shift
+            ;;
+        --repo)
+            REPO="${2:-}"
+            shift 2
+            ;;
+        --ref)
+            REF="${2:-}"
+            shift 2
+            ;;
+        --python)
+            PYTHON_CMD="${2:-}"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Error: unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
 done
 
-if [ -z "$PYTHON_CMD" ]; then
-    echo "Error: Python 3.11+ is required but not found."
+API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+SOURCE_URL="git+https://github.com/${REPO}.git@${REF}#egg=agent-workspace-hub"
+
+if [ "$INSTALL_SOURCE" != "release" ] && [ "$INSTALL_SOURCE" != "source" ]; then
+    echo "Error: --source must be either 'release' or 'source'." >&2
+    exit 2
+fi
+
+log() {
+    printf '%s\n' "$*"
+}
+
+fail() {
+    printf 'Error: %s\n' "$*" >&2
     exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fail "$1 is required but was not found."
+}
+
+python_version_ok() {
+    "$1" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+}
+
+find_python() {
+    if [ -n "$PYTHON_CMD" ]; then
+        command -v "$PYTHON_CMD" >/dev/null 2>&1 || fail "Python executable not found: $PYTHON_CMD"
+        python_version_ok "$PYTHON_CMD" || fail "Python 3.11+ is required: $($PYTHON_CMD --version 2>&1)"
+        return
+    fi
+
+    for cmd in python3.13 python3.12 python3.11 python3 python; do
+        if command -v "$cmd" >/dev/null 2>&1 && python_version_ok "$cmd"; then
+            PYTHON_CMD="$cmd"
+            return
+        fi
+    done
+
+    fail "Python 3.11+ is required but was not found."
+}
+
+pip_install_user() {
+    local spec="$1"
+    local root_action_args=()
+
+    if [ "$(id -u 2>/dev/null || printf '1')" = "0" ]; then
+        root_action_args=(--root-user-action ignore)
+    fi
+
+    log "Installing with pip --user..."
+    "$PYTHON_CMD" -m pip install --user --upgrade "${root_action_args[@]}" pip >/dev/null
+    "$PYTHON_CMD" -m pip install --user --upgrade "${root_action_args[@]}" "$spec"
+}
+
+pipx_install() {
+    local spec="$1"
+    if command -v pipx >/dev/null 2>&1; then
+        log "Installing isolated CLI with pipx..."
+        if pipx install --force "$spec"; then
+            return 0
+        fi
+        log "pipx install failed; falling back to pip --user..."
+    fi
+    return 1
+}
+
+install_spec() {
+    local spec="$1"
+    if ! pipx_install "$spec"; then
+        pip_install_user "$spec"
+    fi
+}
+
+build_package_spec() {
+    local base="$1"
+    if [ "$WITH_COMPOSIO" = "1" ]; then
+        printf '%s[composio]' "$base"
+    else
+        printf '%s' "$base"
+    fi
+}
+
+install_from_source() {
+    local spec
+    spec="$(build_package_spec "$SOURCE_URL")"
+    log "Installing from source: https://github.com/${REPO}.git (${REF})"
+    install_spec "$spec"
+}
+
+install_from_release() {
+    local release_json wheel_url version install_tmp wheel_name wheel_file spec
+
+    require_cmd curl
+    log "Fetching latest release metadata..."
+    if ! release_json="$(curl -fsSL "$API_URL")"; then
+        log "Could not fetch the latest release; falling back to source install."
+        install_from_source
+        return
+    fi
+
+    wheel_url="$(printf '%s' "$release_json" | sed -n 's/.*"browser_download_url": "\([^"]*\.whl\)".*/\1/p' | head -n 1)"
+    version="$(printf '%s' "$release_json" | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
+
+    if [ -z "$wheel_url" ]; then
+        log "No wheel asset found in the latest release; falling back to source install."
+        install_from_source
+        return
+    fi
+
+    log "Latest release: ${version:-unknown}"
+    install_tmp="$(mktemp -d 2>/dev/null || mktemp -d -t awh-install)"
+    trap "rm -rf '${install_tmp}'" EXIT
+
+    wheel_name="${wheel_url%%\?*}"
+    wheel_name="${wheel_name##*/}"
+    case "$wheel_name" in
+        *.whl) ;;
+        *) wheel_name="agent_workspace_hub-${version:-latest}-py3-none-any.whl" ;;
+    esac
+
+    wheel_file="${install_tmp}/${wheel_name}"
+    log "Downloading wheel..."
+    curl -fsSL -o "$wheel_file" "$wheel_url"
+
+    spec="$(build_package_spec "$wheel_file")"
+    install_spec "$spec"
+}
+
+print_success() {
+    cat <<'EOF'
+
+==========================================
+  Installation Complete!
+==========================================
+
+Launch with:
+  awh
+
+If 'awh' is not found, add the user scripts directory to PATH:
+  export PATH="$HOME/.local/bin:$PATH"
+
+First time setup:
+  1. Run: awh
+  2. Go to Settings and add your Composio API key if you use connectors
+  3. Start the MCP server from the Home screen
+EOF
+}
+
+log "=========================================="
+log "  Agent Workspace Hub Installer"
+log "=========================================="
+
+require_cmd curl
+find_python
+log "Found Python: $PYTHON_CMD ($($PYTHON_CMD --version 2>&1))"
+
+if [ "$INSTALL_SOURCE" = "source" ]; then
+    install_from_source
+else
+    install_from_release
 fi
 
-echo "Found Python: $PYTHON_CMD ($($PYTHON_CMD --version))"
-
-# Fetch latest release
-echo "Fetching latest release..."
-RELEASE_JSON=$(curl -fsSL "$API_URL")
-WHEEL_URL=$(echo "$RELEASE_JSON" | grep -o '"browser_download_url": "[^"]*\.whl"' | head -1 | cut -d'"' -f4)
-VERSION=$(echo "$RELEASE_JSON" | grep -o '"tag_name": "[^"]*"' | head -1 | cut -d'"' -f4)
-
-if [ -z "$WHEEL_URL" ]; then
-    echo "Error: Could not find wheel. Installing from source..."
-    $PYTHON_CMD -m pip install --user "git+https://github.com/${REPO}.git#egg=agent-workspace-hub[composio]"
-    echo "Done. Launch with: awh"
-    exit 0
-fi
-
-echo "Latest version: $VERSION"
-echo "Downloading..."
-
-# Use safe temp dir (avoid TMPDIR env var conflict)
-INSTALL_TMP="${HOME}/.awh-install-tmp"
-mkdir -p "$INSTALL_TMP"
-trap "rm -rf $INSTALL_TMP" EXIT
-
-WHEEL_FILE="$INSTALL_TMP/agent_workspace_hub.whl"
-curl -fsSL -o "$WHEEL_FILE" "$WHEEL_URL"
-
-echo "Installing..."
-$PYTHON_CMD -m pip install --user "$WHEEL_FILE"
-
-echo ""
-echo "=========================================="
-echo "  Installation Complete!"
-echo "=========================================="
-echo ""
-echo "Launch with: awh"
-echo ""
-echo "If 'awh' not found, run:"
-echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-echo ""
-echo "First time setup:"
-echo "  1. Run: awh"
-echo "  2. Go to Settings, add Composio API key"
-echo "  3. Start MCP server from Home screen"
-echo ""
+print_success
