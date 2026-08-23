@@ -67,16 +67,16 @@ class HomeScreen(Screen):
             self._restart_server()
 
     async def _start_server(self) -> None:
-        self.query_one(Button, id="btn-start").disabled = True
+        self.query_one("#btn-start",Button).disabled = True
         await self.server.start()
         self._update_status()
-        self.query_one(Button, id="btn-stop").disabled = False
+        self.query_one("#btn-stop", Button).disabled = False
 
     async def _stop_server(self) -> None:
         await self.server.stop()
         self._update_status()
-        self.query_one(Button, id="btn-start").disabled = False
-        self.query_one(Button, id="btn-stop").disabled = True
+        self.query_one("#btn-start", Button).disabled = False
+        self.query_one("#btn-stop", Button).disabled = True
 
     async def _restart_server(self) -> None:
         await self.server.stop()
@@ -87,5 +87,5 @@ class HomeScreen(Screen):
         status = self.query_one(ServerStatus)
         s = self.server.get_status()
         status.update_status(s["running"], s["host"], s["port"])
-        self.query_one(Button, id="btn-start").disabled = s["running"]
-        self.query_one(Button, id="btn-stop").disabled = not s["running"]
+        self.query_one("#btn-start", Button).disabled = s["running"]
+        self.query_one("#btn-stop", Button).disabled = not s["running"]
