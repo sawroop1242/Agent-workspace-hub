@@ -4,7 +4,7 @@ mod skills;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use skills::SkillStore;
+use skills::{GlobalSkillRegistry, ProjectSkillReferences};
 
 #[derive(Debug, Parser)]
 #[command(name = "awh", version, about = "Agent Workspace Hub")]
@@ -15,9 +15,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show the Rust Agent Workspace Hub status.
     Status,
-    /// Manage project skills.
     Skill {
         #[command(subcommand)]
         command: SkillCommand,
@@ -26,19 +24,25 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
-    /// Create a new local skill.
+    /// Create a skill in the global registry.
     Create { name: String, #[arg(short, long)] description: String },
-    /// List installed local skills.
+    /// List globally installed skills.
     List,
-    /// Read skill metadata.
+    /// Read a globally installed skill.
     Read { name: String },
+    /// Add a global skill reference to the current project.
+    Add { name: String },
+    /// Remove a skill reference from the current project.
+    Remove { name: String },
+    /// List skills referenced by the current project.
+    Project,
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let root = std::env::current_dir()?;
-    let store = SkillStore::new(root);
+    let registry = GlobalSkillRegistry::default()?;
+    let project = ProjectSkillReferences::new(std::env::current_dir()?);
 
     match cli.command {
         Some(Command::Status) => {
@@ -47,16 +51,16 @@ fn main() -> Result<()> {
         }
         Some(Command::Skill { command }) => match command {
             SkillCommand::Create { name, description } => {
-                let skill = store.create(&name, &description)?;
-                println!("created skill: {}", skill.name);
+                let skill = registry.create(&name, &description)?;
+                println!("created global skill: {}", skill.name);
                 println!("path: {}", skill.path.display());
             }
             SkillCommand::List => {
-                for skill in store.list()? {
+                for skill in registry.list()? {
                     println!("{} — {}", skill.name, skill.description);
                 }
             }
-            SkillCommand::Read { name } => match store.get(&name)? {
+            SkillCommand::Read { name } => match registry.get(&name)? {
                 Some(skill) => {
                     println!("name: {}", skill.name);
                     println!("description: {}", skill.description);
@@ -65,6 +69,23 @@ fn main() -> Result<()> {
                 }
                 None => println!("skill not found: {name}"),
             },
+            SkillCommand::Add { name } => {
+                project.add(&name, &registry)?;
+                println!("added skill reference: {name}");
+                println!("references: {}", project.path().display());
+            }
+            SkillCommand::Remove { name } => {
+                if project.remove(&name)? {
+                    println!("removed skill reference: {name}");
+                } else {
+                    println!("skill reference not found: {name}");
+                }
+            }
+            SkillCommand::Project => {
+                for skill in project.resolve(&registry)? {
+                    println!("{} — {}", skill.name, skill.description);
+                }
+            }
         },
         None => {
             println!("Agent Workspace Hub — Rust");
