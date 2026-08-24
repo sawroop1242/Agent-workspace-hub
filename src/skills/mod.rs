@@ -1,3 +1,5 @@
+pub mod installer;
+pub mod lockfile;
 pub mod model;
 pub mod package;
 pub mod parser;
@@ -10,6 +12,8 @@ pub mod remote;
 pub mod store;
 pub mod trust;
 
+pub use installer::SkillInstaller;
+pub use lockfile::{LockfileStore, LockedSkill, SkillLockfile};
 pub use model::Skill;
 pub use package::{safe_package_path, sha256_file, validate_skill_package};
 pub use parser::parse_skill;
