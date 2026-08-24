@@ -1,18 +1,22 @@
 pub mod model;
+pub mod package;
 pub mod parser;
 pub mod project;
 pub mod references;
 pub mod registry;
+pub mod registry_client;
 pub mod registry_manifest;
 pub mod remote;
 pub mod store;
 pub mod trust;
 
 pub use model::Skill;
+pub use package::{safe_package_path, sha256_file, validate_skill_package};
 pub use parser::parse_skill;
 pub use project::ProjectSkillReferences;
 pub use references::SkillReferences;
 pub use registry::GlobalSkillRegistry;
+pub use registry_client::RegistryClient;
 pub use registry_manifest::{RegistryManifest, RegistrySkill};
 pub use remote::{RemoteSkillRegistry, SkillRegistrySource};
 pub use store::SkillStore;
