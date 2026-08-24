@@ -4,7 +4,7 @@ mod skills;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use skills::{GlobalSkillRegistry, ProjectSkillReferences};
+use skills::{GlobalSkillRegistry, ProjectSkillReferences, RegistryClient};
 
 #[derive(Debug, Parser)]
 #[command(name = "awh", version, about = "Agent Workspace Hub")]
@@ -20,22 +20,26 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
-    /// Create a skill in the global registry.
     Create { name: String, #[arg(short, long)] description: String },
-    /// List globally installed skills.
     List,
-    /// Read a globally installed skill.
     Read { name: String },
-    /// Add a global skill reference to the current project.
     Add { name: String },
-    /// Remove a skill reference from the current project.
     Remove { name: String },
-    /// List skills referenced by the current project.
     Project,
+    Search { query: String, #[arg(long)] registry: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum RegistryCommand {
+    Search { query: String, url: String },
 }
 
 fn main() -> Result<()> {
@@ -84,6 +88,20 @@ fn main() -> Result<()> {
             SkillCommand::Project => {
                 for skill in project.resolve(&registry)? {
                     println!("{} — {}", skill.name, skill.description);
+                }
+            }
+            SkillCommand::Search { query, registry: url } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                for skill in rt.block_on(RegistryClient::new(url).search(&query))? {
+                    println!("{} v{} — {}", skill.name, skill.version, skill.description);
+                }
+            }
+        },
+        Some(Command::Registry { command }) => match command {
+            RegistryCommand::Search { query, url } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                for skill in rt.block_on(RegistryClient::new(url).search(&query))? {
+                    println!("{} v{} — {}", skill.name, skill.version, skill.description);
                 }
             }
         },
