@@ -1,4 +1,4 @@
-use crate::mcp::{AuthMethod, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, McpTransport, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, StdioMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp};
+use crate::mcp::{AuthMethod, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, McpTransport, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, StreamableHttpMcpClient, StdioMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,28 +10,16 @@ use tokio::runtime::Runtime;
 #[derive(Debug, Serialize)] struct RpcResponse { jsonrpc: &'static str, id: Option<Value>, result: Option<Value>, error: Option<Value> }
 
 pub struct StdioMcpServer { skills: SkillMcp, workspace: WorkspaceMcp, memory: MemoryMcp, tasks: TasksMcp, connectors: ConnectorsMcp, providers: Arc<RwLock<ProviderRegistry>>, runtime: Runtime }
-
 impl StdioMcpServer {
     pub fn new(project_root: PathBuf) -> Result<Self> {
-        let runtime=Runtime::new()?;
-        let registry=Arc::new(RwLock::new(ProviderRegistry::default()));
-        if std::env::var("COMPOSIO_API_KEY").is_ok() { if let Ok(provider)=ComposioProvider::from_env(){registry.write().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?.register(Box::new(provider));} }
+        let runtime=Runtime::new()?; let registry=Arc::new(RwLock::new(ProviderRegistry::default()));
+        if std::env::var("COMPOSIO_API_KEY").is_ok(){if let Ok(provider)=ComposioProvider::from_env(){registry.write().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?.register(Box::new(provider));}}
         let custom=CustomMcpRegistry::new(project_root.clone())?;
-        for cfg in custom.list()? {
-            if !cfg.enabled { continue; }
-            match cfg.transport {
-                McpTransport::Stdio => {
-                    let client=runtime.block_on(StdioMcpClient::spawn(&cfg))?;
-                    runtime.block_on(client.initialize())?;
-                    let provider=CustomMcpProvider::new(cfg.id,Arc::new(client));
-                    registry.write().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?.register(Box::new(provider));
-                }
-                McpTransport::StreamableHttp => {
-                    tracing::warn!(mcp_id=%cfg.id,"streamable HTTP MCP is registered but not connected yet");
-                }
-            }
-        }
-        Ok(Self { skills:SkillMcp::new(project_root.clone())?,workspace:WorkspaceMcp::new(project_root.clone())?,memory:MemoryMcp::new(project_root.clone())?,tasks:TasksMcp::new(project_root.clone())?,connectors:ConnectorsMcp::new(project_root)?,providers:registry,runtime })
+        for cfg in custom.list()? { if !cfg.enabled {continue;} match cfg.transport {
+            McpTransport::Stdio=>{let client=runtime.block_on(StdioMcpClient::spawn(&cfg))?;runtime.block_on(client.initialize())?;let provider=CustomMcpProvider::new(cfg.id,Arc::new(client));registry.write().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?.register(Box::new(provider));}
+            McpTransport::StreamableHttp=>{let client=StreamableHttpMcpClient::new(&cfg)?;runtime.block_on(client.initialize())?;let provider=CustomMcpProvider::new(cfg.id,Arc::new(client));registry.write().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?.register(Box::new(provider));}
+        }}
+        Ok(Self{skills:SkillMcp::new(project_root.clone())?,workspace:WorkspaceMcp::new(project_root.clone())?,memory:MemoryMcp::new(project_root.clone())?,tasks:TasksMcp::new(project_root.clone())?,connectors:ConnectorsMcp::new(project_root)?,providers:registry,runtime})
     }
     pub fn provider_registry(&self)->Arc<RwLock<ProviderRegistry>>{Arc::clone(&self.providers)}
     pub fn handle(&self,input:&str)->Result<String>{let req:RpcRequest=serde_json::from_str(input)?;let result=match req.method.as_str(){"initialize"=>json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"agent-workspace-hub","version":env!("CARGO_PKG_VERSION")}}),"tools/list"=>self.tools_list(),"tools/call"=>self.call_tool(&req.params)?,_=>json!({"error":"method not found"})};Ok(serde_json::to_string(&RpcResponse{jsonrpc:"2.0",id:req.id,result:Some(result),error:None})?)}
