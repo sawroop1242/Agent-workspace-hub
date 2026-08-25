@@ -16,7 +16,11 @@ pub struct SandboxConfig {
 
 impl SandboxConfig {
     pub fn new(project_root: impl Into<PathBuf>, permissions: McpPermissions) -> Result<Self> {
-        let cfg = Self { enabled: true, project_root: project_root.into(), permissions };
+        let cfg = Self {
+            enabled: true,
+            project_root: project_root.into(),
+            permissions,
+        };
         cfg.validate()?;
         Ok(cfg)
     }
@@ -25,22 +29,36 @@ impl SandboxConfig {
         if !self.project_root.is_absolute() {
             bail!("sandbox project root must be an absolute path");
         }
+        if self.project_root.exists() && !self.project_root.is_dir() {
+            bail!("sandbox project root must be a directory: {:?}", self.project_root);
+        }
         self.permissions.validate()
     }
 }
 
 #[cfg(target_os = "linux")]
-pub fn wrap_command(cfg: &SandboxConfig, command: &str, args: &[String]) -> Result<(String, Vec<String>)> {
+pub fn wrap_command(
+    cfg: &SandboxConfig,
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>)> {
     cfg.validate()?;
     if !cfg.enabled {
         return Ok((command.to_string(), args.to_vec()));
     }
 
     let bwrap = std::env::var("AWH_BWRAP").unwrap_or_else(|_| "bwrap".to_string());
-    let available = std::process::Command::new(&bwrap).arg("--version").output()
-        .map(|output| output.status.success()).unwrap_or(false);
+    let available = std::process::Command::new(&bwrap)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
     if !available {
         bail!("MCP sandbox is enabled but bubblewrap was not found; refusing unsandboxed execution");
+    }
+
+    if !cfg.project_root.exists() {
+        bail!("sandbox project root does not exist: {:?}", cfg.project_root);
     }
 
     let mut wrapped: Vec<String> = vec![
@@ -50,10 +68,18 @@ pub fn wrap_command(cfg: &SandboxConfig, command: &str, args: &[String]) -> Resu
         "--unshare-pid".into(),
         "--unshare-ipc".into(),
         "--unshare-uts".into(),
-        "--ro-bind".into(), "/usr".into(), "/usr".into(),
-        "--proc".into(), "/proc".into(),
-        "--dev".into(), "/dev".into(),
-        "--tmpfs".into(), "/tmp".into(),
+        // Do not grant ambient Linux capabilities to the MCP process.
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--ro-bind".into(),
+        "/usr".into(),
+        "/usr".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
     ];
 
     if cfg.permissions.network {
@@ -62,9 +88,8 @@ pub fn wrap_command(cfg: &SandboxConfig, command: &str, args: &[String]) -> Resu
         wrapped.push("--unshare-net".into());
     }
 
-    if !cfg.project_root.exists() {
-        bail!("sandbox project root does not exist: {:?}", cfg.project_root);
-    }
+    // The project root is the explicit writable workspace boundary. Additional
+    // filesystem permissions are also mounted only when explicitly requested.
     wrapped.extend([
         "--bind".into(),
         cfg.project_root.to_string_lossy().into_owned(),
@@ -93,7 +118,11 @@ pub fn wrap_command(cfg: &SandboxConfig, command: &str, args: &[String]) -> Resu
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn wrap_command(cfg: &SandboxConfig, command: &str, args: &[String]) -> Result<(String, Vec<String>)> {
+pub fn wrap_command(
+    cfg: &SandboxConfig,
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>)> {
     if cfg.enabled {
         bail!("OS-level MCP sandbox is currently supported only on Linux");
     }
@@ -104,9 +133,14 @@ pub fn sandbox_available() -> bool {
     #[cfg(target_os = "linux")]
     {
         let bwrap = std::env::var("AWH_BWRAP").unwrap_or_else(|_| "bwrap".into());
-        std::process::Command::new(bwrap).arg("--version").output()
-            .map(|output| output.status.success()).unwrap_or(false)
+        std::process::Command::new(bwrap)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
-    #[cfg(not(target_os = "linux"))]
-    { false }
+    #[cfg(not(target_os = "linux")]
+    {
+        false
+    }
 }
