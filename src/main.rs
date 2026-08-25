@@ -5,7 +5,7 @@ mod skills;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mcp::StdioMcpServer;
+use mcp::{CustomMcpRegistry, CustomMcpServerConfig, McpTransport, StdioMcpServer};
 use skills::{GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller};
 
 #[derive(Debug, Parser)]
@@ -21,21 +21,20 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-enum McpCommand { Serve }
+enum McpCommand {
+    Serve,
+    List,
+    Add { id: String, #[arg(long)] name: String, #[arg(long, default_value = "stdio")] transport: String, #[arg(long)] command: Option<String>, #[arg(long = "arg")] args: Vec<String>, #[arg(long)] url: Option<String>, #[arg(long = "env")] env: Vec<String> },
+    Remove { id: String },
+    Enable { id: String },
+    Disable { id: String },
+}
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
-    Create { name: String, #[arg(short, long)] description: String },
-    List,
-    Read { name: String },
-    Add { name: String },
-    Remove { name: String },
-    Project,
-    Search { query: String, #[arg(long)] registry: String },
-    Install { name: String, #[arg(long)] registry: String, #[arg(long)] add: bool },
-    Uninstall { name: String },
+    Create { name: String, #[arg(short, long)] description: String }, List, Read { name: String }, Add { name: String }, Remove { name: String }, Project,
+    Search { query: String, #[arg(long)] registry: String }, Install { name: String, #[arg(long)] registry: String, #[arg(long)] add: bool }, Uninstall { name: String },
 }
-
 #[derive(Debug, Subcommand)]
 enum RegistryCommand { Add { url: String }, List, Remove { url: String }, Search { query: String, url: String } }
 
@@ -45,38 +44,37 @@ fn main() -> Result<()> {
     if let Some(Command::Mpc { command: McpCommand::Serve }) = cli.command {
         let server = StdioMcpServer::new(std::env::current_dir()?)?;
         use std::io::{self, BufRead, Write};
-        for line in io::stdin().lock().lines() {
-            let line = line?;
-            if line.trim().is_empty() { continue; }
-            let response = server.handle(&line)?;
-            println!("{response}");
-            io::stdout().flush()?;
-        }
+        for line in io::stdin().lock().lines() { let line=line?; if line.trim().is_empty(){continue;} println!("{}",server.handle(&line)?); io::stdout().flush()?; }
         return Ok(());
     }
-    let global = GlobalSkillRegistry::default()?;
-    let project = ProjectSkillReferences::new(std::env::current_dir()?);
-    let home = dirs::home_dir().context("could not determine home directory")?;
-    let registry_store = RegistryStore::new(home.join(".agent-workspace-hub"));
-
+    let global=GlobalSkillRegistry::default()?; let project=ProjectSkillReferences::new(std::env::current_dir()?); let home=dirs::home_dir().context("could not determine home directory")?; let registry_store=RegistryStore::new(home.join(".agent-workspace-hub"));
     match cli.command {
-        Some(Command::Status) => println!("Agent Workspace Hub — Rust core\nstatus: bootstrap complete"),
-        Some(Command::Mpc { .. }) => unreachable!(),
-        Some(Command::Skill { command }) => match command {
-            SkillCommand::Create { name, description } => { let skill = global.create(&name, &description)?; println!("created global skill: {}\npath: {}", skill.name, skill.path.display()); }
-            SkillCommand::List => for skill in global.list()? { println!("{} — {}", skill.name, skill.description); },
-            SkillCommand::Read { name } => match global.get(&name)? { Some(skill) => println!("name: {}\ndescription: {}\nversion: {}\npath: {}", skill.name, skill.description, skill.version.as_deref().unwrap_or("unknown"), skill.path.display()), None => println!("skill not found: {name}"), },
-            SkillCommand::Add { name } => { project.add(&name, &global)?; println!("added project skill reference: {name}"); }
-            SkillCommand::Remove { name } => { if project.remove(&name)? { println!("removed project skill reference: {name}"); } else { println!("skill reference not found: {name}"); } }
-            SkillCommand::Project => for skill in project.resolve(&global)? { println!("{} — {}", skill.name, skill.description); },
-            SkillCommand::Search { query, registry: url } => search_registry(&url, &query)?,
-            SkillCommand::Install { name, registry: url, add } => { let rt = tokio::runtime::Runtime::new()?; let client = RegistryClient::new(url.clone()); let cache = home.join(".agent-workspace-hub").join("cache").join("skills"); rt.block_on(SkillInstaller::new(cache).install_from_registry(&client, &name, &global))?; println!("installed global skill: {name}"); if add { project.add(&name, &global)?; println!("added project reference: {name}"); } }
-            SkillCommand::Uninstall { name } => { let path = global.skills_dir().join(&name); if path.exists() { std::fs::remove_dir_all(path)?; println!("uninstalled global skill: {name}"); } else { println!("skill not installed: {name}"); } }
+        Some(Command::Status)=>println!("Agent Workspace Hub — Rust\nstatus: bootstrap complete"),
+        Some(Command::Mpc { command })=>handle_mcp_cli(command)?,
+        Some(Command::Skill { command })=>match command {
+            SkillCommand::Create{name,description}=>{let s=global.create(&name,&description)?;println!("created global skill: {}\npath: {}",s.name,s.path.display());}, SkillCommand::List=>for s in global.list()?{println!("{} — {}",s.name,s.description)},
+            SkillCommand::Read{name}=>match global.get(&name)?{Some(s)=>println!("name: {}\ndescription: {}\nversion: {}\npath: {}",s.name,s.description,s.version.as_deref().unwrap_or("unknown"),s.path.display()),None=>println!("skill not found: {name}")},
+            SkillCommand::Add{name}=>{project.add(&name,&global)?;println!("added project skill reference: {name}")}, SkillCommand::Remove{name}=>{if project.remove(&name)?{println!("removed project skill reference: {name}")}else{println!("skill reference not found: {name}")}}, SkillCommand::Project=>for s in project.resolve(&global)?{println!("{} — {}",s.name,s.description)},
+            SkillCommand::Search{query,registry:url}=>search_registry(&url,&query)?, SkillCommand::Install{name,registry:url,add}=>{let rt=tokio::runtime::Runtime::new()?;let client=RegistryClient::new(url.clone());let cache=home.join(".agent-workspace-hub").join("cache").join("skills");rt.block_on(SkillInstaller::new(cache).install_from_registry(&client,&name,&global))?;println!("installed global skill: {name}");if add{project.add(&name,&global)?;println!("added project reference: {name}")}}, SkillCommand::Uninstall{name}=>{let path=global.skills_dir().join(&name);if path.exists(){std::fs::remove_dir_all(path)?;println!("uninstalled global skill: {name}")}else{println!("skill not installed: {name}")}}
         },
-        Some(Command::Registry { command }) => match command { RegistryCommand::Add { url } => { if registry_store.add(&url)? { println!("registry added: {url}"); } else { println!("registry already exists: {url}"); } }, RegistryCommand::List => for url in registry_store.load()?.registries { println!("{url}"); }, RegistryCommand::Remove { url } => { if registry_store.remove(&url)? { println!("registry removed: {url}"); } else { println!("registry not found: {url}"); } }, RegistryCommand::Search { query, url } => search_registry(&url, &query)?, },
-        None => println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
-    }
-    Ok(())
+        Some(Command::Registry { command })=>match command{RegistryCommand::Add{url}=>{if registry_store.add(&url)?{println!("registry added: {url}")}else{println!("registry already exists: {url}")}},RegistryCommand::List=>for url in registry_store.load()?.registries{println!("{url}")},RegistryCommand::Remove{url}=>{if registry_store.remove(&url)?{println!("registry removed: {url}")}else{println!("registry not found: {url}")}},RegistryCommand::Search{query,url}=>search_registry(&url,&query)?},
+        None=>println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
+    } Ok(())
 }
 
-fn search_registry(url: &str, query: &str) -> Result<()> { let rt = tokio::runtime::Runtime::new()?; for skill in rt.block_on(RegistryClient::new(url).search(query))? { println!("{} v{} — {}", skill.name, skill.version, skill.description); } Ok(()) }
+fn handle_mcp_cli(command:McpCommand)->Result<()>{
+    let registry=CustomMcpRegistry::new(std::env::current_dir()?)?;
+    match command {
+        McpCommand::List=>for s in registry.list()?{println!("{} — {} [{:?}] {}",s.id,s.name,s.transport,if s.enabled{"enabled"}else{"disabled"})},
+        McpCommand::Add{id,name,transport,command,args,url,env}=>{
+            let transport=match transport.to_ascii_lowercase().as_str(){"stdio"=>McpTransport::Stdio,"streamablehttp"|"streamable-http"|"http"=>McpTransport::StreamableHttp,other=>anyhow::bail!("unsupported MCP transport: {other}")};
+            let mut environment=std::collections::HashMap::new(); for item in env{let(mut parts)=item.splitn(2,'=');let k=parts.next().unwrap_or("");let v=parts.next().unwrap_or("");if k.is_empty(){anyhow::bail!("--env must be KEY=VALUE")}environment.insert(k.to_string(),v.to_string());}
+            let s=registry.add(CustomMcpServerConfig{id,name,transport,command,args,url,env:environment,enabled:true})?;println!("added MCP: {}",s.id);
+        },
+        McpCommand::Remove{id}=>{if registry.remove(&id)?{println!("removed MCP: {id}")}else{println!("MCP not found: {id}")}},
+        McpCommand::Enable{id}=>{registry.set_enabled(&id,true)?;println!("enabled MCP: {id}")},
+        McpCommand::Disable{id}=>{registry.set_enabled(&id,false)?;println!("disabled MCP: {id}")},
+        McpCommand::Serve=>unreachable!(),
+    } Ok(())
+}
+fn search_registry(url:&str,query:&str)->Result<()>{let rt=tokio::runtime::Runtime::new()?;for s in rt.block_on(RegistryClient::new(url).search(query))?{println!("{} v{} — {}",s.name,s.version,s.description)}Ok(())}
