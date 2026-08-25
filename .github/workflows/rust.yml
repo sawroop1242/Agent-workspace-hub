@@ -5,6 +5,7 @@ on:
     branches: [rust]
   pull_request:
     branches: [rust]
+  workflow_dispatch:
 
 jobs:
   check-test:
