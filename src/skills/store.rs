@@ -17,7 +17,11 @@ impl SkillStore {
     }
 
     pub fn create(&self, name: &str, description: &str) -> Result<Skill> {
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
             bail!("invalid skill name: {name}");
         }
         let dir = self.skills_dir().join(name);
