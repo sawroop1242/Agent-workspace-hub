@@ -1,4 +1,5 @@
 pub mod composio;
+pub mod composio_auth;
 pub mod connectors;
 pub mod context;
 pub mod memory;
@@ -9,6 +10,7 @@ pub mod tasks;
 pub mod workspace;
 
 pub use composio::ComposioProvider;
+pub use composio_auth::{AuthLink, ComposioAuth, ConnectedAccount};
 pub use connectors::{AuthMethod, Connector, ConnectorsMcp};
 pub use context::{load_context, WorkspaceContext};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
