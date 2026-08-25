@@ -7,6 +7,7 @@ pub mod global_mcp;
 pub mod community_registry;
 pub mod memory;
 pub mod providers;
+pub mod security;
 pub mod server;
 pub mod skills;
 pub mod tasks;
@@ -21,6 +22,7 @@ pub use global_mcp::{GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectM
 pub use community_registry::{CommunityMcpManifest, CommunityMcpRegistryClient, CommunityRegistryIndex};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
 pub use providers::{ConnectorProvider, CustomMcpProvider, GatewayProvider, ProviderRegistry, ToolCallResult, ToolContent, ToolDescriptor, UnconfiguredProvider};
+pub use security::{sha256_file, validate_command, validate_id, validate_url, verify_sha256, PackageIntegrity};
 pub use server::StdioMcpServer;
 pub use skills::SkillMcp;
 pub use tasks::{Task, TaskPriority, TaskStatus, TasksMcp};
