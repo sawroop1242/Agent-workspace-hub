@@ -15,6 +15,7 @@ pub mod tasks;
 pub mod trust;
 pub mod trust_store;
 pub mod execution_gate;
+pub mod cli_trust;
 pub mod workspace;
 
 pub use composio::ComposioProvider;
@@ -34,4 +35,5 @@ pub use tasks::{Task, TaskPriority, TaskStatus, TasksMcp};
 pub use trust::{can_enable, McpApproval, TrustLevel, TrustStore};
 pub use trust_store::PersistentTrustStore;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
+pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};
 pub use workspace::{WorkspaceFile, WorkspaceMcp};
