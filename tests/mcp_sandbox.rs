@@ -1,5 +1,8 @@
 use agent_workspace_hub::mcp::{wrap_command, McpPermissions, SandboxConfig};
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+static BWRAP_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn permissions() -> McpPermissions {
     McpPermissions::default()
@@ -52,6 +55,7 @@ fn disabled_sandbox_returns_original_command() {
 #[cfg(target_os = "linux")]
 #[test]
 fn enabled_linux_sandbox_fails_closed_without_bwrap() {
+    let _guard = BWRAP_ENV_LOCK.lock().unwrap();
     let root = std::env::temp_dir();
     let cfg = SandboxConfig {
         enabled: true,
