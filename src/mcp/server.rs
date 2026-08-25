@@ -1,16 +1,18 @@
-use crate::mcp::{AuthMethod, Connector, ConnectorsMcp, MemoryMcp, MemoryScope, SkillMcp, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp};
+use crate::mcp::{AuthMethod, Connector, ConnectorsMcp, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Deserialize)] struct RpcRequest { jsonrpc: String, id: Option<Value>, method: String, #[serde(default)] params: Value }
 #[derive(Debug, Serialize)] struct RpcResponse { jsonrpc: &'static str, id: Option<Value>, result: Option<Value>, error: Option<Value> }
 
-pub struct StdioMcpServer { skills: SkillMcp, workspace: WorkspaceMcp, memory: MemoryMcp, tasks: TasksMcp, connectors: ConnectorsMcp }
+pub struct StdioMcpServer { skills: SkillMcp, workspace: WorkspaceMcp, memory: MemoryMcp, tasks: TasksMcp, connectors: ConnectorsMcp, providers: Arc<RwLock<ProviderRegistry>> }
 
 impl StdioMcpServer {
-    pub fn new(project_root: PathBuf) -> Result<Self> { Ok(Self { skills: SkillMcp::new(project_root.clone())?, workspace: WorkspaceMcp::new(project_root.clone())?, memory: MemoryMcp::new(project_root.clone())?, tasks: TasksMcp::new(project_root.clone())?, connectors: ConnectorsMcp::new(project_root)? }) }
+    pub fn new(project_root: PathBuf) -> Result<Self> { Ok(Self { skills: SkillMcp::new(project_root.clone())?, workspace: WorkspaceMcp::new(project_root.clone())?, memory: MemoryMcp::new(project_root.clone())?, tasks: TasksMcp::new(project_root.clone())?, connectors: ConnectorsMcp::new(project_root)?, providers: Arc::new(RwLock::new(ProviderRegistry::default())) }) }
+    pub fn provider_registry(&self) -> Arc<RwLock<ProviderRegistry>> { Arc::clone(&self.providers) }
     pub fn handle(&self, input: &str) -> Result<String> {
         let req: RpcRequest = serde_json::from_str(input)?;
         let result = match req.method.as_str() { "initialize" => json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"agent-workspace-hub","version":env!("CARGO_PKG_VERSION")}}), "tools/list" => self.tools_list(), "tools/call" => self.call_tool(&req.params)?, _ => json!({"error":"method not found"}) };
@@ -37,7 +39,10 @@ impl StdioMcpServer {
         {"name":"connectors.add","description":"Register connector metadata; never stores secrets","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"provider":{"type":"string"},"auth":{"type":"string","enum":["OAuth","ApiKey","None"]},"scopes":{"type":"array","items":{"type":"string"}},"enabled":{"type":"boolean"}},"required":["id","name","provider","auth"]}},
         {"name":"connectors.enable","description":"Enable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
         {"name":"connectors.disable","description":"Disable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-        {"name":"connectors.remove","description":"Remove connector metadata","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
+        {"name":"connectors.remove","description":"Remove connector metadata","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+        {"name":"connector.providers","description":"List registered connector providers","inputSchema":{"type":"object","properties":{}}},
+        {"name":"connector.tools","description":"List tools exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"}},"required":["provider"]}},
+        {"name":"connector.invoke","description":"Invoke a tool exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["provider","tool"]}}
     ]}) }
     fn call_tool(&self, p:&Value)->Result<Value>{
         let n=p.get("name").and_then(Value::as_str).unwrap_or_default(); let a=p.get("arguments").cloned().unwrap_or_else(||json!({}));
@@ -47,6 +52,9 @@ impl StdioMcpServer {
             "memory.store"=>{let s=parse_scope(a.get("scope").and_then(Value::as_str));serde_json::to_value(self.memory.store(strval(&a,"id"),strval(&a,"content"),s,strings(&a,"tags"))?)?}, "memory.search"=>serde_json::to_value(self.memory.search(a.get("query").and_then(Value::as_str).unwrap_or_default(),a.get("scope").and_then(Value::as_str).map(parse_scope))?)?, "memory.get"=>serde_json::to_value(self.memory.get(a.get("id").and_then(Value::as_str).unwrap_or_default())?)?, "memory.delete"=>json!({"deleted":self.memory.delete(a.get("id").and_then(Value::as_str).unwrap_or_default())?}),
             "tasks.create"=>serde_json::to_value(self.tasks.create(strval(&a,"id"),strval(&a,"title"),strval(&a,"description"),parse_priority(a.get("priority").and_then(Value::as_str)),strings(&a,"tags"))?)?, "tasks.list"=>serde_json::to_value(self.tasks.list(a.get("status").and_then(Value::as_str).map(parse_status))?)?, "tasks.update"=>serde_json::to_value(self.tasks.update(a.get("id").and_then(Value::as_str).unwrap_or_default(),a.get("status").and_then(Value::as_str).map(parse_status),a.get("priority").and_then(Value::as_str).map(|x|parse_priority(Some(x))),a.get("assignee").map(|x|x.as_str().map(str::to_string)))?)?, "tasks.delete"=>json!({"deleted":self.tasks.delete(a.get("id").and_then(Value::as_str).unwrap_or_default())?}),
             "connectors.list"=>serde_json::to_value(self.connectors.list()?)?, "connectors.add"=>{let c=Connector{id:strval(&a,"id"),name:strval(&a,"name"),provider:strval(&a,"provider"),auth:parse_auth(a.get("auth").and_then(Value::as_str)),scopes:strings(&a,"scopes"),enabled:a.get("enabled").and_then(Value::as_bool).unwrap_or(true)};serde_json::to_value(self.connectors.add(c)?)?}, "connectors.enable"=>serde_json::to_value(self.connectors.set_enabled(a.get("id").and_then(Value::as_str).unwrap_or_default(),true)?)?, "connectors.disable"=>serde_json::to_value(self.connectors.set_enabled(a.get("id").and_then(Value::as_str).unwrap_or_default(),false)?)?, "connectors.remove"=>json!({"removed":self.connectors.remove(a.get("id").and_then(Value::as_str).unwrap_or_default())?}),
+            "connector.providers"=>{let r=self.providers.read().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?;json!(r.providers())},
+            "connector.tools"=>{let provider=a.get("provider").and_then(Value::as_str).unwrap_or_default();let r=self.providers.read().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?;serde_json::to_value(r.tools(provider)?)?},
+            "connector.invoke"=>{let provider=a.get("provider").and_then(Value::as_str).unwrap_or_default();let tool=a.get("tool").and_then(Value::as_str).unwrap_or_default();let args=a.get("arguments").cloned().unwrap_or_else(||json!({}));let r=self.providers.read().map_err(|_|anyhow::anyhow!("provider registry lock poisoned"))?;serde_json::to_value(r.invoke(provider,tool,args)?)?},
             _=>json!({"error":"unknown tool"})}; Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&v)?}]}))
     }
 }
