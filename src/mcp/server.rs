@@ -1,4 +1,4 @@
-use crate::mcp::{SkillMcp, WorkspaceMcp};
+use crate::mcp::{MemoryMcp, MemoryScope, SkillMcp, WorkspaceMcp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,11 +9,11 @@ struct RpcRequest { jsonrpc: String, id: Option<Value>, method: String, #[serde(
 #[derive(Debug, Serialize)]
 struct RpcResponse { jsonrpc: &'static str, id: Option<Value>, result: Option<Value>, error: Option<Value> }
 
-pub struct StdioMcpServer { skills: SkillMcp, workspace: WorkspaceMcp }
+pub struct StdioMcpServer { skills: SkillMcp, workspace: WorkspaceMcp, memory: MemoryMcp }
 
 impl StdioMcpServer {
     pub fn new(project_root: PathBuf) -> Result<Self> {
-        Ok(Self { skills: SkillMcp::new(project_root.clone())?, workspace: WorkspaceMcp::new(project_root)? })
+        Ok(Self { skills: SkillMcp::new(project_root.clone())?, workspace: WorkspaceMcp::new(project_root.clone())?, memory: MemoryMcp::new(project_root)? })
     }
 
     pub fn handle(&self, input: &str) -> Result<String> {
@@ -36,7 +36,11 @@ impl StdioMcpServer {
             {"name":"skills.search","description":"Search globally installed skills","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
             {"name":"workspace.context","description":"Read project-level agent instructions and README context","inputSchema":{"type":"object","properties":{}}},
             {"name":"workspace.list_files","description":"List files in a project directory","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
-            {"name":"workspace.read_file","description":"Read a UTF-8 project file","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}
+            {"name":"workspace.read_file","description":"Read a UTF-8 project file","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+            {"name":"memory.store","description":"Store or update project memory","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","content","scope"]}},
+            {"name":"memory.search","description":"Search project memory","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]}},"required":["query"]}},
+            {"name":"memory.get","description":"Get a memory entry by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"memory.delete","description":"Delete a memory entry","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
         ]})
     }
 
@@ -52,6 +56,16 @@ impl StdioMcpServer {
             "workspace.context" => serde_json::to_value(self.workspace.context()?)?,
             "workspace.list_files" => serde_json::to_value(self.workspace.list_files(args.get("path").and_then(Value::as_str).unwrap_or("."))?)?,
             "workspace.read_file" => serde_json::to_value(self.workspace.read_file(args.get("path").and_then(Value::as_str).unwrap_or_default())?)?,
+            "memory.store" => {
+                let scope = match args.get("scope").and_then(Value::as_str).unwrap_or("Project") { "Session" => MemoryScope::Session, "Global" => MemoryScope::Global, _ => MemoryScope::Project };
+                serde_json::to_value(self.memory.store(args.get("id").and_then(Value::as_str).unwrap_or_default().to_string(), args.get("content").and_then(Value::as_str).unwrap_or_default().to_string(), scope, args.get("tags").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default())?)?
+            }
+            "memory.search" => {
+                let scope = args.get("scope").and_then(Value::as_str).map(|s| match s { "Session" => MemoryScope::Session, "Global" => MemoryScope::Global, _ => MemoryScope::Project });
+                serde_json::to_value(self.memory.search(args.get("query").and_then(Value::as_str).unwrap_or_default(), scope)?)?
+            }
+            "memory.get" => serde_json::to_value(self.memory.get(args.get("id").and_then(Value::as_str).unwrap_or_default())?)?,
+            "memory.delete" => json!({"deleted": self.memory.delete(args.get("id").and_then(Value::as_str).unwrap_or_default())?}),
             _ => json!({"error":"unknown tool"}),
         };
         Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&value)?}]}))
