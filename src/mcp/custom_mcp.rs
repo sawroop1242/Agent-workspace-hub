@@ -1,0 +1,74 @@
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::fs;
+use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport { Stdio, StreamableHttp }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomMcpServerConfig {
+    pub id: String,
+    pub name: String,
+    pub transport: McpTransport,
+    pub command: Option<String>,
+    #[serde(default)] pub args: Vec<String>,
+    pub url: Option<String>,
+    #[serde(default)] pub env: std::collections::HashMap<String, String>,
+    #[serde(default = "default_true")] pub enabled: bool,
+}
+fn default_true() -> bool { true }
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CustomMcpStore { pub servers: Vec<CustomMcpServerConfig> }
+
+pub struct CustomMcpRegistry { path: PathBuf }
+impl CustomMcpRegistry {
+    pub fn new(project_root: impl Into<PathBuf>) -> Result<Self> {
+        let root = project_root.into(); fs::create_dir_all(root.join(".agent"))?;
+        Ok(Self { path: root.join(".agent").join("mcps.json") })
+    }
+    fn load(&self) -> Result<CustomMcpStore> { if !self.path.exists() { return Ok(CustomMcpStore::default()); } Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?) }
+    fn save(&self, s: &CustomMcpStore) -> Result<()> { fs::write(&self.path, serde_json::to_string_pretty(s)?)?; Ok(()) }
+    pub fn list(&self) -> Result<Vec<CustomMcpServerConfig>> { Ok(self.load()?.servers) }
+    pub fn add(&self, server: CustomMcpServerConfig) -> Result<CustomMcpServerConfig> {
+        if server.id.is_empty() || server.name.is_empty() { bail!("id and name are required"); }
+        match server.transport { McpTransport::Stdio if server.command.as_deref().unwrap_or("").is_empty() => bail!("stdio MCP requires command"), McpTransport::StreamableHttp if server.url.as_deref().unwrap_or("").is_empty() => bail!("HTTP MCP requires url"), _ => {} }
+        let mut s = self.load()?; s.servers.retain(|x| x.id != server.id); s.servers.push(server.clone()); self.save(&s)?; Ok(server)
+    }
+    pub fn remove(&self, id: &str) -> Result<bool> { let mut s=self.load()?; let n=s.servers.len(); s.servers.retain(|x|x.id!=id); self.save(&s)?; Ok(n!=s.servers.len()) }
+    pub fn set_enabled(&self,id:&str,enabled:bool)->Result<Option<CustomMcpServerConfig>>{let mut s=self.load()?;let x=match s.servers.iter_mut().find(|x|x.id==id){Some(x)=>x,None=>return Ok(None)};x.enabled=enabled;let r=x.clone();self.save(&s)?;Ok(Some(r))}
+    pub fn get(&self,id:&str)->Result<Option<CustomMcpServerConfig>>{Ok(self.load()?.servers.into_iter().find(|x|x.id==id))}
+}
+
+pub struct StdioMcpClient { child: Mutex<Child>, stdin: Mutex<ChildStdin>, stdout: Mutex<BufReader<ChildStdout>>, next_id: Mutex<u64> }
+impl StdioMcpClient {
+    pub async fn spawn(cfg: &CustomMcpServerConfig) -> Result<Self> {
+        let command=cfg.command.as_ref().context("missing stdio command")?;
+        let mut cmd=Command::new(command); cmd.args(&cfg.args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
+        for (k,v) in &cfg.env { cmd.env(k, expand_secret_ref(v)); }
+        let mut child=cmd.spawn().context("failed to start MCP server")?;
+        let stdin=child.stdin.take().context("MCP stdin unavailable")?; let stdout=child.stdout.take().context("MCP stdout unavailable")?;
+        Ok(Self{child:Mutex::new(child),stdin:Mutex::new(stdin),stdout:Mutex::new(BufReader::new(stdout)),next_id:Mutex::new(1)})
+    }
+    async fn request(&self,method:&str,params:Value)->Result<Value>{
+        let mut id=self.next_id.lock().await; let request_id=*id;*id+=1;drop(id);
+        let msg=json!({"jsonrpc":"2.0","id":request_id,"method":method,"params":params});
+        {let mut input=self.stdin.lock().await;input.write_all((serde_json::to_string(&msg)?+"\n").as_bytes()).await?;input.flush().await?;}
+        let mut line=String::new();self.stdout.lock().await.read_line(&mut line).await?;let response:Value=serde_json::from_str(line.trim()).context("invalid MCP JSON-RPC response")?;
+        if let Some(error)=response.get("error"){bail!("MCP error: {error}")};Ok(response.get("result").cloned().unwrap_or(response))
+    }
+    pub async fn initialize(&self)->Result<Value>{self.request("initialize",json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent-workspace-hub","version":env!("CARGO_PKG_VERSION")}})).await}
+    pub async fn tools_list(&self)->Result<Value>{self.request("tools/list",json!({})).await}
+    pub async fn tools_call(&self,name:&str,arguments:Value)->Result<Value>{self.request("tools/call",json!({"name":name,"arguments":arguments})).await}
+}
+
+fn expand_secret_ref(value:&str)->String{
+    if let Some(key)=value.strip_prefix("${secret:").and_then(|x|x.strip_suffix('}')) { return std::env::var(key).unwrap_or_default(); }
+    value.to_string()
+}
