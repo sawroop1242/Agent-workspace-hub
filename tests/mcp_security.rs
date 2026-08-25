@@ -1,6 +1,6 @@
 use agent_workspace_hub::mcp::{
-    authorize_mcp_execution, McpExecutionRequest, McpPermissions, PersistentTrustStore,
-    TrustLevel, TrustStore,
+    authorize_mcp_execution, McpExecutionRequest, McpPermissions, PersistentTrustStore, TrustLevel,
+    TrustStore,
 };
 use tempfile::tempdir;
 
@@ -103,12 +103,7 @@ fn approved_mcp_is_allowed() {
         &["GITHUB_TOKEN"],
     );
     trust
-        .approve(
-            "github",
-            TrustLevel::Reviewed,
-            approved.clone(),
-            "1.0.0",
-        )
+        .approve("github", TrustLevel::Reviewed, approved.clone(), "1.0.0")
         .unwrap();
     let request = McpExecutionRequest {
         id: "github",
