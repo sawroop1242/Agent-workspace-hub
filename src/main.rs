@@ -5,8 +5,10 @@ mod skills;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mcp::{CustomMcpRegistry, CustomMcpServerConfig, McpTransport, StdioMcpServer};
+use mcp::{CommunityMcpRegistryClient, CustomMcpRegistry, CustomMcpServerConfig, GlobalMcpRegistry, McpTransport, ProjectMcpReferences, StdioMcpServer};
 use skills::{GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller};
+
+const DEFAULT_MCP_REGISTRY: &str = "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/mcps/index.json";
 
 #[derive(Debug, Parser)]
 #[command(name = "awh", version, about = "Agent Workspace Hub")]
@@ -28,6 +30,10 @@ enum McpCommand {
     Remove { id: String },
     Enable { id: String },
     Disable { id: String },
+    Search { query: String, #[arg(long, default_value = DEFAULT_MCP_REGISTRY)] registry: String },
+    Install { id: String, #[arg(long, default_value = DEFAULT_MCP_REGISTRY)] registry: String, #[arg(long)] add: bool },
+    Update { id: String, #[arg(long, default_value = DEFAULT_MCP_REGISTRY)] registry: String },
+    Uninstall { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -74,6 +80,10 @@ fn handle_mcp_cli(command:McpCommand)->Result<()>{
         McpCommand::Remove{id}=>{if registry.remove(&id)?{println!("removed MCP: {id}")}else{println!("MCP not found: {id}")}},
         McpCommand::Enable{id}=>{registry.set_enabled(&id,true)?;println!("enabled MCP: {id}")},
         McpCommand::Disable{id}=>{registry.set_enabled(&id,false)?;println!("disabled MCP: {id}")},
+        McpCommand::Search{query,registry:url}=>{let rt=tokio::runtime::Runtime::new()?;for m in rt.block_on(CommunityMcpRegistryClient::new(url).search(&query))?{println!("{} v{} — {}",m.id,if m.version.is_empty(){"unknown"}else{&m.version},m.description);}},
+        McpCommand::Install{id,registry:url,add}=>{let rt=tokio::runtime::Runtime::new()?;let global=GlobalMcpRegistry::new()?;let project=ProjectMcpReferences::new(std::env::current_dir()?)?;let entry=rt.block_on(CommunityMcpRegistryClient::new(url).install(&global,&id))?;println!("installed global MCP: {} v{}",entry.config.id,entry.version);if add{project.add(&id)?;println!("added project MCP reference: {id}")}},
+        McpCommand::Update{id,registry:url}=>{let rt=tokio::runtime::Runtime::new()?;let global=GlobalMcpRegistry::new()?;let entry=rt.block_on(CommunityMcpRegistryClient::new(url).update(&global,&id))?;println!("updated MCP: {} v{}",entry.config.id,entry.version);},
+        McpCommand::Uninstall{id}=>{let global=GlobalMcpRegistry::new()?;if global.remove(&id)?{println!("uninstalled global MCP: {id}")}else{println!("global MCP not found: {id}")}},
         McpCommand::Serve=>unreachable!(),
     } Ok(())
 }
