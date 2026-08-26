@@ -3,56 +3,112 @@ use serde_json::Value;
 
 const MAX_SCHEMA_DEPTH: usize = 32;
 
-pub fn validate_tool_arguments(tools_response: &Value, tool_name: &str, arguments: &Value) -> Result<()> {
-    let tools = tools_response.get("tools").and_then(Value::as_array).context("MCP tools/list response has no tools array")?;
-    let tool = tools.iter().find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name)).with_context(|| format!("MCP tool not found: {tool_name}"))?;
-    let schema = tool.get("inputSchema").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"}));
+pub fn validate_tool_arguments(
+    tools_response: &Value,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<()> {
+    let tools = tools_response
+        .get("tools")
+        .and_then(Value::as_array)
+        .context("MCP tools/list response has no tools array")?;
+    let tool = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+        .with_context(|| format!("MCP tool not found: {tool_name}"))?;
+    let schema = tool
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
     validate_json_schema(&schema, arguments, 0, "arguments")
 }
 
 fn validate_json_schema(schema: &Value, value: &Value, depth: usize, path: &str) -> Result<()> {
-    if depth > MAX_SCHEMA_DEPTH { bail!("MCP argument validation exceeded maximum nesting depth") }
+    if depth > MAX_SCHEMA_DEPTH {
+        bail!("MCP argument validation exceeded maximum nesting depth");
+    }
+
     if let Some(schema_type) = schema.get("type") {
         let matches = match schema_type {
             Value::String(kind) => type_matches(kind, value),
-            Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).any(|kind| type_matches(kind, value)),
+            Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| type_matches(kind, value)),
             _ => false,
         };
-        if !matches { bail!("MCP argument validation failed at {path}: expected schema type") }
+        if !matches {
+            bail!("MCP argument validation failed at {path}: expected schema type");
+        }
     }
+
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        if !values.iter().any(|candidate| candidate == value) { bail!("MCP argument validation failed at {path}: value is not allowed") }
+        if !values.iter().any(|candidate| candidate == value) {
+            bail!("MCP argument validation failed at {path}: value is not allowed");
+        }
     }
+
     if let Some(object) = value.as_object() {
         if let Some(required) = schema.get("required").and_then(Value::as_array) {
             for field in required.iter().filter_map(Value::as_str) {
-                if !object.contains_key(field) { bail!("MCP argument validation failed at {path}: missing required field '{field}'") }
+                if !object.contains_key(field) {
+                    bail!(
+                        "MCP argument validation failed at {path}: missing required field '{field}'"
+                    );
+                }
             }
         }
+
         if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
             for (field, child_schema) in properties {
-                if let Some(child) = object.get(field) { validate_json_schema(child_schema, child, depth + 1, &format!("{path}.{field}"))?; }
+                if let Some(child) = object.get(field) {
+                    validate_json_schema(
+                        child_schema,
+                        child,
+                        depth + 1,
+                        &format!("{path}.{field}"),
+                    )?;
+                }
             }
+
             if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
                 for field in object.keys() {
-                    if !properties.contains_key(field) { bail!("MCP argument validation failed at {path}: unknown field '{field}'") }
+                    if !properties.contains_key(field) {
+                        bail!(
+                            "MCP argument validation failed at {path}: unknown field '{field}'"
+                        );
+                    }
                 }
             }
         }
     }
+
     if let Some(item_schema) = schema.get("items") {
         if let Some(array) = value.as_array() {
-            for (index, item) in array.iter().enumerate() { validate_json_schema(item_schema, item, depth + 1, &format!("{path}[{index}]"))?; }
+            for (index, item) in array.iter().enumerate() {
+                validate_json_schema(
+                    item_schema,
+                    item,
+                    depth + 1,
+                    &format!("{path}[{index}]"),
+                )?;
+            }
         }
     }
+
     Ok(())
 }
 
 fn type_matches(kind: &str, value: &Value) -> bool {
     match kind {
-        "object" => value.is_object(), "array" => value.is_array(), "string" => value.is_string(),
-        "number" => value.is_number(), "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "boolean" => value.is_boolean(), "null" => value.is_null(), _ => true,
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
     }
 }
 
@@ -61,12 +117,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn schema() -> Value { json!({"tools":[{"name":"sum","inputSchema":{"type":"object","required":["a"],"properties":{"a":{"type":"integer"},"b":{"type":"string"}},"additionalProperties":false}}]}) }
+    fn schema() -> Value {
+        json!({
+            "tools": [{
+                "name": "sum",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["a"],
+                    "properties": {
+                        "a": {"type": "integer"},
+                        "b": {"type": "string"}
+                    },
+                    "additionalProperties": false
+                }
+            }]
+        })
+    }
 
     #[test]
-    fn accepts_valid_arguments() { assert!(validate_tool_arguments(&schema(), "sum", &json!({"a":4,"b":"x"})).is_ok()); }
+    fn accepts_valid_arguments() {
+        assert!(validate_tool_arguments(&schema(), "sum", &json!({"a": 4, "b": "x"})).is_ok());
+    }
+
     #[test]
-    fn rejects_missing_required_argument() { assert!(validate_tool_arguments(&schema(), "sum", &json!({})).is_err()); }
+    fn rejects_missing_required_argument() {
+        assert!(validate_tool_arguments(&schema(), "sum", &json!({})).is_err());
+    }
+
     #[test]
-    fn rejects_wrong_type_and_unknown_field() { assert!(validate_tool_arguments(&schema(), "sum", &json!({"a":"4"})).is_err()); assert!(validate_tool_arguments(&schema(), "sum", &json!({"a":4,"x":true})).is_err()); }
+    fn rejects_wrong_type_and_unknown_field() {
+        assert!(validate_tool_arguments(&schema(), "sum", &json!({"a": "4"})).is_err());
+        assert!(validate_tool_arguments(&schema(), "sum", &json!({"a": 4, "x": true})).is_err());
+    }
 }
