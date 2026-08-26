@@ -2,6 +2,30 @@ use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use super::permissions::McpPermissions;
 
+/// Resource limits applied to a sandboxed MCP process.
+#[derive(Debug, Clone, Copy)]
+pub struct SandboxLimits {
+    /// Maximum virtual address space in bytes. `None` leaves the limit unset.
+    pub address_space_bytes: Option<u64>,
+    /// Maximum CPU time in seconds. `None` leaves the limit unset.
+    pub cpu_seconds: Option<u64>,
+    /// Maximum number of processes/threads. `None` leaves the limit unset.
+    pub processes: Option<u64>,
+    /// Maximum number of open file descriptors. `None` leaves the limit unset.
+    pub open_files: Option<u64>,
+}
+
+impl Default for SandboxLimits {
+    fn default() -> Self {
+        Self {
+            address_space_bytes: Some(2 * 1024 * 1024 * 1024),
+            cpu_seconds: Some(300),
+            processes: Some(128),
+            open_files: Some(1024),
+        }
+    }
+}
+
 /// Linux sandbox policy for stdio MCP processes.
 ///
 /// When enabled, execution is fail-closed if bubblewrap is unavailable.
@@ -12,6 +36,7 @@ pub struct SandboxConfig {
     pub enabled: bool,
     pub project_root: PathBuf,
     pub permissions: McpPermissions,
+    pub limits: SandboxLimits,
 }
 
 impl SandboxConfig {
@@ -20,6 +45,7 @@ impl SandboxConfig {
             enabled: true,
             project_root: project_root.into(),
             permissions,
+            limits: SandboxLimits::default(),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -68,7 +94,6 @@ pub fn wrap_command(
         "--unshare-pid".into(),
         "--unshare-ipc".into(),
         "--unshare-uts".into(),
-        // Do not grant ambient Linux capabilities to the MCP process.
         "--cap-drop".into(),
         "ALL".into(),
         "--ro-bind".into(),
@@ -82,14 +107,25 @@ pub fn wrap_command(
         "/tmp".into(),
     ];
 
+    if let Some(value) = cfg.limits.address_space_bytes {
+        wrapped.extend(["--rlimit-as".into(), value.to_string()]);
+    }
+    if let Some(value) = cfg.limits.cpu_seconds {
+        wrapped.extend(["--rlimit-cpu".into(), value.to_string()]);
+    }
+    if let Some(value) = cfg.limits.processes {
+        wrapped.extend(["--rlimit-nproc".into(), value.to_string()]);
+    }
+    if let Some(value) = cfg.limits.open_files {
+        wrapped.extend(["--rlimit-nofile".into(), value.to_string()]);
+    }
+
     if cfg.permissions.network {
         wrapped.push("--share-net".into());
     } else {
         wrapped.push("--unshare-net".into());
     }
 
-    // The project root is the explicit writable workspace boundary. Additional
-    // filesystem permissions are also mounted only when explicitly requested.
     wrapped.extend([
         "--bind".into(),
         cfg.project_root.to_string_lossy().into_owned(),
@@ -139,7 +175,7 @@ pub fn sandbox_available() -> bool {
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
-    #[cfg(not(target_os = "linux")]
+    #[cfg(not(target_os = "linux"))]
     {
         false
     }
