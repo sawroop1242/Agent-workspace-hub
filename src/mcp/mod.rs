@@ -27,7 +27,7 @@ pub use custom_mcp::{CustomMcpRegistry, CustomMcpServerConfig, CustomMcpStore, M
 pub use global_mcp::{GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs};
 pub use community_registry::{CommunityMcpManifest, CommunityMcpRegistryClient, CommunityRegistryIndex};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
-pub use permissions::{require as require_permission, McpPermissions, Permission};
+pub use permissions::{is_blocked_environment, is_valid_env_name, require as require_permission, McpPermissions, Permission};
 pub use providers::{ConnectorProvider, CustomMcpProvider, GatewayProvider, ProviderRegistry, ToolCallResult, ToolContent, ToolDescriptor, UnconfiguredProvider};
 pub use security::{sha256_file, validate_command, validate_id, validate_url, verify_sha256, PackageIntegrity};
 pub use server::StdioMcpServer;
