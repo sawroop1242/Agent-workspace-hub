@@ -38,7 +38,7 @@ impl ComposioProvider {
 impl ConnectorProvider for ComposioProvider {
     fn provider_id(&self) -> &str { "composio" }
 
-    fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+    async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
         let mut req = self.client.get(format!("{BASE_URL}/tools"));
         if let Some(toolkit) = &self.toolkit { req = req.query(&[("toolkit", toolkit)]); }
         let body = self.request(req)?;
@@ -53,7 +53,7 @@ impl ConnectorProvider for ComposioProvider {
         }).collect())
     }
 
-    fn invoke(&self, tool: &str, arguments: Value) -> Result<ToolCallResult> {
+    async fn invoke(&self, tool: &str, arguments: Value) -> Result<ToolCallResult> {
         if tool.trim().is_empty() { bail!("Composio tool slug is required"); }
         let mut payload = json!({"arguments": arguments, "version": "latest"});
         if let Some(account) = &self.connected_account_id { payload["connected_account_id"] = json!(account); }

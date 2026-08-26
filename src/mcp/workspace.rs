@@ -55,7 +55,7 @@ impl WorkspaceMcp {
 
     fn safe_path(&self, relative: &str) -> Result<PathBuf> {
         let candidate = Path::new(relative);
-        if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::Root | std::path::Component::Prefix(_))) {
+        if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
             bail!("unsafe workspace path");
         }
         let joined = self.root.join(candidate);

@@ -20,7 +20,7 @@ pub fn validate_skill_package(dir: impl AsRef<Path>) -> Result<()> {
 
 pub fn safe_package_path(root: impl AsRef<Path>, relative: impl AsRef<Path>) -> Result<PathBuf> {
     let relative = relative.as_ref();
-    if relative.is_absolute() || relative.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::Root | std::path::Component::Prefix(_))) {
+    if relative.is_absolute() || relative.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
         bail!("unsafe package path");
     }
     Ok(root.as_ref().join(relative))
