@@ -2,27 +2,36 @@ use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use super::permissions::McpPermissions;
 
-/// Resource limits applied to a sandboxed MCP process.
-#[derive(Debug, Clone, Copy)]
+/// Resource limits applied to Linux stdio MCP processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLimits {
-    /// Maximum virtual address space in bytes. `None` leaves the limit unset.
-    pub address_space_bytes: Option<u64>,
-    /// Maximum CPU time in seconds. `None` leaves the limit unset.
-    pub cpu_seconds: Option<u64>,
-    /// Maximum number of processes/threads. `None` leaves the limit unset.
-    pub processes: Option<u64>,
-    /// Maximum number of open file descriptors. `None` leaves the limit unset.
-    pub open_files: Option<u64>,
+    /// Maximum address space in bytes.
+    pub address_space_bytes: u64,
+    /// Maximum CPU time in seconds.
+    pub cpu_seconds: u64,
+    /// Maximum number of processes/threads.
+    pub processes: u64,
+    /// Maximum number of open file descriptors.
+    pub open_files: u64,
 }
 
 impl Default for SandboxLimits {
     fn default() -> Self {
         Self {
-            address_space_bytes: Some(2 * 1024 * 1024 * 1024),
-            cpu_seconds: Some(300),
-            processes: Some(128),
-            open_files: Some(1024),
+            address_space_bytes: 2 * 1024 * 1024 * 1024,
+            cpu_seconds: 300,
+            processes: 128,
+            open_files: 1024,
         }
+    }
+}
+
+impl SandboxLimits {
+    fn validate(&self) -> Result<()> {
+        if self.address_space_bytes == 0 || self.cpu_seconds == 0 || self.processes == 0 || self.open_files == 0 {
+            bail!("sandbox resource limits must be greater than zero");
+        }
+        Ok(())
     }
 }
 
@@ -58,7 +67,8 @@ impl SandboxConfig {
         if self.project_root.exists() && !self.project_root.is_dir() {
             bail!("sandbox project root must be a directory: {:?}", self.project_root);
         }
-        self.permissions.validate()
+        self.permissions.validate()?;
+        self.limits.validate()
     }
 }
 
@@ -96,6 +106,14 @@ pub fn wrap_command(
         "--unshare-uts".into(),
         "--cap-drop".into(),
         "ALL".into(),
+        "--rlimit-as".into(),
+        cfg.limits.address_space_bytes.to_string(),
+        "--rlimit-cpu".into(),
+        cfg.limits.cpu_seconds.to_string(),
+        "--rlimit-nproc".into(),
+        cfg.limits.processes.to_string(),
+        "--rlimit-nofile".into(),
+        cfg.limits.open_files.to_string(),
         "--ro-bind".into(),
         "/usr".into(),
         "/usr".into(),
@@ -106,19 +124,6 @@ pub fn wrap_command(
         "--tmpfs".into(),
         "/tmp".into(),
     ];
-
-    if let Some(value) = cfg.limits.address_space_bytes {
-        wrapped.extend(["--rlimit-as".into(), value.to_string()]);
-    }
-    if let Some(value) = cfg.limits.cpu_seconds {
-        wrapped.extend(["--rlimit-cpu".into(), value.to_string()]);
-    }
-    if let Some(value) = cfg.limits.processes {
-        wrapped.extend(["--rlimit-nproc".into(), value.to_string()]);
-    }
-    if let Some(value) = cfg.limits.open_files {
-        wrapped.extend(["--rlimit-nofile".into(), value.to_string()]);
-    }
 
     if cfg.permissions.network {
         wrapped.push("--share-net".into());
