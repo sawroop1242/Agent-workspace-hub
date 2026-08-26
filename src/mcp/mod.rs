@@ -29,7 +29,7 @@ pub use community_registry::{CommunityMcpManifest, CommunityMcpRegistryClient, C
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
 pub use permissions::{is_blocked_environment, is_valid_env_name, require as require_permission, McpPermissions, Permission};
 pub use providers::{ConnectorProvider, CustomMcpProvider, GatewayProvider, ProviderRegistry, ToolCallResult, ToolContent, ToolDescriptor, UnconfiguredProvider};
-pub use security::{sha256_file, validate_command, validate_id, validate_url, verify_sha256, PackageIntegrity};
+pub use security::{atomic_write, secure_destination, secure_path, sha256_file, validate_command, validate_id, validate_url, verify_sha256, PackageIntegrity};
 pub use server::StdioMcpServer;
 pub use skills::SkillMcp;
 pub use tasks::{Task, TaskPriority, TaskStatus, TasksMcp};
