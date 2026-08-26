@@ -37,5 +37,5 @@ pub use trust::{can_enable, McpApproval, TrustLevel, TrustStore};
 pub use trust_store::PersistentTrustStore;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
 pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};
-pub use sandbox::{sandbox_available, wrap_command, SandboxConfig};
+pub use sandbox::{sandbox_available, wrap_command, SandboxConfig, SandboxLimits};
 pub use workspace::{WorkspaceFile, WorkspaceMcp};
