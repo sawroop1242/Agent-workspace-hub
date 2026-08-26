@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 use super::permissions::McpPermissions;
@@ -263,7 +263,7 @@ pub fn apply_windows_job(
             job,
             JobObjectExtendedLimitInformation,
             &mut info as *mut _ as *mut _,
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
     };
     if result == 0 {
