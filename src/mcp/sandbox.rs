@@ -1,8 +1,9 @@
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
+
 use super::permissions::McpPermissions;
 
-/// Resource limits applied to Linux stdio MCP processes.
+/// Resource limits applied to MCP processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLimits {
     /// Maximum address space in bytes.
@@ -11,7 +12,7 @@ pub struct SandboxLimits {
     pub cpu_seconds: u64,
     /// Maximum number of processes/threads.
     pub processes: u64,
-    /// Maximum number of open file descriptors.
+    /// Maximum number of open file descriptors where the host sandbox supports it.
     pub open_files: u64,
 }
 
@@ -28,18 +29,18 @@ impl Default for SandboxLimits {
 
 impl SandboxLimits {
     fn validate(&self) -> Result<()> {
-        if self.address_space_bytes == 0 || self.cpu_seconds == 0 || self.processes == 0 || self.open_files == 0 {
+        if self.address_space_bytes == 0
+            || self.cpu_seconds == 0
+            || self.processes == 0
+            || self.open_files == 0
+        {
             bail!("sandbox resource limits must be greater than zero");
         }
         Ok(())
     }
 }
 
-/// Linux sandbox policy for stdio MCP processes.
-///
-/// When enabled, execution is fail-closed if bubblewrap is unavailable.
-/// Network permission currently means access to the host network namespace;
-/// fine-grained egress control is intentionally left for a later phase.
+/// Cross-platform sandbox policy for stdio MCP processes.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     pub enabled: bool,
@@ -92,7 +93,6 @@ pub fn wrap_command(
     if !available {
         bail!("MCP sandbox is enabled but bubblewrap was not found; refusing unsandboxed execution");
     }
-
     if !cfg.project_root.exists() {
         bail!("sandbox project root does not exist: {:?}", cfg.project_root);
     }
@@ -158,16 +158,141 @@ pub fn wrap_command(
     Ok((bwrap, wrapped))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub fn wrap_command(
+    cfg: &SandboxConfig,
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>)> {
+    cfg.validate()?;
+    if !cfg.enabled {
+        return Ok((command.to_string(), args.to_vec()));
+    }
+
+    ensure_command_available("sandbox-exec")?;
+    if !cfg.project_root.exists() {
+        bail!("sandbox project root does not exist: {:?}", cfg.project_root);
+    }
+
+    let root = profile_quote(&cfg.project_root.to_string_lossy());
+    let command_path = profile_quote(command);
+    let mut profile = format!(
+        "(version 1)\n(deny default)\n(allow process*)\n(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/Library\") (literal \"{}\"))\n(allow file-read* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))\n(allow file-write* (subpath \"/tmp\"))\n",
+        command_path, root, root
+    );
+    if cfg.permissions.network {
+        profile.push_str("(allow network-outbound)\n");
+    }
+
+    let mut wrapped = vec!["-p".into(), profile, command.to_string()];
+    wrapped.extend(args.iter().cloned());
+    Ok(("sandbox-exec".into(), wrapped))
+}
+
+#[cfg(windows)]
+pub fn wrap_command(
+    cfg: &SandboxConfig,
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>)> {
+    cfg.validate()?;
+    if !cfg.enabled {
+        return Ok((command.to_string(), args.to_vec()));
+    }
+    Ok((command.to_string(), args.to_vec()))
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
 pub fn wrap_command(
     cfg: &SandboxConfig,
     command: &str,
     args: &[String],
 ) -> Result<(String, Vec<String>)> {
     if cfg.enabled {
-        bail!("OS-level MCP sandbox is currently supported only on Linux");
+        bail!("OS-level MCP sandbox is unsupported on this platform; refusing unsandboxed execution");
     }
     Ok((command.to_string(), args.to_vec()))
+}
+
+#[cfg(windows)]
+pub struct WindowsJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn apply_windows_job(
+    child: &tokio::process::Child,
+    limits: &SandboxLimits,
+) -> Result<WindowsJob> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+
+    let process = child
+        .raw_handle()
+        .context("Windows MCP process handle unavailable")?;
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job == 0 || job == INVALID_HANDLE_VALUE as isize {
+        bail!("failed to create Windows Job Object");
+    }
+
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_JOB_MEMORY
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    info.ProcessMemoryLimit = limits.address_space_bytes as usize;
+    info.JobMemoryLimit = limits.address_space_bytes as usize;
+    info.BasicLimitInformation.ActiveProcessLimit = limits.processes as u32;
+
+    let result = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if result == 0 {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        bail!("failed to configure Windows MCP Job Object");
+    }
+
+    if unsafe { AssignProcessToJobObject(job, process as _) } == 0 {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        bail!("failed to assign MCP process to Windows Job Object");
+    }
+
+    Ok(WindowsJob { handle: job })
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_command_available(command: &str) -> Result<()> {
+    let status = std::process::Command::new("/usr/bin/which")
+        .arg(command)
+        .status();
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        bail!("MCP sandbox is enabled but {command} was not found; refusing unsandboxed execution");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn profile_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 pub fn sandbox_available() -> bool {
@@ -180,7 +305,19 @@ pub fn sandbox_available() -> bool {
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/which")
+            .arg("sandbox-exec")
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
     {
         false
     }
