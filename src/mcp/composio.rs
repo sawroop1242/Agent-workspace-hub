@@ -1,6 +1,6 @@
 use crate::mcp::providers::{ConnectorProvider, ToolCallResult, ToolContent, ToolDescriptor};
 use anyhow::{bail, Context, Result};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde_json::{json, Value};
 
 const BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
@@ -26,22 +26,23 @@ impl ComposioProvider {
         Self { api_key, connected_account_id, toolkit, client: Client::new() }
     }
 
-    fn request(&self, builder: reqwest::blocking::RequestBuilder) -> Result<Value> {
-        let response = builder.header("x-api-key", &self.api_key).header("content-type", "application/json").send()?;
+    async fn request(&self, builder: reqwest::RequestBuilder) -> Result<Value> {
+        let response = builder.header("x-api-key", &self.api_key).header("content-type", "application/json").send().await?;
         let status = response.status();
-        let body: Value = response.json().unwrap_or_else(|_| json!({}));
+        let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
         if !status.is_success() { bail!("Composio API returned {}: {}", status, body); }
         Ok(body)
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorProvider for ComposioProvider {
     fn provider_id(&self) -> &str { "composio" }
 
     async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
         let mut req = self.client.get(format!("{BASE_URL}/tools"));
         if let Some(toolkit) = &self.toolkit { req = req.query(&[("toolkit", toolkit)]); }
-        let body = self.request(req)?;
+        let body = self.request(req).await?;
         let items = body.get("items").or_else(|| body.get("data")).and_then(Value::as_array).cloned().unwrap_or_default();
         Ok(items.into_iter().filter_map(|item| {
             let name = item.get("slug").or_else(|| item.get("tool_slug")).and_then(Value::as_str)?.to_string();
@@ -57,7 +58,7 @@ impl ConnectorProvider for ComposioProvider {
         if tool.trim().is_empty() { bail!("Composio tool slug is required"); }
         let mut payload = json!({"arguments": arguments, "version": "latest"});
         if let Some(account) = &self.connected_account_id { payload["connected_account_id"] = json!(account); }
-        let body = self.request(self.client.post(format!("{BASE_URL}/tools/execute/{tool}")).json(&payload))?;
+        let body = self.request(self.client.post(format!("{BASE_URL}/tools/execute/{tool}")).json(&payload)).await?;
         Ok(ToolCallResult { content: vec![ToolContent::Json { json: body }] })
     }
 }
