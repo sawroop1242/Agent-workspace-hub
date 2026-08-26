@@ -21,7 +21,7 @@ impl FileStore {
             bail!("absolute paths are not allowed")
         }
         for component in relative.components() {
-            if matches!(component, Component::ParentDir | Component::Root | Component::Prefix(_)) {
+            if matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {
                 bail!("path traversal is not allowed")
             }
         }
