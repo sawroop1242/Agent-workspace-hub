@@ -24,13 +24,17 @@ const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MCP_ID_LEN: usize = 128;
 const MAX_MCP_NAME_LEN: usize = 256;
 
+/// Transport mechanism used to communicate with an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
+    /// Launch and talk to the server over stdin/stdout.
     Stdio,
+    /// Talk to the server over HTTP (streamable transport).
     StreamableHttp,
 }
 
+/// Configuration for a custom MCP server, including permissions and enablement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomMcpServerConfig {
     pub id: String,
@@ -52,6 +56,7 @@ fn default_true() -> bool {
     true
 }
 
+/// In-memory collection of custom MCP server configs.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CustomMcpStore {
     pub servers: Vec<CustomMcpServerConfig>,
@@ -151,11 +156,13 @@ fn validate_server(server: &CustomMcpServerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Persistent per-project store for custom MCP server configs.
 pub struct CustomMcpRegistry {
     path: PathBuf,
 }
 
 impl CustomMcpRegistry {
+    /// Creates a registry backed by `.agent/mcps.json` under the project root.
     pub fn new(project_root: impl Into<PathBuf>) -> Result<Self> {
         let root = project_root.into();
         fs::create_dir_all(root.join(".agent"))?;
@@ -192,10 +199,12 @@ impl CustomMcpRegistry {
         Ok(())
     }
 
+    /// Lists all configured MCP servers.
     pub fn list(&self) -> Result<Vec<CustomMcpServerConfig>> {
         Ok(self.load()?.servers)
     }
 
+    /// Adds (or replaces) a server after validating its configuration.
     pub fn add(&self, server: CustomMcpServerConfig) -> Result<CustomMcpServerConfig> {
         validate_server(&server)?;
         let mut store = self.load()?;
@@ -205,6 +214,7 @@ impl CustomMcpRegistry {
         Ok(server)
     }
 
+    /// Removes a server, returning whether it existed.
     pub fn remove(&self, id: &str) -> Result<bool> {
         let mut store = self.load()?;
         let before = store.servers.len();
@@ -215,6 +225,7 @@ impl CustomMcpRegistry {
         Ok(before != store.servers.len())
     }
 
+    /// Toggles a server's enabled state, returning the updated config.
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Option<CustomMcpServerConfig>> {
         let mut store = self.load()?;
         let entry = match store.servers.iter_mut().find(|entry| entry.id == id) {
@@ -227,6 +238,7 @@ impl CustomMcpRegistry {
         Ok(Some(result))
     }
 
+    /// Returns the config for a specific server id, if present.
     pub fn get(&self, id: &str) -> Result<Option<CustomMcpServerConfig>> {
         Ok(self
             .load()?
@@ -236,6 +248,7 @@ impl CustomMcpRegistry {
     }
 }
 
+/// A JSON-RPC client for a stdio MCP server process.
 pub struct StdioMcpClient {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
@@ -246,6 +259,7 @@ pub struct StdioMcpClient {
 }
 
 impl StdioMcpClient {
+    /// Spawns the configured command (optionally sandboxed) and wires stdio.
     pub async fn spawn(
         cfg: &CustomMcpServerConfig,
         workspace_root: impl Into<PathBuf>,
@@ -320,6 +334,7 @@ impl StdioMcpClient {
         jsonrpc_result(serde_json::from_str(line.trim()).context("invalid MCP JSON-RPC response")?)
     }
 
+    /// Sends the MCP `initialize` handshake over stdio.
     pub async fn initialize(&self) -> Result<Value> {
         self.request(
             "initialize",
@@ -335,10 +350,12 @@ impl StdioMcpClient {
         .await
     }
 
+    /// Lists tools exposed by the stdio server.
     pub async fn tools_list(&self) -> Result<Value> {
         self.request("tools/list", json!({})).await
     }
 
+    /// Calls a tool on the stdio server, validating arguments first.
     pub async fn tools_call(&self, name: &str, arguments: Value) -> Result<Value> {
         let tools = self.tools_list().await?;
         validate_tool_arguments(&tools, name, &arguments)?;
@@ -353,6 +370,7 @@ impl StdioMcpClient {
     }
 }
 
+/// A JSON-RPC client for a streamable HTTP MCP server.
 pub struct StreamableHttpMcpClient {
     client: Client,
     url: String,
@@ -362,6 +380,7 @@ pub struct StreamableHttpMcpClient {
 }
 
 impl StreamableHttpMcpClient {
+    /// Creates a client from a server config, deriving headers from permitted env vars.
     pub fn new(cfg: &CustomMcpServerConfig) -> Result<Self> {
         validate_server(cfg)?;
         let url = cfg.url.clone().context("missing streamable HTTP MCP url")?;
@@ -413,6 +432,7 @@ impl StreamableHttpMcpClient {
         parse_http_response(response).await
     }
 
+    /// Sends the MCP `initialize` handshake over HTTP.
     pub async fn initialize(&self) -> Result<Value> {
         self.request(
             "initialize",
@@ -428,10 +448,12 @@ impl StreamableHttpMcpClient {
         .await
     }
 
+    /// Lists tools exposed by the HTTP server.
     pub async fn tools_list(&self) -> Result<Value> {
         self.request("tools/list", json!({})).await
     }
 
+    /// Calls a tool on the HTTP server, validating arguments first.
     pub async fn tools_call(&self, name: &str, arguments: Value) -> Result<Value> {
         let tools = self.tools_list().await?;
         validate_tool_arguments(&tools, name, &arguments)?;

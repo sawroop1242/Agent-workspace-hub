@@ -4,11 +4,16 @@ use anyhow::Context;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
+/// Resource limits enforced on a sandboxed MCP process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLimits {
+    /// Maximum address space (virtual memory) in bytes.
     pub address_space_bytes: u64,
+    /// Maximum CPU time in seconds.
     pub cpu_seconds: u64,
+    /// Maximum number of processes/threads.
     pub processes: u64,
+    /// Maximum number of open file descriptors.
     pub open_files: u64,
 }
 impl Default for SandboxLimits {
@@ -34,14 +39,20 @@ impl SandboxLimits {
     }
 }
 
+/// Configuration for sandboxing an MCP process.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
+    /// Whether OS-level sandboxing is enabled.
     pub enabled: bool,
+    /// The project root directory exposed to the sandbox.
     pub project_root: PathBuf,
+    /// The permissions granted to the sandboxed process.
     pub permissions: McpPermissions,
+    /// Resource limits enforced on the sandboxed process.
     pub limits: SandboxLimits,
 }
 impl SandboxConfig {
+    /// Creates a sandbox config with default limits, enabling sandboxing.
     pub fn new(project_root: impl Into<PathBuf>, permissions: McpPermissions) -> Result<Self> {
         let cfg = Self {
             enabled: true,
@@ -52,6 +63,7 @@ impl SandboxConfig {
         cfg.validate()?;
         Ok(cfg)
     }
+    /// Validates the config: absolute project root, valid permissions and limits.
     pub fn validate(&self) -> Result<()> {
         if !self.project_root.is_absolute() {
             bail!("sandbox project root must be an absolute path");
@@ -67,6 +79,7 @@ impl SandboxConfig {
     }
 }
 
+/// Wraps a command with `bwrap` (Linux) to enforce sandbox limits and permissions.
 #[cfg(target_os = "linux")]
 pub fn wrap_command(
     cfg: &SandboxConfig,
@@ -151,6 +164,7 @@ pub fn wrap_command(
     Ok((bwrap, wrapped))
 }
 
+/// Wraps a command with `sandbox-exec` (macOS) to enforce sandbox restrictions.
 #[cfg(target_os = "macos")]
 pub fn wrap_command(
     cfg: &SandboxConfig,
@@ -179,6 +193,7 @@ pub fn wrap_command(
     Ok(("sandbox-exec".into(), wrapped))
 }
 
+/// Windows applies limits via a Job Object rather than a wrapper command.
 #[cfg(windows)]
 pub fn wrap_command(
     cfg: &SandboxConfig,
@@ -192,6 +207,7 @@ pub fn wrap_command(
     Ok((command.to_string(), args.to_vec()))
 }
 
+/// Rejects sandboxing on unsupported platforms rather than running unsandboxed.
 #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(windows)))]
 pub fn wrap_command(
     cfg: &SandboxConfig,
@@ -206,6 +222,7 @@ pub fn wrap_command(
     Ok((command.to_string(), args.to_vec()))
 }
 
+/// A Windows Job Object handle that limits a sandboxed process and releases it on drop.
 #[cfg(windows)]
 pub struct WindowsJob {
     handle: usize,
@@ -220,6 +237,7 @@ impl Drop for WindowsJob {
         }
     }
 }
+/// Applies sandbox limits to a running Windows child process via a Job Object.
 #[cfg(windows)]
 pub fn apply_windows_job(
     child: &tokio::process::Child,
@@ -283,6 +301,7 @@ fn profile_quote(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Reports whether OS-level sandboxing is available on this platform.
 pub fn sandbox_available() -> bool {
     #[cfg(target_os = "linux")]
     {

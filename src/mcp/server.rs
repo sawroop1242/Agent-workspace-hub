@@ -27,6 +27,8 @@ struct RpcResponse {
     error: Option<Value>,
 }
 
+/// The stdio JSON-RPC MCP server exposing project skills, workspace, memory,
+/// tasks, and connectors.
 pub struct StdioMcpServer {
     skills: SkillMcp,
     workspace: WorkspaceMcp,
@@ -38,6 +40,7 @@ pub struct StdioMcpServer {
 }
 
 impl StdioMcpServer {
+    /// Builds the server for a project, wiring the Composio and custom MCP providers.
     pub fn new(project_root: PathBuf) -> Result<Self> {
         let runtime = Runtime::new()?;
         let registry = Arc::new(RwLock::new(ProviderRegistry::default()));

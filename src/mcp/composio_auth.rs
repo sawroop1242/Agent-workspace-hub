@@ -5,12 +5,14 @@ use serde_json::Value;
 
 const BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
 
+/// An authorization link returned by the Composio Auth Link API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthLink {
     pub redirect_url: String,
     pub connected_account_id: Option<String>,
 }
 
+/// A connected Composio account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedAccount {
     pub id: String,
@@ -19,6 +21,7 @@ pub struct ConnectedAccount {
     pub user_id: Option<String>,
 }
 
+/// Client for Composio connected-account authentication.
 pub struct ComposioAuth {
     client: Client,
     api_key: String,
@@ -26,6 +29,7 @@ pub struct ComposioAuth {
 }
 
 impl ComposioAuth {
+    /// Builds a client from the `COMPOSIO_API_KEY` env var.
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var("COMPOSIO_API_KEY")
             .map_err(|_| anyhow!("COMPOSIO_API_KEY is not configured"))?;
@@ -36,6 +40,7 @@ impl ComposioAuth {
         })
     }
 
+    /// Creates a client with an explicit API key and base URL.
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -51,6 +56,7 @@ impl ComposioAuth {
             .header("Content-Type", "application/json")
     }
 
+    /// Creates a link for connecting an account and returns the redirect URL.
     pub async fn create_link(
         &self,
         auth_config_id: &str,
@@ -97,6 +103,7 @@ impl ComposioAuth {
         })
     }
 
+    /// Lists connected accounts, optionally filtered by user and toolkit.
     pub async fn list_accounts(
         &self,
         user_id: Option<&str>,
@@ -129,6 +136,7 @@ impl ComposioAuth {
             .collect())
     }
 
+    /// Fetches a single connected account by id.
     pub async fn get_account(&self, account_id: &str) -> Result<ConnectedAccount> {
         if account_id.is_empty() {
             bail!("account_id is required");
@@ -145,6 +153,7 @@ impl ComposioAuth {
             .await?)
     }
 
+    /// Deletes a connected account by id.
     pub async fn delete_account(&self, account_id: &str) -> Result<()> {
         if account_id.is_empty() {
             bail!("account_id is required");

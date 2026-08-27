@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 const BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
 
+/// A [`ConnectorProvider`] backed by the Composio API.
 pub struct ComposioProvider {
     api_key: String,
     connected_account_id: Option<String>,
@@ -14,6 +15,7 @@ pub struct ComposioProvider {
 }
 
 impl ComposioProvider {
+    /// Builds a provider from the `COMPOSIO_API_KEY` (and optional account/toolkit) env vars.
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var("COMPOSIO_API_KEY")
             .context("COMPOSIO_API_KEY is required to enable the Composio provider")?;
@@ -27,6 +29,7 @@ impl ComposioProvider {
         ))
     }
 
+    /// Creates a provider from an API key and optional account/toolkit filters.
     pub fn new(
         api_key: String,
         connected_account_id: Option<String>,
