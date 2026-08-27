@@ -4,11 +4,13 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Expected SHA-256 digest used to integrity-check downloaded packages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageIntegrity {
     pub sha256: String,
 }
 
+/// Validates an MCP id: 1-128 chars of `[A-Za-z0-9._-]`.
 pub fn validate_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 128 {
         bail!("MCP id must contain 1-128 characters");
@@ -22,6 +24,7 @@ pub fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates an MCP command string: non-empty and free of control characters.
 pub fn validate_command(command: Option<&str>) -> Result<()> {
     if let Some(command) = command {
         let command = command.trim();
@@ -35,6 +38,7 @@ pub fn validate_command(command: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Validates an MCP URL, permitting only `http`/`https` schemes.
 pub fn validate_url(url: Option<&str>) -> Result<()> {
     if let Some(url) = url {
         let parsed = reqwest::Url::parse(url)?;
@@ -111,6 +115,7 @@ pub fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Verifies a file's SHA-256 digest matches `expected` (case-insensitive).
 pub fn verify_sha256(path: impl AsRef<Path>, expected: &str) -> Result<()> {
     let actual = sha256_file(path)?;
     if !actual.eq_ignore_ascii_case(expected) {

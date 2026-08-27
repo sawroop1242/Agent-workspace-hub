@@ -2,20 +2,28 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// The set of capabilities an MCP server may request. Requests are validated
+/// against an approved [`McpPermissions`] before a server may execute.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpPermissions {
+    /// Whether outbound network access is permitted.
     #[serde(default)]
     pub network: bool,
+    /// Filesystem paths the server may access.
     #[serde(default)]
     pub filesystem: Vec<String>,
+    /// Environment variable names the server may receive.
     #[serde(default)]
     pub environment: Vec<String>,
+    /// Whether the server may spawn subprocesses.
     #[serde(default)]
     pub process: bool,
+    /// Secret names (referenced via `${secret:NAME}`) the server may resolve.
     #[serde(default)]
     pub secrets: Vec<String>,
 }
 
+/// A coarse capability category used for permission checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
     Network,
@@ -39,6 +47,8 @@ const BLOCKED_ENVIRONMENT: &[&str] = &[
     "PERL5LIB",
 ];
 
+/// Environment variable names must be a safe identifier: start with an ASCII
+/// letter or underscore, followed by ASCII alphanumerics or underscores.
 pub fn is_valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -48,6 +58,8 @@ pub fn is_valid_env_name(name: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+/// Dangerous loader/interpreter variables (e.g. `LD_PRELOAD`, `PYTHONPATH`)
+/// are blocked to prevent code injection via environment.
 pub fn is_blocked_environment(name: &str) -> bool {
     BLOCKED_ENVIRONMENT
         .iter()
@@ -55,6 +67,9 @@ pub fn is_blocked_environment(name: &str) -> bool {
 }
 
 impl McpPermissions {
+    /// Validates the permission set: rejects empty filesystem paths, invalid or
+    /// blocked environment/secret names, and secrets without a matching
+    /// environment entry.
     pub fn validate(&self) -> Result<()> {
         if self.filesystem.iter().any(|p| p.trim().is_empty()) {
             bail!("filesystem permission path cannot be empty");
@@ -85,6 +100,7 @@ impl McpPermissions {
         Ok(())
     }
 
+    /// Whether a coarse capability category is granted.
     pub fn allows(&self, permission: Permission) -> bool {
         match permission {
             Permission::Network => self.network,
@@ -95,6 +111,7 @@ impl McpPermissions {
         }
     }
 
+    /// Filters a requested environment list down to the approved names.
     pub fn allowed_environment(&self, requested: impl IntoIterator<Item = String>) -> Vec<String> {
         let allowed: HashSet<&str> = self.environment.iter().map(String::as_str).collect();
         requested
@@ -103,11 +120,13 @@ impl McpPermissions {
             .collect()
     }
 
+    /// Whether a particular secret name is approved for resolution.
     pub fn allows_secret(&self, name: &str) -> bool {
         self.secrets.iter().any(|allowed| allowed == name)
     }
 }
 
+/// Requires a capability, failing closed if it is not granted.
 pub fn require(permissions: &McpPermissions, permission: Permission) -> Result<()> {
     if !permissions.allows(permission) {
         bail!("MCP permission denied: {:?}", permission);

@@ -1,3 +1,10 @@
+//! MCP (Model Context Protocol) integration and enforcement.
+//!
+//! This module implements the security boundary around MCP tool servers: trust
+//! and approval policy, permission validation, sandboxed process execution,
+//! argument/schema validation, and bounded transport. Every boundary fails
+//! closed — if a protection cannot be applied, the operation is rejected.
+
 pub mod cli_trust;
 pub mod community_registry;
 pub mod composio;

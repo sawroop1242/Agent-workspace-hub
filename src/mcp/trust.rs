@@ -2,6 +2,8 @@ use super::permissions::McpPermissions;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+/// The trust level assigned to an MCP server. `Unknown` (untrusted) and
+/// `Blocked` deny execution; `Review` and `Trusted` permit it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustLevel {
@@ -11,6 +13,7 @@ pub enum TrustLevel {
     Blocked,
 }
 
+/// A persisted approval for a specific MCP server id, version, and permission set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpApproval {
     pub id: String,
@@ -30,14 +33,17 @@ impl Default for TrustLevel {
         Self::Unknown
     }
 }
+/// In-memory collection of MCP approvals.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TrustStore {
     pub approvals: Vec<McpApproval>,
 }
 impl TrustStore {
+    /// Returns the approval for `id`, if any.
     pub fn get(&self, id: &str) -> Option<&McpApproval> {
         self.approvals.iter().find(|x| x.id == id)
     }
+    /// Records (or replaces) an approval after validating the permission set.
     pub fn approve(
         &mut self,
         id: impl Into<String>,
@@ -59,12 +65,15 @@ impl TrustStore {
         });
         Ok(())
     }
+    /// Removes an approval, returning whether one existed for `id`.
     pub fn revoke(&mut self, id: &str) -> bool {
         let before = self.approvals.len();
         self.approvals.retain(|x| x.id != id);
         before != self.approvals.len()
     }
 }
+/// Whether an approval authorizes the requested permissions and version,
+/// denying blocked/unknown levels and over-broad requests.
 pub fn can_enable(
     approval: Option<&McpApproval>,
     requested: &McpPermissions,

@@ -1,6 +1,8 @@
 use super::{can_enable, McpPermissions, TrustStore};
 use anyhow::{bail, Result};
 
+/// A request to execute an MCP server, carrying the identity, version, and
+/// requested permissions that must be authorized against a [`TrustStore`].
 #[derive(Debug, Clone)]
 pub struct McpExecutionRequest<'a> {
     pub id: &'a str,
@@ -8,6 +10,8 @@ pub struct McpExecutionRequest<'a> {
     pub permissions: &'a McpPermissions,
 }
 
+/// Authorizes an MCP execution request against the trust store, failing closed
+/// for missing, blocked, mismatched-version, or over-broad permission requests.
 pub fn authorize(request: &McpExecutionRequest<'_>, trust: &TrustStore) -> Result<()> {
     if request.id.trim().is_empty() {
         bail!("MCP id is required");

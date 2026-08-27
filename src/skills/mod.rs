@@ -1,3 +1,9 @@
+//! Skill discovery, installation, and reference management.
+//!
+//! Skills are validated packages installed from local paths or remote
+//! registries, then referenced per-project. Installation writes are atomic and
+//! integrity-checked (SHA-256).
+
 pub mod installer;
 pub mod lockfile;
 pub mod model;

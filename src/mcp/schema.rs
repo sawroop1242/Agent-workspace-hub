@@ -3,6 +3,8 @@ use serde_json::Value;
 
 const MAX_SCHEMA_DEPTH: usize = 32;
 
+/// Validates tool-call arguments against the tool's advertised `inputSchema`,
+/// rejecting invalid arguments before the MCP tool is invoked.
 pub fn validate_tool_arguments(
     tools_response: &Value,
     tool_name: &str,
