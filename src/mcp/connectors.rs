@@ -4,27 +4,46 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AuthMethod { OAuth, ApiKey, None }
+pub enum AuthMethod {
+    OAuth,
+    ApiKey,
+    None,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Connector { pub id: String, pub name: String, pub provider: String, pub auth: AuthMethod, pub scopes: Vec<String>, pub enabled: bool }
+pub struct Connector {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub auth: AuthMethod,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct ConnectorStore { connectors: Vec<Connector> }
+struct ConnectorStore {
+    connectors: Vec<Connector>,
+}
 
 /// Stores connector metadata and references only. OAuth tokens/API secrets must live
 /// in an OS credential store or external secret manager, never in this JSON file.
-pub struct ConnectorsMcp { path: PathBuf }
+pub struct ConnectorsMcp {
+    path: PathBuf,
+}
 
 impl ConnectorsMcp {
     pub fn new(project_root: impl Into<PathBuf>) -> Result<Self> {
         let root = project_root.into();
         fs::create_dir_all(root.join(".agent"))?;
-        Ok(Self { path: root.join(".agent").join("connectors.json") })
+        Ok(Self {
+            path: root.join(".agent").join("connectors.json"),
+        })
     }
 
     fn load(&self) -> Result<ConnectorStore> {
-        if !self.path.exists() { return Ok(ConnectorStore::default()); }
+        if !self.path.exists() {
+            return Ok(ConnectorStore::default());
+        }
         Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
 
@@ -33,10 +52,14 @@ impl ConnectorsMcp {
         Ok(())
     }
 
-    pub fn list(&self) -> Result<Vec<Connector>> { Ok(self.load()?.connectors) }
+    pub fn list(&self) -> Result<Vec<Connector>> {
+        Ok(self.load()?.connectors)
+    }
 
     pub fn add(&self, connector: Connector) -> Result<Connector> {
-        if connector.id.is_empty() || connector.name.is_empty() || connector.provider.is_empty() { bail!("connector id, name and provider are required"); }
+        if connector.id.is_empty() || connector.name.is_empty() || connector.provider.is_empty() {
+            bail!("connector id, name and provider are required");
+        }
         let mut store = self.load()?;
         store.connectors.retain(|c| c.id != connector.id);
         store.connectors.push(connector.clone());
@@ -54,7 +77,10 @@ impl ConnectorsMcp {
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Option<Connector>> {
         let mut store = self.load()?;
-        let connector = match store.connectors.iter_mut().find(|c| c.id == id) { Some(c) => c, None => return Ok(None) };
+        let connector = match store.connectors.iter_mut().find(|c| c.id == id) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
         connector.enabled = enabled;
         let result = connector.clone();
         self.save(&store)?;

@@ -15,7 +15,9 @@ pub struct ProjectSkillReferences {
 
 impl ProjectSkillReferences {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        Self { path: project_root.into().join(".agent").join("skills.json") }
+        Self {
+            path: project_root.into().join(".agent").join("skills.json"),
+        }
     }
 
     pub fn load(&self) -> Result<SkillReferences> {

@@ -74,9 +74,7 @@ fn validate_json_schema(schema: &Value, value: &Value, depth: usize, path: &str)
             if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
                 for field in object.keys() {
                     if !properties.contains_key(field) {
-                        bail!(
-                            "MCP argument validation failed at {path}: unknown field '{field}'"
-                        );
+                        bail!("MCP argument validation failed at {path}: unknown field '{field}'");
                     }
                 }
             }
@@ -86,12 +84,7 @@ fn validate_json_schema(schema: &Value, value: &Value, depth: usize, path: &str)
     if let Some(item_schema) = schema.get("items") {
         if let Some(array) = value.as_array() {
             for (index, item) in array.iter().enumerate() {
-                validate_json_schema(
-                    item_schema,
-                    item,
-                    depth + 1,
-                    &format!("{path}[{index}]"),
-                )?;
+                validate_json_schema(item_schema, item, depth + 1, &format!("{path}[{index}]"))?;
             }
         }
     }

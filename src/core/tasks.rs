@@ -52,7 +52,9 @@ impl TaskStore {
     }
 
     pub fn set_status(&self, id: &str, status: TaskStatus) -> Result<bool> {
-        let Some(mut task) = self.get(id)? else { return Ok(false) };
+        let Some(mut task) = self.get(id)? else {
+            return Ok(false);
+        };
         task.status = status;
         self.create(&task)?;
         Ok(true)

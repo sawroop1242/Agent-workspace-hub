@@ -18,14 +18,19 @@ pub struct SkillMcp {
 impl SkillMcp {
     pub fn new(project_root: PathBuf) -> Result<Self> {
         Ok(Self {
-            registry: GlobalSkillRegistry::default()?,
+            registry: GlobalSkillRegistry::discover()?,
             project: ProjectSkillReferences::new(project_root),
         })
     }
 
     /// MCP-facing discovery: only skills referenced by this project are visible.
     pub fn list(&self) -> Result<Vec<SkillSummary>> {
-        Ok(self.project.resolve(&self.registry)?.into_iter().map(summary).collect())
+        Ok(self
+            .project
+            .resolve(&self.registry)?
+            .into_iter()
+            .map(summary)
+            .collect())
     }
 
     /// MCP-facing read: resolve a project reference before exposing skill content.
@@ -33,7 +38,9 @@ impl SkillMcp {
         if !self.project.load()?.skills.iter().any(|s| s == name) {
             bail!("skill is not referenced by the current project: {name}");
         }
-        self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("skill not installed globally: {name}"))
+        self.registry
+            .get(name)?
+            .ok_or_else(|| anyhow::anyhow!("skill not installed globally: {name}"))
     }
 
     pub fn add(&self, name: &str) -> Result<()> {
@@ -47,13 +54,23 @@ impl SkillMcp {
 
     pub fn search_global(&self, query: &str) -> Result<Vec<SkillSummary>> {
         let query = query.to_ascii_lowercase();
-        Ok(self.registry.list()?.into_iter()
-            .filter(|s| s.name.to_ascii_lowercase().contains(&query) || s.description.to_ascii_lowercase().contains(&query))
+        Ok(self
+            .registry
+            .list()?
+            .into_iter()
+            .filter(|s| {
+                s.name.to_ascii_lowercase().contains(&query)
+                    || s.description.to_ascii_lowercase().contains(&query)
+            })
             .map(summary)
             .collect())
     }
 }
 
 fn summary(skill: Skill) -> SkillSummary {
-    SkillSummary { name: skill.name, description: skill.description, version: skill.version }
+    SkillSummary {
+        name: skill.name,
+        description: skill.description,
+        version: skill.version,
+    }
 }

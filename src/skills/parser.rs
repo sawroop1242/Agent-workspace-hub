@@ -1,7 +1,7 @@
 use crate::skills::model::Skill;
 use anyhow::{bail, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn parse_skill(path: impl AsRef<Path>) -> Result<Skill> {
     let path = path.as_ref().to_path_buf();
@@ -21,7 +21,7 @@ pub fn parse_skill(path: impl AsRef<Path>) -> Result<Skill> {
         name,
         description,
         version,
-        path: PathBuf::from(path),
+        path,
     })
 }
 
@@ -39,7 +39,9 @@ fn parse_front_matter(content: &str) -> Result<(String, String, Option<String>)>
         if line.trim() == "---" {
             break;
         }
-        let Some((key, value)) = line.split_once(':') else { continue };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         let value = value.trim().trim_matches('"').trim_matches('\'');
         match key.trim() {
             "name" => name = Some(value.to_owned()),
@@ -50,12 +52,15 @@ fn parse_front_matter(content: &str) -> Result<(String, String, Option<String>)>
     }
 
     let name = name.ok_or_else(|| anyhow::anyhow!("missing skill metadata: name"))?;
-    let description = description.ok_or_else(|| anyhow::anyhow!("missing skill metadata: description"))?;
+    let description =
+        description.ok_or_else(|| anyhow::anyhow!("missing skill metadata: description"))?;
     Ok((name, description, version))
 }
 
 fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 100
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }

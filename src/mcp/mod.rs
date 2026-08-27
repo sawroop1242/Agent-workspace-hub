@@ -1,43 +1,59 @@
+pub mod cli_trust;
+pub mod community_registry;
 pub mod composio;
 pub mod composio_auth;
 pub mod connectors;
 pub mod context;
 pub mod custom_mcp;
+pub mod execution_gate;
 pub mod global_mcp;
-pub mod community_registry;
 pub mod memory;
 pub mod permissions;
 pub mod providers;
+pub mod sandbox;
+pub mod schema;
 pub mod security;
 pub mod server;
 pub mod skills;
 pub mod tasks;
 pub mod trust;
 pub mod trust_store;
-pub mod execution_gate;
-pub mod cli_trust;
-pub mod sandbox;
-pub mod schema;
 pub mod workspace;
 
+pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};
+pub use community_registry::{
+    CommunityMcpManifest, CommunityMcpRegistryClient, CommunityRegistryIndex,
+};
 pub use composio::ComposioProvider;
 pub use composio_auth::{AuthLink, ComposioAuth, ConnectedAccount};
 pub use connectors::{AuthMethod, Connector, ConnectorsMcp};
 pub use context::{load_context, WorkspaceContext};
-pub use custom_mcp::{CustomMcpRegistry, CustomMcpServerConfig, CustomMcpStore, McpTransport, StdioMcpClient, StreamableHttpMcpClient};
-pub use global_mcp::{GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs};
-pub use community_registry::{CommunityMcpManifest, CommunityMcpRegistryClient, CommunityRegistryIndex};
+pub use custom_mcp::{
+    CustomMcpRegistry, CustomMcpServerConfig, CustomMcpStore, McpTransport, StdioMcpClient,
+    StreamableHttpMcpClient,
+};
+pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
+pub use global_mcp::{
+    GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs,
+};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
-pub use permissions::{is_blocked_environment, is_valid_env_name, require as require_permission, McpPermissions, Permission};
-pub use providers::{ConnectorProvider, CustomMcpProvider, GatewayProvider, ProviderRegistry, ToolCallResult, ToolContent, ToolDescriptor, UnconfiguredProvider};
-pub use security::{atomic_write, secure_destination, secure_path, sha256_file, validate_command, validate_id, validate_url, verify_sha256, PackageIntegrity};
+pub use permissions::{
+    is_blocked_environment, is_valid_env_name, require as require_permission, McpPermissions,
+    Permission,
+};
+pub use providers::{
+    ConnectorProvider, CustomMcpProvider, GatewayProvider, ProviderRegistry, ToolCallResult,
+    ToolContent, ToolDescriptor, UnconfiguredProvider,
+};
+pub use sandbox::{sandbox_available, wrap_command, SandboxConfig, SandboxLimits};
+pub use schema::validate_tool_arguments;
+pub use security::{
+    atomic_write, secure_destination, secure_path, sha256_file, validate_command, validate_id,
+    validate_url, verify_sha256, PackageIntegrity,
+};
 pub use server::StdioMcpServer;
 pub use skills::SkillMcp;
 pub use tasks::{Task, TaskPriority, TaskStatus, TasksMcp};
 pub use trust::{can_enable, McpApproval, TrustLevel, TrustStore};
 pub use trust_store::PersistentTrustStore;
-pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
-pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};
-pub use sandbox::{sandbox_available, wrap_command, SandboxConfig, SandboxLimits};
-pub use schema::validate_tool_arguments;
 pub use workspace::{WorkspaceFile, WorkspaceMcp};

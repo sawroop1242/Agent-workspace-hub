@@ -27,8 +27,9 @@ impl ProjectStore {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() && path.join(".agent").is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    projects.push(Project::new(name, path));
+                let name = path.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+                if let Some(name) = name {
+                    projects.push(Project::new(&name, path));
                 }
             }
         }

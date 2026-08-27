@@ -5,19 +5,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PackageIntegrity { pub sha256: String }
+pub struct PackageIntegrity {
+    pub sha256: String,
+}
 
 pub fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty() || id.len() > 128 { bail!("MCP id must contain 1-128 characters"); }
-    if !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) { bail!("MCP id contains unsupported characters"); }
+    if id.is_empty() || id.len() > 128 {
+        bail!("MCP id must contain 1-128 characters");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("MCP id contains unsupported characters");
+    }
     Ok(())
 }
 
 pub fn validate_command(command: Option<&str>) -> Result<()> {
     if let Some(command) = command {
         let command = command.trim();
-        if command.is_empty() { bail!("MCP command cannot be empty"); }
-        if command.contains(['\n', '\r', '\0']) { bail!("MCP command contains invalid control characters"); }
+        if command.is_empty() {
+            bail!("MCP command cannot be empty");
+        }
+        if command.contains(['\n', '\r', '\0']) {
+            bail!("MCP command contains invalid control characters");
+        }
     }
     Ok(())
 }
@@ -25,7 +38,10 @@ pub fn validate_command(command: Option<&str>) -> Result<()> {
 pub fn validate_url(url: Option<&str>) -> Result<()> {
     if let Some(url) = url {
         let parsed = reqwest::Url::parse(url)?;
-        match parsed.scheme() { "http" | "https" => {}, other => bail!("unsupported MCP URL scheme: {other}") }
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => bail!("unsupported MCP URL scheme: {other}"),
+        }
     }
     Ok(())
 }
@@ -34,7 +50,11 @@ pub fn validate_url(url: Option<&str>) -> Result<()> {
 pub fn secure_path(base: impl AsRef<Path>, candidate: impl AsRef<Path>) -> Result<PathBuf> {
     let base = fs::canonicalize(base.as_ref()).context("failed to canonicalize security base")?;
     let candidate = candidate.as_ref();
-    let joined = if candidate.is_absolute() { candidate.to_path_buf() } else { base.join(candidate) };
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
     let resolved = if joined.exists() {
         fs::canonicalize(&joined).context("failed to canonicalize target path")?
     } else {
@@ -42,30 +62,45 @@ pub fn secure_path(base: impl AsRef<Path>, candidate: impl AsRef<Path>) -> Resul
         let parent = fs::canonicalize(parent).context("failed to canonicalize target parent")?;
         parent.join(joined.file_name().context("target has no file name")?)
     };
-    if !resolved.starts_with(&base) { bail!("path escapes allowed security directory"); }
+    if !resolved.starts_with(&base) {
+        bail!("path escapes allowed security directory");
+    }
     Ok(resolved)
 }
 
 /// Validate a destination beneath `base`, including canonicalization of its parent.
-pub fn secure_destination(base: impl AsRef<Path>, destination: impl AsRef<Path>) -> Result<PathBuf> {
+pub fn secure_destination(
+    base: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<PathBuf> {
     let base = fs::canonicalize(base.as_ref()).context("failed to canonicalize security base")?;
     let resolved = secure_path(&base, destination)?;
     if let Some(parent) = resolved.parent() {
-        let parent = fs::canonicalize(parent).context("failed to canonicalize destination parent")?;
-        if !parent.starts_with(&base) { bail!("destination parent escapes allowed security directory"); }
+        let parent =
+            fs::canonicalize(parent).context("failed to canonicalize destination parent")?;
+        if !parent.starts_with(&base) {
+            bail!("destination parent escapes allowed security directory");
+        }
     }
     Ok(resolved)
 }
 
 /// Atomically write a file inside `base` using a temporary file in the validated parent.
-pub fn atomic_write(base: impl AsRef<Path>, destination: impl AsRef<Path>, contents: &[u8]) -> Result<()> {
+pub fn atomic_write(
+    base: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    contents: &[u8],
+) -> Result<()> {
     let target = secure_destination(&base, destination)?;
     let parent = target.parent().context("destination has no parent")?;
     fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent).context("failed to create temporary file")?;
+    let mut temp =
+        tempfile::NamedTempFile::new_in(parent).context("failed to create temporary file")?;
     std::io::Write::write_all(&mut temp, contents)?;
     temp.as_file().sync_all()?;
-    temp.persist(&target).map_err(|error| error.error).context("failed to atomically install file")?;
+    temp.persist(&target)
+        .map_err(|error| error.error)
+        .context("failed to atomically install file")?;
     Ok(())
 }
 
@@ -78,7 +113,9 @@ pub fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
 
 pub fn verify_sha256(path: impl AsRef<Path>, expected: &str) -> Result<()> {
     let actual = sha256_file(path)?;
-    if !actual.eq_ignore_ascii_case(expected) { bail!("MCP integrity check failed: SHA-256 mismatch"); }
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("MCP integrity check failed: SHA-256 mismatch");
+    }
     Ok(())
 }
 

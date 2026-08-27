@@ -15,7 +15,10 @@ pub struct WorkspaceMcp {
 
 impl WorkspaceMcp {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into().canonicalize().context("workspace root does not exist")?;
+        let root = root
+            .into()
+            .canonicalize()
+            .context("workspace root does not exist")?;
         Ok(Self { root })
     }
 
@@ -59,7 +62,7 @@ impl WorkspaceMcp {
         if metadata.len() > 2 * 1024 * 1024 {
             bail!("workspace file exceeds 2 MiB limit");
         }
-        Ok(fs::read_to_string(path).context("workspace file is not valid UTF-8")?)
+        fs::read_to_string(path).context("workspace file is not valid UTF-8")
     }
 
     fn safe_path(&self, relative: &str) -> Result<PathBuf> {

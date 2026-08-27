@@ -10,7 +10,9 @@ pub struct ContextStore {
 
 impl ContextStore {
     pub fn for_project(project_path: &Path) -> Self {
-        Self { path: project_path.join(".agent/context.md") }
+        Self {
+            path: project_path.join(".agent/context.md"),
+        }
     }
 
     pub fn path(&self) -> &Path {

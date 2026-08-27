@@ -6,8 +6,13 @@ use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub enum SkillRegistrySource {
-    GitHub { repository: String, reference: String },
-    Community { url: String },
+    GitHub {
+        repository: String,
+        reference: String,
+    },
+    Community {
+        url: String,
+    },
 }
 
 impl SkillRegistrySource {

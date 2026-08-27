@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,10 +13,10 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use super::permissions::{is_blocked_environment, is_valid_env_name, McpPermissions};
-use super::sandbox::{wrap_command, SandboxConfig};
-use super::schema::validate_tool_arguments;
 #[cfg(windows)]
 use super::sandbox::apply_windows_job;
+use super::sandbox::{wrap_command, SandboxConfig};
+use super::schema::validate_tool_arguments;
 
 const MAX_MCP_LINE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -59,24 +59,38 @@ pub struct CustomMcpStore {
 
 fn filter_env(cfg: &CustomMcpServerConfig) -> impl Iterator<Item = (&String, &String)> {
     cfg.env.iter().filter(move |(key, _)| {
-        cfg.permissions.environment.iter().any(|allowed| allowed == *key)
+        cfg.permissions
+            .environment
+            .iter()
+            .any(|allowed| allowed == *key)
             && is_valid_env_name(key)
             && !is_blocked_environment(key)
     })
 }
 
 fn expand_secret_ref(value: &str, permissions: &McpPermissions) -> Result<String> {
-    if let Some(key) = value.strip_prefix("${secret:").and_then(|v| v.strip_suffix('}')) {
+    if let Some(key) = value
+        .strip_prefix("${secret:")
+        .and_then(|v| v.strip_suffix('}'))
+    {
         if !is_valid_env_name(key) {
             tracing::warn!(event = "mcp_secret_denied", reason = "invalid_name");
             bail!("invalid secret environment variable name");
         }
         if is_blocked_environment(key) {
-            tracing::warn!(event = "mcp_secret_denied", reason = "blocked_name", name = key);
+            tracing::warn!(
+                event = "mcp_secret_denied",
+                reason = "blocked_name",
+                name = key
+            );
             bail!("dangerous secret environment variable is blocked: {key}");
         }
         if !permissions.allows_secret(key) {
-            tracing::warn!(event = "mcp_secret_denied", reason = "not_approved", name = key);
+            tracing::warn!(
+                event = "mcp_secret_denied",
+                reason = "not_approved",
+                name = key
+            );
             bail!("secret environment variable is not approved: {key}");
         }
         return std::env::var(key)
@@ -98,7 +112,11 @@ fn validate_server(server: &CustomMcpServerConfig) -> Result<()> {
     if server.id != server.id.trim() || server.name != server.name.trim() {
         bail!("MCP id and name must not have leading or trailing whitespace");
     }
-    if server.id.chars().any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))) {
+    if server
+        .id
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
         bail!("MCP id may contain only ASCII letters, digits, '-', '_' and '.'");
     }
     server.permissions.validate()?;
@@ -150,7 +168,8 @@ impl CustomMcpRegistry {
         if !self.path.exists() {
             return Ok(CustomMcpStore::default());
         }
-        let content = fs::read_to_string(&self.path).context("failed to read custom MCP registry")?;
+        let content =
+            fs::read_to_string(&self.path).context("failed to read custom MCP registry")?;
         serde_json::from_str(&content).context("custom MCP registry contains invalid JSON")
     }
 
@@ -161,9 +180,12 @@ impl CustomMcpRegistry {
             .context("custom MCP registry has no parent directory")?;
         fs::create_dir_all(parent)?;
         let content = serde_json::to_vec_pretty(store)?;
-        let mut temp = NamedTempFile::new_in(parent).context("failed to create MCP registry temp file")?;
+        let mut temp =
+            NamedTempFile::new_in(parent).context("failed to create MCP registry temp file")?;
         std::io::Write::write_all(&mut temp, &content)?;
-        temp.as_file().sync_all().context("failed to flush MCP registry")?;
+        temp.as_file()
+            .sync_all()
+            .context("failed to flush MCP registry")?;
         temp.persist(&self.path)
             .map_err(|error| error.error)
             .context("failed to atomically replace custom MCP registry")?;
@@ -206,7 +228,11 @@ impl CustomMcpRegistry {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<CustomMcpServerConfig>> {
-        Ok(self.load()?.servers.into_iter().find(|entry| entry.id == id))
+        Ok(self
+            .load()?
+            .servers
+            .into_iter()
+            .find(|entry| entry.id == id))
     }
 }
 
@@ -291,9 +317,7 @@ impl StdioMcpClient {
         if line.len() > MAX_MCP_LINE_BYTES {
             bail!("MCP response exceeds 10 MiB limit");
         }
-        jsonrpc_result(
-            serde_json::from_str(line.trim()).context("invalid MCP JSON-RPC response")?,
-        )
+        jsonrpc_result(serde_json::from_str(line.trim()).context("invalid MCP JSON-RPC response")?)
     }
 
     pub async fn initialize(&self) -> Result<Value> {
@@ -318,11 +342,14 @@ impl StdioMcpClient {
     pub async fn tools_call(&self, name: &str, arguments: Value) -> Result<Value> {
         let tools = self.tools_list().await?;
         validate_tool_arguments(&tools, name, &arguments)?;
-        self.request(
-            "tools/call",
-            json!({"name": name, "arguments": arguments}),
-        )
-        .await
+        self.request("tools/call", json!({"name": name, "arguments": arguments}))
+            .await
+    }
+
+    /// Terminates the underlying MCP process so it cannot outlive the client.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.child.lock().await.kill().await?;
+        Ok(())
     }
 }
 
@@ -408,11 +435,8 @@ impl StreamableHttpMcpClient {
     pub async fn tools_call(&self, name: &str, arguments: Value) -> Result<Value> {
         let tools = self.tools_list().await?;
         validate_tool_arguments(&tools, name, &arguments)?;
-        self.request(
-            "tools/call",
-            json!({"name": name, "arguments": arguments}),
-        )
-        .await
+        self.request("tools/call", json!({"name": name, "arguments": arguments}))
+            .await
     }
 }
 

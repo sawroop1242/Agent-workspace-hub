@@ -14,8 +14,9 @@ impl GlobalSkillRegistry {
         Self { root: root.into() }
     }
 
-    pub fn default() -> Result<Self> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    pub fn discover() -> Result<Self> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
         Ok(Self::new(home.join(".agent-workspace-hub").join("skills")))
     }
 
@@ -61,7 +62,12 @@ impl GlobalSkillRegistry {
 }
 
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 100 || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+    if name.is_empty()
+        || name.len() > 100
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
         bail!("invalid skill name: {name}");
     }
     Ok(())

@@ -1,7 +1,7 @@
 use crate::mcp::{
     AuthMethod, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
-    McpTransport, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, StreamableHttpMcpClient,
-    StdioMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
+    McpTransport, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, StdioMcpClient,
+    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,8 @@ impl StdioMcpServer {
             }
             match cfg.transport {
                 McpTransport::Stdio => {
-                    let client = runtime.block_on(StdioMcpClient::spawn(&cfg, project_root.clone()))?;
+                    let client =
+                        runtime.block_on(StdioMcpClient::spawn(&cfg, project_root.clone()))?;
                     runtime.block_on(client.initialize())?;
                     let provider = CustomMcpProvider::new(cfg.id, Arc::new(client));
                     registry
@@ -95,6 +96,9 @@ impl StdioMcpServer {
 
     pub fn handle(&self, input: &str) -> Result<String> {
         let req: RpcRequest = serde_json::from_str(input)?;
+        if req.jsonrpc != "2.0" {
+            anyhow::bail!("unsupported JSON-RPC version: {}", req.jsonrpc);
+        }
         let result = match req.method.as_str() {
             "initialize" => json!({
                 "protocolVersion": "2025-06-18",
@@ -174,12 +178,20 @@ impl StdioMcpServer {
         let value = match name {
             "skills.list" => serde_json::to_value(self.skills.list()?)?,
             "skills.read" => serde_json::to_value(
-                self.skills
-                    .read(arguments.get("name").and_then(Value::as_str).unwrap_or_default())?,
+                self.skills.read(
+                    arguments
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?,
             )?,
             "skills.add" => {
-                self.skills
-                    .add(arguments.get("name").and_then(Value::as_str).unwrap_or_default())?;
+                self.skills.add(
+                    arguments
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?;
                 json!({"ok": true})
             }
             "skills.remove" => json!({
@@ -187,22 +199,27 @@ impl StdioMcpServer {
                     arguments.get("name").and_then(Value::as_str).unwrap_or_default()
                 )?
             }),
-            "skills.search" => serde_json::to_value(self.skills.search_global(
-                arguments
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )?)?,
+            "skills.search" => serde_json::to_value(
+                self.skills.search_global(
+                    arguments
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?,
+            )?,
             "workspace.context" => serde_json::to_value(self.workspace.context()?)?,
-            "workspace.list_files" => serde_json::to_value(self.workspace.list_files(
-                arguments.get("path").and_then(Value::as_str).unwrap_or("."),
-            )?)?,
-            "workspace.read_file" => serde_json::to_value(self.workspace.read_file(
-                arguments
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )?)?,
+            "workspace.list_files" => serde_json::to_value(
+                self.workspace
+                    .list_files(arguments.get("path").and_then(Value::as_str).unwrap_or("."))?,
+            )?,
+            "workspace.read_file" => serde_json::to_value(
+                self.workspace.read_file(
+                    arguments
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?,
+            )?,
             "memory.store" => {
                 let scope = parse_scope(arguments.get("scope").and_then(Value::as_str));
                 serde_json::to_value(self.memory.store(
@@ -212,22 +229,26 @@ impl StdioMcpServer {
                     strings(&arguments, "tags"),
                 )?)?
             }
-            "memory.search" => serde_json::to_value(self.memory.search(
-                arguments
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                arguments
-                    .get("scope")
-                    .and_then(Value::as_str)
-                    .map(|scope| parse_scope(Some(scope))),
-            )?)?,
-            "memory.get" => serde_json::to_value(self.memory.get(
-                arguments
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )?)?,
+            "memory.search" => serde_json::to_value(
+                self.memory.search(
+                    arguments
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    arguments
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .map(|scope| parse_scope(Some(scope))),
+                )?,
+            )?,
+            "memory.get" => serde_json::to_value(
+                self.memory.get(
+                    arguments
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?,
+            )?,
             "memory.delete" => json!({
                 "deleted": self.memory.delete(
                     arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -240,26 +261,33 @@ impl StdioMcpServer {
                 parse_priority(arguments.get("priority").and_then(Value::as_str)),
                 strings(&arguments, "tags"),
             )?)?,
-            "tasks.list" => serde_json::to_value(self.tasks.list(
-                arguments
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(parse_status),
-            )?)?,
-            "tasks.update" => serde_json::to_value(self.tasks.update(
-                arguments.get("id").and_then(Value::as_str).unwrap_or_default(),
-                arguments
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(parse_status),
-                arguments
-                    .get("priority")
-                    .and_then(Value::as_str)
-                    .map(|value| parse_priority(Some(value))),
-                arguments
-                    .get("assignee")
-                    .map(|value| value.as_str().map(str::to_string)),
-            )?)?,
+            "tasks.list" => serde_json::to_value(
+                self.tasks.list(
+                    arguments
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(parse_status),
+                )?,
+            )?,
+            "tasks.update" => serde_json::to_value(
+                self.tasks.update(
+                    arguments
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    arguments
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(parse_status),
+                    arguments
+                        .get("priority")
+                        .and_then(Value::as_str)
+                        .map(|value| parse_priority(Some(value))),
+                    arguments
+                        .get("assignee")
+                        .map(|value| value.as_str().map(str::to_string)),
+                )?,
+            )?,
             "tasks.delete" => json!({
                 "deleted": self.tasks.delete(
                     arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -280,20 +308,24 @@ impl StdioMcpServer {
                 };
                 serde_json::to_value(self.connectors.add(connector)?)?
             }
-            "connectors.enable" => serde_json::to_value(self.connectors.set_enabled(
-                arguments
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                true,
-            )?)?,
-            "connectors.disable" => serde_json::to_value(self.connectors.set_enabled(
-                arguments
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                false,
-            )?)?,
+            "connectors.enable" => serde_json::to_value(
+                self.connectors.set_enabled(
+                    arguments
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    true,
+                )?,
+            )?,
+            "connectors.disable" => serde_json::to_value(
+                self.connectors.set_enabled(
+                    arguments
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    false,
+                )?,
+            )?,
             "connectors.remove" => json!({
                 "removed": self.connectors.remove(
                     arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -334,9 +366,10 @@ impl StdioMcpServer {
                     .providers
                     .read()
                     .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?;
-                serde_json::to_value(self.runtime.block_on(registry.invoke(
-                    provider, tool, args,
-                ))?)?
+                serde_json::to_value(
+                    self.runtime
+                        .block_on(registry.invoke(provider, tool, args))?,
+                )?
             }
             _ if name.contains('.') => {
                 let registry = self

@@ -13,7 +13,9 @@ pub struct MemoryStore {
 
 impl MemoryStore {
     pub fn for_project(project_path: &Path) -> Self {
-        Self { path: project_path.join(".agent/memory.jsonl") }
+        Self {
+            path: project_path.join(".agent/memory.jsonl"),
+        }
     }
 
     pub fn path(&self) -> &Path {
