@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Authentication method required by a connector.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthMethod {
     OAuth,
@@ -10,6 +11,7 @@ pub enum AuthMethod {
     None,
 }
 
+/// Metadata for an external service connector. Holds no secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connector {
     pub id: String,
@@ -52,10 +54,12 @@ impl ConnectorsMcp {
         Ok(())
     }
 
+    /// Lists all connectors.
     pub fn list(&self) -> Result<Vec<Connector>> {
         Ok(self.load()?.connectors)
     }
 
+    /// Adds (or replaces) a connector after validating its required fields.
     pub fn add(&self, connector: Connector) -> Result<Connector> {
         if connector.id.is_empty() || connector.name.is_empty() || connector.provider.is_empty() {
             bail!("connector id, name and provider are required");
@@ -67,6 +71,7 @@ impl ConnectorsMcp {
         Ok(connector)
     }
 
+    /// Removes a connector, returning whether it existed.
     pub fn remove(&self, id: &str) -> Result<bool> {
         let mut store = self.load()?;
         let before = store.connectors.len();
@@ -75,6 +80,7 @@ impl ConnectorsMcp {
         Ok(before != store.connectors.len())
     }
 
+    /// Toggles a connector's enabled state, returning the updated connector.
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Option<Connector>> {
         let mut store = self.load()?;
         let connector = match store.connectors.iter_mut().find(|c| c.id == id) {

@@ -3,17 +3,20 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// A single file entry within the workspace, with path and byte size.
 #[derive(Debug, Serialize)]
 pub struct WorkspaceFile {
     pub path: String,
     pub size: u64,
 }
 
+/// Project-scoped MCP workspace access with path-traversal protection.
 pub struct WorkspaceMcp {
     root: PathBuf,
 }
 
 impl WorkspaceMcp {
+    /// Creates a workspace handle, canonicalizing and validating the root exists.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root
             .into()
@@ -22,6 +25,7 @@ impl WorkspaceMcp {
         Ok(Self { root })
     }
 
+    /// Reads the concatenated contents of `AGENTS.md`, `AGENT.md`, and `README.md`.
     pub fn context(&self) -> Result<String> {
         let mut out = String::new();
         for name in ["AGENTS.md", "AGENT.md", "README.md"] {
@@ -33,6 +37,7 @@ impl WorkspaceMcp {
         Ok(out)
     }
 
+    /// Lists files (not directories) under a workspace subdirectory.
     pub fn list_files(&self, relative: &str) -> Result<Vec<WorkspaceFile>> {
         let dir = self.safe_path(relative)?;
         if !dir.is_dir() {
@@ -53,6 +58,7 @@ impl WorkspaceMcp {
         Ok(files)
     }
 
+    /// Reads a workspace file as UTF-8, bounded to 2 MiB.
     pub fn read_file(&self, relative: &str) -> Result<String> {
         let path = self.safe_path(relative)?;
         if !path.is_file() {

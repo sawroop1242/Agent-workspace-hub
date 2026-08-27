@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::custom_mcp::{CustomMcpServerConfig, McpTransport};
 use super::global_mcp::{GlobalMcpEntry, GlobalMcpRegistry};
 
+/// A server entry in a community MCP registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityMcpManifest {
     pub id: String,
@@ -29,17 +30,20 @@ pub struct CommunityMcpManifest {
     pub repository: Option<String>,
 }
 
+/// The index returned by a community MCP registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityRegistryIndex {
     pub mcps: Vec<CommunityMcpManifest>,
 }
 
+/// HTTP client for a community MCP registry's index.
 pub struct CommunityMcpRegistryClient {
     client: Client,
     index_url: String,
 }
 
 impl CommunityMcpRegistryClient {
+    /// Creates a client for the registry at `index_url`.
     pub fn new(index_url: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -47,6 +51,7 @@ impl CommunityMcpRegistryClient {
         }
     }
 
+    /// Fetches the registry index.
     pub async fn index(&self) -> Result<CommunityRegistryIndex> {
         let response = self
             .client
@@ -60,6 +65,7 @@ impl CommunityMcpRegistryClient {
             .context("invalid community MCP registry index")
     }
 
+    /// Searches the registry by id, name, description, or author (case-insensitive).
     pub async fn search(&self, query: &str) -> Result<Vec<CommunityMcpManifest>> {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
@@ -83,6 +89,7 @@ impl CommunityMcpRegistryClient {
             .collect())
     }
 
+    /// Returns the manifest for a specific MCP `id`.
     pub async fn get(&self, id: &str) -> Result<CommunityMcpManifest> {
         self.index()
             .await?
@@ -92,6 +99,7 @@ impl CommunityMcpRegistryClient {
             .ok_or_else(|| anyhow!("MCP '{}' not found in community registry", id))
     }
 
+    /// Installs an MCP by id into the global registry.
     pub async fn install(&self, global: &GlobalMcpRegistry, id: &str) -> Result<GlobalMcpEntry> {
         let manifest = self.get(id).await?;
         let config = manifest_to_config(&manifest)?;
@@ -102,6 +110,7 @@ impl CommunityMcpRegistryClient {
         )
     }
 
+    /// Updates an already-installed MCP to the latest registry version.
     pub async fn update(&self, global: &GlobalMcpRegistry, id: &str) -> Result<GlobalMcpEntry> {
         let manifest = self.get(id).await?;
         let current = global
