@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A remote source for a skill registry.
 #[derive(Debug, Clone)]
 pub enum SkillRegistrySource {
     GitHub {
@@ -16,6 +17,7 @@ pub enum SkillRegistrySource {
 }
 
 impl SkillRegistrySource {
+    /// Parses a `github:owner/repo#ref` or `community:https://...` source specifier.
     pub fn parse(value: &str) -> Result<Self> {
         if let Some(repo) = value.strip_prefix("github:") {
             let mut parts = repo.splitn(2, '#');
@@ -41,6 +43,7 @@ impl SkillRegistrySource {
     }
 }
 
+/// Installs skills from remote Git repositories.
 pub struct RemoteSkillRegistry {
     pub cache_dir: PathBuf,
 }
@@ -52,6 +55,7 @@ impl RemoteSkillRegistry {
         }
     }
 
+    /// Clones a GitHub repository and installs a skill from it into the global registry.
     pub fn install_github(
         &self,
         repository: &str,

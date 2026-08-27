@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// A skill pinned in the lockfile with its source and integrity digest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockedSkill {
     pub name: String,
@@ -11,12 +12,14 @@ pub struct LockedSkill {
     pub sha256: Option<String>,
 }
 
+/// The project skill lockfile, recording pinned skill versions.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillLockfile {
     pub version: u32,
     pub skills: Vec<LockedSkill>,
 }
 
+/// Persistent store for a project's skill lockfile.
 pub struct LockfileStore {
     path: PathBuf,
 }
@@ -28,6 +31,7 @@ impl LockfileStore {
         }
     }
 
+    /// Loads the lockfile, defaulting to an empty v1 lockfile.
     pub fn load(&self) -> Result<SkillLockfile> {
         if !self.path.exists() {
             return Ok(SkillLockfile {
@@ -38,6 +42,7 @@ impl LockfileStore {
         Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
 
+    /// Persists the lockfile.
     pub fn save(&self, lock: &SkillLockfile) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;

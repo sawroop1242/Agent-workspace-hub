@@ -3,6 +3,8 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Downloads and installs skills into the global registry from a remote
+/// registry or a local directory.
 pub struct SkillInstaller {
     cache_dir: PathBuf,
 }
@@ -14,6 +16,8 @@ impl SkillInstaller {
         }
     }
 
+    /// Downloads a skill from a remote registry and installs it globally,
+    /// after validating the package and a safe download path.
     pub async fn install_from_registry(
         &self,
         client: &RegistryClient,
@@ -57,6 +61,7 @@ impl SkillInstaller {
         Ok(())
     }
 
+    /// Installs a skill from a local directory into the global registry.
     pub fn install_from_local(
         &self,
         source: impl AsRef<Path>,

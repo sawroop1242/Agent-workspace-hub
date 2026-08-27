@@ -3,6 +3,8 @@ use anyhow::{bail, Result};
 use std::fs;
 use std::path::PathBuf;
 
+/// Project-scoped skill store (`SkillStore`), managing skills under a
+/// `.agent/skills` directory.
 pub struct SkillStore {
     root: PathBuf,
 }
@@ -16,6 +18,7 @@ impl SkillStore {
         self.root.join(".agent").join("skills")
     }
 
+    /// Creates a new project skill with a starter `SKILL.md` template.
     pub fn create(&self, name: &str, description: &str) -> Result<Skill> {
         if name.is_empty()
             || !name
@@ -34,6 +37,7 @@ impl SkillStore {
         parse_skill(dir)
     }
 
+    /// Returns the project skill named `name`, if present.
     pub fn get(&self, name: &str) -> Result<Option<Skill>> {
         let dir = self.skills_dir().join(name);
         if !dir.exists() {
@@ -42,6 +46,7 @@ impl SkillStore {
         Ok(Some(parse_skill(dir)?))
     }
 
+    /// Lists all project skills, sorted by name.
     pub fn list(&self) -> Result<Vec<Skill>> {
         let dir = self.skills_dir();
         if !dir.exists() {
