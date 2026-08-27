@@ -15,7 +15,10 @@ pub struct WorkspaceMcp {
 
 impl WorkspaceMcp {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into().canonicalize().context("workspace root does not exist")?;
+        let root = root
+            .into()
+            .canonicalize()
+            .context("workspace root does not exist")?;
         Ok(Self { root })
     }
 

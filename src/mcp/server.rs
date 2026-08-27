@@ -1,7 +1,7 @@
 use crate::mcp::{
     AuthMethod, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
-    McpTransport, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, StreamableHttpMcpClient,
-    StdioMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
+    McpTransport, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, StdioMcpClient,
+    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,6 @@ struct RpcRequest {
     #[serde(default)]
     params: Value,
 }
-
 #[derive(Debug, Serialize)]
 struct RpcResponse {
     jsonrpc: &'static str,
@@ -36,12 +35,10 @@ pub struct StdioMcpServer {
     providers: Arc<RwLock<ProviderRegistry>>,
     runtime: Runtime,
 }
-
 impl StdioMcpServer {
     pub fn new(project_root: PathBuf) -> Result<Self> {
         let runtime = Runtime::new()?;
         let registry = Arc::new(RwLock::new(ProviderRegistry::default()));
-
         if std::env::var("COMPOSIO_API_KEY").is_ok() {
             if let Ok(provider) = ComposioProvider::from_env() {
                 registry
@@ -50,7 +47,6 @@ impl StdioMcpServer {
                     .register(Box::new(provider));
             }
         }
-
         let custom = CustomMcpRegistry::new(project_root.clone())?;
         for cfg in custom.list()? {
             if !cfg.enabled {
@@ -58,7 +54,8 @@ impl StdioMcpServer {
             }
             match cfg.transport {
                 McpTransport::Stdio => {
-                    let client = runtime.block_on(StdioMcpClient::spawn(&cfg, project_root.clone()))?;
+                    let client =
+                        runtime.block_on(StdioMcpClient::spawn(&cfg, project_root.clone()))?;
                     runtime.block_on(client.initialize())?;
                     let provider = CustomMcpProvider::new(cfg.id, Arc::new(client));
                     registry
@@ -77,7 +74,6 @@ impl StdioMcpServer {
                 }
             }
         }
-
         Ok(Self {
             skills: SkillMcp::new(project_root.clone())?,
             workspace: WorkspaceMcp::new(project_root.clone())?,
@@ -88,24 +84,19 @@ impl StdioMcpServer {
             runtime,
         })
     }
-
     pub fn provider_registry(&self) -> Arc<RwLock<ProviderRegistry>> {
         Arc::clone(&self.providers)
     }
-
     pub fn handle(&self, input: &str) -> Result<String> {
         let req: RpcRequest = serde_json::from_str(input)?;
         let result = match req.method.as_str() {
-            "initialize" => json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "agent-workspace-hub", "version": env!("CARGO_PKG_VERSION")}
-            }),
+            "initialize" => {
+                json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"agent-workspace-hub","version":env!("CARGO_PKG_VERSION")}})
+            }
             "tools/list" => self.tools_list_aggregated()?,
             "tools/call" => self.call_tool(&req.params)?,
-            _ => json!({"error": "method not found"}),
+            _ => json!({"error":"method not found"}),
         };
-
         Ok(serde_json::to_string(&RpcResponse {
             jsonrpc: "2.0",
             id: req.id,
@@ -113,7 +104,6 @@ impl StdioMcpServer {
             error: None,
         })?)
     }
-
     fn tools_list_aggregated(&self) -> Result<Value> {
         let mut base = self
             .tools_list()
@@ -121,292 +111,210 @@ impl StdioMcpServer {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let registry = self
+        let r = self
             .providers
             .read()
             .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?;
-        let dynamic = self.runtime.block_on(registry.aggregate_tools())?;
-        for tool in dynamic {
-            base.push(serde_json::to_value(tool)?);
+        let dynamic = self.runtime.block_on(r.aggregate_tools())?;
+        for t in dynamic {
+            base.push(serde_json::to_value(t)?);
         }
-        Ok(json!({"tools": base}))
+        Ok(json!({"tools":base}))
     }
-
     fn tools_list(&self) -> Value {
-        json!({"tools": [
-            {"name":"skills.list","description":"List project-referenced skills","inputSchema":{"type":"object","properties":{}}},
-            {"name":"skills.read","description":"Read a project-referenced skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
-            {"name":"skills.add","description":"Add an installed global skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
-            {"name":"skills.remove","description":"Remove a project skill reference","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
-            {"name":"skills.search","description":"Search globally installed skills","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
-            {"name":"workspace.context","description":"Read project agent instructions","inputSchema":{"type":"object","properties":{}}},
-            {"name":"workspace.list_files","description":"List workspace files","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
-            {"name":"workspace.read_file","description":"Read a workspace file","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
-            {"name":"memory.store","description":"Store project memory","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","content","scope"]}},
-            {"name":"memory.search","description":"Search memory","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]}},"required":["query"]}},
-            {"name":"memory.get","description":"Get memory by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-            {"name":"memory.delete","description":"Delete memory","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-            {"name":"tasks.create","description":"Create a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string","enum":["Low","Normal","High","Critical"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","title","description"]}},
-            {"name":"tasks.list","description":"List tasks","inputSchema":{"type":"object","properties":{"status":{"type":"string","enum":["Todo","InProgress","Blocked","Done"]}}}},
-            {"name":"tasks.update","description":"Update a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["Todo","InProgress","Blocked","Done"]},"priority":{"type":"string","enum":["Low","Normal","High","Critical"]},"assignee":{"type":["string","null"]}},"required":["id"]}},
-            {"name":"tasks.delete","description":"Delete a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-            {"name":"connectors.list","description":"List connector metadata for this project","inputSchema":{"type":"object","properties":{}}},
-            {"name":"connectors.add","description":"Register connector metadata; never stores secrets","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"provider":{"type":"string"},"auth":{"type":"string","enum":["OAuth","ApiKey","None"]},"scopes":{"type":"array","items":{"type":"string"}},"enabled":{"type":"boolean"}},"required":["id","name","provider","auth"]}},
-            {"name":"connectors.enable","description":"Enable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-            {"name":"connectors.disable","description":"Disable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-            {"name":"connectors.remove","description":"Remove connector metadata","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-            {"name":"connector.providers","description":"List registered connector and custom MCP providers","inputSchema":{"type":"object","properties":{}}},
-            {"name":"connector.tools","description":"List tools exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"}},"required":["provider"]}},
-            {"name":"connector.invoke","description":"Invoke a tool exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["provider","tool"]}}
+        json!({"tools":[
+            {"name":"skills.list","description":"List project-referenced skills","inputSchema":{"type":"object","properties":{}}},{"name":"skills.read","description":"Read a project-referenced skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},{"name":"skills.add","description":"Add an installed global skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},{"name":"skills.remove","description":"Remove a project skill reference","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},{"name":"skills.search","description":"Search globally installed skills","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+            {"name":"workspace.context","description":"Read project agent instructions","inputSchema":{"type":"object","properties":{}}},{"name":"workspace.list_files","description":"List workspace files","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},{"name":"workspace.read_file","description":"Read a workspace file","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+            {"name":"memory.store","description":"Store project memory","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","content","scope"]}},{"name":"memory.search","description":"Search memory","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]}},"required":["query"]}},{"name":"memory.get","description":"Get memory by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},{"name":"memory.delete","description":"Delete memory","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"tasks.create","description":"Create a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string","enum":["Low","Normal","High","Critical"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","title","description"]}},{"name":"tasks.list","description":"List tasks","inputSchema":{"type":"object","properties":{"status":{"type":"string","enum":["Todo","InProgress","Blocked","Done"]}}}},{"name":"tasks.update","description":"Update a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["Todo","InProgress","Blocked","Done"]},"priority":{"type":"string","enum":["Low","Normal","High","Critical"]},"assignee":{"type":["string","null"]}},"required":["id"]}},{"name":"tasks.delete","description":"Delete a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"connectors.list","description":"List connector metadata for this project","inputSchema":{"type":"object","properties":{}}},{"name":"connectors.add","description":"Register connector metadata; never stores secrets","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"provider":{"type":"string"},"auth":{"type":"string","enum":["OAuth","ApiKey","None"]},"scopes":{"type":"array","items":{"type":"string"}},"enabled":{"type":"boolean"}},"required":["id","name","provider","auth"]}},{"name":"connectors.enable","description":"Enable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},{"name":"connectors.disable","description":"Disable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},{"name":"connectors.remove","description":"Remove connector metadata","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"connector.providers","description":"List registered connector and custom MCP providers","inputSchema":{"type":"object","properties":{}}},{"name":"connector.tools","description":"List tools exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"}},"required":["provider"]}},{"name":"connector.invoke","description":"Invoke a tool exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["provider","tool"]}}
         ]})
     }
-
-    fn call_tool(&self, params: &Value) -> Result<Value> {
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-
-        let value = match name {
+    fn call_tool(&self, p: &Value) -> Result<Value> {
+        let n = p.get("name").and_then(Value::as_str).unwrap_or_default();
+        let a = p.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let v = match n {
             "skills.list" => serde_json::to_value(self.skills.list()?)?,
             "skills.read" => serde_json::to_value(
                 self.skills
-                    .read(arguments.get("name").and_then(Value::as_str).unwrap_or_default())?,
+                    .read(a.get("name").and_then(Value::as_str).unwrap_or_default())?,
             )?,
             "skills.add" => {
                 self.skills
-                    .add(arguments.get("name").and_then(Value::as_str).unwrap_or_default())?;
-                json!({"ok": true})
+                    .add(a.get("name").and_then(Value::as_str).unwrap_or_default())?;
+                json!({"ok":true})
             }
-            "skills.remove" => json!({
-                "removed": self.skills.remove(
-                    arguments.get("name").and_then(Value::as_str).unwrap_or_default()
-                )?
-            }),
-            "skills.search" => serde_json::to_value(self.skills.search_global(
-                arguments
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )?)?,
+            "skills.remove" => {
+                json!({"removed":self.skills.remove(a.get("name").and_then(Value::as_str).unwrap_or_default())?})
+            }
+            "skills.search" => serde_json::to_value(
+                self.skills
+                    .search_global(a.get("query").and_then(Value::as_str).unwrap_or_default())?,
+            )?,
             "workspace.context" => serde_json::to_value(self.workspace.context()?)?,
-            "workspace.list_files" => serde_json::to_value(self.workspace.list_files(
-                arguments.get("path").and_then(Value::as_str).unwrap_or("."),
-            )?)?,
-            "workspace.read_file" => serde_json::to_value(self.workspace.read_file(
-                arguments
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )?)?,
+            "workspace.list_files" => serde_json::to_value(
+                self.workspace
+                    .list_files(a.get("path").and_then(Value::as_str).unwrap_or("."))?,
+            )?,
+            "workspace.read_file" => serde_json::to_value(
+                self.workspace
+                    .read_file(a.get("path").and_then(Value::as_str).unwrap_or_default())?,
+            )?,
             "memory.store" => {
-                let scope = parse_scope(arguments.get("scope").and_then(Value::as_str));
+                let s = parse_scope(a.get("scope").and_then(Value::as_str));
                 serde_json::to_value(self.memory.store(
-                    strval(&arguments, "id"),
-                    strval(&arguments, "content"),
-                    scope,
-                    strings(&arguments, "tags"),
+                    strval(&a, "id"),
+                    strval(&a, "content"),
+                    s,
+                    strings(&a, "tags"),
                 )?)?
             }
             "memory.search" => serde_json::to_value(self.memory.search(
-                arguments
-                    .get("query")
+                a.get("query").and_then(Value::as_str).unwrap_or_default(),
+                a.get("scope")
                     .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                arguments
-                    .get("scope")
-                    .and_then(Value::as_str)
-                    .map(|scope| parse_scope(Some(scope))),
+                    .map(|s| parse_scope(Some(s))),
             )?)?,
-            "memory.get" => serde_json::to_value(self.memory.get(
-                arguments
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )?)?,
-            "memory.delete" => json!({
-                "deleted": self.memory.delete(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
-                )?
-            }),
+            "memory.get" => serde_json::to_value(
+                self.memory
+                    .get(a.get("id").and_then(Value::as_str).unwrap_or_default())?,
+            )?,
+            "memory.delete" => {
+                json!({"deleted":self.memory.delete(a.get("id").and_then(Value::as_str).unwrap_or_default())?})
+            }
             "tasks.create" => serde_json::to_value(self.tasks.create(
-                strval(&arguments, "id"),
-                strval(&arguments, "title"),
-                strval(&arguments, "description"),
-                parse_priority(arguments.get("priority").and_then(Value::as_str)),
-                strings(&arguments, "tags"),
+                strval(&a, "id"),
+                strval(&a, "title"),
+                strval(&a, "description"),
+                parse_priority(a.get("priority").and_then(Value::as_str)),
+                strings(&a, "tags"),
             )?)?,
-            "tasks.list" => serde_json::to_value(self.tasks.list(
-                arguments
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(parse_status),
-            )?)?,
-            "tasks.update" => serde_json::to_value(self.tasks.update(
-                arguments.get("id").and_then(Value::as_str).unwrap_or_default(),
-                arguments
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(parse_status),
-                arguments
-                    .get("priority")
-                    .and_then(Value::as_str)
-                    .map(|value| parse_priority(Some(value))),
-                arguments
-                    .get("assignee")
-                    .map(|value| value.as_str().map(str::to_string)),
-            )?)?,
-            "tasks.delete" => json!({
-                "deleted": self.tasks.delete(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
-                )?
-            }),
+            "tasks.list" => serde_json::to_value(
+                self.tasks
+                    .list(a.get("status").and_then(Value::as_str).map(parse_status))?,
+            )?,
+            "tasks.update" => serde_json::to_value(
+                self.tasks.update(
+                    a.get("id").and_then(Value::as_str).unwrap_or_default(),
+                    a.get("status").and_then(Value::as_str).map(parse_status),
+                    a.get("priority")
+                        .and_then(Value::as_str)
+                        .map(|x| parse_priority(Some(x))),
+                    a.get("assignee").map(|x| x.as_str().map(str::to_string)),
+                )?,
+            )?,
+            "tasks.delete" => {
+                json!({"deleted":self.tasks.delete(a.get("id").and_then(Value::as_str).unwrap_or_default())?})
+            }
             "connectors.list" => serde_json::to_value(self.connectors.list()?)?,
             "connectors.add" => {
-                let connector = Connector {
-                    id: strval(&arguments, "id"),
-                    name: strval(&arguments, "name"),
-                    provider: strval(&arguments, "provider"),
-                    auth: parse_auth(arguments.get("auth").and_then(Value::as_str)),
-                    scopes: strings(&arguments, "scopes"),
-                    enabled: arguments
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
+                let c = Connector {
+                    id: strval(&a, "id"),
+                    name: strval(&a, "name"),
+                    provider: strval(&a, "provider"),
+                    auth: parse_auth(a.get("auth").and_then(Value::as_str)),
+                    scopes: strings(&a, "scopes"),
+                    enabled: a.get("enabled").and_then(Value::as_bool).unwrap_or(true),
                 };
-                serde_json::to_value(self.connectors.add(connector)?)?
+                serde_json::to_value(self.connectors.add(c)?)?
             }
             "connectors.enable" => serde_json::to_value(self.connectors.set_enabled(
-                arguments
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
+                a.get("id").and_then(Value::as_str).unwrap_or_default(),
                 true,
             )?)?,
             "connectors.disable" => serde_json::to_value(self.connectors.set_enabled(
-                arguments
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
+                a.get("id").and_then(Value::as_str).unwrap_or_default(),
                 false,
             )?)?,
-            "connectors.remove" => json!({
-                "removed": self.connectors.remove(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
-                )?
-            }),
+            "connectors.remove" => {
+                json!({"removed":self.connectors.remove(a.get("id").and_then(Value::as_str).unwrap_or_default())?})
+            }
             "connector.providers" => {
-                let registry = self
+                let r = self
                     .providers
                     .read()
                     .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?;
-                json!(registry.providers())
+                json!(r.providers())
             }
             "connector.tools" => {
-                let provider = arguments
+                let provider = a
                     .get("provider")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let registry = self
+                let r = self
                     .providers
                     .read()
                     .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?;
-                serde_json::to_value(self.runtime.block_on(registry.tools(provider))?)?
+                serde_json::to_value(self.runtime.block_on(r.tools(provider))?)?
             }
             "connector.invoke" => {
-                let provider = arguments
+                let provider = a
                     .get("provider")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let tool = arguments
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let args = arguments
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                let registry = self
+                let tool = a.get("tool").and_then(Value::as_str).unwrap_or_default();
+                let args = a.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let r = self
                     .providers
                     .read()
                     .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?;
-                serde_json::to_value(self.runtime.block_on(registry.invoke(
-                    provider, tool, args,
-                ))?)?
+                serde_json::to_value(self.runtime.block_on(r.invoke(provider, tool, args))?)?
             }
-            _ if name.contains('.') => {
-                let registry = self
+            _ if n.contains('.') => {
+                let r = self
                     .providers
                     .read()
                     .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?;
-                serde_json::to_value(
-                    self.runtime
-                        .block_on(registry.invoke_qualified(name, arguments))?,
-                )?
+                serde_json::to_value(self.runtime.block_on(r.invoke_qualified(n, a))?)?
             }
-            _ => json!({"error": "unknown tool"}),
+            _ => json!({"error":"unknown tool"}),
         };
-
-        Ok(json!({
-            "content": [{"type": "text", "text": serde_json::to_string(&value)?}]
-        }))
+        Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&v)?}]}))
     }
 }
-
-fn strval(arguments: &Value, key: &str) -> String {
-    arguments
-        .get(key)
+fn strval(a: &Value, k: &str) -> String {
+    a.get(k)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
 }
-
-fn strings(arguments: &Value, key: &str) -> Vec<String> {
-    arguments
-        .get(key)
+fn strings(a: &Value, k: &str) -> Vec<String> {
+    a.get(k)
         .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
+        .map(|x| {
+            x.iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()
 }
-
-fn parse_scope(value: Option<&str>) -> MemoryScope {
-    match value.unwrap_or("Project") {
+fn parse_scope(x: Option<&str>) -> MemoryScope {
+    match x.unwrap_or("Project") {
         "Session" => MemoryScope::Session,
         "Global" => MemoryScope::Global,
         _ => MemoryScope::Project,
     }
 }
-
-fn parse_status(value: &str) -> TaskStatus {
-    match value {
+fn parse_status(x: &str) -> TaskStatus {
+    match x {
         "InProgress" => TaskStatus::InProgress,
         "Blocked" => TaskStatus::Blocked,
         "Done" => TaskStatus::Done,
         _ => TaskStatus::Todo,
     }
 }
-
-fn parse_priority(value: Option<&str>) -> TaskPriority {
-    match value.unwrap_or("Normal") {
+fn parse_priority(x: Option<&str>) -> TaskPriority {
+    match x.unwrap_or("Normal") {
         "Low" => TaskPriority::Low,
         "High" => TaskPriority::High,
         "Critical" => TaskPriority::Critical,
         _ => TaskPriority::Normal,
     }
 }
-
-fn parse_auth(value: Option<&str>) -> AuthMethod {
-    match value.unwrap_or("None") {
+fn parse_auth(x: Option<&str>) -> AuthMethod {
+    match x.unwrap_or("None") {
         "OAuth" => AuthMethod::OAuth,
         "ApiKey" => AuthMethod::ApiKey,
         _ => AuthMethod::None,

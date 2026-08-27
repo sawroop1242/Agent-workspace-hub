@@ -1,11 +1,13 @@
 use crate::mcp::providers::{ConnectorProvider, ToolCallResult, ToolContent, ToolDescriptor};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use serde_json::{json, Value};
 
 const BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
 
+/// Composio REST provider. The API key is read from the environment and is never
+/// persisted in the workspace registry. Connected-account credentials remain in Composio.
 pub struct ComposioProvider {
     api_key: String,
     connected_account_id: Option<String>,
@@ -40,20 +42,15 @@ impl ComposioProvider {
         }
     }
 
-    async fn request(&self, builder: reqwest::RequestBuilder) -> Result<Value> {
+    fn request(&self, builder: reqwest::blocking::RequestBuilder) -> Result<Value> {
         let response = builder
             .header("x-api-key", &self.api_key)
             .header("content-type", "application/json")
-            .send()
-            .await
-            .context("Composio HTTP request failed")?;
+            .send()?;
         let status = response.status();
-        let body: Value = response
-            .json()
-            .await
-            .context("Composio returned invalid JSON")?;
+        let body: Value = response.json().unwrap_or_else(|_| json!({}));
         if !status.is_success() {
-            bail!("Composio API returned {status}: {body}");
+            bail!("Composio API returned {}: {}", status, body);
         }
         Ok(body)
     }
@@ -70,7 +67,7 @@ impl ConnectorProvider for ComposioProvider {
         if let Some(toolkit) = &self.toolkit {
             req = req.query(&[("toolkit", toolkit)]);
         }
-        let body = self.request(req).await?;
+        let body = self.request(req)?;
         let items = body
             .get("items")
             .or_else(|| body.get("data"))
@@ -110,13 +107,11 @@ impl ConnectorProvider for ComposioProvider {
         if let Some(account) = &self.connected_account_id {
             payload["connected_account_id"] = json!(account);
         }
-        let body = self
-            .request(
-                self.client
-                    .post(format!("{BASE_URL}/tools/execute/{tool}"))
-                    .json(&payload),
-            )
-            .await?;
+        let body = self.request(
+            self.client
+                .post(format!("{BASE_URL}/tools/execute/{tool}"))
+                .json(&payload),
+        )?;
         Ok(ToolCallResult {
             content: vec![ToolContent::Json { json: body }],
             is_error: false,
