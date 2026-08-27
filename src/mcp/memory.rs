@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// A single persisted memory record within a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub id: String,
@@ -13,6 +14,7 @@ pub struct MemoryEntry {
     pub updated_at: String,
 }
 
+/// The visibility scope of a memory entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryScope {
     Session,
@@ -25,6 +27,7 @@ struct MemoryStore {
     entries: Vec<MemoryEntry>,
 }
 
+/// Project-scoped MCP memory store persisted to `.agent/memory.json`.
 pub struct MemoryMcp {
     path: PathBuf,
 }
@@ -52,6 +55,7 @@ impl MemoryMcp {
         Ok(())
     }
 
+    /// Inserts or overwrites a memory entry keyed by `id`, updating timestamps.
     pub fn store(
         &self,
         id: String,
@@ -83,6 +87,7 @@ impl MemoryMcp {
         Ok(entry)
     }
 
+    /// Searches entries by content or tag, optionally constrained to a scope.
     pub fn search(&self, query: &str, scope: Option<MemoryScope>) -> Result<Vec<MemoryEntry>> {
         let q = query.to_ascii_lowercase();
         Ok(self
@@ -97,10 +102,12 @@ impl MemoryMcp {
             .collect())
     }
 
+    /// Returns the memory entry with the given `id`, if present.
     pub fn get(&self, id: &str) -> Result<Option<MemoryEntry>> {
         Ok(self.load()?.entries.into_iter().find(|e| e.id == id))
     }
 
+    /// Deletes the memory entry with the given `id`, returning whether it existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
         let mut db = self.load()?;
         let before = db.entries.len();

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// A single tracked task with status, priority, and optional assignee.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -17,6 +18,7 @@ pub struct Task {
     pub updated_at: String,
 }
 
+/// Lifecycle state of a [`Task`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskStatus {
     Todo,
@@ -25,6 +27,7 @@ pub enum TaskStatus {
     Done,
 }
 
+/// Relative importance of a [`Task`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskPriority {
     Low,
@@ -38,6 +41,7 @@ struct TaskStore {
     tasks: Vec<Task>,
 }
 
+/// Project-scoped MCP task store persisted to `.agent/tasks.json`.
 pub struct TasksMcp {
     path: PathBuf,
 }
@@ -63,6 +67,7 @@ impl TasksMcp {
         Ok(())
     }
 
+    /// Creates (or replaces) a task, starting in the `Todo` state.
     pub fn create(
         &self,
         id: String,
@@ -90,6 +95,7 @@ impl TasksMcp {
         Ok(task)
     }
 
+    /// Lists tasks, optionally filtered by status.
     pub fn list(&self, status: Option<TaskStatus>) -> Result<Vec<Task>> {
         Ok(self
             .load()?
@@ -99,6 +105,7 @@ impl TasksMcp {
             .collect())
     }
 
+    /// Updates a task's status, priority, and/or assignee, returning the updated task.
     pub fn update(
         &self,
         id: &str,
@@ -126,6 +133,7 @@ impl TasksMcp {
         Ok(Some(result))
     }
 
+    /// Deletes the task with the given `id`, returning whether it existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
         let mut store = self.load()?;
         let before = store.tasks.len();
