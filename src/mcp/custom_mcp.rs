@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -20,6 +21,8 @@ use super::sandbox::apply_windows_job;
 const MAX_MCP_LINE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_MCP_ID_LEN: usize = 128;
+const MAX_MCP_NAME_LEN: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,6 +85,54 @@ fn expand_secret_ref(value: &str, permissions: &McpPermissions) -> Result<String
     Ok(value.to_string())
 }
 
+fn validate_server(server: &CustomMcpServerConfig) -> Result<()> {
+    if server.id.trim().is_empty() || server.name.trim().is_empty() {
+        bail!("MCP id and name are required");
+    }
+    if server.id.len() > MAX_MCP_ID_LEN {
+        bail!("MCP id exceeds {MAX_MCP_ID_LEN} characters");
+    }
+    if server.name.len() > MAX_MCP_NAME_LEN {
+        bail!("MCP name exceeds {MAX_MCP_NAME_LEN} characters");
+    }
+    if server.id != server.id.trim() || server.name != server.name.trim() {
+        bail!("MCP id and name must not have leading or trailing whitespace");
+    }
+    if server.id.chars().any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))) {
+        bail!("MCP id may contain only ASCII letters, digits, '-', '_' and '.'");
+    }
+    server.permissions.validate()?;
+    match server.transport {
+        McpTransport::Stdio => {
+            if server.command.as_deref().unwrap_or("").trim().is_empty() {
+                bail!("stdio MCP requires command");
+            }
+        }
+        McpTransport::StreamableHttp => {
+            let url = server.url.as_deref().unwrap_or("").trim();
+            if url.is_empty() {
+                bail!("HTTP MCP requires url");
+            }
+            let parsed = reqwest::Url::parse(url).context("invalid MCP HTTP URL")?;
+            if parsed.scheme() != "https" && parsed.scheme() != "http" {
+                bail!("MCP HTTP URL must use http or https");
+            }
+            if parsed.username() != "" || parsed.password().is_some() {
+                bail!("MCP HTTP URL must not contain embedded credentials");
+            }
+        }
+    }
+    for key in server.env.keys() {
+        if !is_valid_env_name(key) {
+            bail!("invalid MCP environment variable name: {key}");
+        }
+        if is_blocked_environment(key) {
+            bail!("dangerous MCP environment variable is blocked: {key}");
+        }
+    }
+    Ok(())
+}
+
 pub struct CustomMcpRegistry {
     path: PathBuf,
 }
@@ -99,11 +150,23 @@ impl CustomMcpRegistry {
         if !self.path.exists() {
             return Ok(CustomMcpStore::default());
         }
-        Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
+        let content = fs::read_to_string(&self.path).context("failed to read custom MCP registry")?;
+        serde_json::from_str(&content).context("custom MCP registry contains invalid JSON")
     }
 
     fn save(&self, store: &CustomMcpStore) -> Result<()> {
-        fs::write(&self.path, serde_json::to_string_pretty(store)?)?;
+        let parent = self
+            .path
+            .parent()
+            .context("custom MCP registry has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        let content = serde_json::to_vec_pretty(store)?;
+        let mut temp = NamedTempFile::new_in(parent).context("failed to create MCP registry temp file")?;
+        std::io::Write::write_all(&mut temp, &content)?;
+        temp.as_file().sync_all().context("failed to flush MCP registry")?;
+        temp.persist(&self.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically replace custom MCP registry")?;
         Ok(())
     }
 
@@ -112,19 +175,7 @@ impl CustomMcpRegistry {
     }
 
     pub fn add(&self, server: CustomMcpServerConfig) -> Result<CustomMcpServerConfig> {
-        if server.id.is_empty() || server.name.is_empty() {
-            bail!("id and name are required");
-        }
-        server.permissions.validate()?;
-        match server.transport {
-            McpTransport::Stdio if server.command.as_deref().unwrap_or("").is_empty() => {
-                bail!("stdio MCP requires command")
-            }
-            McpTransport::StreamableHttp if server.url.as_deref().unwrap_or("").is_empty() => {
-                bail!("HTTP MCP requires url")
-            }
-            _ => {}
-        }
+        validate_server(&server)?;
         let mut store = self.load()?;
         store.servers.retain(|entry| entry.id != server.id);
         store.servers.push(server.clone());
@@ -136,7 +187,9 @@ impl CustomMcpRegistry {
         let mut store = self.load()?;
         let before = store.servers.len();
         store.servers.retain(|entry| entry.id != id);
-        self.save(&store)?;
+        if before != store.servers.len() {
+            self.save(&store)?;
+        }
         Ok(before != store.servers.len())
     }
 
@@ -171,6 +224,7 @@ impl StdioMcpClient {
         cfg: &CustomMcpServerConfig,
         workspace_root: impl Into<PathBuf>,
     ) -> Result<Self> {
+        validate_server(cfg)?;
         let command = cfg.command.as_ref().context("missing stdio command")?;
         let sandbox = SandboxConfig::new(workspace_root, cfg.permissions.clone())?;
         let (program, args) = wrap_command(&sandbox, command, &cfg.args)?;
@@ -282,6 +336,7 @@ pub struct StreamableHttpMcpClient {
 
 impl StreamableHttpMcpClient {
     pub fn new(cfg: &CustomMcpServerConfig) -> Result<Self> {
+        validate_server(cfg)?;
         let url = cfg.url.clone().context("missing streamable HTTP MCP url")?;
         let mut headers = HashMap::new();
         for (key, value) in filter_env(cfg) {
