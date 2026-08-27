@@ -3,11 +3,13 @@ use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Persistent task storage under `.agent/tasks` as per-task JSON files.
 pub struct TaskStore {
     root: PathBuf,
 }
 
 impl TaskStore {
+    /// Creates a `TaskStore` rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -16,6 +18,7 @@ impl TaskStore {
         self.root.join(".agent").join("tasks")
     }
 
+    /// Creates (or overwrites) a task, keyed by its `id`.
     pub fn create(&self, task: &Task) -> Result<()> {
         fs::create_dir_all(self.tasks_dir())?;
         let path = self.tasks_dir().join(format!("{}.json", task.id));
@@ -24,6 +27,7 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Returns the task with the given `id`, or `None` if it does not exist.
     pub fn get(&self, id: &str) -> Result<Option<Task>> {
         let path = self.tasks_dir().join(format!("{}.json", id));
         if !path.exists() {
@@ -32,6 +36,7 @@ impl TaskStore {
         Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
     }
 
+    /// Lists all stored tasks sorted by `id`.
     pub fn list(&self) -> Result<Vec<Task>> {
         let dir = self.tasks_dir();
         if !dir.exists() {
@@ -51,6 +56,7 @@ impl TaskStore {
         Ok(tasks)
     }
 
+    /// Updates a task's status, returning `false` if the task does not exist.
     pub fn set_status(&self, id: &str, status: TaskStatus) -> Result<bool> {
         let Some(mut task) = self.get(id)? else {
             return Ok(false);
@@ -61,6 +67,7 @@ impl TaskStore {
     }
 }
 
+/// Returns whether `id` is safe to use as a task filename (no path separators or traversal).
 pub fn is_safe_task_id(id: &str) -> bool {
     !id.is_empty()
         && id != "."

@@ -12,16 +12,19 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Creates a memory store rooted at the given project's `.agent/memory.jsonl`.
     pub fn for_project(project_path: &Path) -> Self {
         Self {
             path: project_path.join(".agent/memory.jsonl"),
         }
     }
 
+    /// Returns the backing memory file path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Appends one memory entry as a JSONL line, creating the file if needed.
     pub fn append(&self, entry: &MemoryEntry) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -36,6 +39,7 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Reads all memory entries, skipping blank lines and ignoring a missing file.
     pub fn read_all(&self) -> Result<Vec<MemoryEntry>> {
         if !self.path.exists() {
             return Ok(Vec::new());

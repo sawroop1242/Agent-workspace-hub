@@ -75,6 +75,9 @@ impl RemoteSkillRegistry {
         if clone_target.exists() {
             fs::remove_dir_all(&clone_target)?;
         }
+        let clone_target_str = clone_target
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("cache path is not valid UTF-8"))?;
         let status = Command::new("git")
             .args([
                 "clone",
@@ -83,7 +86,7 @@ impl RemoteSkillRegistry {
                 "--branch",
                 reference,
                 &url,
-                clone_target.to_str().unwrap(),
+                clone_target_str,
             ])
             .status()?;
         if !status.success() {

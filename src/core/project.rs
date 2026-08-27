@@ -4,9 +4,11 @@ use std::path::Path;
 
 use crate::models::Project;
 
+/// Static helper for creating and listing projects under a workspace root.
 pub struct ProjectStore;
 
 impl ProjectStore {
+    /// Creates a project directory (with its `.agent` subdirectory) and returns it.
     pub fn create(root: &Path, name: &str) -> Result<Project> {
         let path = root.join(name);
         fs::create_dir_all(path.join(".agent"))
@@ -14,10 +16,12 @@ impl ProjectStore {
         Ok(Project::new(name, path))
     }
 
+    /// Returns whether a project directory with `name` exists under `root`.
     pub fn exists(root: &Path, name: &str) -> bool {
         root.join(name).is_dir()
     }
 
+    /// Lists projects under `root` (directories containing a `.agent` subdirectory).
     pub fn list(root: &Path) -> Result<Vec<Project>> {
         let mut projects = Vec::new();
         if !root.exists() {
