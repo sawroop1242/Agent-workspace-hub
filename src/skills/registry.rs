@@ -14,6 +14,7 @@ impl GlobalSkillRegistry {
         Self { root: root.into() }
     }
 
+    /// Locates the user-global registry under `~/.agent-workspace-hub/skills`.
     pub fn discover() -> Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
@@ -24,6 +25,7 @@ impl GlobalSkillRegistry {
         &self.root
     }
 
+    /// Creates a new global skill with a starter `SKILL.md` template.
     pub fn create(&self, name: &str, description: &str) -> Result<Skill> {
         validate_name(name)?;
         fs::create_dir_all(&self.root)?;
@@ -36,6 +38,7 @@ impl GlobalSkillRegistry {
         parse_skill(dir)
     }
 
+    /// Returns the global skill named `name`, if installed.
     pub fn get(&self, name: &str) -> Result<Option<Skill>> {
         validate_name(name)?;
         let dir = self.root.join(name);
@@ -45,6 +48,7 @@ impl GlobalSkillRegistry {
         Ok(Some(parse_skill(dir)?))
     }
 
+    /// Lists all installed global skills, sorted by name.
     pub fn list(&self) -> Result<Vec<Skill>> {
         if !self.root.exists() {
             return Ok(Vec::new());

@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Names of skills a project references from the global registry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillReferences {
     pub skills: Vec<String>,
 }
 
+/// Per-project skill references persisted under `.agent/skills.json`.
 pub struct ProjectSkillReferences {
     path: PathBuf,
 }
@@ -20,6 +22,7 @@ impl ProjectSkillReferences {
         }
     }
 
+    /// Loads the project's skill references, defaulting to empty.
     pub fn load(&self) -> Result<SkillReferences> {
         if !self.path.exists() {
             return Ok(SkillReferences::default());
@@ -27,6 +30,7 @@ impl ProjectSkillReferences {
         Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
 
+    /// Adds a skill reference, requiring the skill to be installed globally.
     pub fn add(&self, name: &str, registry: &GlobalSkillRegistry) -> Result<()> {
         if registry.get(name)?.is_none() {
             bail!("global skill is not installed: {name}");
@@ -39,6 +43,7 @@ impl ProjectSkillReferences {
         self.save(&refs)
     }
 
+    /// Removes a skill reference, returning whether it was present.
     pub fn remove(&self, name: &str) -> Result<bool> {
         let mut refs = self.load()?;
         let before = refs.skills.len();
@@ -50,6 +55,7 @@ impl ProjectSkillReferences {
         Ok(true)
     }
 
+    /// Resolves referenced skill names to installed skills, failing if one is missing.
     pub fn resolve(&self, registry: &GlobalSkillRegistry) -> Result<Vec<Skill>> {
         let refs = self.load()?;
         let mut resolved = Vec::new();
@@ -70,6 +76,7 @@ impl ProjectSkillReferences {
         Ok(())
     }
 
+    /// Returns the on-disk path of the references file.
     pub fn path(&self) -> &Path {
         &self.path
     }

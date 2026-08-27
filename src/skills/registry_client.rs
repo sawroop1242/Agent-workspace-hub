@@ -2,6 +2,7 @@ use crate::skills::{RegistryManifest, RegistrySkill};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+/// HTTP client for fetching skill registry manifests and searching skills.
 pub struct RegistryClient {
     pub base_url: String,
 }
@@ -29,6 +30,7 @@ impl RegistryClient {
             .context("invalid registry.json")
     }
 
+    /// Searches registry skills by name or description (case-insensitive).
     pub async fn search(&self, query: &str) -> Result<Vec<RegistrySkill>> {
         let manifest = self.fetch_manifest().await?;
         let query = query.to_ascii_lowercase();

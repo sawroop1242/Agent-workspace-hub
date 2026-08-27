@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Names of skills a project references from the global registry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillReferences {
     pub skills: Vec<String>,
 }
 
+/// Per-project skill references persisted under `.agent/skills.json`.
 pub struct ProjectSkillReferences {
     project_root: PathBuf,
 }
@@ -20,10 +22,12 @@ impl ProjectSkillReferences {
         }
     }
 
+    /// Returns the on-disk path of the references file.
     pub fn path(&self) -> PathBuf {
         self.project_root.join(".agent").join("skills.json")
     }
 
+    /// Loads the project's skill references, defaulting to empty.
     pub fn load(&self) -> Result<SkillReferences> {
         let path = self.path();
         if !path.exists() {
@@ -44,6 +48,7 @@ impl ProjectSkillReferences {
         Ok(())
     }
 
+    /// Adds a skill reference, returning whether it was newly added.
     pub fn add(&self, name: &str, registry: &GlobalSkillRegistry) -> Result<bool> {
         Self::validate_name(name)?;
         if registry.get(name)?.is_none() {
@@ -60,6 +65,7 @@ impl ProjectSkillReferences {
         Ok(true)
     }
 
+    /// Removes a skill reference, returning whether it was present.
     pub fn remove(&self, name: &str) -> Result<bool> {
         let mut refs = self.load()?;
         let old_len = refs.skills.len();
@@ -71,6 +77,7 @@ impl ProjectSkillReferences {
         Ok(true)
     }
 
+    /// Resolves referenced skill names to installed skills, skipping missing ones.
     pub fn resolve(&self, registry: &GlobalSkillRegistry) -> Result<Vec<Skill>> {
         let refs = self.load()?;
         let mut resolved = Vec::with_capacity(refs.skills.len());
@@ -82,6 +89,7 @@ impl ProjectSkillReferences {
         Ok(resolved)
     }
 
+    /// Persists the project's skill references.
     pub fn save(&self, refs: &SkillReferences) -> Result<()> {
         let path = self.path();
         if let Some(parent) = path.parent() {

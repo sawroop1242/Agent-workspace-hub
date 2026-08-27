@@ -3,6 +3,8 @@ use anyhow::{bail, Result};
 use std::fs;
 use std::path::Path;
 
+/// Parses a `SKILL.md` file into a [`Skill`], validating its YAML front matter
+/// and name.
 pub fn parse_skill(path: impl AsRef<Path>) -> Result<Skill> {
     let path = path.as_ref().to_path_buf();
     let skill_file = path.join("SKILL.md");
