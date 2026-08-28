@@ -1,39 +1,46 @@
 #!/usr/bin/env bash
-# Agent Workspace Hub — one-line installer
+# Agent Workspace Hub — one-line installer (Rust binary)
+#
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash
-# Optional:
-#   curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --source source --with-composio
+#
+# Options:
+#   curl ... | bash -s -- --source source     # build from source with cargo
+#   curl ... | bash -s -- --version v0.1.0    # install a specific release tag
+#   curl ... | bash -s -- --prefix ~/.bin     # install to a custom directory
+#
+# The installer downloads a prebuilt binary from the latest GitHub release for
+# the detected OS/architecture, falling back to a cargo build when no matching
+# asset exists (or when --source source is requested).
 
 set -Eeuo pipefail
 
 REPO="${AWH_REPO:-sawroop1242/Agent-workspace-hub}"
 REF="${AWH_REF:-main}"
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-SOURCE_URL="git+https://github.com/${REPO}.git@${REF}#egg=agent-workspace-hub"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${REF}/scripts/install.sh"
-INSTALL_SOURCE="release"
-WITH_COMPOSIO="0"
-PYTHON_CMD="${PYTHON:-}"
+
+INSTALL_SOURCE="${AWH_SOURCE:-release}"
+VERSION="${AWH_VERSION:-latest}"
+PREFIX="${AWH_PREFIX:-$HOME/.local/bin}"
 
 usage() {
     cat <<EOF
-Agent Workspace Hub installer
+Agent Workspace Hub installer (Rust binary)
 
 Usage:
   curl -fsSL ${RAW_URL} | bash
   curl -fsSL ${RAW_URL} | bash -s -- [options]
 
 Options:
-  --source release|source  Install latest release wheel first, or install from Git source. Default: release
-  --with-composio          Install optional Composio dependencies too
+  --source release|source  Install a prebuilt binary, or build from source with cargo. Default: release
+  --version tag            Install a specific release tag (default: latest)
   --repo owner/name        GitHub repository to install from. Default: ${REPO}
   --ref git-ref            Git ref for source installs and raw installer URL. Default: ${REF}
-  --python path            Python 3.11+ executable to use
+  --prefix dir             Install directory (default: ${PREFIX})
   -h, --help               Show this help
 
 Environment overrides:
-  AWH_REPO, AWH_REF, PYTHON
+  AWH_REPO, AWH_REF, AWH_SOURCE, AWH_VERSION, AWH_PREFIX
 EOF
 }
 
@@ -43,9 +50,9 @@ while [ "$#" -gt 0 ]; do
             INSTALL_SOURCE="${2:-}"
             shift 2
             ;;
-        --with-composio)
-            WITH_COMPOSIO="1"
-            shift
+        --version)
+            VERSION="${2:-}"
+            shift 2
             ;;
         --repo)
             REPO="${2:-}"
@@ -55,8 +62,8 @@ while [ "$#" -gt 0 ]; do
             REF="${2:-}"
             shift 2
             ;;
-        --python)
-            PYTHON_CMD="${2:-}"
+        --prefix)
+            PREFIX="${2:-}"
             shift 2
             ;;
         -h|--help)
@@ -71,121 +78,110 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-SOURCE_URL="git+https://github.com/${REPO}.git@${REF}#egg=agent-workspace-hub"
-
 if [ "$INSTALL_SOURCE" != "release" ] && [ "$INSTALL_SOURCE" != "source" ]; then
     echo "Error: --source must be either 'release' or 'source'." >&2
     exit 2
 fi
 
-log() {
-    printf '%s\n' "$*"
-}
-
-fail() {
-    printf 'Error: %s\n' "$*" >&2
-    exit 1
-}
+log()    { printf '%s\n' "$*"; }
+fail()   { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail "$1 is required but was not found."
 }
 
-python_version_ok() {
-    "$1" - <<'PY' >/dev/null 2>&1
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
-PY
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)  echo "linux" ;;
+        Darwin*) echo "macos" ;;
+        *MINGW*|*MSYS*|*CYGWIN*) echo "windows" ;;
+        *) fail "Unsupported operating system: $(uname -s)" ;;
+    esac
 }
 
-find_python() {
-    if [ -n "$PYTHON_CMD" ]; then
-        command -v "$PYTHON_CMD" >/dev/null 2>&1 || fail "Python executable not found: $PYTHON_CMD"
-        python_version_ok "$PYTHON_CMD" || fail "Python 3.11+ is required: $($PYTHON_CMD --version 2>&1)"
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) fail "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+asset_name() {
+    local os="$1" arch="$2"
+    case "$os" in
+        linux)   echo "awh-linux-${arch}" ;;
+        macos)   echo "awh-macos-${arch}" ;;
+        windows) echo "awh-windows-${arch}.exe" ;;
+    esac
+}
+
+# Resolve the release tag (tag_name) from the GitHub API for the requested version.
+resolve_tag() {
+    if [ "$VERSION" != "latest" ]; then
+        printf '%s' "$VERSION"
         return
     fi
-
-    for cmd in python3.13 python3.12 python3.11 python3 python; do
-        if command -v "$cmd" >/dev/null 2>&1 && python_version_ok "$cmd"; then
-            PYTHON_CMD="$cmd"
-            return
-        fi
-    done
-
-    fail "Python 3.11+ is required but was not found."
+    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
+        sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1
 }
 
-pip_install_user() {
-    local spec="$1"
-    log "Installing with pip --user..."
-    "$PYTHON_CMD" -m pip install --user --upgrade pip >/dev/null
-    "$PYTHON_CMD" -m pip install --user --upgrade "$spec"
-}
+download_binary() {
+    local os arch asset tag release_api url dest final
 
-pipx_install() {
-    local spec="$1"
-    if command -v pipx >/dev/null 2>&1; then
-        log "Installing isolated CLI with pipx..."
-        pipx install --force "$spec"
-        return 0
+    os="$(detect_os)"
+    arch="$(detect_arch)"
+    asset="$(asset_name "$os" "$arch")"
+
+    tag="$(resolve_tag)"
+    if [ -z "$tag" ]; then
+        return 1
     fi
-    return 1
-}
 
-install_spec() {
-    local spec="$1"
-    if ! pipx_install "$spec"; then
-        pip_install_user "$spec"
+    # Locate the matching asset via the release API for the requested tag.
+    release_api="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
+    url="$(curl -fsSL "$release_api" |
+        sed -n "s|.*\"browser_download_url\": \"\([^\"]*${asset}[^\"]*\)\".*|\1|p" | head -n 1)"
+
+    if [ -z "$url" ]; then
+        # Fall back to the predictable naming for the concrete architecture.
+        url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
     fi
-}
 
-build_package_spec() {
-    local base="$1"
-    if [ "$WITH_COMPOSIO" = "1" ]; then
-        printf '%s[composio]' "$base"
+    log "Downloading ${asset} (${tag})..."
+    dest="${PREFIX}/${asset}"
+    curl -fsSL -o "$dest" "$url"
+
+    # Never execute a download we cannot confirm is non-empty.
+    [ -s "$dest" ] || fail "Downloaded asset is empty: $url"
+
+    if [ "$os" != "windows" ]; then
+        chmod +x "$dest"
+    fi
+
+    # Install a stable `awh` name alongside the versioned asset.
+    if [ "$os" = "windows" ]; then
+        cp "$dest" "${PREFIX}/awh.exe"
+        final="${PREFIX}/awh.exe"
     else
-        printf '%s' "$base"
+        ln -sf "$(basename "$dest")" "${PREFIX}/awh"
+        final="${PREFIX}/awh"
     fi
+
+    log "Installed: ${final}"
 }
 
-install_from_source() {
-    local spec
-    spec="$(build_package_spec "$SOURCE_URL")"
-    log "Installing from source: https://github.com/${REPO}.git (${REF})"
-    install_spec "$spec"
-}
+build_from_source() {
+    require_cmd cargo
+    local tmpdir
+    tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t awh-build)"
+    trap 'rm -rf "$tmpdir"' EXIT
 
-install_from_release() {
-    local release_json wheel_url version install_tmp wheel_file spec
-
-    require_cmd curl
-    log "Fetching latest release metadata..."
-    if ! release_json="$(curl -fsSL "$API_URL")"; then
-        log "Could not fetch the latest release; falling back to source install."
-        install_from_source
-        return
-    fi
-
-    wheel_url="$(printf '%s' "$release_json" | sed -n 's/.*"browser_download_url": "\([^"]*\.whl\)".*/\1/p' | head -n 1)"
-    version="$(printf '%s' "$release_json" | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
-
-    if [ -z "$wheel_url" ]; then
-        log "No wheel asset found in the latest release; falling back to source install."
-        install_from_source
-        return
-    fi
-
-    log "Latest release: ${version:-unknown}"
-    install_tmp="$(mktemp -d 2>/dev/null || mktemp -d -t awh-install)"
-    trap 'rm -rf "$install_tmp"' EXIT
-
-    wheel_file="${install_tmp}/agent_workspace_hub.whl"
-    log "Downloading wheel..."
-    curl -fsSL -o "$wheel_file" "$wheel_url"
-
-    spec="$(build_package_spec "$wheel_file")"
-    install_spec "$spec"
+    log "Building from source: https://github.com/${REPO}.git (${REF})"
+    git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$tmpdir/repo"
+    ( cd "$tmpdir/repo" && cargo build --release )
+    install -m 755 "$tmpdir/repo/target/release/awh" "${PREFIX}/awh"
+    log "Installed: ${PREFIX}/awh"
 }
 
 print_success() {
@@ -198,28 +194,30 @@ print_success() {
 Launch with:
   awh
 
-If 'awh' is not found, add the user scripts directory to PATH:
+If 'awh' is not found on PATH, add the install directory:
   export PATH="$HOME/.local/bin:$PATH"
 
-First time setup:
-  1. Run: awh
-  2. Go to Settings and add your Composio API key if you use connectors
-  3. Start the MCP server from the Home screen
+Tune runtime limits via AWH_* environment variables (see docs/SECURITY.md).
 EOF
 }
 
 log "=========================================="
-log "  Agent Workspace Hub Installer"
+log "  Agent Workspace Hub Installer (Rust)"
 log "=========================================="
 
 require_cmd curl
-find_python
-log "Found Python: $PYTHON_CMD ($($PYTHON_CMD --version 2>&1))"
+
+mkdir -p "$PREFIX"
 
 if [ "$INSTALL_SOURCE" = "source" ]; then
-    install_from_source
+    build_from_source
 else
-    install_from_release
+    if download_binary; then
+        :
+    else
+        log "Prebuilt binary unavailable; falling back to building from source."
+        build_from_source
+    fi
 fi
 
 print_success

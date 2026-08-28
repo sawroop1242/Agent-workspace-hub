@@ -9,27 +9,28 @@
 
 ## One-line install
 
-Install Agent Workspace Hub with one command:
+Install Agent Workspace Hub with one command (downloads a prebuilt Rust binary
+for your OS/architecture):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash
 ```
 
-Install directly from Git source instead of the latest release wheel:
+Build directly from Git source instead of the latest release binary:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --source source
 ```
 
-Install with optional Composio connector dependencies:
+Install a specific release tag, or to a custom directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --with-composio
+curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --version v0.1.0 --prefix "$HOME/.bin"
 ```
 
-The installer requires Python 3.11+, prefers `pipx` for an isolated CLI install when
-available, falls back to `python -m pip install --user`, and prints PATH setup guidance
-after installation.
+The installer requires `curl`; source installs additionally require `cargo`.
+Prebuilt binaries target Linux (x86_64, aarch64), macOS (x86_64, aarch64), and
+Windows (x86_64), falling back to a `cargo build` when no matching asset exists.
 
 
 
