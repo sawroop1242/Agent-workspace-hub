@@ -17,6 +17,8 @@ pub mod community_registry;
 pub mod composio;
 /// Composio authentication.
 pub mod composio_auth;
+/// Runtime configuration and resource limits with precedence rules.
+pub mod config;
 /// Connector metadata store.
 pub mod connectors;
 /// Workspace context assembly.
@@ -62,6 +64,7 @@ pub use community_registry::{
 };
 pub use composio::ComposioProvider;
 pub use composio_auth::{AuthLink, ComposioAuth, ConnectedAccount};
+pub use config::ResourceLimits;
 pub use connectors::{AuthMethod, Connector, ConnectorsMcp};
 pub use context::{load_context, WorkspaceContext};
 pub use custom_mcp::{

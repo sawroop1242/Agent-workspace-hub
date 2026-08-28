@@ -1,7 +1,8 @@
 use crate::mcp::{
-    AuthMethod, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
-    McpTransport, MemoryMcp, MemoryScope, ProviderRegistry, SkillMcp, StdioMcpClient,
-    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
+    AuthMethod, CircuitBreakerConfig, CircuitBreakerMcpClient, ComposioProvider, Connector,
+    ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, McpTransport, MemoryMcp, MemoryScope,
+    ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient, StreamableHttpMcpClient,
+    TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -64,7 +65,12 @@ impl StdioMcpServer {
                     let client =
                         runtime.block_on(StdioMcpClient::spawn(&cfg, project_root.clone()))?;
                     runtime.block_on(client.initialize())?;
-                    let provider = CustomMcpProvider::new(cfg.id, Arc::new(client));
+                    let guarded = CircuitBreakerMcpClient::new(
+                        cfg.id.clone(),
+                        Arc::new(client),
+                        circuit_breaker_config(),
+                    );
+                    let provider = CustomMcpProvider::new(cfg.id, Arc::new(guarded));
                     registry
                         .write()
                         .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?
@@ -73,7 +79,12 @@ impl StdioMcpServer {
                 McpTransport::StreamableHttp => {
                     let client = StreamableHttpMcpClient::new(&cfg)?;
                     runtime.block_on(client.initialize())?;
-                    let provider = CustomMcpProvider::new(cfg.id, Arc::new(client));
+                    let guarded = CircuitBreakerMcpClient::new(
+                        cfg.id.clone(),
+                        Arc::new(client),
+                        circuit_breaker_config(),
+                    );
+                    let provider = CustomMcpProvider::new(cfg.id, Arc::new(guarded));
                     registry
                         .write()
                         .map_err(|_| anyhow::anyhow!("provider registry lock poisoned"))?
@@ -448,5 +459,19 @@ fn parse_auth(value: Option<&str>) -> AuthMethod {
         "OAuth" => AuthMethod::OAuth,
         "ApiKey" => AuthMethod::ApiKey,
         _ => AuthMethod::None,
+    }
+}
+
+/// Builds the circuit-breaker config from the resolved runtime resource limits.
+fn circuit_breaker_config() -> CircuitBreakerConfig {
+    let limits = ResourceLimits::default()
+        .with_env_overrides()
+        .unwrap_or_else(|e| {
+            tracing::warn!(event = "config_invalid", error = %e);
+            ResourceLimits::default()
+        });
+    CircuitBreakerConfig {
+        failure_threshold: limits.circuit_failure_threshold,
+        cooldown: limits.circuit_cooldown,
     }
 }

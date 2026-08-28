@@ -5,7 +5,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -13,17 +12,27 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use super::audit::audit_secret_deny;
+use super::config::ResourceLimits;
 use super::permissions::{is_blocked_environment, is_valid_env_name, McpPermissions};
 #[cfg(windows)]
 use super::sandbox::apply_windows_job;
 use super::sandbox::{wrap_command, SandboxConfig};
 use super::schema::validate_tool_arguments;
 
-const MAX_MCP_LINE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 10 * 1024 * 1024;
-const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MCP_ID_LEN: usize = 128;
 const MAX_MCP_NAME_LEN: usize = 256;
+
+/// Resolves runtime resource limits, applying any `AWH_*` environment overrides.
+///
+/// On malformed env values the conservative default is used (fail-safe).
+fn resolve_limits() -> ResourceLimits {
+    ResourceLimits::default()
+        .with_env_overrides()
+        .unwrap_or_else(|e| {
+            tracing::warn!(event = "config_invalid", error = %e);
+            ResourceLimits::default()
+        })
+}
 
 /// Transport mechanism used to communicate with an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +266,7 @@ pub struct StdioMcpClient {
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
     next_id: Mutex<u64>,
+    limits: ResourceLimits,
     #[cfg(windows)]
     _job: super::sandbox::WindowsJob,
 }
@@ -297,6 +307,7 @@ impl StdioMcpClient {
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
             next_id: Mutex::new(1),
+            limits: resolve_limits(),
             #[cfg(windows)]
             _job: job,
         })
@@ -317,8 +328,8 @@ impl StdioMcpClient {
         {
             let mut input = self.stdin.lock().await;
             let encoded = serde_json::to_vec(&msg)?;
-            if encoded.len() > MAX_MCP_LINE_BYTES {
-                bail!("MCP request exceeds 10 MiB limit");
+            if encoded.len() > self.limits.max_mcp_line_bytes {
+                bail!("MCP request exceeds size limit");
             }
             input.write_all(&encoded).await?;
             input.write_all(b"\n").await?;
@@ -326,13 +337,13 @@ impl StdioMcpClient {
         }
 
         let mut line = String::new();
-        timeout(MCP_REQUEST_TIMEOUT, async {
+        timeout(self.limits.mcp_request_timeout, async {
             self.stdout.lock().await.read_line(&mut line).await
         })
         .await
         .context("MCP request timed out")??;
-        if line.len() > MAX_MCP_LINE_BYTES {
-            bail!("MCP response exceeds 10 MiB limit");
+        if line.len() > self.limits.max_mcp_line_bytes {
+            bail!("MCP response exceeds size limit");
         }
         jsonrpc_result(serde_json::from_str(line.trim()).context("invalid MCP JSON-RPC response")?)
     }
@@ -380,6 +391,7 @@ pub struct StreamableHttpMcpClient {
     next_id: Mutex<u64>,
     session_id: Mutex<Option<String>>,
     headers: HashMap<String, String>,
+    limits: ResourceLimits,
 }
 
 impl StreamableHttpMcpClient {
@@ -392,11 +404,14 @@ impl StreamableHttpMcpClient {
             headers.insert(key.clone(), expand_secret_ref(value, &cfg.permissions)?);
         }
         Ok(Self {
-            client: Client::builder().timeout(MCP_REQUEST_TIMEOUT).build()?,
+            client: Client::builder()
+                .timeout(resolve_limits().http_client_timeout)
+                .build()?,
             url,
             next_id: Mutex::new(1),
             session_id: Mutex::new(None),
             headers,
+            limits: resolve_limits(),
         })
     }
 
@@ -432,7 +447,7 @@ impl StreamableHttpMcpClient {
         {
             *self.session_id.lock().await = Some(session.to_string());
         }
-        parse_http_response(response).await
+        parse_http_response(response, self.limits).await
     }
 
     /// Sends the MCP `initialize` handshake over HTTP.
@@ -465,7 +480,7 @@ impl StreamableHttpMcpClient {
     }
 }
 
-async fn parse_http_response(response: Response) -> Result<Value> {
+async fn parse_http_response(response: Response, limits: ResourceLimits) -> Result<Value> {
     let content_type = response
         .headers()
         .get("content-type")
@@ -473,8 +488,8 @@ async fn parse_http_response(response: Response) -> Result<Value> {
         .unwrap_or("")
         .to_ascii_lowercase();
     let bytes = response.bytes().await?;
-    if bytes.len() > MAX_HTTP_BODY_BYTES {
-        bail!("MCP HTTP response exceeds 10 MiB limit");
+    if bytes.len() > limits.max_http_body_bytes {
+        bail!("MCP HTTP response exceeds size limit");
     }
     if content_type.contains("application/json") {
         return jsonrpc_result(serde_json::from_slice(&bytes)?);
