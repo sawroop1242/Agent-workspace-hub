@@ -1,5 +1,12 @@
 # Agent-workspace-hub
 
+## Documentation
+
+- [Security policy and threat model](docs/SECURITY.md)
+- [Installation and upgrade guide](docs/INSTALL.md)
+- [Project status and implementation guide](docs/PROJECT_STATUS.md)
+- [Community MCP registry](docs/community-mcp-registry.md)
+
 ## One-line install
 
 Install Agent Workspace Hub with one command:

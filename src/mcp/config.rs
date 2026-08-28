@@ -141,9 +141,9 @@ mod tests {
 
     #[test]
     fn invalid_env_value_is_rejected() {
-        std::env::set_var("AWH_MAX_MCP_LINE_BYTES", "not-a-number");
+        std::env::set_var("AWH_MAX_HTTP_BODY_BYTES", "not-a-number");
         let resolved = ResourceLimits::default().with_env_overrides();
         assert!(resolved.is_err());
-        std::env::remove_var("AWH_MAX_MCP_LINE_BYTES");
+        std::env::remove_var("AWH_MAX_HTTP_BODY_BYTES");
     }
 }
