@@ -7,32 +7,49 @@ use std::path::PathBuf;
 /// A single tracked task with status, priority, and optional assignee.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
+    /// Unique task id.
     pub id: String,
+    /// Short human-readable summary.
     pub title: String,
+    /// Longer description of the work.
     pub description: String,
+    /// Current lifecycle state.
     pub status: TaskStatus,
+    /// Relative importance.
     pub priority: TaskPriority,
+    /// Optional owner/assignee.
     pub assignee: Option<String>,
+    /// Arbitrary tags for categorization.
     pub tags: Vec<String>,
+    /// RFC 3339 creation timestamp.
     pub created_at: String,
+    /// RFC 3339 last-update timestamp.
     pub updated_at: String,
 }
 
 /// Lifecycle state of a [`Task`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskStatus {
+    /// Not yet started.
     Todo,
+    /// Currently in progress.
     InProgress,
+    /// Blocked by a dependency.
     Blocked,
+    /// Completed.
     Done,
 }
 
 /// Relative importance of a [`Task`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskPriority {
+    /// Lowest importance.
     Low,
+    /// Default importance.
     Normal,
+    /// Important.
     High,
+    /// Most important.
     Critical,
 }
 
@@ -47,6 +64,7 @@ pub struct TasksMcp {
 }
 
 impl TasksMcp {
+    /// Creates a task store backed by `.agent/tasks.json` under the project root.
     pub fn new(project_root: impl Into<PathBuf>) -> Result<Self> {
         let root = project_root.into();
         fs::create_dir_all(root.join(".agent"))?;

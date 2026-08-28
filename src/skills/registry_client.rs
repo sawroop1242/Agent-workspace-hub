@@ -4,10 +4,12 @@ use serde_json::Value;
 
 /// HTTP client for fetching skill registry manifests and searching skills.
 pub struct RegistryClient {
+    /// Base URL of the registry, without a trailing slash.
     pub base_url: String,
 }
 
 impl RegistryClient {
+    /// Creates a client for the given registry base URL.
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),

@@ -7,20 +7,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustLevel {
+    /// Explicitly trusted.
     Trusted,
+    /// Reviewed and approved.
     Reviewed,
+    /// Untrusted (fail closed).
     Unknown,
+    /// Explicitly blocked.
     Blocked,
 }
 
 /// A persisted approval for a specific MCP server id, version, and permission set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpApproval {
+    /// MCP server id being approved.
     pub id: String,
+    /// Assigned trust level.
     #[serde(default)]
     pub level: TrustLevel,
+    /// The permission set explicitly approved for the server.
     #[serde(default)]
     pub approved_permissions: McpPermissions,
+    /// The server version this approval applies to (empty means any).
     #[serde(default)]
     pub approved_version: String,
 }
@@ -36,6 +44,7 @@ impl Default for TrustLevel {
 /// In-memory collection of MCP approvals.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TrustStore {
+    /// The stored approvals.
     pub approvals: Vec<McpApproval>,
 }
 impl TrustStore {

@@ -5,26 +5,47 @@
 //! argument/schema validation, and bounded transport. Every boundary fails
 //! closed — if a protection cannot be applied, the operation is rejected.
 
+/// CLI trust commands.
 pub mod cli_trust;
+/// Community MCP registry client.
 pub mod community_registry;
+/// Composio provider integration.
 pub mod composio;
+/// Composio authentication.
 pub mod composio_auth;
+/// Connector metadata store.
 pub mod connectors;
+/// Workspace context assembly.
 pub mod context;
+/// Custom (per-project) MCP servers.
 pub mod custom_mcp;
+/// MCP execution authorization gate.
 pub mod execution_gate;
+/// Globally installed MCP servers.
 pub mod global_mcp;
+/// MCP memory store.
 pub mod memory;
+/// MCP permission validation.
 pub mod permissions;
+/// Connector provider registry.
 pub mod providers;
+/// Sandboxed command execution.
 pub mod sandbox;
+/// Tool argument/schema validation.
 pub mod schema;
+/// Security helpers (paths, hashes, validation).
 pub mod security;
+/// Stdio JSON-RPC MCP server.
 pub mod server;
+/// Skill gateway.
 pub mod skills;
+/// MCP task store.
 pub mod tasks;
+/// MCP trust and approval policy.
 pub mod trust;
+/// Persistent trust store.
 pub mod trust_store;
+/// MCP workspace access.
 pub mod workspace;
 
 pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};

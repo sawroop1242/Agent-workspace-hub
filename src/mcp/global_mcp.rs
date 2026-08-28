@@ -7,9 +7,12 @@ use super::custom_mcp::{CustomMcpServerConfig, McpTransport};
 /// A globally installed MCP server entry with its version and source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalMcpEntry {
+    /// The server configuration.
     pub config: CustomMcpServerConfig,
+    /// Installed version.
     #[serde(default)]
     pub version: String,
+    /// Originating source (registry or repository).
     #[serde(default)]
     pub source: String,
 }
@@ -17,6 +20,7 @@ pub struct GlobalMcpEntry {
 /// In-memory collection of globally installed MCP servers.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GlobalMcpStore {
+    /// Installed servers.
     pub servers: Vec<GlobalMcpEntry>,
 }
 
@@ -108,6 +112,7 @@ impl GlobalMcpRegistry {
 /// Names of MCP servers a project references from the global registry.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ProjectMcpRefs {
+    /// Referenced server ids.
     pub mcps: Vec<String>,
 }
 

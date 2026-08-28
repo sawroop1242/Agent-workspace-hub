@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 /// A single file entry within the workspace, with path and byte size.
 #[derive(Debug, Serialize)]
 pub struct WorkspaceFile {
+    /// Path relative to the workspace root.
     pub path: String,
+    /// File size in bytes.
     pub size: u64,
 }
 

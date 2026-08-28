@@ -6,8 +6,11 @@ use std::path::PathBuf;
 /// A lightweight skill summary exposed over MCP (name, description, version).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillSummary {
+    /// Skill name.
     pub name: String,
+    /// Short description of what the skill does.
     pub description: String,
+    /// Optional version string.
     pub version: Option<String>,
 }
 

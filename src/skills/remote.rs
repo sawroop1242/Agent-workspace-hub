@@ -7,11 +7,16 @@ use std::process::Command;
 /// A remote source for a skill registry.
 #[derive(Debug, Clone)]
 pub enum SkillRegistrySource {
+    /// A GitHub repository and branch/tag reference.
     GitHub {
+        /// `owner/repo` repository path.
         repository: String,
+        /// Branch or tag reference.
         reference: String,
     },
+    /// A community registry served over HTTP(S).
     Community {
+        /// Registry base URL.
         url: String,
     },
 }
@@ -45,10 +50,12 @@ impl SkillRegistrySource {
 
 /// Installs skills from remote Git repositories.
 pub struct RemoteSkillRegistry {
+    /// Directory used to cache cloned repositories.
     pub cache_dir: PathBuf,
 }
 
 impl RemoteSkillRegistry {
+    /// Creates a remote registry using the given cache directory.
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             cache_dir: cache_dir.into(),

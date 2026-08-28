@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 /// Expected SHA-256 digest used to integrity-check downloaded packages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageIntegrity {
+    /// Expected lowercase hex SHA-256 digest.
     pub sha256: String,
 }
 
@@ -108,6 +109,7 @@ pub fn atomic_write(
     Ok(())
 }
 
+/// Computes the lowercase hex SHA-256 digest of a file's contents.
 pub fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
     let bytes = fs::read(path)?;
     let mut hasher = Sha256::new();

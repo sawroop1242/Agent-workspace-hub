@@ -9,23 +9,35 @@ use super::global_mcp::{GlobalMcpEntry, GlobalMcpRegistry};
 /// A server entry in a community MCP registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityMcpManifest {
+    /// Unique server id.
     pub id: String,
+    /// Human-facing server name.
     pub name: String,
+    /// Optional description.
     #[serde(default)]
     pub description: String,
+    /// Optional version.
     #[serde(default)]
     pub version: String,
+    /// Optional author.
     #[serde(default)]
     pub author: String,
+    /// Transport used to launch the server.
     pub transport: McpTransport,
+    /// Launch command (for stdio transport).
     pub command: Option<String>,
+    /// Command-line arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Server URL (for HTTP transport).
     pub url: Option<String>,
+    /// Environment variables passed to the server.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Optional project homepage.
     #[serde(default)]
     pub homepage: Option<String>,
+    /// Optional source repository URL.
     #[serde(default)]
     pub repository: Option<String>,
 }
@@ -33,6 +45,7 @@ pub struct CommunityMcpManifest {
 /// The index returned by a community MCP registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityRegistryIndex {
+    /// Servers advertised by the registry.
     pub mcps: Vec<CommunityMcpManifest>,
 }
 

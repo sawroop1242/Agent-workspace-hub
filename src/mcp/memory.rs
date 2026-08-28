@@ -6,19 +6,28 @@ use std::path::PathBuf;
 /// A single persisted memory record within a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
+    /// Unique entry id.
     pub id: String,
+    /// Visibility scope of the entry.
     pub scope: MemoryScope,
+    /// The memory content.
     pub content: String,
+    /// Categorization tags.
     pub tags: Vec<String>,
+    /// RFC 3339 creation timestamp.
     pub created_at: String,
+    /// RFC 3339 last-update timestamp.
     pub updated_at: String,
 }
 
 /// The visibility scope of a memory entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryScope {
+    /// Visible only within the current session.
     Session,
+    /// Visible to the whole project.
     Project,
+    /// Visible globally across projects.
     Global,
 }
 
@@ -33,6 +42,7 @@ pub struct MemoryMcp {
 }
 
 impl MemoryMcp {
+    /// Creates a memory store backed by `.agent/memory.json` under the project root.
     pub fn new(project_root: impl Into<PathBuf>) -> Result<Self> {
         let root = project_root.into();
         fs::create_dir_all(root.join(".agent"))?;

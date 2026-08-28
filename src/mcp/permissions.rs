@@ -26,10 +26,15 @@ pub struct McpPermissions {
 /// A coarse capability category used for permission checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
+    /// Outbound network access.
     Network,
+    /// Filesystem path access.
     Filesystem,
+    /// Environment variable access.
     Environment,
+    /// Subprocess spawning.
     Process,
+    /// Secret resolution.
     Secrets,
 }
 

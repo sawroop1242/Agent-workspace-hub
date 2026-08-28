@@ -7,9 +7,12 @@ use std::collections::HashMap;
 /// Describes a tool exposed by a connector provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDescriptor {
+    /// Tool name.
     pub name: String,
+    /// Human-readable description.
     #[serde(default)]
     pub description: String,
+    /// JSON Schema describing the tool's input arguments.
     #[serde(rename = "inputSchema", alias = "input_schema")]
     pub input_schema: Value,
 }
@@ -17,7 +20,9 @@ pub struct ToolDescriptor {
 /// The result of invoking a tool, carrying content and an error flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallResult {
+    /// Output content pieces produced by the tool.
     pub content: Vec<ToolContent>,
+    /// Whether the invocation reported an error.
     #[serde(default, rename = "isError")]
     pub is_error: bool,
 }
@@ -26,8 +31,16 @@ pub struct ToolCallResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ToolContent {
-    Text { text: String },
-    Json { json: Value },
+    /// Plain-text output.
+    Text {
+        /// The text.
+        text: String,
+    },
+    /// Structured JSON output.
+    Json {
+        /// The JSON value.
+        json: Value,
+    },
 }
 
 /// A connector provider exposing tools that can be listed and invoked.

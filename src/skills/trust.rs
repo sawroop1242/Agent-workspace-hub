@@ -4,9 +4,13 @@ use serde::{Deserialize, Serialize};
 /// Trust level for a skill source or package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TrustLevel {
+    /// Published by an official source.
     Official,
+    /// Independently verified.
     Verified,
+    /// Community-contributed.
     Community,
+    /// Unvetted and untrusted.
     Untrusted,
 }
 

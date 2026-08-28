@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 /// Names of skills a project references from the global registry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillReferences {
+    /// Referenced skill names, sorted and deduplicated.
     pub skills: Vec<String>,
 }
 
@@ -16,6 +17,7 @@ pub struct ProjectSkillReferences {
 }
 
 impl ProjectSkillReferences {
+    /// Creates reference storage for a project root.
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             path: project_root.into().join(".agent").join("skills.json"),

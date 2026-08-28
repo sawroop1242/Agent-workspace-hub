@@ -8,6 +8,7 @@ use super::trust::{McpApproval, TrustLevel, TrustStore};
 /// Persistent, JSON-backed trust store mirroring the in-memory [`TrustStore`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistentTrustStore {
+    /// The persisted approvals.
     pub approvals: Vec<McpApproval>,
 }
 

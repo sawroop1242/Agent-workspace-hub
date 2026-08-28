@@ -4,19 +4,33 @@
 //! registries, then referenced per-project. Installation writes are atomic and
 //! integrity-checked (SHA-256).
 
+/// Skill installer.
 pub mod installer;
+/// Skill lockfile persistence.
 pub mod lockfile;
+/// Skill data model.
 pub mod model;
+/// Skill package helpers.
 pub mod package;
+/// SKILL.md parsing.
 pub mod parser;
+/// Project skill references.
 pub mod project;
+/// Skill references.
 pub mod references;
+/// Skill registries.
 pub mod registries;
+/// Global skill registry.
 pub mod registry;
+/// Registry HTTP client.
 pub mod registry_client;
+/// Registry manifest models.
 pub mod registry_manifest;
+/// Remote (Git/community) skill sources.
 pub mod remote;
+/// Project skill store.
 pub mod store;
+/// Skill trust levels.
 pub mod trust;
 
 pub use installer::SkillInstaller;

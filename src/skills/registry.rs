@@ -10,6 +10,7 @@ pub struct GlobalSkillRegistry {
 }
 
 impl GlobalSkillRegistry {
+    /// Creates a registry rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -21,6 +22,7 @@ impl GlobalSkillRegistry {
         Ok(Self::new(home.join(".agent-workspace-hub").join("skills")))
     }
 
+    /// Returns the on-disk skills directory backing this registry.
     pub fn skills_dir(&self) -> &Path {
         &self.root
     }

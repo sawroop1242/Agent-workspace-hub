@@ -10,6 +10,7 @@ pub struct SkillInstaller {
 }
 
 impl SkillInstaller {
+    /// Creates an installer using the given cache directory.
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             cache_dir: cache_dir.into(),
@@ -77,6 +78,7 @@ impl SkillInstaller {
         copy_dir(source, &installed)
     }
 
+    /// Returns the registry entry's skill name.
     pub fn entry_name(entry: &RegistrySkill) -> &str {
         &entry.name
     }

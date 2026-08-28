@@ -6,19 +6,28 @@ use std::path::PathBuf;
 /// Authentication method required by a connector.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthMethod {
+    /// OAuth 2.0 authorization.
     OAuth,
+    /// Static API key.
     ApiKey,
+    /// No authentication.
     None,
 }
 
 /// Metadata for an external service connector. Holds no secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connector {
+    /// Connector id.
     pub id: String,
+    /// Human-facing name.
     pub name: String,
+    /// Backing provider/service name.
     pub provider: String,
+    /// Authentication method used.
     pub auth: AuthMethod,
+    /// OAuth scopes requested by the connector.
     pub scopes: Vec<String>,
+    /// Whether the connector is enabled.
     pub enabled: bool,
 }
 
@@ -34,6 +43,7 @@ pub struct ConnectorsMcp {
 }
 
 impl ConnectorsMcp {
+    /// Creates a connector store backed by `.agent/connectors.json` under the project root.
     pub fn new(project_root: impl Into<PathBuf>) -> Result<Self> {
         let root = project_root.into();
         fs::create_dir_all(root.join(".agent"))?;

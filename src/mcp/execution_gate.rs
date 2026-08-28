@@ -5,8 +5,11 @@ use anyhow::{bail, Result};
 /// requested permissions that must be authorized against a [`TrustStore`].
 #[derive(Debug, Clone)]
 pub struct McpExecutionRequest<'a> {
+    /// MCP server id.
     pub id: &'a str,
+    /// Server version requesting execution.
     pub version: &'a str,
+    /// Permissions requested by the server.
     pub permissions: &'a McpPermissions,
 }
 

@@ -93,10 +93,12 @@ impl StdioMcpServer {
         })
     }
 
+    /// Returns the shared provider registry used to dispatch tool calls.
     pub fn provider_registry(&self) -> Arc<RwLock<ProviderRegistry>> {
         Arc::clone(&self.providers)
     }
 
+    /// Handles a single JSON-RPC request line, returning the JSON response.
     pub fn handle(&self, input: &str) -> Result<String> {
         let req: RpcRequest = serde_json::from_str(input)?;
         if req.jsonrpc != "2.0" {

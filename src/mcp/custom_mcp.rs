@@ -37,17 +37,26 @@ pub enum McpTransport {
 /// Configuration for a custom MCP server, including permissions and enablement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomMcpServerConfig {
+    /// Unique server id.
     pub id: String,
+    /// Human-facing server name.
     pub name: String,
+    /// Transport used to launch the server.
     pub transport: McpTransport,
+    /// Launch command (for stdio transport).
     pub command: Option<String>,
+    /// Command-line arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Server URL (for HTTP transport).
     pub url: Option<String>,
+    /// Environment variables passed to the server.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Permissions granted to the server.
     #[serde(default)]
     pub permissions: McpPermissions,
+    /// Whether the server is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -59,6 +68,7 @@ fn default_true() -> bool {
 /// In-memory collection of custom MCP server configs.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CustomMcpStore {
+    /// Configured servers.
     pub servers: Vec<CustomMcpServerConfig>,
 }
 

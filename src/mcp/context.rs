@@ -6,7 +6,9 @@ use serde::Serialize;
 /// project instructions.
 #[derive(Debug, Serialize)]
 pub struct WorkspaceContext {
+    /// Workspace root directory.
     pub root: String,
+    /// Discovered project instructions.
     pub instructions: String,
 }
 

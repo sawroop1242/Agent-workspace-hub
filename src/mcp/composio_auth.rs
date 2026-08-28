@@ -8,16 +8,22 @@ const BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
 /// An authorization link returned by the Composio Auth Link API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthLink {
+    /// URL to which the user is redirected to authorize the account.
     pub redirect_url: String,
+    /// Optional id of the connected account created by this link.
     pub connected_account_id: Option<String>,
 }
 
 /// A connected Composio account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedAccount {
+    /// Account id.
     pub id: String,
+    /// Optional connection status.
     pub status: Option<String>,
+    /// Optional toolkit metadata.
     pub toolkit: Option<Value>,
+    /// Optional owning user id.
     pub user_id: Option<String>,
 }
 

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 /// Configured skill registry URLs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryConfig {
+    /// The registry URLs, sorted and trailing-slash-trimmed.
     pub registries: Vec<String>,
 }
 
@@ -15,6 +16,7 @@ pub struct RegistryStore {
 }
 
 impl RegistryStore {
+    /// Creates a store backed by `root/registries.json`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             path: root.into().join("registries.json"),

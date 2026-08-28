@@ -10,6 +10,7 @@ pub struct SkillStore {
 }
 
 impl SkillStore {
+    /// Creates a store rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
