@@ -155,4 +155,65 @@ mod tests {
         atomic_write(dir.path(), "skills/example/SKILL.md", b"safe").unwrap();
         assert_eq!(fs::read_to_string(destination).unwrap(), "safe");
     }
+
+    #[test]
+    fn secure_path_rejects_absolute_escape() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // An absolute path pointing outside `dir` must be rejected.
+        assert!(secure_path(dir.path(), outside.path().join("x")).is_err());
+    }
+
+    #[test]
+    fn secure_destination_rejects_escape_via_missing_parent() {
+        let dir = tempdir().unwrap();
+        assert!(secure_destination(dir.path(), "sub/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn validate_id_accepts_common_forms() {
+        assert!(validate_id("github").is_ok());
+        assert!(validate_id("my-server_1.0").is_ok());
+        assert!(validate_id(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn validate_id_rejects_bad_input() {
+        assert!(validate_id("").is_err());
+        assert!(validate_id(&"a".repeat(129)).is_err());
+        assert!(validate_id("bad/id").is_err());
+        assert!(validate_id("has space").is_err());
+    }
+
+    #[test]
+    fn validate_command_rejects_control_characters() {
+        assert!(validate_command(Some("echo hi")).is_ok());
+        assert!(validate_command(None).is_ok());
+        assert!(validate_command(Some("  ")).is_err());
+        assert!(validate_command(Some("echo\nhi")).is_err());
+        assert!(validate_command(Some("echo\0")).is_err());
+    }
+
+    #[test]
+    fn validate_url_allows_only_http_schemes() {
+        assert!(validate_url(Some("https://example.com")).is_ok());
+        assert!(validate_url(Some("http://example.com")).is_ok());
+        assert!(validate_url(None).is_ok());
+        assert!(validate_url(Some("file:///etc/passwd")).is_err());
+        assert!(validate_url(Some("not-a-url")).is_err());
+    }
+
+    #[test]
+    fn sha256_and_verify_round_trip() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("data.bin");
+        fs::write(&file, b"hello world").unwrap();
+        let digest = sha256_file(&file).unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(verify_sha256(&file, &digest).is_ok());
+        // Uppercase form and a mismatched value.
+        assert!(verify_sha256(&file, &digest.to_uppercase()).is_ok());
+        assert!(verify_sha256(&file, &"0".repeat(64)).is_err());
+    }
 }

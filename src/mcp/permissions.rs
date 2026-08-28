@@ -138,3 +138,80 @@ pub fn require(permissions: &McpPermissions, permission: Permission) -> Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_reports_granted_capabilities() {
+        let perms = McpPermissions {
+            network: true,
+            filesystem: vec!["/tmp".into()],
+            environment: vec!["FOO".into()],
+            process: false,
+            secrets: vec!["TOKEN".into()],
+        };
+        assert!(perms.allows(Permission::Network));
+        assert!(perms.allows(Permission::Filesystem));
+        assert!(perms.allows(Permission::Environment));
+        assert!(perms.allows(Permission::Secrets));
+        assert!(!perms.allows(Permission::Process));
+
+        let empty = McpPermissions::default();
+        assert!(!empty.allows(Permission::Network));
+        assert!(!empty.allows(Permission::Filesystem));
+        assert!(!empty.allows(Permission::Environment));
+        assert!(!empty.allows(Permission::Secrets));
+    }
+
+    #[test]
+    fn allowed_environment_filters_to_approved_names() {
+        let perms = McpPermissions {
+            environment: vec!["FOO".into(), "BAR".into()],
+            ..McpPermissions::default()
+        };
+        let filtered = perms.allowed_environment(vec!["FOO".into(), "BAR".into(), "BAZ".into()]);
+        assert_eq!(filtered, vec!["FOO".to_string(), "BAR".to_string()]);
+    }
+
+    #[test]
+    fn allows_secret_matches_exact_name() {
+        let perms = McpPermissions {
+            secrets: vec!["API_TOKEN".into()],
+            ..McpPermissions::default()
+        };
+        assert!(perms.allows_secret("API_TOKEN"));
+        assert!(!perms.allows_secret("OTHER"));
+    }
+
+    #[test]
+    fn require_fails_closed_when_not_granted() {
+        let perms = McpPermissions {
+            network: true,
+            ..McpPermissions::default()
+        };
+        assert!(require(&perms, Permission::Network).is_ok());
+        assert!(require(&perms, Permission::Process).is_err());
+    }
+
+    #[test]
+    fn is_valid_env_name_accepts_safe_identifiers() {
+        assert!(is_valid_env_name("FOO"));
+        assert!(is_valid_env_name("_leading"));
+        assert!(is_valid_env_name("A1_b2"));
+        assert!(!is_valid_env_name("1abc"));
+        assert!(!is_valid_env_name("with-dash"));
+        assert!(!is_valid_env_name(""));
+    }
+
+    #[test]
+    fn is_blocked_environment_is_case_insensitive() {
+        assert!(is_blocked_environment("PATH"));
+        assert!(is_blocked_environment("path"));
+        assert!(is_blocked_environment("LD_PRELOAD"));
+        assert!(is_blocked_environment("PythonPath"));
+        assert!(!is_blocked_environment("HOME"));
+        assert!(!is_blocked_environment("API_KEY"));
+    }
+}

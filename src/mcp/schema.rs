@@ -144,4 +144,96 @@ mod tests {
         assert!(validate_tool_arguments(&schema(), "sum", &json!({"a": "4"})).is_err());
         assert!(validate_tool_arguments(&schema(), "sum", &json!({"a": 4, "x": true})).is_err());
     }
+
+    #[test]
+    fn missing_tools_array_is_rejected() {
+        assert!(validate_tool_arguments(&json!({}), "sum", &json!({"a": 1})).is_err());
+    }
+
+    #[test]
+    fn unknown_tool_is_rejected() {
+        assert!(validate_tool_arguments(&schema(), "nope", &json!({"a": 1})).is_err());
+    }
+
+    #[test]
+    fn enum_values_are_enforced() {
+        let response = json!({
+            "tools": [{
+                "name": "level",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "level": {"type": "string", "enum": ["low", "high"]}
+                    }
+                }
+            }]
+        });
+        assert!(validate_tool_arguments(&response, "level", &json!({"level": "low"})).is_ok());
+        assert!(validate_tool_arguments(&response, "level", &json!({"level": "medium"})).is_err());
+    }
+
+    #[test]
+    fn nested_objects_and_arrays_are_validated() {
+        let response = json!({
+            "tools": [{
+                "name": "grid",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cell": {
+                            "type": "object",
+                            "properties": {
+                                "coords": {"type": "array", "items": {"type": "integer"}}
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        assert!(validate_tool_arguments(
+            &response,
+            "grid",
+            &json!({"cell": {"coords": [1, 2, 3]}})
+        )
+        .is_ok());
+        // An item of the wrong type must fail.
+        assert!(
+            validate_tool_arguments(&response, "grid", &json!({"cell": {"coords": [1, "2"]}}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multi_type_union_accepts_any_listed_type() {
+        let response = json!({
+            "tools": [{
+                "name": "flex",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": ["string", "integer"]}
+                    }
+                }
+            }]
+        });
+        assert!(validate_tool_arguments(&response, "flex", &json!({"value": "x"})).is_ok());
+        assert!(validate_tool_arguments(&response, "flex", &json!({"value": 42})).is_ok());
+        assert!(validate_tool_arguments(&response, "flex", &json!({"value": true})).is_err());
+    }
+
+    #[test]
+    fn excessive_nesting_depth_is_rejected() {
+        // Build a schema nested deeper than MAX_SCHEMA_DEPTH; resolution follows
+        // the schema tree, so the deeply nested value must also match it.
+        let mut schema = serde_json::json!({"type": "object", "properties": {}});
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            schema = json!({"type": "object", "properties": {"next": schema}});
+        }
+        let mut value = json!(0);
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            value = json!({"next": value});
+        }
+        let response = json!({ "tools": [{ "name": "deep", "inputSchema": schema }] });
+        assert!(validate_tool_arguments(&response, "deep", &value).is_err());
+    }
 }
