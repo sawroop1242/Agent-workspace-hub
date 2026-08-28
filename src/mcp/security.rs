@@ -216,4 +216,49 @@ mod tests {
         assert!(verify_sha256(&file, &digest.to_uppercase()).is_ok());
         assert!(verify_sha256(&file, &"0".repeat(64)).is_err());
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Security invariant: for any candidate path, a successful resolution
+        // must stay within `base`; failures must simply be `Err` (never panic).
+        proptest! {
+            #[test]
+            fn secure_path_never_escapes_base(
+                base_name in "[a-z]{1,16}",
+                candidate in "[a-zA-Z0-9._/\\\\-]{0,64}",
+            ) {
+                let base = tempdir().unwrap();
+                let base_sub = base.path().join(&base_name);
+                fs::create_dir_all(&base_sub).unwrap();
+
+                if let Ok(resolved) = secure_path(&base, &candidate) {
+                    prop_assert!(
+                        resolved.starts_with(base.path()),
+                        "resolved {:?} escaped base {:?} for candidate {:?}",
+                        resolved,
+                        base.path(),
+                        candidate
+                    );
+                }
+            }
+
+            #[test]
+            fn secure_destination_never_escapes_base(
+                candidate in "[a-zA-Z0-9._/\\\\-]{0,64}",
+            ) {
+                let base = tempdir().unwrap();
+                if let Ok(resolved) = secure_destination(&base, &candidate) {
+                    prop_assert!(resolved.starts_with(base.path()));
+                }
+            }
+
+            #[test]
+            fn validate_id_never_panics(id in "[a-zA-Z0-9._/\\\\ -]{0,256}") {
+                let _ = validate_id(&id);
+                let _ = validate_command(Some(&id));
+            }
+        }
+    }
 }

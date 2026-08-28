@@ -236,4 +236,58 @@ mod tests {
         let response = json!({ "tools": [{ "name": "deep", "inputSchema": schema }] });
         assert!(validate_tool_arguments(&response, "deep", &value).is_err());
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // The validator must never panic on arbitrary JSON values.
+        proptest! {
+            #[test]
+            fn tool_validation_never_panics_on_arbitrary_input(value in any_json()) {
+                let response = json!({
+                    "tools": [{
+                        "name": "sum",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["a"],
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "string"}
+                            },
+                            "additionalProperties": false
+                        }
+                    }]
+                });
+                // Must not panic; result is irrelevant.
+                let _ = validate_tool_arguments(&response, "sum", &value);
+            }
+        }
+
+        /// Generates a bounded, recursive, arbitrary JSON value.
+        fn any_json() -> impl Strategy<Value = serde_json::Value> {
+            let leaf = prop_oneof![
+                Just(serde_json::Value::Null),
+                any::<bool>().prop_map(serde_json::Value::Bool),
+                any::<i64>().prop_map(serde_json::Value::from),
+                any::<f64>().prop_map(serde_json::Value::from),
+                "[a-zA-Z0-9]{0,16}".prop_map(serde_json::Value::String),
+            ];
+            leaf.prop_recursive(4, 16, 4, |inner| {
+                prop_oneof![
+                    proptest::collection::vec(inner.clone(), 0..4)
+                        .prop_map(serde_json::Value::Array),
+                    proptest::collection::vec(
+                        ("[a-z]{1,8}".prop_map(String::from), inner.clone()),
+                        0..4,
+                    )
+                    .prop_map(|pairs| {
+                        serde_json::Value::Object(
+                            pairs.into_iter().collect::<serde_json::Map<_, _>>(),
+                        )
+                    }),
+                ]
+            })
+        }
+    }
 }
