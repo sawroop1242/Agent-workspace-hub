@@ -1,7 +1,9 @@
 use agent_workspace_hub::mcp::{wrap_command, McpPermissions, SandboxConfig, SandboxLimits};
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 
+#[cfg(target_os = "linux")]
 static BWRAP_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn permissions() -> McpPermissions {

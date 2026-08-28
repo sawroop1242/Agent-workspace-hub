@@ -74,6 +74,14 @@ impl SandboxConfig {
                 self.project_root
             );
         }
+        if let Some(path) = self
+            .permissions
+            .filesystem
+            .iter()
+            .find(|p| !Path::new(p).is_absolute())
+        {
+            bail!("sandbox filesystem paths must be absolute: {path:?}");
+        }
         self.permissions.validate()?;
         self.limits.validate()
     }
@@ -146,9 +154,6 @@ pub fn wrap_command(
     ]);
     for path in &cfg.permissions.filesystem {
         let path = Path::new(path);
-        if !path.is_absolute() {
-            bail!("sandbox filesystem paths must be absolute: {path:?}");
-        }
         if !path.exists() {
             bail!("sandbox filesystem path does not exist: {path:?}");
         }
@@ -255,7 +260,7 @@ pub fn apply_windows_job(
         .raw_handle()
         .context("Windows MCP process handle unavailable")?;
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    if job == 0 || job == INVALID_HANDLE_VALUE {
+    if job.is_null() || job == INVALID_HANDLE_VALUE {
         bail!("failed to create Windows Job Object");
     }
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
