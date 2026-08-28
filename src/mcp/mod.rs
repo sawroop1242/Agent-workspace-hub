@@ -5,6 +5,10 @@
 //! argument/schema validation, and bounded transport. Every boundary fails
 //! closed — if a protection cannot be applied, the operation is rejected.
 
+/// Structured security audit logging.
+pub mod audit;
+/// Circuit breaker for repeated MCP provider failures.
+pub mod circuit_breaker;
 /// CLI trust commands.
 pub mod cli_trust;
 /// Community MCP registry client.
@@ -50,6 +54,8 @@ pub mod trust_store;
 /// MCP workspace access.
 pub mod workspace;
 
+pub use audit::{audit_circuit_open, audit_deny, audit_secret_deny};
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerMcpClient};
 pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};
 pub use community_registry::{
     CommunityMcpManifest, CommunityMcpRegistryClient, CommunityRegistryIndex,

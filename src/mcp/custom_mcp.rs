@@ -12,6 +12,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use super::audit::audit_secret_deny;
 use super::permissions::{is_blocked_environment, is_valid_env_name, McpPermissions};
 #[cfg(windows)]
 use super::sandbox::apply_windows_job;
@@ -89,23 +90,15 @@ fn expand_secret_ref(value: &str, permissions: &McpPermissions) -> Result<String
         .and_then(|v| v.strip_suffix('}'))
     {
         if !is_valid_env_name(key) {
-            tracing::warn!(event = "mcp_secret_denied", reason = "invalid_name");
+            audit_secret_deny("invalid_name", "");
             bail!("invalid secret environment variable name");
         }
         if is_blocked_environment(key) {
-            tracing::warn!(
-                event = "mcp_secret_denied",
-                reason = "blocked_name",
-                name = key
-            );
+            audit_secret_deny("blocked_name", key);
             bail!("dangerous secret environment variable is blocked: {key}");
         }
         if !permissions.allows_secret(key) {
-            tracing::warn!(
-                event = "mcp_secret_denied",
-                reason = "not_approved",
-                name = key
-            );
+            audit_secret_deny("not_approved", key);
             bail!("secret environment variable is not approved: {key}");
         }
         return std::env::var(key)

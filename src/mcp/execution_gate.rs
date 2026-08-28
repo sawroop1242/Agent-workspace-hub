@@ -1,4 +1,4 @@
-use super::{can_enable, McpAuthorizationError, McpPermissions, TrustStore};
+use super::{audit_deny, can_enable, McpAuthorizationError, McpPermissions, TrustStore};
 
 /// A request to execute an MCP server, carrying the identity, version, and
 /// requested permissions that must be authorized against a [`TrustStore`].
@@ -23,11 +23,13 @@ pub fn authorize(
     }
     let approval = trust.get(request.id);
     if approval.is_none() {
+        audit_deny("authorize_mcp_execution", "no_approval", request.id);
         return Err(McpAuthorizationError::NoApproval {
             id: request.id.to_string(),
         });
     }
     if !can_enable(approval, request.permissions, request.version) {
+        audit_deny("authorize_mcp_execution", "trust_mismatch", request.id);
         return Err(McpAuthorizationError::Mismatch {
             id: request.id.to_string(),
         });
