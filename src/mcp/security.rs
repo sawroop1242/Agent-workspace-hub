@@ -230,15 +230,20 @@ mod tests {
                 candidate in "[a-zA-Z0-9._/\\\\-]{0,64}",
             ) {
                 let base = tempdir().unwrap();
-                let base_sub = base.path().join(&base_name);
+                // Compare against the canonicalized base: `secure_path` operates
+                // on the canonical base, and on macOS `/var` is a symlink to
+                // `/private/var`, so the raw `base.path()` differs from the
+                // canonical form.
+                let base_canonical = fs::canonicalize(base.path()).unwrap();
+                let base_sub = base_canonical.join(&base_name);
                 fs::create_dir_all(&base_sub).unwrap();
 
-                if let Ok(resolved) = secure_path(&base, &candidate) {
+                if let Ok(resolved) = secure_path(&base_canonical, &candidate) {
                     prop_assert!(
-                        resolved.starts_with(base.path()),
+                        resolved.starts_with(&base_canonical),
                         "resolved {:?} escaped base {:?} for candidate {:?}",
                         resolved,
-                        base.path(),
+                        base_canonical,
                         candidate
                     );
                 }
@@ -249,8 +254,9 @@ mod tests {
                 candidate in "[a-zA-Z0-9._/\\\\-]{0,64}",
             ) {
                 let base = tempdir().unwrap();
-                if let Ok(resolved) = secure_destination(&base, &candidate) {
-                    prop_assert!(resolved.starts_with(base.path()));
+                let base_canonical = fs::canonicalize(base.path()).unwrap();
+                if let Ok(resolved) = secure_destination(&base_canonical, &candidate) {
+                    prop_assert!(resolved.starts_with(&base_canonical));
                 }
             }
 
