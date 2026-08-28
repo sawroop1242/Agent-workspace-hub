@@ -19,6 +19,8 @@ pub mod connectors;
 pub mod context;
 /// Custom (per-project) MCP servers.
 pub mod custom_mcp;
+/// Structured authorization/security errors.
+pub mod error;
 /// MCP execution authorization gate.
 pub mod execution_gate;
 /// Globally installed MCP servers.
@@ -60,6 +62,7 @@ pub use custom_mcp::{
     CustomMcpRegistry, CustomMcpServerConfig, CustomMcpStore, McpTransport, StdioMcpClient,
     StreamableHttpMcpClient,
 };
+pub use error::McpAuthorizationError;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
 pub use global_mcp::{
     GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs,
