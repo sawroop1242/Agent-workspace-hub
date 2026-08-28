@@ -39,7 +39,7 @@ impl ComposioProvider {
             api_key,
             connected_account_id,
             toolkit,
-            client: Client::new(),
+            client: super::config::build_http_client(),
         }
     }
 

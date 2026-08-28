@@ -64,7 +64,7 @@ pub use community_registry::{
 };
 pub use composio::ComposioProvider;
 pub use composio_auth::{AuthLink, ComposioAuth, ConnectedAccount};
-pub use config::ResourceLimits;
+pub use config::{build_http_client, ResourceLimits};
 pub use connectors::{AuthMethod, Connector, ConnectorsMcp};
 pub use context::{load_context, WorkspaceContext};
 pub use custom_mcp::{

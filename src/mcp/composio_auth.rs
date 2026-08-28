@@ -40,7 +40,7 @@ impl ComposioAuth {
         let api_key = std::env::var("COMPOSIO_API_KEY")
             .map_err(|_| anyhow!("COMPOSIO_API_KEY is not configured"))?;
         Ok(Self {
-            client: Client::new(),
+            client: super::config::build_http_client(),
             api_key,
             base_url: BASE_URL.to_string(),
         })
@@ -49,7 +49,7 @@ impl ComposioAuth {
     /// Creates a client with an explicit API key and base URL.
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: super::config::build_http_client(),
             api_key: api_key.into(),
             base_url: base_url.into(),
         }

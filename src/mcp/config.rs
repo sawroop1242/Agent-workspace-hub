@@ -93,6 +93,26 @@ fn env_opt(key: &str) -> Result<Option<usize>> {
     }
 }
 
+/// Builds a shared, consistently-configured HTTP client.
+///
+/// The client applies the resolved request timeout and a common user-agent, and
+/// its connection pool is reused across all requests for its lifetime. This is
+/// the single canonical client configuration; callers should use this rather
+/// than `reqwest::Client::new()` so timeout and identity policy stay uniform.
+pub fn build_http_client() -> reqwest::Client {
+    let limits = ResourceLimits::default()
+        .with_env_overrides()
+        .unwrap_or_else(|e| {
+            tracing::warn!(event = "config_invalid", error = %e);
+            ResourceLimits::default()
+        });
+    reqwest::Client::builder()
+        .timeout(limits.http_client_timeout)
+        .user_agent(format!("agent-workspace-hub/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("static reqwest client configuration is valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

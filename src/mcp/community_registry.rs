@@ -59,7 +59,7 @@ impl CommunityMcpRegistryClient {
     /// Creates a client for the registry at `index_url`.
     pub fn new(index_url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: super::config::build_http_client(),
             index_url: index_url.into(),
         }
     }
