@@ -10,8 +10,9 @@
 #   curl ... | bash -s -- --prefix ~/.bin     # install to a custom directory
 #
 # The installer downloads a prebuilt binary from the latest GitHub release for
-# the detected OS/architecture, falling back to a cargo build when no matching
-# asset exists (or when --source source is requested).
+# the detected OS/architecture. Termux on Android is detected automatically
+# and uses the native Android ARM64 asset. It falls back to a cargo build when
+# no matching asset exists (or when --source source is requested).
 
 set -Eeuo pipefail
 
@@ -91,6 +92,15 @@ require_cmd() {
 }
 
 detect_os() {
+    # Termux exposes PREFIX under /data/data/com.termux/files/usr and may set
+    # TERMUX_VERSION. Check this before generic Linux detection.
+    if [ -n "${TERMUX_VERSION:-}" ] ||
+       [ "${PREFIX:-}" = "/data/data/com.termux/files/usr" ] ||
+       [ -n "${TERMUX_APK_RELEASE:-}" ]; then
+        echo "android"
+        return
+    fi
+
     case "$(uname -s)" in
         Linux*)  echo "linux" ;;
         Darwin*) echo "macos" ;;
@@ -111,12 +121,12 @@ asset_name() {
     local os="$1" arch="$2"
     case "$os" in
         linux)   echo "awh-linux-${arch}" ;;
+        android) echo "awh-android-${arch}" ;;
         macos)   echo "awh-macos-${arch}" ;;
         windows) echo "awh-windows-${arch}.exe" ;;
     esac
 }
 
-# Resolve the release tag (tag_name) from the GitHub API for the requested version.
 resolve_tag() {
     if [ "$VERSION" != "latest" ]; then
         printf '%s' "$VERSION"
@@ -133,33 +143,35 @@ download_binary() {
     arch="$(detect_arch)"
     asset="$(asset_name "$os" "$arch")"
 
+    # The Android release currently supports ARM64 only.
+    if [ "$os" = "android" ] && [ "$arch" != "aarch64" ]; then
+        fail "Android prebuilt binaries currently support aarch64/ARM64 only."
+    fi
+
     tag="$(resolve_tag)"
     if [ -z "$tag" ]; then
         return 1
     fi
 
-    # Locate the matching asset via the release API for the requested tag.
     release_api="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
     url="$(curl -fsSL "$release_api" |
         sed -n "s|.*\"browser_download_url\": \"\([^\"]*${asset}[^\"]*\)\".*|\1|p" | head -n 1)"
 
     if [ -z "$url" ]; then
-        # Fall back to the predictable naming for the concrete architecture.
         url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
     fi
 
+    log "Detected platform: ${os}/${arch}"
     log "Downloading ${asset} (${tag})..."
     dest="${PREFIX}/${asset}"
     curl -fsSL -o "$dest" "$url"
 
-    # Never execute a download we cannot confirm is non-empty.
     [ -s "$dest" ] || fail "Downloaded asset is empty: $url"
 
     if [ "$os" != "windows" ]; then
         chmod +x "$dest"
     fi
 
-    # Install a stable `awh` name alongside the versioned asset.
     if [ "$os" = "windows" ]; then
         cp "$dest" "${PREFIX}/awh.exe"
         final="${PREFIX}/awh.exe"
