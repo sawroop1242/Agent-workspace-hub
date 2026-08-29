@@ -148,7 +148,11 @@ enum RegistryCommand {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // JSON-RPC responses are written to stdout; keep all diagnostics on stderr
+    // so they never corrupt the protocol stream consumed by MCP clients.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
     if let Some(Command::Mcp {
         command: McpCommand::Serve,
@@ -161,7 +165,7 @@ fn main() -> Result<()> {
             if line.trim().is_empty() {
                 continue;
             }
-            println!("{}", server.handle(&line)?);
+            println!("{}", server.handle_response(&line));
             io::stdout().flush()?;
         }
         return Ok(());

@@ -134,6 +134,34 @@ impl StdioMcpServer {
         })?)
     }
 
+    /// Handles a request line and always returns a JSON-RPC response string,
+    /// turning any parse/dispatch failure into a JSON-RPC error object so the
+    /// serve loop survives malformed or unknown requests instead of exiting.
+    pub fn handle_response(&self, input: &str) -> String {
+        // Best-effort id extraction so the error response echoes the request id.
+        let id = serde_json::from_str::<Value>(input)
+            .ok()
+            .and_then(|value| value.get("id").cloned());
+
+        match self.handle(input) {
+            Ok(response) => response,
+            Err(error) => {
+                serde_json::to_string(&RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32600,
+                        "message": error.to_string(),
+                    })),
+                })
+                .unwrap_or_else(|_| {
+                    r#"{"jsonrpc":"2.0","id":null,"result":null,"error":{"code":-32600,"message":"internal error"}}"#.to_string()
+                })
+            }
+        }
+    }
+
     fn tools_list_aggregated(&self) -> Result<Value> {
         let mut base = self
             .tools_list()
