@@ -65,14 +65,24 @@ impl SandboxConfig {
     }
     /// Validates the config: absolute project root, valid permissions and limits.
     pub fn validate(&self) -> Result<()> {
-        if !self.project_root.is_absolute() {
-            bail!("sandbox project root must be an absolute path");
-        }
-        if self.project_root.exists() && !self.project_root.is_dir() {
-            bail!(
-                "sandbox project root must be a directory: {:?}",
-                self.project_root
-            );
+        // A disabled sandbox applies no root restrictions, so only validate the
+        // project root when sandboxing is actually enabled.
+        if self.enabled {
+            if !self.project_root.is_absolute() {
+                bail!("sandbox project root must be an absolute path");
+            }
+            if !self.project_root.exists() {
+                bail!(
+                    "sandbox project root does not exist: {:?}",
+                    self.project_root
+                );
+            }
+            if !self.project_root.is_dir() {
+                bail!(
+                    "sandbox project root must be a directory: {:?}",
+                    self.project_root
+                );
+            }
         }
         if let Some(path) = self
             .permissions
