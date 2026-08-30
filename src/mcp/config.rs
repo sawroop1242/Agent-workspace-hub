@@ -58,38 +58,54 @@ impl ResourceLimits {
     /// - `AWH_CIRCUIT_FAILURE_THRESHOLD`
     /// - `AWH_CIRCUIT_COOLDOWN_SECS`
     pub fn with_env_overrides(self) -> Result<Self> {
+        self.with_overrides_from(|key| env::var(key).ok())
+    }
+
+    /// Applies overrides on top of these limits using an injected key-value
+    /// source instead of reading the process environment directly.
+    ///
+    /// `lookup` returns the raw string value for a given `AWH_*` key (or
+    /// `None` if unset). Decoupling the source from `std::env` lets callers —
+    /// most importantly tests — supply a deterministic in-memory map without
+    /// mutating shared process-global state.
+    pub fn with_overrides_from<F>(self, lookup: F) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let mut out = self;
-        if let Some(v) = env_opt("AWH_MAX_MCP_LINE_BYTES")? {
+        if let Some(v) = opt_value(&lookup, "AWH_MAX_MCP_LINE_BYTES")? {
             out.max_mcp_line_bytes = v;
         }
-        if let Some(v) = env_opt("AWH_MAX_HTTP_BODY_BYTES")? {
+        if let Some(v) = opt_value(&lookup, "AWH_MAX_HTTP_BODY_BYTES")? {
             out.max_http_body_bytes = v;
         }
-        if let Some(v) = env_opt("AWH_MCP_REQUEST_TIMEOUT_SECS")? {
+        if let Some(v) = opt_value(&lookup, "AWH_MCP_REQUEST_TIMEOUT_SECS")? {
             out.mcp_request_timeout = Duration::from_secs(v as u64);
         }
-        if let Some(v) = env_opt("AWH_HTTP_CLIENT_TIMEOUT_SECS")? {
+        if let Some(v) = opt_value(&lookup, "AWH_HTTP_CLIENT_TIMEOUT_SECS")? {
             out.http_client_timeout = Duration::from_secs(v as u64);
         }
-        if let Some(v) = env_opt("AWH_CIRCUIT_FAILURE_THRESHOLD")? {
+        if let Some(v) = opt_value(&lookup, "AWH_CIRCUIT_FAILURE_THRESHOLD")? {
             out.circuit_failure_threshold = v as u32;
         }
-        if let Some(v) = env_opt("AWH_CIRCUIT_COOLDOWN_SECS")? {
+        if let Some(v) = opt_value(&lookup, "AWH_CIRCUIT_COOLDOWN_SECS")? {
             out.circuit_cooldown = Duration::from_secs(v as u64);
         }
         Ok(out)
     }
 }
 
-/// Reads an optional `usize` environment variable, erroring on non-numeric input.
-fn env_opt(key: &str) -> Result<Option<usize>> {
-    match env::var(key) {
-        Ok(raw) => match raw.trim().parse::<usize>() {
+/// Resolves an optional `usize` value from `lookup`, erroring on non-numeric input.
+fn opt_value<F>(lookup: &F, key: &str) -> Result<Option<usize>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(key) {
+        Some(raw) => match raw.trim().parse::<usize>() {
             Ok(v) => Ok(Some(v)),
             Err(_) => bail!("invalid value for {key}: {raw:?}"),
         },
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => bail!("invalid (non-unicode) value for {key}"),
+        None => Ok(None),
     }
 }
 
@@ -116,11 +132,13 @@ pub fn build_http_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::collections::HashMap;
 
-    /// Serializes access to process-global environment variables, which are
-    /// shared across parallel test threads and otherwise race one another.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Builds an in-memory override source so tests never mutate the real
+    /// process environment (which is shared across parallel test threads).
+    fn lookup<'a>(map: &'a HashMap<&'static str, &'a str>) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| map.get(key).map(|v| (*v).to_string())
+    }
 
     #[test]
     fn defaults_match_security_conservative_baseline() {
@@ -133,24 +151,36 @@ mod tests {
 
     #[test]
     fn env_overrides_apply_on_top_of_explicit_values() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // Explicit base value should be overridden by the env var.
+        let mut vars = HashMap::new();
+        vars.insert("AWH_MAX_MCP_LINE_BYTES", "456");
+        // Explicit base value should be overridden by the injected value.
         let base = ResourceLimits {
             max_mcp_line_bytes: 123,
             ..ResourceLimits::default()
         };
-        std::env::set_var("AWH_MAX_MCP_LINE_BYTES", "456");
-        let resolved = base.with_env_overrides().unwrap();
+        let resolved = base.with_overrides_from(lookup(&vars)).unwrap();
         assert_eq!(resolved.max_mcp_line_bytes, 456);
-        std::env::remove_var("AWH_MAX_MCP_LINE_BYTES");
     }
 
     #[test]
     fn invalid_env_value_is_rejected() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("AWH_MAX_HTTP_BODY_BYTES", "not-a-number");
-        let resolved = ResourceLimits::default().with_env_overrides();
+        let mut vars = HashMap::new();
+        vars.insert("AWH_MAX_HTTP_BODY_BYTES", "not-a-number");
+        let resolved = ResourceLimits::default().with_overrides_from(lookup(&vars));
         assert!(resolved.is_err());
-        std::env::remove_var("AWH_MAX_HTTP_BODY_BYTES");
+
+        let mut vars = HashMap::new();
+        vars.insert("AWH_CIRCUIT_FAILURE_THRESHOLD", "");
+        let resolved = ResourceLimits::default().with_overrides_from(lookup(&vars));
+        assert!(resolved.is_err());
+    }
+
+    #[test]
+    fn no_overrides_preserves_base() {
+        let vars = HashMap::new();
+        let resolved = ResourceLimits::default()
+            .with_overrides_from(lookup(&vars))
+            .unwrap();
+        assert_eq!(resolved, ResourceLimits::default());
     }
 }

@@ -653,23 +653,31 @@ fn invalid_env_value_is_rejected() {
 Applied in commit `94364d0`; confirmed green on
 `windows-latest`/`ubuntu-latest`/`macos-latest` in run `33292371208`.
 
-**Follow-up worth doing, not yet done:** this fixes the two tests that
-exist today, but the same class of bug will recur if a third test is ever
-added that touches these env vars without taking `ENV_LOCK`. Longer-term,
-consider refactoring `with_env_overrides()` to accept an injected key-value
-source instead of reading `std::env` directly, so tests don't need to
-mutate real global process state at all.
+**Follow-up (RESOLVED):** the durable fix described below has now been
+applied: `with_env_overrides()` was refactored to delegate to a new
+`with_overrides_from(lookup)` that accepts an injected key-value source, and
+the `config.rs` tests were rewritten to pass an in-memory `HashMap` instead
+of mutating `std::env`. The `ENV_LOCK` guard and all `std::env::set_var` /
+`remove_var` calls in this test module were removed, eliminating the entire
+test-suite race class rather than just serializing the two tests that
+existed at the time.
 
-## Minor: `main` branch CI workflow references Rust toolchain with no Rust code present
+## Minor (`RESOLVED`): `main` branch CI workflow references Rust toolchain with no Rust code present
 
 `main` has no `Cargo.toml` and no `.rs` files (it is a pure Python
-implementation), but `.github/workflows/release.yml` on that branch still
-contains `cargo fmt` / `cargo clippy` / `cargo build --release` steps
-carried over from the `rust` branch. It is currently dormant
-(`workflow_dispatch`-only, not triggered on push), so it does not fail CI
-today — but it would fail immediately if manually dispatched. Either remove
-the Rust steps from `main`'s `release.yml` or restrict that workflow to the
-`rust` branch.
+implementation), but `.github/workflows/main.yml` on that branch contained
+`cargo fmt` / `cargo clippy` / `cargo test` / `cargo build --release` steps
+carried over from the `rust` branch. It was dormant (`workflow_dispatch`-only,
+not triggered on push), so it did not fail CI during normal pushes — but it
+would fail immediately if manually dispatched, because `main` has no Rust code
+to build.
+
+The fix was to delete the misplaced Rust release workflow
+`.github/workflows/main.yml` from `main`. The `main` branch already has a
+correct Python-only release workflow (`release.yml`, using `setup-python`,
+`build`, and `twine`), so the Rust workflow was redundant and was removed
+rather than patched. The Rust release workflow remains intact on the `rust`
+branch.
 
 ## Summary
 
