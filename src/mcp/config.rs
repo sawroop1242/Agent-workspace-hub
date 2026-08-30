@@ -116,6 +116,11 @@ pub fn build_http_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes access to process-global environment variables, which are
+    /// shared across parallel test threads and otherwise race one another.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn defaults_match_security_conservative_baseline() {
@@ -128,6 +133,7 @@ mod tests {
 
     #[test]
     fn env_overrides_apply_on_top_of_explicit_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Explicit base value should be overridden by the env var.
         let base = ResourceLimits {
             max_mcp_line_bytes: 123,
@@ -141,6 +147,7 @@ mod tests {
 
     #[test]
     fn invalid_env_value_is_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("AWH_MAX_HTTP_BODY_BYTES", "not-a-number");
         let resolved = ResourceLimits::default().with_env_overrides();
         assert!(resolved.is_err());
