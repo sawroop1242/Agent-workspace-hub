@@ -385,10 +385,62 @@ The project should only be declared complete when all of the following are true:
 - threat model and security policy are documented
 - backward compatibility is verified
 
-**Current conclusion:** Agent Workspace Hub has a strong security foundation; the five
-planned Phase-1 controls are implemented, and Phases 2–5 (code quality, testing,
-runtime reliability, and release polish) are now complete. The remaining work is
-the cross-platform hardening follow-ups listed in §6 (Windows suspended-process
-sandboxing, a modern macOS sandbox, incremental SSE bounding, OS-level safe-open
-primitives, and an explicit secret provider) plus final cross-platform CI
-verification and a release tag.
+## 11. Standalone Rust MCP agent status — 2026-08-30
+
+The Rust branch now has a verified working standalone MCP server path that does not require OpenCode.
+
+### 11.1 Verified MCP transport
+
+`awh mcp serve` currently operates as a **stdio MCP server**. It reads JSON-RPC requests from stdin and writes JSON-RPC responses to stdout. It is not an HTTP listener and does not expose `/mcp` on port `8765`.
+
+Verified initialization command:
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0"}}}' | awh mcp serve
+```
+
+Observed result: successful MCP initialization with server name `agent-workspace-hub`, version `0.1.0`, and negotiated protocol version `2025-06-18`.
+
+### 11.2 Verified tool discovery
+
+`tools/list` was successfully exercised against `awh mcp serve`.
+
+The current server advertises **26 MCP tools** covering:
+
+- skills: `skills.list`, `skills.read`, `skills.add`, `skills.remove`, `skills.search`
+- workspace: `workspace.context`, `workspace.list_files`, `workspace.read_file`
+- memory: `memory.store`, `memory.search`, `memory.get`, `memory.delete`
+- tasks: `tasks.create`, `tasks.list`, `tasks.update`, `tasks.delete`
+- connectors: `connectors.list`, `connectors.add`, `connectors.enable`, `connectors.disable`, `connectors.remove`, `connector.providers`, `connector.tools`, `connector.invoke`
+
+### 11.3 Current standalone-agent gap
+
+The MCP server is protocol-functional, but the Rust branch does not yet provide a standalone LLM agent loop. A future agent runtime should connect an OpenAI-compatible model provider (for example, OpenRouter) to the stdio MCP server, execute model-requested tool calls, return tool results to the model, and continue until completion.
+
+The intended architecture is:
+
+```text
+OpenAI-compatible LLM provider
+            │
+            ▼
+     AWH Agent Runtime
+            │
+            │ stdio MCP
+            ▼
+       awh mcp serve
+            │
+            ▼
+       26 AWH tools
+```
+
+### 11.4 Current workspace-tool gap
+
+The verified 26-tool MCP surface currently includes workspace context and read/list operations, but does **not** advertise dedicated `workspace.write_file`, `workspace.patch_file`, `workspace.exec`, or Git mutation tools. These should be treated as future runtime capabilities and added only with the existing approval, sandbox, path-security, audit, and resource-limit controls.
+
+### 11.5 HTTP MCP status
+
+The Rust `mcp add` subsystem supports registering external MCP servers using `stdio` and Streamable HTTP transports. However, `awh mcp serve` itself currently instantiates the stdio server. Therefore, a remotely accessible AWH `/mcp` HTTP service remains future engineering work.
+
+## 12. Current conclusion
+
+Agent Workspace Hub has a strong security foundation; the planned Phase-1 controls are implemented, and Phases 2–5 (code quality, testing, runtime reliability, and release polish) are complete. The Rust MCP implementation has now been directly verified for stdio initialization and tool discovery with 26 advertised tools. The remaining work is the cross-platform hardening follow-ups listed in §6, plus a standalone LLM agent runtime, workspace mutation/execution tools, optional HTTP MCP serving, final cross-platform CI verification, and a release tag.
