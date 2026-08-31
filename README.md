@@ -1,93 +1,136 @@
 # Agent-workspace-hub
 
+## Documentation
+
+- [Security policy and threat model](docs/SECURITY.md)
+- [Installation and upgrade guide](docs/INSTALL.md)
+- [Project status and implementation guide](docs/PROJECT_STATUS.md)
+- [Community MCP registry](docs/community-mcp-registry.md)
+
 ## One-line install
 
-Install Agent Workspace Hub with one command:
+Install Agent Workspace Hub with one command (downloads a prebuilt Rust binary
+for your OS/architecture):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash
 ```
 
-Install directly from Git source instead of the latest release wheel:
+Build directly from Git source instead of the latest release binary:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --source source
 ```
 
-Install with optional Composio connector dependencies:
+Install a specific release tag, or to a custom directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --with-composio
+curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --version v0.1.0 --prefix "$HOME/.bin"
 ```
 
-The installer requires Python 3.11+, prefers `pipx` for an isolated CLI install when
-available, falls back to `python -m pip install --user`, and prints PATH setup guidance
-after installation.
+The installer requires `curl`; source installs additionally require `cargo`.
+Prebuilt binaries target Linux (x86_64, aarch64), macOS (x86_64, aarch64), and
+Windows (x86_64), falling back to a `cargo build` when no matching asset exists.
 
 
 
 ## Agent handoff workflow
 
-Agent Workspace Hub is designed as an MCP server that preserves enough project state
-for a different AI agent to continue work without a new bootstrap prompt. Each project
-keeps durable state in `.agent/context.md`, `.agent/memory.jsonl`, task files, enabled
-skills, and enabled Composio-backed plugins.
+Agent Workspace Hub is an MCP server that preserves enough project state for a
+different AI agent to continue work without a new bootstrap prompt. Each project
+keeps durable state in `.agent/context.md`, `.agent/memory.json`, `.agent/tasks/`,
+enabled skills, and configured connectors.
 
 Recommended new-agent startup:
 
-1. Call `get_agent_handoff(project)` to receive the compact continuation brief.
-2. Call `get_project_summary(project)` when full context, active tasks, recent memory,
-   enabled skills, and enabled plugins are needed.
-3. Read relevant skills before applying project-specific procedures.
-4. Use Composio plugin actions only when the enabled connector is required by the
-   active task.
-5. After meaningful work, update context, append memory, update tasks, and create a
-   checkpoint when appropriate.
+1. Call `workspace.context` to receive the persisted project context.
+2. Call `memory.search` (or `memory.get` for a known id) when recent decisions and
+   notes are needed.
+3. Call `tasks.list` to see active tasks and their status.
+4. Read relevant skills via `skills.read` before applying project-specific procedures.
+5. Use `connector.invoke` only when a configured connector is required by the active task.
 
 This loop makes context transfer explicit: the outgoing agent records decisions and
-progress, and the incoming agent starts from the persisted handoff state instead of
-asking the user to repeat the project idea.
+progress, and the incoming agent starts from the persisted state instead of asking
+the user to repeat the project idea.
 
-| File                                   | Purpose                                     |
-| -------------------------------------- | ------------------------------------------- |
-| `pyproject.toml`                       | Package config, deps, CLI entry point `awh` |
-| `requirements.txt`                     | Core dependencies                           |
-| `.gitignore`                           | Git ignore rules                            |
-| `config/constants.py`                  | App constants, paths, security patterns     |
-| `config/settings.py`                   | Settings with OS keychain vault             |
-| `models/*.py`                          | Pydantic models for all entities            |
-| `core/workspace.py`                    | Workspace root management                   |
-| `core/project.py`                      | Project CRUD + AGENT.md template            |
-| `core/context.py`                      | context.md read/update                      |
-| `core/memory.py`                       | Append-only memory.jsonl                    |
-| `core/files.py`                        | Safe file ops with path guards              |
-| `core/tasks.py`                        | Task CRUD                                   |
-| `core/skills_engine.py`                | Global + project skill management           |
-| `core/plugins_engine.py`               | Plugin enable/disable                       |
-| `core/git_engine.py`                   | Git init, commit, diff, checkpoints         |
-| `core/approvals.py`                    | Approval queue                              |
-| `core/logs.py`                         | Structured logging with streaming           |
-| `composio_integration/client.py`       | Composio API wrapper                        |
-| `composio_integration/tools_mapper.py` | Composio → MCP mapping                      |
-| `skill_hub/client.py`                  | skill\_hub.ai API client                    |
-| `skill_hub/search.py`                  | Search helper                               |
-| `mcp/server.py`                        | FastMCP server + lifecycle                  |
-| `mcp/tools/*.py`                       | MCP tools, including project handoff state  |
-| `mcp/prompts/agent_bootstrap.py`       | Agent bootstrap prompt                      |
-| `tui/app.py`                           | Main Textual App                            |
-| `tui/screens/home.py`                  | Start/Stop + live logs                      |
-| `tui/screens/projects.py`              | Project list                                |
-| `tui/screens/project_detail.py`        | Context, tasks, memory tabs                 |
-| `tui/screens/files.py`                 | File tree + editor                          |
-| `tui/screens/skills.py`                | Installed + skill\_hub.ai search            |
-| `tui/screens/plugins.py`               | Composio tools manager                      |
-| `tui/screens/git_screen.py`            | Git status, diff, checkpoints               |
-| `tui/screens/approvals.py`             | Approval center                             |
-| `tui/screens/logs_screen.py`           | Log viewer with filters                     |
-| `tui/screens/settings.py`              | Composio key, workspace, config             |
-| `tui/widgets/*.py`                     | Reusable widgets                            |
-| `tui/styles/app.tcss`                  | Textual CSS                                 |
-| `__main__.py`                          | Entry point                                 |
-| `scripts/install.sh`                   | Installation script                         |
-| `README.md`                            | Full documentation                          |
-| `docs/USAGE.md`                        | Usage guide                                 |
+## MCP transports
+
+Agent Workspace Hub exposes its MCP tools over two transports:
+
+| Transport         | Command                          | Audience                       |
+| --------------------- | ------------------------------------ | ------------------------------ |
+| stdio (default)    | `awh mcp serve`                   | Local agents on the same host |
+| HTTPS + SSE (remote)   | `awh mcp serve --transport sse`   | Remote agents                 |
+
+### stdio
+
+The default transport speaks JSON-RPC over standard input/output:
+
+```bash
+awh mcp serve
+```
+
+Equivalent explicit form:
+
+```bash
+awh mcp serve --transport stdio
+```
+
+### SSE (remote)
+
+The SSE transport hosts an HTTP(S) server with:
+
+| Endpoint   | Purpose                                                              |
+| ---------- | -------------------------------------------------------------------- |
+| `GET /health` | Liveness probe (unauthenticated, no secrets).                      |
+| `GET /sse`    | Server-Sent Events stream; each client gets an isolated session.   |
+| `POST /mcp`   | Submit a JSON-RPC message for an SSE session (`?sessionId=...`).     |
+
+Remote access is **mandatory bearer-token authenticated**. Start it over HTTPS
+with a single API key:
+
+```bash
+AWH_API_KEY="..." \
+AWH_TLS_CERT="/etc/awh/cert.pem" \
+AWH_TLS_KEY="/etc/awh/key.pem" \
+AWH_PORT=8443 \
+awh mcp serve --transport sse
+```
+
+The server refuses to start without `AWH_API_KEY` and rejects a half-configured
+TLS setup (certificate without key, or key without certificate). Configuration is
+supplied via environment variables or CLI flags:
+
+| Setting             | Env var               | CLI flag          | Default       |
+| ------------------- | --------------------- | ----------------- | ------------- |
+| Bind address        | `AWH_HOST`            | `--host`          | `0.0.0.0`     |
+| Port                | `AWH_PORT`            | `--port`          | `8443`        |
+| TLS certificate     | `AWH_TLS_CERT`        | `--tls-cert`      | (off -> HTTP) |
+| TLS private key     | `AWH_TLS_KEY`         | `--tls-key`       | (off -> HTTP) |
+| API key variable    | -                     | `--api-key-env`   | `AWH_API_KEY` |
+| Allowed origins     | `AWH_ALLOWED_ORIGINS` | -                 | empty (none)  |
+
+Full details (TLS setup, authentication, firewall requirements, secure production
+deployment, troubleshooting) are in [docs/INSTALL.md](docs/INSTALL.md),
+[docs/SECURITY.md](docs/SECURITY.md), and [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
+
+| File / directory                        | Purpose                                              |
+| ------------------------------------------- | ---------------------------------------------------- |
+| `Cargo.toml` / `Cargo.lock`             | Rust package config, dependencies, binary target `awh` |
+| `src/main.rs`                           | CLI entry point                                      |
+| `src/lib.rs`                            | Library root                                         |
+| `src/core/*.rs`                         | Workspace, project, context, memory, files, tasks     |
+| `src/models/*.rs`                       | Data models (memory, project, task)                  |
+| `src/mcp/*.rs`                          | MCP server, providers, trust, permissions, sandbox    |
+| `src/mcp/audit.rs`                      | Structured security audit logging                    |
+| `src/mcp/circuit_breaker.rs`            | Fail-fast breaker for misbehaving MCP servers         |
+| `src/mcp/config.rs`                     | Resource limits + config precedence rules            |
+| `src/mcp/sandbox.rs`                    | Per-platform process sandboxing (Linux/macOS/Windows) |
+| `src/mcp/schema.rs`                     | JSON Schema argument-validation gate                 |
+| `src/skills/*.rs`                       | Skill registry, installer, package, remote fetching  |
+| `tests/*.rs`                            | Integration + security test suites                   |
+| `examples/bench.rs`                     | Micro-benchmark for the schema-validation gate       |
+| `docs/*.md`                             | Security policy, install guide, project status       |
+| `scripts/install.sh`                    | One-line Rust-binary installer                       |
+| `.github/workflows/*.yml`               | CI (fmt/test/clippy) and release pipeline            |

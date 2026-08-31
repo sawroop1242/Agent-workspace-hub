@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+
+  build:
+    name: Build (${{ matrix.os }} / ${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: awh-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset_name: awh-linux-aarch64
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            asset_name: awh-android-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_name: awh-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: awh-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: awh-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set up Android SDK/NDK
+        if: matrix.target == 'aarch64-linux-android'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        run: sdkmanager "ndk;27.2.12479018"
+
+      - name: Configure Android linker
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+
+      - name: Install cross-compiler (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT="target/${{ matrix.target }}/release/awh"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            ARTIFACT="${ARTIFACT}.exe"
+          fi
+          test -s "$ARTIFACT"
+          cp "$ARTIFACT" "${{ matrix.asset_name }}"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: ${{ matrix.asset_name }}
+          fail_on_unmatched_files: true
+
+  checksums:
+    name: Generate checksums
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --dir assets \
+            --clobber
+      - name: Generate SHA-256 checksums
+        run: |
+          cd assets
+          sha256sum * > ../sha256sums.txt
+          cat ../sha256sums.txt
+      - name: Attach checksums and installer
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: |
+            sha256sums.txt
+            scripts/install.sh
+          fail_on_unmatched_files: true
