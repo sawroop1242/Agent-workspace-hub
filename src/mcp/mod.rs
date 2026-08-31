@@ -7,6 +7,8 @@
 
 /// Structured security audit logging.
 pub mod audit;
+/// Bearer-token authentication for the remote transport.
+pub mod auth;
 /// Circuit breaker for repeated MCP provider failures.
 pub mod circuit_breaker;
 /// CLI trust commands.
@@ -25,12 +27,16 @@ pub mod connectors;
 pub mod context;
 /// Custom (per-project) MCP servers.
 pub mod custom_mcp;
+/// Transport-agnostic MCP JSON-RPC dispatcher (shared by all transports).
+pub mod dispatcher;
 /// Structured authorization/security errors.
 pub mod error;
 /// MCP execution authorization gate.
 pub mod execution_gate;
 /// Globally installed MCP servers.
 pub mod global_mcp;
+/// HTTP/SSE remote transport server.
+pub mod http;
 /// MCP memory store.
 pub mod memory;
 /// MCP permission validation.
@@ -47,8 +53,12 @@ pub mod security;
 pub mod server;
 /// Skill gateway.
 pub mod skills;
+/// Server-Sent Events sessions for the remote transport.
+pub mod sse;
 /// MCP task store.
 pub mod tasks;
+/// TLS configuration for the remote transport.
+pub mod tls;
 /// MCP trust and approval policy.
 pub mod trust;
 /// Persistent trust store.
@@ -57,6 +67,7 @@ pub mod trust_store;
 pub mod workspace;
 
 pub use audit::{audit_circuit_open, audit_deny, audit_secret_deny};
+pub use auth::{bearer_token, load_api_key, verify_token};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerMcpClient};
 pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};
 pub use community_registry::{
@@ -71,11 +82,13 @@ pub use custom_mcp::{
     CustomMcpRegistry, CustomMcpServerConfig, CustomMcpStore, McpTransport, StdioMcpClient,
     StreamableHttpMcpClient,
 };
+pub use dispatcher::{DispatchResult, McpDispatcher, MCP_PROTOCOL_VERSION};
 pub use error::McpAuthorizationError;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
 pub use global_mcp::{
     GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs,
 };
+pub use http::{build_router, serve, AppState, HttpServerConfig};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
 pub use permissions::{
     is_blocked_environment, is_valid_env_name, require as require_permission, McpPermissions,
@@ -93,7 +106,9 @@ pub use security::{
 };
 pub use server::StdioMcpServer;
 pub use skills::SkillMcp;
+pub use sse::{Session, SessionRegistry, SseEvent};
 pub use tasks::{Task, TaskPriority, TaskStatus, TasksMcp};
+pub use tls::TlsConfig;
 pub use trust::{can_enable, McpApproval, TrustLevel, TrustStore};
 pub use trust_store::PersistentTrustStore;
 pub use workspace::{WorkspaceFile, WorkspaceMcp};

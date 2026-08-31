@@ -54,22 +54,83 @@ This loop makes context transfer explicit: the outgoing agent records decisions 
 progress, and the incoming agent starts from the persisted state instead of asking
 the user to repeat the project idea.
 
-| File / directory                            | Purpose                                              |
+## MCP transports
+
+Agent Workspace Hub exposes its MCP tools over two transports:
+
+| Transport         | Command                          | Audience                       |
+| --------------------- | ------------------------------------ | ------------------------------ |
+| stdio (default)    | `awh mcp serve`                   | Local agents on the same host |
+| HTTPS + SSE (remote)   | `awh mcp serve --transport sse`   | Remote agents                 |
+
+### stdio
+
+The default transport speaks JSON-RPC over standard input/output:
+
+```bash
+awh mcp serve
+```
+
+Equivalent explicit form:
+
+```bash
+awh mcp serve --transport stdio
+```
+
+### SSE (remote)
+
+The SSE transport hosts an HTTP(S) server with:
+
+| Endpoint   | Purpose                                                              |
+| ---------- | -------------------------------------------------------------------- |
+| `GET /health` | Liveness probe (unauthenticated, no secrets).                      |
+| `GET /sse`    | Server-Sent Events stream; each client gets an isolated session.   |
+| `POST /mcp`   | Submit a JSON-RPC message for an SSE session (`?sessionId=...`).     |
+
+Remote access is **mandatory bearer-token authenticated**. Start it over HTTPS
+with a single API key:
+
+```bash
+AWH_API_KEY="..." \
+AWH_TLS_CERT="/etc/awh/cert.pem" \
+AWH_TLS_KEY="/etc/awh/key.pem" \
+AWH_PORT=8443 \
+awh mcp serve --transport sse
+```
+
+The server refuses to start without `AWH_API_KEY` and rejects a half-configured
+TLS setup (certificate without key, or key without certificate). Configuration is
+supplied via environment variables or CLI flags:
+
+| Setting             | Env var               | CLI flag          | Default       |
+| ------------------- | --------------------- | ----------------- | ------------- |
+| Bind address        | `AWH_HOST`            | `--host`          | `0.0.0.0`     |
+| Port                | `AWH_PORT`            | `--port`          | `8443`        |
+| TLS certificate     | `AWH_TLS_CERT`        | `--tls-cert`      | (off -> HTTP) |
+| TLS private key     | `AWH_TLS_KEY`         | `--tls-key`       | (off -> HTTP) |
+| API key variable    | -                     | `--api-key-env`   | `AWH_API_KEY` |
+| Allowed origins     | `AWH_ALLOWED_ORIGINS` | -                 | empty (none)  |
+
+Full details (TLS setup, authentication, firewall requirements, secure production
+deployment, troubleshooting) are in [docs/INSTALL.md](docs/INSTALL.md),
+[docs/SECURITY.md](docs/SECURITY.md), and [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
+
+| File / directory                        | Purpose                                              |
 | ------------------------------------------- | ---------------------------------------------------- |
-| `Cargo.toml` / `Cargo.lock`                 | Rust package config, dependencies, binary target `awh` |
-| `src/main.rs`                               | CLI entry point                                      |
-| `src/lib.rs`                                | Library root                                         |
-| `src/core/*.rs`                             | Workspace, project, context, memory, files, tasks     |
-| `src/models/*.rs`                           | Data models (memory, project, task)                  |
-| `src/mcp/*.rs`                              | MCP server, providers, trust, permissions, sandbox    |
-| `src/mcp/audit.rs`                          | Structured security audit logging                    |
-| `src/mcp/circuit_breaker.rs`                | Fail-fast breaker for misbehaving MCP servers         |
-| `src/mcp/config.rs`                         | Resource limits + config precedence rules            |
-| `src/mcp/sandbox.rs`                        | Per-platform process sandboxing (Linux/macOS/Windows) |
-| `src/mcp/schema.rs`                         | JSON Schema argument-validation gate                 |
-| `src/skills/*.rs`                           | Skill registry, installer, package, remote fetching  |
-| `tests/*.rs`                                | Integration + security test suites                   |
-| `examples/bench.rs`                         | Micro-benchmark for the schema-validation gate       |
-| `docs/*.md`                                 | Security policy, install guide, project status       |
-| `scripts/install.sh`                        | One-line Rust-binary installer                       |
-| `.github/workflows/*.yml`                   | CI (fmt/test/clippy) and release pipeline            |
+| `Cargo.toml` / `Cargo.lock`             | Rust package config, dependencies, binary target `awh` |
+| `src/main.rs`                           | CLI entry point                                      |
+| `src/lib.rs`                            | Library root                                         |
+| `src/core/*.rs`                         | Workspace, project, context, memory, files, tasks     |
+| `src/models/*.rs`                       | Data models (memory, project, task)                  |
+| `src/mcp/*.rs`                          | MCP server, providers, trust, permissions, sandbox    |
+| `src/mcp/audit.rs`                      | Structured security audit logging                    |
+| `src/mcp/circuit_breaker.rs`            | Fail-fast breaker for misbehaving MCP servers         |
+| `src/mcp/config.rs`                     | Resource limits + config precedence rules            |
+| `src/mcp/sandbox.rs`                    | Per-platform process sandboxing (Linux/macOS/Windows) |
+| `src/mcp/schema.rs`                     | JSON Schema argument-validation gate                 |
+| `src/skills/*.rs`                       | Skill registry, installer, package, remote fetching  |
+| `tests/*.rs`                            | Integration + security test suites                   |
+| `examples/bench.rs`                     | Micro-benchmark for the schema-validation gate       |
+| `docs/*.md`                             | Security policy, install guide, project status       |
+| `scripts/install.sh`                    | One-line Rust-binary installer                       |
+| `.github/workflows/*.yml`               | CI (fmt/test/clippy) and release pipeline            |

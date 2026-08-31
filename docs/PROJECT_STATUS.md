@@ -437,10 +437,21 @@ OpenAI-compatible LLM provider
 
 The verified 26-tool MCP surface currently includes workspace context and read/list operations, but does **not** advertise dedicated `workspace.write_file`, `workspace.patch_file`, `workspace.exec`, or Git mutation tools. These should be treated as future runtime capabilities and added only with the existing approval, sandbox, path-security, audit, and resource-limit controls.
 
-### 11.5 HTTP MCP status
+### 11.5 HTTP/SSE MCP status
 
-The Rust `mcp add` subsystem supports registering external MCP servers using `stdio` and Streamable HTTP transports. However, `awh mcp serve` itself currently instantiates the stdio server. Therefore, a remotely accessible AWH `/mcp` HTTP service remains future engineering work.
+The remote (HTTP + SSE) transport is implemented. `awh mcp serve --transport sse` starts an HTTPS server that exposes:
+
+- `GET /health` - liveness probe.
+- `GET /sse` - Server-Sent Events stream; each connection is an isolated session.
+- `POST /mcp?sessionId=...` - submit a JSON-RPC message for an SSE session.
+
+Both transports share the same `McpDispatcher`, so the tool implementations are
+not duplicated: stdio (`StdioMcpServer`) and HTTP/SSE (`build_router`) both call
+`McpDispatcher::dispatch`. Remote access is mandatory bearer-token authenticated
+(`AWH_API_KEY`), TLS is enabled with `AWH_TLS_CERT`/`AWH_TLS_KEY`, and request
+size, session, timeout, and SSE idle limits are enforced. See `README.md`,
+`docs/INSTALL.md`, and `docs/SECURITY.md` for configuration and deployment.
 
 ## 12. Current conclusion
 
-Agent Workspace Hub has a strong security foundation; the planned Phase-1 controls are implemented, and Phases 2–5 (code quality, testing, runtime reliability, and release polish) are complete. The Rust MCP implementation has now been directly verified for stdio initialization and tool discovery with 26 advertised tools. The remaining work is the cross-platform hardening follow-ups listed in §6, plus a standalone LLM agent runtime, workspace mutation/execution tools, optional HTTP MCP serving, final cross-platform CI verification, and a release tag.
+Agent Workspace Hub has a strong security foundation; the planned Phase-1 controls are implemented, and Phases 2–5 (code quality, testing, runtime reliability, and release polish) are complete. The Rust MCP implementation has been directly verified for stdio initialization and tool discovery with 26 advertised tools, and now also exposes the same tools over an authenticated HTTPS/SSE transport through the shared dispatcher. The remaining work is the cross-platform hardening follow-ups listed in §6, plus a standalone LLM agent runtime, workspace mutation/execution tools, final cross-platform CI verification, and a release tag.

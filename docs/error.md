@@ -104,6 +104,22 @@ may appear to hang. This is expected for a stdio MCP server: it waits for MCP JS
 
 Do not expect a message such as `Listening on http://127.0.0.1:3000` unless an HTTP transport is explicitly implemented.
 
+## Remote (HTTP/SSE) transport troubleshooting
+
+The remote transport is enabled with `awh mcp serve --transport sse`. Common
+failures and their causes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `refusing to serve remote MCP without an API key` | `AWH_API_KEY` unset or empty | `export AWH_API_KEY="$(openssl rand -hex 32)"` |
+| `TLS certificate provided without a private key` | Only `AWH_TLS_CERT` set | Set both `AWH_TLS_CERT` and `AWH_TLS_KEY` |
+| `TLS private key provided without a certificate` | Only `AWH_TLS_KEY` set | Set both `AWH_TLS_CERT` and `AWH_TLS_KEY` |
+| `failed to bind 0.0.0.0:8443` | Port in use or host unreachable | Change `AWH_PORT`/`AWH_HOST` |
+| `401 Unauthorized` | Missing/invalid `Authorization: Bearer <token>` | Send the correct bearer token |
+| `404 unknown session` | `POST /mcp` without a valid `sessionId` | Open `GET /sse` first and reuse its session id |
+| `400 malformed JSON-RPC body` | Body is not well-formed JSON | Send a valid JSON-RPC message |
+| `413 Content Too Large` | Body exceeds the request-size limit | Split large payloads |
+
 ## `awh mcp status` requires an ID
 
 ### Symptom

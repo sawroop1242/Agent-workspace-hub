@@ -60,6 +60,9 @@ Each row maps a boundary to the implemented control and its source module.
 | Tool authorization | Execution gate approves/denies tool calls | `mcp/execution_gate` |
 | Provider resilience | Circuit breaker trips after configured consecutive failures | `mcp/circuit_breaker` |
 | Auditability | Structured audit events for every denied decision and circuit trip | `mcp/audit` |
+| Remote transport auth | Mandatory bearer-token auth for the HTTP/SSE transport; constant-time comparison; fail closed when the API key is unset | `mcp/auth` |
+| Remote transport TLS | TLS 1.2+ with certificate/key material loaded from files; half-configured TLS rejected | `mcp/tls` |
+| Remote request limits | Bounded HTTP body, connection, session, and timeout limits; per-session isolation | `mcp/http`, `mcp/sse` |
 
 ### Out of scope / residual risks
 
@@ -101,6 +104,41 @@ Tunable variables:
 | `AWH_HTTP_CLIENT_TIMEOUT_SECS` | HTTP client timeout |
 | `AWH_CIRCUIT_FAILURE_THRESHOLD` | Consecutive failures before trip |
 | `AWH_CIRCUIT_COOLDOWN_SECS` | Open-circuit cooldown |
+| `AWH_API_KEY` | Bearer token required for remote (HTTP/SSE) MCP access |
+| `AWH_HOST` | Remote transport bind address (default `0.0.0.0`) |
+| `AWH_PORT` | Remote transport port (default `8443`) |
+| `AWH_TLS_CERT` | Path to PEM certificate chain (enables HTTPS) |
+| `AWH_TLS_KEY` | Path to PEM private key (enables HTTPS) |
+| `AWH_ALLOWED_ORIGINS` | CORS allow-list (empty disables CORS) |
+
+## Remote transport security
+
+The remote (HTTP/SSE) transport is disabled by default; stdio is the only
+transport enabled unless `awh mcp serve --transport sse` is invoked. Remote MCP
+enforces the following, all of which fail closed:
+
+- **Authentication is mandatory.** The expected API key is read from `AWH_API_KEY`
+  (or the variable named by `--api-key-env`). If it is unset or empty, the server
+  refuses to start. Comparisons use a constant-time routine (`subtle`).
+- **TLS private keys are never logged.** Error paths reference only the file path,
+  never the key contents. API keys and `Authorization` headers are likewise never
+  written to logs or errors.
+- **No secret leakage in errors.** HTTP error bodies are generic (`401 Unauthorized`,
+  `404 unknown session`, `400 malformed ...`). Filesystem paths, environment
+  variables, and stack traces are not exposed.
+- **Per-session isolation.** Each SSE connection is a distinct session with its own
+  broadcast channel; one client cannot observe another's responses.
+- **Limits.** Request body size, session count, request timeout, and SSE idle/keep-alive
+  timeouts are bounded to resist resource exhaustion.
+- **CORS is restrictive by default.** No `Access-Control-Allow-Origin` is emitted
+  unless `AWH_ALLOWED_ORIGINS` is configured with an explicit allow-list.
+
+### Never log these
+
+- TLS private key bytes.
+- API keys (`AWH_API_KEY` or the configured variable's value).
+- `Authorization` header values.
+- MCP secret values resolved from `${secret:NAME}` references.
 
 ## Audit logging
 

@@ -1,6 +1,7 @@
 use agent_workspace_hub::mcp::{
-    CommunityMcpRegistryClient, CustomMcpRegistry, CustomMcpServerConfig, GlobalMcpRegistry,
-    McpPermissions, McpTransport, PersistentTrustStore, ProjectMcpReferences, StdioMcpServer,
+    auth::load_api_key, CommunityMcpRegistryClient, CustomMcpRegistry, CustomMcpServerConfig,
+    GlobalMcpRegistry, HttpServerConfig, McpDispatcher, McpPermissions, McpTransport,
+    PersistentTrustStore, ProjectMcpReferences, ResourceLimits, StdioMcpServer, TlsConfig,
     TrustLevel,
 };
 use agent_workspace_hub::skills::{
@@ -8,6 +9,7 @@ use agent_workspace_hub::skills::{
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 
 const DEFAULT_MCP_REGISTRY: &str = "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/mcps/index.json";
 
@@ -38,7 +40,31 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum McpCommand {
-    Serve,
+    Serve {
+        /// Transport to serve MCP over (defaults to stdio for backwards compatibility).
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+
+        /// HTTP bind address for the remote (`sse`) transport.
+        #[arg(long)]
+        host: Option<String>,
+
+        /// HTTP port for the remote (`sse`) transport.
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Path to a PEM TLS certificate (enables HTTPS).
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// Path to a PEM TLS private key (enables HTTPS).
+        #[arg(long)]
+        tls_key: Option<String>,
+
+        /// Environment variable holding the API key for remote access.
+        #[arg(long, default_value = "AWH_API_KEY")]
+        api_key_env: String,
+    },
     List,
     Add {
         id: String,
@@ -155,18 +181,25 @@ fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     if let Some(Command::Mcp {
-        command: McpCommand::Serve,
+        command:
+            McpCommand::Serve {
+                transport,
+                host,
+                port,
+                tls_cert,
+                tls_key,
+                api_key_env,
+            },
     }) = cli.command
     {
-        let server = StdioMcpServer::new(std::env::current_dir()?)?;
-        use std::io::{self, BufRead, Write};
-        for line in io::stdin().lock().lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
+        match transport.to_ascii_lowercase().as_str() {
+            "stdio" => serve_stdio()?,
+            "sse" | "http" | "streamable-http" | "streamablehttp" => {
+                serve_sse(host, port, tls_cert, tls_key, api_key_env)?
             }
-            println!("{}", server.handle_response(&line));
-            io::stdout().flush()?;
+            other => {
+                anyhow::bail!("unsupported MCP transport: {other} (expected 'stdio' or 'sse')")
+            }
         }
         return Ok(());
     }
@@ -480,7 +513,7 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
                 }
             );
         }
-        McpCommand::Serve => unreachable!(),
+        McpCommand::Serve { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -490,4 +523,89 @@ fn search_registry(url: &str, query: &str) -> Result<()> {
         println!("{} v{} — {}", s.name, s.version, s.description)
     }
     Ok(())
+}
+
+/// Runs the standard stdio MCP serve loop (the original `awh mcp serve` path).
+fn serve_stdio() -> Result<()> {
+    let server = StdioMcpServer::new(std::env::current_dir()?)?;
+    use std::io::{self, BufRead, Write};
+    for line in io::stdin().lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = server.handle_response(&line);
+        if !response.is_empty() {
+            println!("{response}");
+            io::stdout().flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds and runs the remote HTTP/SSE MCP server.
+fn serve_sse(
+    host: Option<String>,
+    port: Option<u16>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    api_key_env: String,
+) -> Result<()> {
+    // Precedence: explicit CLI flag > `AWH_*` environment variable > default.
+    let host = host
+        .or_else(|| std::env::var("AWH_HOST").ok())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let port = port
+        .or_else(|| std::env::var("AWH_PORT").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(8443);
+    let tls_cert = tls_cert.or_else(|| std::env::var("AWH_TLS_CERT").ok());
+    let tls_key = tls_key.or_else(|| std::env::var("AWH_TLS_KEY").ok());
+
+    let allowed_origins = parse_allowed_origins();
+
+    let api_key = load_api_key(&api_key_env).with_context(|| {
+        format!("remote MCP requires a bearer token; set {api_key_env} or use --transport stdio")
+    })?;
+
+    let limits = ResourceLimits::default()
+        .with_env_overrides()
+        .unwrap_or_else(|e| {
+            tracing::warn!(event = "config_invalid", error = %e);
+            ResourceLimits::default()
+        });
+
+    let config = HttpServerConfig {
+        host,
+        port,
+        tls: TlsConfig {
+            cert: tls_cert,
+            key: tls_key,
+        },
+        api_key,
+        allowed_origins,
+        max_body_bytes: limits.max_http_body_bytes,
+        max_sessions: 100,
+        request_timeout: limits.mcp_request_timeout,
+        ..HttpServerConfig::default()
+    };
+    config.tls.validate()?;
+
+    let dispatcher = Arc::new(McpDispatcher::new(std::env::current_dir()?)?);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(agent_workspace_hub::mcp::http::serve(config, dispatcher))
+}
+
+/// Parses the `AWH_ALLOWED_ORIGINS` comma-separated allow-list.
+fn parse_allowed_origins() -> Vec<String> {
+    std::env::var("AWH_ALLOWED_ORIGINS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
