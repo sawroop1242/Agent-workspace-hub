@@ -11,12 +11,64 @@ use crate::mcp::{
     ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient, StreamableHttpMcpClient,
     TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// JSON-RPC 2.0 standard error codes.
+mod codes {
+    pub const PARSE_ERROR: i64 = -32700;
+    pub const INVALID_REQUEST: i64 = -32600;
+    pub const METHOD_NOT_FOUND: i64 = -32601;
+    pub const INVALID_PARAMS: i64 = -32602;
+    pub const INTERNAL_ERROR: i64 = -32603;
+}
+
+/// A dispatch failure carrying the appropriate JSON-RPC error code, so protocol
+/// errors and genuine tool-execution failures are reported with the correct
+/// (`-32700`/`-32600`/`-32601`/`-32602`/`-32603`) code rather than a blanket
+/// "-32600 invalid request".
+#[derive(Debug)]
+pub struct DispatchError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl DispatchError {
+    fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn parse(message: impl Into<String>) -> Self {
+        Self::new(codes::PARSE_ERROR, message)
+    }
+
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(codes::INVALID_REQUEST, message)
+    }
+
+    fn invalid_params(message: impl Into<String>) -> Self {
+        Self::new(codes::INVALID_PARAMS, message)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(codes::INTERNAL_ERROR, message)
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DispatchError {}
 
 /// JSON-RPC protocol version negotiated by this server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -153,8 +205,8 @@ impl McpDispatcher {
                     id,
                     result: None,
                     error: Some(json!({
-                        "code": -32600,
-                        "message": error.to_string(),
+                        "code": error.code,
+                        "message": error.message,
                     })),
                 })
             }
@@ -169,14 +221,18 @@ impl McpDispatcher {
     /// historical fail-closed contract: structural/protocol errors surface as
     /// hard errors, while *known* JSON-RPC failure modes (e.g. an unknown
     /// method) still return a well-formed error response.
-    pub async fn dispatch_strict(&self, input: &str) -> Result<DispatchResult> {
+    pub async fn dispatch_strict(&self, input: &str) -> Result<DispatchResult, DispatchError> {
         self.dispatch_inner(input).await
     }
 
-    async fn dispatch_inner(&self, input: &str) -> Result<DispatchResult> {
-        let req: RpcRequest = serde_json::from_str(input)?;
+    async fn dispatch_inner(&self, input: &str) -> Result<DispatchResult, DispatchError> {
+        let req: RpcRequest = serde_json::from_str(input)
+            .map_err(|e| DispatchError::parse(format!("invalid JSON: {e}")))?;
         if req.jsonrpc != "2.0" {
-            bail!("unsupported JSON-RPC version: {}", req.jsonrpc);
+            return Err(DispatchError::invalid_request(format!(
+                "unsupported JSON-RPC version: {}",
+                req.jsonrpc
+            )));
         }
 
         // Notifications (no `id`) produce no response.
@@ -195,8 +251,14 @@ impl McpDispatcher {
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "agent-workspace-hub", "version": env!("CARGO_PKG_VERSION")}
             }),
-            "tools/list" => self.tools_list_aggregated().await?,
-            "tools/call" => self.call_tool(&req.params).await?,
+            "tools/list" => self
+                .tools_list_aggregated()
+                .await
+                .map_err(to_dispatch_error)?,
+            "tools/call" => self
+                .call_tool(&req.params)
+                .await
+                .map_err(to_dispatch_error)?,
             _ => {
                 // Unknown method: a proper JSON-RPC "method not found" error.
                 return Ok(DispatchResult::Response(RpcResponse {
@@ -204,7 +266,7 @@ impl McpDispatcher {
                     id,
                     result: None,
                     error: Some(json!({
-                        "code": -32601,
+                        "code": codes::METHOD_NOT_FOUND,
                         "message": "method not found",
                     })),
                 }));
@@ -461,13 +523,27 @@ impl McpDispatcher {
                 let registry = self.providers.read().await;
                 serde_json::to_value(registry.invoke_qualified(name, arguments).await?)?
             }
-            _ => json!({"error": "unknown tool"}),
+            _ => {
+                // Unknown tool: fail as an invalid-params error rather than a
+                // success envelope containing an error string (MCP conformance).
+                return Err(DispatchError::invalid_params(format!("unknown tool: {name}")).into());
+            }
         };
 
         Ok(json!({
             "content": [{"type": "text", "text": serde_json::to_string(&value)?}]
         }))
     }
+}
+
+/// Converts a dispatch error to a [`DispatchError`], preserving an existing
+/// error code (e.g. `-32602` for an unknown tool) and defaulting other failures
+/// to `-32603` internal error.
+fn to_dispatch_error(error: anyhow::Error) -> DispatchError {
+    if let Some(de) = error.downcast_ref::<DispatchError>() {
+        return DispatchError::new(de.code, de.message.clone());
+    }
+    DispatchError::internal(error.to_string())
 }
 
 fn strval(arguments: &Value, key: &str) -> String {

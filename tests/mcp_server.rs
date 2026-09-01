@@ -157,17 +157,24 @@ fn unknown_tool_returns_error_not_panic() {
     let dir = tempdir().unwrap();
     let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
 
-    // A name without a dot hits the "unknown tool" fallthrough and returns a
-    // JSON error result rather than panicking.
-    let result = rpc(
-        &server,
-        "tools/call",
-        json!({"name": "doesnotexist", "arguments": {}}),
-    );
-    let text = result["content"][0]["text"].as_str().unwrap();
+    // A name without a dot hits the "unknown tool" fallthrough and now returns
+    // a JSON-RPC error (-32602 invalid params) rather than a success envelope
+    // containing an error string, in line with MCP conformance.
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "doesnotexist", "arguments": {}}
+    });
+    let response: Value =
+        serde_json::from_str(&server.handle_response(&request.to_string())).unwrap();
+    let error = response
+        .get("error")
+        .expect("unknown tool must yield an error");
+    assert_eq!(error["code"], -32602);
     assert!(
-        text.contains("unknown tool") || text.contains("error"),
-        "got: {text}"
+        error["message"].as_str().unwrap().contains("unknown tool"),
+        "got: {error}"
     );
 }
 
@@ -191,4 +198,32 @@ fn unsupported_jsonrpc_version_is_rejected() {
     let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
     let request = json!({"jsonrpc": "1.0", "id": 1, "method": "initialize", "params": {}});
     assert!(server.handle(&request.to_string()).is_err());
+}
+
+#[test]
+fn malformed_json_returns_parse_error_code() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    let response: Value = serde_json::from_str(&server.handle_response("{ not json")).unwrap();
+    assert_eq!(response["error"]["code"], -32700);
+}
+
+#[test]
+fn unsupported_jsonrpc_version_returns_invalid_request_code() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    let request = json!({"jsonrpc": "1.0", "id": 1, "method": "initialize", "params": {}});
+    let response: Value =
+        serde_json::from_str(&server.handle_response(&request.to_string())).unwrap();
+    assert_eq!(response["error"]["code"], -32600);
+}
+
+#[test]
+fn unknown_method_returns_method_not_found_code() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": "bogus/method", "params": {}});
+    let response: Value =
+        serde_json::from_str(&server.handle_response(&request.to_string())).unwrap();
+    assert_eq!(response["error"]["code"], -32601);
 }
