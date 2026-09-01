@@ -1,0 +1,13 @@
+{
+  "name": "awh-mcp-interop",
+  "private": true,
+  "type": "module",
+  "description": "Interop harnesses for awh mcp serve against the official MCP SDK",
+  "scripts": {
+    "stdio": "node stdio-client.mjs",
+    "sse": "node sse-client.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
