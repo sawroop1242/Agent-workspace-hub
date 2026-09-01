@@ -98,7 +98,9 @@ pub use providers::{
     ConnectorProvider, CustomMcpProvider, GatewayProvider, ProviderRegistry, ToolCallResult,
     ToolContent, ToolDescriptor, UnconfiguredProvider,
 };
-pub use sandbox::{sandbox_available, wrap_command, SandboxConfig, SandboxLimits};
+pub use sandbox::{
+    sandbox_available, wrap_command, wrap_command_with, SandboxConfig, SandboxLimits,
+};
 pub use schema::validate_tool_arguments;
 pub use security::{
     atomic_write, secure_destination, secure_path, sha256_file, validate_command, validate_id,

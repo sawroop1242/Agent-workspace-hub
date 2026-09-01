@@ -1,10 +1,7 @@
-use agent_workspace_hub::mcp::{wrap_command, McpPermissions, SandboxConfig, SandboxLimits};
+use agent_workspace_hub::mcp::{
+    wrap_command, wrap_command_with, McpPermissions, SandboxConfig, SandboxLimits,
+};
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
-use std::sync::Mutex;
-
-#[cfg(target_os = "linux")]
-static BWRAP_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn permissions() -> McpPermissions {
     McpPermissions::default()
@@ -84,7 +81,6 @@ fn zero_resource_limit_is_rejected() {
 #[cfg(target_os = "linux")]
 #[test]
 fn enabled_linux_sandbox_fails_closed_without_bwrap() {
-    let _guard = BWRAP_ENV_LOCK.lock().unwrap();
     let root = std::env::temp_dir();
     let cfg = SandboxConfig {
         enabled: true,
@@ -92,8 +88,8 @@ fn enabled_linux_sandbox_fails_closed_without_bwrap() {
         permissions: permissions(),
         limits: SandboxLimits::default(),
     };
-    std::env::set_var("AWH_BWRAP", "/definitely/missing/bwrap");
-    let result = wrap_command(&cfg, "echo", &[]);
-    std::env::remove_var("AWH_BWRAP");
+    // Injected binary path: exercises the fail-closed path without mutating
+    // the process environment (master prompt 18.20 configuration testability).
+    let result = wrap_command_with(&cfg, "echo", &[], "/definitely/missing/bwrap");
     assert!(result.is_err());
 }

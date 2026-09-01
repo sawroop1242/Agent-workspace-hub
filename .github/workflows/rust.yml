@@ -41,3 +41,16 @@ jobs:
           toolchain: stable
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  audit:
+    name: Dependency vulnerability audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      # Fails on actual RUSTSEC vulnerabilities; warning-level advisories
+      # (unmaintained/yanked transitive crates) are surfaced but non-blocking.
+      - run: cargo install --locked cargo-audit
+      - run: cargo audit

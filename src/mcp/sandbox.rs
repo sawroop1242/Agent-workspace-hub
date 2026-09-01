@@ -104,12 +104,25 @@ pub fn wrap_command(
     command: &str,
     args: &[String],
 ) -> Result<(String, Vec<String>)> {
+    let bwrap = std::env::var("AWH_BWRAP").unwrap_or_else(|_| "bwrap".to_string());
+    wrap_command_with(cfg, command, args, &bwrap)
+}
+
+/// Linux [`wrap_command`] with an injected bubblewrap binary path, so tests
+/// can exercise the fail-closed path without mutating the process
+/// environment (see master prompt 18.20 on configuration testability).
+#[cfg(target_os = "linux")]
+pub fn wrap_command_with(
+    cfg: &SandboxConfig,
+    command: &str,
+    args: &[String],
+    bwrap: &str,
+) -> Result<(String, Vec<String>)> {
     cfg.validate()?;
     if !cfg.enabled {
         return Ok((command.to_string(), args.to_vec()));
     }
-    let bwrap = std::env::var("AWH_BWRAP").unwrap_or_else(|_| "bwrap".to_string());
-    let available = std::process::Command::new(&bwrap)
+    let available = std::process::Command::new(bwrap)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -176,7 +189,7 @@ pub fn wrap_command(
     wrapped.push("--".into());
     wrapped.push(command.to_string());
     wrapped.extend(args.iter().cloned());
-    Ok((bwrap, wrapped))
+    Ok((bwrap.to_string(), wrapped))
 }
 
 /// Wraps a command with `sandbox-exec` (macOS) to enforce sandbox restrictions.
