@@ -6,10 +6,11 @@
 //! through [`McpDispatcher`] so the tool implementations are never duplicated.
 
 use crate::mcp::{
-    AuthMethod, CircuitBreakerConfig, CircuitBreakerMcpClient, ComposioProvider, Connector,
-    ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, McpTransport, MemoryMcp, MemoryScope,
-    ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient, StreamableHttpMcpClient,
-    TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
+    audit_deny, authorize_mcp_execution, AuthMethod, CircuitBreakerConfig, CircuitBreakerMcpClient,
+    ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
+    CustomMcpServerConfig, McpExecutionRequest, McpTransport, MemoryMcp, MemoryScope,
+    PersistentTrustStore, ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient,
+    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -139,8 +140,17 @@ impl McpDispatcher {
         }
 
         let custom = CustomMcpRegistry::new(project_root.clone())?;
+        let trust_store = load_trust_store();
         for cfg in custom.list()? {
             if !cfg.enabled {
+                continue;
+            }
+            // Enforce the centralized execution gate: an enabled custom MCP
+            // server is only spawned if it has an explicit, matching trust
+            // approval. Missing, blocked, mismatched-version, or over-broad
+            // permission requests fail closed (the server is skipped), so a
+            // server cannot execute merely because it was registered.
+            if !is_authorized(&cfg, trust_store.as_ref()) {
                 continue;
             }
             match cfg.transport {
@@ -546,6 +556,43 @@ fn to_dispatch_error(error: anyhow::Error) -> DispatchError {
     DispatchError::internal(error.to_string())
 }
 
+/// Loads the persistent trust store from the user data directory, returning
+/// `None` if it cannot be loaded (corrupt or missing). A `None` here means
+/// "nothing is approved", so every custom MCP server fails closed.
+fn load_trust_store() -> Option<PersistentTrustStore> {
+    let dir = dirs::home_dir()?.join(".agent-workspace-hub");
+    match PersistentTrustStore::new(dir) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            tracing::warn!(event = "trust_store_unreadable", error = %error);
+            None
+        }
+    }
+}
+
+/// Whether a custom MCP server is authorized to execute under the centralized
+/// execution gate. Fails closed (and audits) on any denial.
+fn is_authorized(cfg: &CustomMcpServerConfig, trust_store: Option<&PersistentTrustStore>) -> bool {
+    let Some(store) = trust_store else {
+        audit_deny("dispatch_custom_mcp", "trust_store_unavailable", &cfg.id);
+        return false;
+    };
+    // Custom (per-project) servers carry no semantic version; use the same
+    // `"local"` marker the CLI `trust` command defaults to.
+    let request = McpExecutionRequest {
+        id: &cfg.id,
+        version: "local",
+        permissions: &cfg.permissions,
+    };
+    match authorize_mcp_execution(&request, &store.to_store()) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(event = "mcp_execution_denied", id = %cfg.id, error = %error);
+            false
+        }
+    }
+}
+
 fn strval(arguments: &Value, key: &str) -> String {
     arguments
         .get(key)
@@ -613,5 +660,97 @@ fn circuit_breaker_config() -> CircuitBreakerConfig {
     CircuitBreakerConfig {
         failure_threshold: limits.circuit_failure_threshold,
         cooldown: limits.circuit_cooldown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::{McpPermissions, TrustLevel, TrustStore};
+
+    fn config(id: &str, permissions: McpPermissions) -> CustomMcpServerConfig {
+        CustomMcpServerConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            transport: McpTransport::Stdio,
+            command: Some("echo".to_string()),
+            args: Vec::new(),
+            url: None,
+            env: Default::default(),
+            permissions,
+            enabled: true,
+        }
+    }
+
+    /// No trust store at all => every custom MCP server fails closed.
+    #[test]
+    fn unapproved_server_is_denied_when_trust_store_missing() {
+        let cfg = config("server", McpPermissions::default());
+        assert!(!is_authorized(&cfg, None));
+    }
+
+    /// A server with no approval record is denied.
+    #[test]
+    fn no_approval_record_is_denied() {
+        let store = PersistentTrustStore::from_store(&TrustStore::default());
+        let cfg = config("server", McpPermissions::default());
+        assert!(!is_authorized(&cfg, Some(&store)));
+    }
+
+    /// A server blocked at any trust level is denied.
+    #[test]
+    fn blocked_server_is_denied() {
+        let mut trust = TrustStore::default();
+        trust
+            .approve(
+                "server",
+                TrustLevel::Blocked,
+                McpPermissions::default(),
+                "local",
+            )
+            .unwrap();
+        let store = PersistentTrustStore::from_store(&trust);
+        let cfg = config("server", McpPermissions::default());
+        assert!(!is_authorized(&cfg, Some(&store)));
+    }
+
+    /// A reviewed/trusted server with matching permissions and version is allowed.
+    #[test]
+    fn approved_server_is_allowed() {
+        let mut trust = TrustStore::default();
+        trust
+            .approve(
+                "server",
+                TrustLevel::Reviewed,
+                McpPermissions::default(),
+                "local",
+            )
+            .unwrap();
+        let store = PersistentTrustStore::from_store(&trust);
+        let cfg = config("server", McpPermissions::default());
+        assert!(is_authorized(&cfg, Some(&store)));
+    }
+
+    /// A server requesting broader permissions than approved is denied.
+    #[test]
+    fn over_broad_permissions_are_denied() {
+        let mut trust = TrustStore::default();
+        trust
+            .approve(
+                "server",
+                TrustLevel::Reviewed,
+                McpPermissions::default(),
+                "local",
+            )
+            .unwrap();
+        let store = PersistentTrustStore::from_store(&trust);
+        let cfg = config(
+            "server",
+            McpPermissions {
+                network: true,
+                ..McpPermissions::default()
+            },
+        );
+        assert!(!is_authorized(&cfg, Some(&store)));
     }
 }

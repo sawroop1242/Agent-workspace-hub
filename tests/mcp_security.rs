@@ -154,6 +154,23 @@ fn persistent_trust_round_trip() {
 }
 
 #[test]
+fn corrupted_trust_store_fails_closed() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("trust.json"), "{ not valid json").unwrap();
+    // A corrupt trust file must fail to load (surfacing an error) rather than
+    // silently defaulting to an empty trust store, which would fail open.
+    assert!(PersistentTrustStore::new(dir.path()).is_err());
+}
+
+#[test]
+fn empty_trust_store_defaults_to_no_approvals() {
+    let dir = tempdir().unwrap();
+    // A missing trust file is the legitimate "no approvals yet" state.
+    let store = PersistentTrustStore::new(dir.path()).unwrap();
+    assert!(store.approvals.is_empty());
+}
+
+#[test]
 fn environment_names_require_safe_identifier_syntax() {
     assert!(is_valid_env_name("GITHUB_TOKEN"));
     assert!(is_valid_env_name("_A1"));
