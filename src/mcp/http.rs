@@ -25,10 +25,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -278,18 +280,63 @@ async fn sse_handler(State(state): State<AppState>) -> Response {
     let initial =
         futures_util::stream::once(async move { Ok::<Event, Infallible>(endpoint_event) });
 
-    // Remove the session when the stream terminates (client disconnect).
-    let cleanup_state = state.clone();
-    let cleanup_id = session_id;
     let keepalive = state.sse_keepalive;
 
-    tokio::spawn(async move {
-        cleanup_state.sessions.remove(&cleanup_id).await;
-    });
+    // Keep the session alive for exactly as long as the SSE stream is being
+    // served, then remove it. The stream's `Drop` runs when the response body
+    // is dropped — i.e. when the client disconnects or the connection closes —
+    // so cleanup is tied to the actual stream lifetime rather than detached.
+    let guarded = SessionGuard {
+        inner: initial.chain(stream),
+        registry: Arc::clone(&state.sessions),
+        session_id,
+    };
 
-    Sse::new(initial.chain(stream))
+    Sse::new(guarded)
         .keep_alive(KeepAlive::new().interval(keepalive).text("keep-alive"))
         .into_response()
+}
+
+/// A [`Stream`] wrapper that removes its SSE session from the registry when the
+/// stream is dropped.
+///
+/// `Sse` (via `axum`) drops the body stream when the client disconnects or the
+/// connection is closed, which drops this guard and removes the session. This
+/// keeps the session alive for exactly the duration the client is connected —
+/// never shorter (the prior detached `tokio::spawn` could remove it before the
+/// client used its endpoint) and never leaking a session after disconnect.
+struct SessionGuard<S> {
+    inner: S,
+    registry: Arc<SessionRegistry>,
+    session_id: String,
+}
+
+impl<S> Drop for SessionGuard<S> {
+    fn drop(&mut self) {
+        // Removal is async; spawn a task using the registry's own handle since
+        // `Drop` cannot await. The registry is `Arc`-owned so it outlives this.
+        let registry = Arc::clone(&self.registry);
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            registry.remove(&session_id).await;
+        });
+    }
+}
+
+impl<S> Stream for SessionGuard<S>
+where
+    S: Stream,
+{
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        // SAFETY: `SessionGuard` never structurally pins its fields and is not
+        // `Drop`-pin-projected, so it is safe to project to the inner stream.
+        unsafe {
+            let this = self.get_unchecked_mut();
+            Pin::new_unchecked(&mut this.inner).poll_next(cx)
+        }
+    }
 }
 
 /// `POST /mcp` — accepts a JSON-RPC message for an SSE session and dispatches it.
@@ -394,4 +441,55 @@ async fn shutdown_signal() {
     }
 
     tracing::info!(event = "http_server_shutdown");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::sse::SseEvent;
+
+    /// Verifies the session is retained while the guard's stream is alive and
+    /// removed once the guard is dropped (client disconnect). This guards the
+    /// regression where a detached `tokio::spawn` removed the session before the
+    /// client ever used its endpoint.
+    #[tokio::test]
+    async fn session_guard_removes_session_on_drop_only() {
+        let registry = Arc::new(SessionRegistry::new());
+        let session = registry.create("/mcp").await;
+        let session_id = session.id.clone();
+        assert_eq!(registry.len().await, 1);
+
+        // A finite stream that yields one event then EOF.
+        let inner = tokio_stream::iter(vec![SseEvent::Endpoint("/mcp".to_string())]);
+        let guarded = SessionGuard {
+            inner,
+            registry: Arc::clone(&registry),
+            session_id: session_id.clone(),
+        };
+
+        // While the guard is alive (not dropped), the session must still exist.
+        let mut pinned = Box::pin(guarded);
+        let first = std::future::poll_fn(|cx| Pin::new(&mut pinned).poll_next(cx)).await;
+        assert!(first.is_some());
+        assert_eq!(
+            registry.len().await,
+            1,
+            "session must not be removed while alive"
+        );
+
+        // Drop the guard to simulate the client disconnecting.
+        drop(pinned);
+
+        // Removal is async; yield until the spawned cleanup task runs.
+        let mut attempts = 0;
+        while registry.len().await != 0 && attempts < 100 {
+            tokio::task::yield_now().await;
+            attempts += 1;
+        }
+        assert_eq!(
+            registry.len().await,
+            0,
+            "session must be removed after the guard is dropped"
+        );
+    }
 }
