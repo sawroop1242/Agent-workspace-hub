@@ -27,7 +27,7 @@ verified in this environment is marked **NOT VERIFIED**.
 | Audit | COMPLETE | Allow + deny events; subscriber-capture test |
 | Error handling | COMPLETE | Typed errors; single justified `expect` (static reqwest client; see below) |
 | Configuration | COMPLETE | Precedence defaults → env → CLI; injectable for tests |
-| Cross-platform CI | FIXED | Was BROKEN on macOS/Windows (E0432 re-export of Linux-only `wrap_command_with`); fixed by cfg-gating; 3-OS matrix is the control that caught it |
+| Cross-platform CI | COMPLETE | Run 33516714115 passed all 6 jobs on ubuntu/windows/macos; caught + fixed a real E0432 break |
 | Branch protection | PARTIAL | Runbook in security.md; manual application pending (API scope) |
 | Release engineering | PARTIAL | Workflow + version guard authored; first release not yet cut |
 | Documentation | COMPLETE | 9 required docs present and synced to behavior |
@@ -92,8 +92,9 @@ unconfined unsafe.
 ### CI & release — fixed cross-platform break; release authored, first run pending
 
 - `rust.yml`: fmt · build+test ×3 OS · clippy -D warnings · cargo audit.
-  Verified locally on Linux: 123 tests pass, clippy clean, 0 vulnerabilities
-  (2 transitive warnings: `rustls-pemfile` unmaintained, `chacha20` yanked).
+  **CI run 33516714115 (commit `c55af27`, branch `rust`) passed all 6 jobs**:
+  fmt, Build/test ×3 OS, clippy, vulnerability audit. This closes the
+  cross-platform verification gap for macOS and Windows.
 - **Cross-platform defect found via CI and fixed**: run 33497564337
   (`ce7b9f5`) failed `cargo check` on macOS and Windows with E0432 —
   `wrap_command_with` (a Linux-only function) was re-exported
@@ -116,10 +117,11 @@ documented that does not exist): `architecture.md`, `security.md`,
 ## Honest accounting of what is NOT done
 
 1. **macOS/Windows sandbox runtime verification** — TEST GAP (not MISSING):
-   the `sandbox-exec` (macOS) and Job Object (Windows) implementations exist
-   and compile, but no mac/Windows host was available to execute them; CI
-   builds on both platforms, runtime behavior there is unverified. Linux
-   bwrap is the fully tested path.
+   the `sandbox-exec` (macOS) and Job Object (Windows) implementations exist,
+   and CI run 33516714115 compiles and runs the test suite on both hosts;
+   but the platform-specific confinement paths are only exercised by
+   compile + generic tests there, not by dedicated runtime confinement
+   probes on those OSes. Linux `bwrap` is the fully tested path.
 2. **OpenCode / Codex vendor clients** — NOT VERIFIED. Reference SDK +
    official Inspector are verified proxies; vendor UX checks need accounts.
 3. **Branch protection on `rust`** — PENDING manual application (runbook in
@@ -140,16 +142,15 @@ documented that does not exist): `architecture.md`, `security.md`,
    Inspector over both transports.
 - **Test coverage**: 123 automated tests passing (81 unit + 42
   integration) + 16 interop harness checks.
-- **CI status**: 4 jobs authored and locally mirrored; GitHub-hosted run
-  triggered by the push containing this audit (evidence below).
+- **CI status**: 6 jobs authored; run 33516714115 on the pushed `rust` HEAD
+  passed all 6 on ubuntu, windows, and macos (evidence below).
 - **Documentation status**: complete and synchronized.
 - **Known limitations**: enumerated above (1–4).
 - **Remaining risks**: documented per-threat in `threat-model.md`.
 
 Percentage claims require a concrete checklist; on the 22-row matrix above:
-20 rows COMPLETE/FIXED or implemented-with-verification-comes-from-CI, 2
-PARTIAL-PENDING (branch protection, first release) → **≈90%**, with the
-remainder explicitly enumerated rather than hidden.
+20 COMPLETE rows, 2 PARTIAL-PENDING (branch protection, first release) →
+**≈90%**, with the remainder explicitly enumerated rather than hidden.
 
 ## Evidence appendix
 
