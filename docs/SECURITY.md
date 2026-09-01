@@ -146,3 +146,41 @@ All denied security decisions and circuit-breaker trips emit structured `tracing
 events with a stable `event` field (`mcp_security_denied`, `mcp_secret_denied`,
 `mcp_circuit_open`). Secret values are never included; only secret *names* and
 stable reason slugs are logged.
+
+Allow-side events are audited as well (`mcp_audit`), covering successful HTTP
+authentication, SSE session creation and destruction, every `tools/call`
+invocation (tool name only, never arguments), and external connector
+invocation (provider and tool name only).
+
+## Branch protection (manual configuration required)
+
+The production branch is **`rust`**. It must be protected so nothing reaches it
+without passing the required CI checks. The automation token available to the
+hardening workflow cannot call the branch-protection API (the
+`Administration: write` permission is not granted), so an administrator must
+configure the following **manually** under
+*Settings → Branches → Branch protection rules → Add rule → Branch name pattern:
+`rust`*:
+
+| Setting | Required value | Reason |
+| --- | --- | --- |
+| Require a pull request before merging | Enabled | No direct pushes to production |
+| Require approvals | 1 (or 2 for stricter policy) | Human review gate |
+| Dismiss stale pull request approvals | Enabled | Approvals do not survive new pushes |
+| Require review from code owners | Enabled, if `CODEOWNERS` present | Named accountable reviewers |
+| Require status checks to pass | Enabled | Blocks merges that fail CI |
+| Required checks | `fmt`, `build-test (ubuntu-latest)`, `build-test (macos-latest)`, `build-test (windows-latest)`, `clippy`, `audit` | The four jobs defined in `.github/workflows/rust.yml` |
+| Require branches to be up to date | Enabled | Merges must include the latest production code |
+| Require conversation resolution | Enabled | No silently dropped review threads |
+| Require signed commits | Recommended | Provenance of production code |
+| Require linear history | Recommended | Clean, revertible history |
+| Include administrators | Enabled | The rule applies to everyone |
+| Restrict force pushes / deletions | Both denied | Production history is immutable |
+
+The `audit` check fails the merge on any RUSTSEC vulnerability found in
+`Cargo.lock`; warning-level advisories (unmaintained/yanked transitive crates)
+are surfaced but do not block.
+
+Verification: after applying the rule, `GET /repos/{owner}/{repo}/branches/rust/protection`
+should return the settings above, and a direct push to `rust` should be rejected
+with *"Protected branch update failed"*.
