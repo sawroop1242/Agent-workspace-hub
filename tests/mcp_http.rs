@@ -123,6 +123,122 @@ async fn sse_requires_authentication() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// Sends a request with a raw `Authorization` header value (not auto-`Bearer`-wrapped).
+async fn send_raw_auth(
+    router: axum::Router,
+    method: &str,
+    uri: &str,
+    body: String,
+    authorization: &str,
+) -> StatusCode {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, authorization)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    response.status()
+}
+
+#[tokio::test]
+async fn rejects_non_bearer_and_malformed_bearer_headers() {
+    let (router, _) = harness("secret");
+    let body = "{}".to_string();
+
+    // Non-Bearer scheme.
+    assert_eq!(
+        send_raw_auth(
+            router.clone(),
+            "POST",
+            "/mcp?sessionId=x",
+            body.clone(),
+            "Basic abc"
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Bearer with no token.
+    assert_eq!(
+        send_raw_auth(
+            router.clone(),
+            "POST",
+            "/mcp?sessionId=x",
+            body.clone(),
+            "Bearer"
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Bearer with only whitespace.
+    assert_eq!(
+        send_raw_auth(
+            router.clone(),
+            "POST",
+            "/mcp?sessionId=x",
+            body.clone(),
+            "Bearer   "
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Empty token.
+    assert_eq!(
+        send_raw_auth(
+            router.clone(),
+            "POST",
+            "/mcp?sessionId=x",
+            body.clone(),
+            "Bearer "
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Very long token (length mismatch short-circuits constant-time compare).
+    let long_token = "a".repeat(10_000);
+    assert_eq!(
+        send_raw_auth(
+            router.clone(),
+            "POST",
+            "/mcp?sessionId=x",
+            body.clone(),
+            &format!("Bearer {long_token}"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn enforces_session_limit() {
+    let dir = tempdir().unwrap();
+    let dispatcher =
+        Arc::new(McpDispatcher::new(dir.path().to_path_buf()).expect("build dispatcher"));
+    let state = AppState {
+        dispatcher,
+        sessions: Arc::new(SessionRegistry::new()),
+        api_key: Arc::from("secret"),
+        max_sessions: 2,
+        sse_keepalive: Duration::from_secs(15),
+    };
+    let config = HttpServerConfig {
+        api_key: "secret".to_string(),
+        max_sessions: 2,
+        ..HttpServerConfig::default()
+    };
+    let router = build_router(state.clone(), &config);
+
+    // Two sessions established directly through the registry reach the cap.
+    state.sessions.create("/mcp").await;
+    state.sessions.create("/mcp").await;
+    assert_eq!(state.sessions.len().await, 2);
+
+    // A third `/sse` connection attempt must fail closed (503).
+    let (status, _) = send(router.clone(), "GET", "/sse", String::new(), Some("secret")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[tokio::test]
 async fn unknown_session_is_rejected() {
     let (router, _) = harness("secret");
