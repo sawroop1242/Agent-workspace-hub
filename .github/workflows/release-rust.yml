@@ -29,6 +29,18 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Version consistency (tag must match Cargo.toml)
+        run: |
+          set -euo pipefail
+          EXPECTED="v$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')"
+          INPUT="${{ github.event.inputs.version }}"
+          echo "Cargo.toml version: ${EXPECTED#v}"
+          echo "Requested tag:       ${INPUT#v}"
+          if [ "$EXPECTED" != "$INPUT" ]; then
+            echo "::error::Release tag $INPUT does not match Cargo.toml version $EXPECTED. Bump Cargo.toml first, then re-run."
+            exit 1
+          fi
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets
