@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -338,7 +338,13 @@ impl StdioMcpClient {
 
         let mut line = String::new();
         timeout(self.limits.mcp_request_timeout, async {
-            self.stdout.lock().await.read_line(&mut line).await
+            let limit = self.limits.max_mcp_line_bytes;
+            // Bound the read at the limit + 1 byte so a misbehaving server cannot
+            // grow the buffer unboundedly before the size check runs. Hitting the
+            // cap without a newline means the line exceeds the limit.
+            let mut stdout = self.stdout.lock().await;
+            let mut bounded = (&mut *stdout).take(limit as u64 + 1);
+            bounded.read_line(&mut line).await
         })
         .await
         .context("MCP request timed out")??;
@@ -510,4 +516,58 @@ fn jsonrpc_result(response: Value) -> Result<Value> {
         bail!("MCP error: {error}");
     }
     Ok(response.get("result").cloned().unwrap_or(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+
+    /// A reader that yields bytes exceeding the size limit with no newline,
+    /// simulating a misbehaving MCP server streaming an unbounded line.
+    struct GiganticLine {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl GiganticLine {
+        fn new(len: usize) -> Self {
+            Self {
+                data: vec![b'a'; len],
+                pos: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for GiganticLine {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return Poll::Ready(Ok(()));
+            }
+            let n = buf.remaining().min(self.data.len() - self.pos);
+            let chunk = &self.data[self.pos..self.pos + n];
+            buf.put_slice(chunk);
+            self.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Verifies the bounded-read strategy used by `StdioMcpClient::request`:
+    /// a misbehaving server emitting an over-limit line with no newline grows
+    /// the buffer by at most limit + 1 bytes before the size check rejects it.
+    #[tokio::test]
+    async fn oversized_line_read_is_bounded_by_limit() {
+        let limit = 64usize;
+        let reader = BufReader::new(GiganticLine::new(limit * 4));
+        let mut line = String::new();
+        let mut bounded = reader.take(limit as u64 + 1);
+        bounded.read_line(&mut line).await.unwrap();
+        assert_eq!(line.len(), limit + 1);
+    }
 }
