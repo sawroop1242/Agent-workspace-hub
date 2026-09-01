@@ -107,9 +107,9 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
         .with_context(|| format!("failed to bind {addr}"))?;
 
     // Never log the API key; only log the bind address and TLS status.
-    tracing::info!(event = "http_server_started", addr = %addr, tls = config.tls.enabled());
-
     let acceptor = config.tls.build_acceptor()?;
+
+    tracing::info!(event = "http_server_started", addr = %addr, tls = config.tls.enabled());
 
     match acceptor {
         Some(acceptor) => {
