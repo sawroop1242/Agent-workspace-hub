@@ -2,7 +2,15 @@
 
 ## Documentation
 
-- [Security policy and threat model](docs/SECURITY.md)
+- [Architecture](docs/architecture.md) — components, request flow, security layers
+- [Security policy and threat model](docs/security.md)
+- [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
+- [MCP integration](docs/mcp.md) — transports, 24 tools, interop evidence
+- [Configuration](docs/configuration.md) — every `AWH_*` variable and precedence
+- [Development guide](docs/development.md) — conventions, commands, PR process
+- [Testing guide](docs/testing.md) — suite map and regression policy
+- [Release engineering](docs/release.md) — artifacts, checksums, CI-gated process
+- [Completeness audit](docs/completeness-audit.md) — honest per-subsystem status
 - [Installation and upgrade guide](docs/INSTALL.md)
 - [Project status and implementation guide](docs/PROJECT_STATUS.md)
 - [Community MCP registry](docs/community-mcp-registry.md)
@@ -113,7 +121,7 @@ supplied via environment variables or CLI flags:
 
 Full details (TLS setup, authentication, firewall requirements, secure production
 deployment, troubleshooting) are in [docs/INSTALL.md](docs/INSTALL.md),
-[docs/SECURITY.md](docs/SECURITY.md), and [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
+[docs/security.md](docs/security.md), and [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
 | File / directory                        | Purpose                                              |
 | ------------------------------------------- | ---------------------------------------------------- |

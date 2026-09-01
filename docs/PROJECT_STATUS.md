@@ -217,7 +217,7 @@ Complete.
 | standardize structured errors with `thiserror` | Complete |
 | add `anyhow::Context` at application boundaries | Complete |
 | add Rustdoc to public APIs | Complete |
-| document security invariants | Complete — see `docs/SECURITY.md` |
+| document security invariants | Complete — see `docs/security.md` |
 
 ### Phase 3 — Testing
 
@@ -263,7 +263,7 @@ Complete.
 | zero Clippy warnings as a release gate | Complete — `cargo clippy --all-targets --all-features -- -D warnings` |
 | complete API/user documentation | Complete — Rustdoc on public APIs |
 | installation and upgrade guides | Complete — `docs/INSTALL.md` |
-| security policy and threat model | Complete — `docs/SECURITY.md` |
+| security policy and threat model | Complete — `docs/security.md` |
 | reproducible release validation | Complete — documented gates in CI + `docs/INSTALL.md` |
 | benchmark and latency/memory verification | Complete — `examples/bench.rs` (results below) |
 
@@ -450,7 +450,7 @@ not duplicated: stdio (`StdioMcpServer`) and HTTP/SSE (`build_router`) both call
 `McpDispatcher::dispatch`. Remote access is mandatory bearer-token authenticated
 (`AWH_API_KEY`), TLS is enabled with `AWH_TLS_CERT`/`AWH_TLS_KEY`, and request
 size, session, timeout, and SSE idle limits are enforced. See `README.md`,
-`docs/INSTALL.md`, and `docs/SECURITY.md` for configuration and deployment.
+`docs/INSTALL.md`, and `docs/security.md` for configuration and deployment.
 
 ## 12. Current conclusion
 

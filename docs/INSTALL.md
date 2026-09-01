@@ -39,7 +39,7 @@ These run in CI on `ubuntu-latest`, `macos-latest`, and `windows-latest`.
 ## Configuration
 
 Runtime resource limits are tuned through `AWH_*` environment variables. See
-[`SECURITY.md`](SECURITY.md) for the full list and precedence rules.
+[`docs/security.md`](security.md) for the full list and precedence rules.
 
 ## Remote MCP transport (HTTP/SSE/HTTPS)
 
