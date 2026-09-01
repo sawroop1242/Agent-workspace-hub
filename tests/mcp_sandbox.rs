@@ -1,6 +1,6 @@
-use agent_workspace_hub::mcp::{
-    wrap_command, wrap_command_with, McpPermissions, SandboxConfig, SandboxLimits,
-};
+#[cfg(target_os = "linux")]
+use agent_workspace_hub::mcp::wrap_command_with;
+use agent_workspace_hub::mcp::{wrap_command, McpPermissions, SandboxConfig, SandboxLimits};
 use std::path::PathBuf;
 
 fn permissions() -> McpPermissions {

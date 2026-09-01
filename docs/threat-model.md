@@ -48,9 +48,9 @@ session identifiers, headers, registry content, and external connector data.
 | **Asset** | Host filesystem outside the workspace |
 | **Attacker** | Malicious MCP client, malicious skill, or malicious project |
 | **Attack** | `workspace.read_file` with `../../etc/passwd`, absolute paths, symlinks, null bytes, Unicode tricks |
-| **Mitigation** | Project root must be absolute and existing; relative paths resolved against it; all file access goes through the centralized path validation; subprocess execution runs under `bwrap` with read-only bind mounts |
+| **Mitigation** | Project root must be absolute and existing; relative paths resolved against it; all file access goes through the centralized path validation; subprocess execution is confined per platform: `bwrap` (Linux), `sandbox-exec` seatbelt profile (macOS), Job Object limits (Windows); any other platform refuses to run unsandboxed |
 | **Test** | `tests/mcp_sandbox.rs`: relative project root rejected; sandbox requires absolute existing root; relative filesystem paths rejected; fails closed without `bwrap` |
-| **Residual risk** | Platforms without `bwrap` cannot run sandboxed execution at all (fail-closed — no code runs, but the capability is absent rather than degraded). Symlink-time-of-check windows inside the project directory are narrowed by canonicalization but not provably zero on all filesystems |
+| **Residual risk** | The macOS (`sandbox-exec`) and Windows (Job Object) confinement paths are implemented and CI-compiled but not runtime-verified on those hosts; Linux `bwrap` is the fully tested path. Symlink-time-of-check windows inside the project directory are narrowed by canonicalization but not provably zero on all filesystems |
 
 ## T4 — Credential theft
 

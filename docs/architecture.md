@@ -99,9 +99,10 @@ StdioMcpServer ─────────────┬──── HTTP serve
    methods return deterministic JSON-RPC error codes, never panics.
 5. **Execution gate** — permission, trust, approval, and resource-limit
    checks run centrally. A tool implementation cannot opt out.
-6. **Sandbox** — subprocess execution runs under `bwrap` with
-   read-only bind mounts of the project root and resource caps
-   (CPU, memory, wall clock, output size).
+6. **Sandbox** — subprocess execution is confined per platform: `bwrap`
+   (Linux, the fully tested path), `sandbox-exec` seatbelt profile (macOS),
+   Job Object limits (Windows); unsupported platforms refuse unsandboxed
+   execution. Resource caps: CPU, memory, wall clock, output size.
 7. **Sanitization** — responses pass through secret redaction before
    reaching the client.
 8. **Audit** — every invoke (allowed) and every denial is emitted as a
