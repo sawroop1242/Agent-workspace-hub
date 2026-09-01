@@ -86,7 +86,8 @@ impl ResourceLimits {
             out.http_client_timeout = Duration::from_secs(v as u64);
         }
         if let Some(v) = opt_value(&lookup, "AWH_CIRCUIT_FAILURE_THRESHOLD")? {
-            out.circuit_failure_threshold = v as u32;
+            out.circuit_failure_threshold = u32::try_from(v)
+                .map_err(|_| anyhow::anyhow!("AWH_CIRCUIT_FAILURE_THRESHOLD out of range: {v}"))?;
         }
         if let Some(v) = opt_value(&lookup, "AWH_CIRCUIT_COOLDOWN_SECS")? {
             out.circuit_cooldown = Duration::from_secs(v as u64);
@@ -182,5 +183,15 @@ mod tests {
             .with_overrides_from(lookup(&vars))
             .unwrap();
         assert_eq!(resolved, ResourceLimits::default());
+    }
+
+    #[test]
+    fn out_of_range_threshold_is_rejected_not_silently_truncated() {
+        let mut vars = HashMap::new();
+        vars.insert("AWH_CIRCUIT_FAILURE_THRESHOLD", "4294967296"); // 2^32
+        let resolved = ResourceLimits::default().with_overrides_from(lookup(&vars));
+        // A value exceeding u32 must surface as an error rather than wrapping
+        // to a silently tiny threshold.
+        assert!(resolved.is_err());
     }
 }
