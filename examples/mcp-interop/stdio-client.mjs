@@ -27,6 +27,9 @@ try {
   const transport = new StdioClientTransport({
     command: AWH,
     args: ["mcp", "serve"],
+    // Run in a scratch cwd so the server cannot write runtime state
+    // (.agent/, memory) into this repo checkout.
+    cwd: HOME,
     env: { ...process.env, HOME },
   });
   await client.connect(transport);

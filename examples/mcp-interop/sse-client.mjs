@@ -50,6 +50,9 @@ function fail(step, err) {
 
 // --- start the server -----------------------------------------------------
 const server = spawn(AWH, ["mcp", "serve", "--transport", "sse", "--port", String(PORT)], {
+  // Scratch cwd so the server cannot write runtime state (.agent/, memory)
+  // into this repo checkout.
+  cwd: HOME,
   env: {
     ...process.env,
     HOME,
