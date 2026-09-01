@@ -44,12 +44,17 @@ impl TlsConfig {
     }
 
     /// Builds a [`TlsAcceptor`] from the configured certificate and key.
+    ///
+    /// Returns `Ok(None)` when TLS is fully unconfigured. A half-configured
+    /// state (cert without key or vice versa) is a typed error, mirroring
+    /// [`TlsConfig::validate`], rather than silently treating TLS as off.
     pub fn build_acceptor(&self) -> Result<Option<TlsAcceptor>> {
-        if !self.enabled() {
-            return Ok(None);
-        }
-        let cert_path = self.cert.as_deref().expect("enabled implies cert present");
-        let key_path = self.key.as_deref().expect("enabled implies key present");
+        let (Some(cert_path), Some(key_path)) = (self.cert.as_deref(), self.key.as_deref()) else {
+            if self.cert.is_none() && self.key.is_none() {
+                return Ok(None);
+            }
+            bail!("TLS enabled with incomplete certificate/key configuration");
+        };
 
         ensure_regular_files(cert_path, key_path)?;
 
@@ -144,6 +149,37 @@ mod tests {
         let missing = dir.path().join("nope.pem").to_string_lossy().to_string();
         assert!(load_certs(&missing).is_err());
         assert!(load_key(&missing).is_err());
+    }
+
+    #[test]
+    fn half_configured_acceptor_fails_with_typed_error_not_panic() {
+        // Half-configured TLS (cert without key or vice versa) must produce a
+        // typed error, never a panic and never a silent "TLS off" acceptor.
+        // Regression: this path previously relied on `expect` + `enabled()`
+        // coupling, or worse, silently returned Ok(None).
+        for config in [
+            TlsConfig {
+                cert: Some("cert.pem".into()),
+                key: None,
+            },
+            TlsConfig {
+                cert: None,
+                key: Some("key.pem".into()),
+            },
+        ] {
+            let result = std::panic::catch_unwind(|| config.build_acceptor());
+            assert!(
+                result.is_ok_and(|r| r.is_err()),
+                "half-configured TLS must fail with a typed error, not panic or return Ok(None)"
+            );
+        }
+
+        // Fully unconfigured still yields Ok(None) (TLS off).
+        let off = TlsConfig {
+            cert: None,
+            key: None,
+        };
+        assert!(off.build_acceptor().unwrap().is_none());
     }
 
     #[test]

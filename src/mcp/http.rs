@@ -9,11 +9,11 @@
 //! size/time/connection limits, and exposes no secrets or internal paths in
 //! error responses.
 
-use crate::mcp::audit_deny;
 use crate::mcp::auth;
 use crate::mcp::dispatcher::{DispatchResult, McpDispatcher};
 use crate::mcp::sse::{SessionRegistry, SseEvent};
 use crate::mcp::tls::TlsConfig;
+use crate::mcp::{audit_allow, audit_deny};
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -236,7 +236,10 @@ async fn authenticate(
         .and_then(|s| auth::bearer_token(Some(s)));
 
     match token {
-        Some(t) if auth::verify_token(&state.api_key, t) => next.run(request).await,
+        Some(t) if auth::verify_token(&state.api_key, t) => {
+            audit_allow("http_auth", "remote", "success");
+            next.run(request).await
+        }
         _ => {
             audit_deny("http_auth", "invalid_or_missing_token", "remote");
             (

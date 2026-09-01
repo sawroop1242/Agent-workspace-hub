@@ -6,10 +6,10 @@
 //! through [`McpDispatcher`] so the tool implementations are never duplicated.
 
 use crate::mcp::{
-    audit_deny, authorize_mcp_execution, AuthMethod, CircuitBreakerConfig, CircuitBreakerMcpClient,
-    ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
-    CustomMcpServerConfig, McpExecutionRequest, McpTransport, MemoryMcp, MemoryScope,
-    PersistentTrustStore, ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient,
+    audit_allow, audit_deny, authorize_mcp_execution, AuthMethod, CircuitBreakerConfig,
+    CircuitBreakerMcpClient, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider,
+    CustomMcpRegistry, CustomMcpServerConfig, McpExecutionRequest, McpTransport, MemoryMcp,
+    MemoryScope, PersistentTrustStore, ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient,
     StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
 use anyhow::Result;
@@ -345,6 +345,10 @@ impl McpDispatcher {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        // Audit every tool invocation by name only. Arguments are deliberately
+        // never logged: they may contain file contents or secret material.
+        audit_allow("tool_invoke", name, "tools/call");
+
         let value = match name {
             "skills.list" => serde_json::to_value(self.skills.list()?)?,
             "skills.read" => serde_json::to_value(
@@ -526,6 +530,9 @@ impl McpDispatcher {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                // External connector invocations are security-relevant: log the
+                // provider and tool (never the arguments, which may hold secrets).
+                audit_allow("connector_invoke", provider, tool);
                 let registry = self.providers.read().await;
                 serde_json::to_value(registry.invoke(provider, tool, args).await?)?
             }

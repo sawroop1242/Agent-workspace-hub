@@ -78,6 +78,7 @@ impl SessionRegistry {
             tx,
         };
         self.sessions.lock().await.insert(id, session.clone());
+        crate::mcp::audit_allow("session_create", &session.id, endpoint_path);
         session
     }
 
@@ -88,7 +89,10 @@ impl SessionRegistry {
 
     /// Removes and drops a session (on disconnect or shutdown).
     pub async fn remove(&self, id: &str) {
-        self.sessions.lock().await.remove(id);
+        let existed = self.sessions.lock().await.remove(id).is_some();
+        if existed {
+            crate::mcp::audit_allow("session_destroy", id, "disconnect");
+        }
     }
 
     /// Returns the number of active sessions (used by shutdown and limits).
