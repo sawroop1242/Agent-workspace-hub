@@ -30,6 +30,17 @@ pub struct DashboardSnapshot {
     pub dirty_entries: usize,
     /// Non-fatal problems surfaced as warnings on the dashboard.
     pub warnings: Vec<String>,
+    /// Project the operator last opened, when any.
+    pub current_project: Option<String>,
+    /// One-shot terminal runs are not sessions; interactive session
+    /// support would track live processes here.
+    pub running_sessions: usize,
+    /// MCP plane state as seen from this client.
+    pub mcp_status: String,
+    /// Control API plane state as seen from this client.
+    pub api_status: String,
+    /// Recent security-relevant events, newest first (spec section 7).
+    pub recent_activity: Vec<String>,
 }
 
 /// Backend operations available to every TUI screen.
@@ -39,6 +50,8 @@ pub trait WorkspaceBackend {
     fn list_projects(&self) -> Result<Vec<String>>;
     fn create_project(&self, name: &str) -> Result<()>;
     fn delete_project(&self, name: &str) -> Result<()>;
+    /// Focuses a project as the operator's current context (spec 7).
+    fn open_project(&mut self, name: &str) -> Result<()>;
 
     fn list_dir(&self, relative: &str) -> Result<Vec<ListEntry>>;
     fn read_file(&self, relative: &str) -> Result<String>;
@@ -66,11 +79,14 @@ pub trait WorkspaceBackend {
 pub struct LocalBackend {
     root: PathBuf,
     runtime: tokio::runtime::Runtime,
+    /// Project the operator last opened, surfaced on the dashboard.
+    current_project: Option<String>,
 }
 
 impl LocalBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
+            current_project: None,
             root: root.into(),
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -82,6 +98,11 @@ impl LocalBackend {
     /// Absolute workspace root this backend operates on.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Records the project the operator opened, for the dashboard.
+    pub fn set_current_project(&mut self, name: &str) {
+        self.current_project = Some(name.to_owned());
     }
 }
 
@@ -111,6 +132,15 @@ impl WorkspaceBackend for LocalBackend {
             branch,
             dirty_entries,
             warnings: Vec::new(),
+            current_project: self.current_project.clone(),
+            running_sessions: 0,
+            mcp_status: "separate process: awh mcp serve".to_string(),
+            api_status: "separate process: awh serve".to_string(),
+            recent_activity: crate::services::audit::global()
+                .recent(5)
+                .into_iter()
+                .map(|e| format!("{} {} {} ({})", e.kind, e.action, e.subject, e.detail))
+                .collect(),
         })
     }
 
@@ -124,6 +154,7 @@ impl WorkspaceBackend for LocalBackend {
     fn create_project(&self, name: &str) -> Result<()> {
         crate::services::projects::validate_project_name(name)?;
         crate::core::workspace::Workspace::new(&self.root).create_project(name)?;
+        crate::services::audit::record_allow("tui_project_create", name, "operator");
         Ok(())
     }
 
@@ -134,6 +165,17 @@ impl WorkspaceBackend for LocalBackend {
             anyhow::bail!("project not found: {name}");
         }
         std::fs::remove_dir_all(path)?;
+        crate::services::audit::record_allow("tui_project_delete", name, "operator");
+        Ok(())
+    }
+
+    fn open_project(&mut self, name: &str) -> Result<()> {
+        crate::services::projects::validate_project_name(name)?;
+        let path = crate::core::workspace::Workspace::new(&self.root).project_path(name);
+        if !path.is_dir() {
+            anyhow::bail!("project not found: {name}");
+        }
+        self.set_current_project(name);
         Ok(())
     }
 
@@ -190,7 +232,13 @@ impl WorkspaceBackend for LocalBackend {
 
     fn git_commit(&self, message: &str) -> Result<GitOutput> {
         let git = crate::services::git::GitService::open(&self.root)?;
-        self.runtime.block_on(git.commit(message))
+        let out = self.runtime.block_on(git.commit(message))?;
+        crate::services::audit::record_allow(
+            "tui_git_commit",
+            "operator",
+            &truncate_detail(message, 60),
+        );
+        Ok(out)
     }
 
     fn git_stage(&self, path: &str) -> Result<GitOutput> {
@@ -214,7 +262,31 @@ impl WorkspaceBackend for LocalBackend {
 
     fn terminal_run(&self, program: &str, args: &[String]) -> Result<ExecOutcome> {
         let terminal = crate::services::terminal::TerminalService::new(&self.root);
-        self.runtime.block_on(terminal.run(program, args))
+        let outcome = self.runtime.block_on(terminal.run(program, args))?;
+        // Spec 22: terminal execution is high-risk; record program name
+        // and exit status, never args (they can carry secrets).
+        crate::services::audit::record_allow(
+            "tui_terminal_run",
+            program,
+            &format!(
+                "exit={}",
+                outcome
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "timeout".into())
+            ),
+        );
+        Ok(outcome)
+    }
+}
+
+/// Truncates free-form audit detail on a char boundary.
+fn truncate_detail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let cut: String = s.chars().take(max - 1).collect();
+        format!("{cut}\u{2026}")
     }
 }
 
@@ -230,6 +302,56 @@ mod tests {
         assert_eq!(snap.root, tmp.path().canonicalize().unwrap());
         assert_eq!(snap.project_count, 0);
         assert!(!snap.is_git_repo);
+        assert_eq!(snap.current_project, None);
+        assert_eq!(snap.running_sessions, 0);
+        assert!(!snap.mcp_status.is_empty());
+        assert!(!snap.api_status.is_empty());
+    }
+
+    #[test]
+    fn open_project_records_current_project_and_errors_on_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut backend = LocalBackend::new(tmp.path().to_path_buf());
+        backend.create_project("alpha").unwrap();
+        backend.open_project("alpha").unwrap();
+        assert_eq!(
+            backend.dashboard().unwrap().current_project.as_deref(),
+            Some("alpha")
+        );
+        assert!(backend.open_project("ghost").is_err());
+        assert_eq!(
+            backend.dashboard().unwrap().current_project.as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn dashboard_surfaces_recent_audit_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(tmp.path().to_path_buf());
+        backend.terminal_run("true", &[]).unwrap();
+        let snap = backend.dashboard().unwrap();
+        assert!(snap
+            .recent_activity
+            .iter()
+            .any(|a| a.contains("tui_terminal_run")));
+    }
+
+    #[test]
+    fn terminal_run_records_audit_event_without_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(tmp.path().to_path_buf());
+        backend
+            .terminal_run("echo", &["hush-secret-value".to_string()])
+            .unwrap();
+        let recent = crate::services::audit::global().recent(20);
+        let entry = recent
+            .iter()
+            .find(|e| e.action == "tui_terminal_run")
+            .expect("terminal run audited");
+        assert_eq!(entry.subject, "echo");
+        assert!(!entry.detail.contains("hush-secret-value"));
+        assert!(!format!("{entry:?}").contains("hush-secret-value"));
     }
 
     #[test]

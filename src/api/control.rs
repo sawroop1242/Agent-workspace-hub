@@ -224,10 +224,15 @@ async fn create_project(
     State(state): State<Arc<ControlState>>,
     Json(body): Json<CreateProjectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .projects()
-        .create(&body.name)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    match state.projects().create(&body.name) {
+        Ok(_) => {
+            audit_allow("api_project_create", &body.name, "remote");
+        }
+        Err(e) => {
+            audit_deny("api_project_create", "rejected", &body.name);
+            return Err(ApiError::bad_request(format!("{e:#}")));
+        }
+    }
     Ok(Json(json!({"created": body.name})))
 }
 
@@ -255,12 +260,14 @@ async fn delete_project(
         .list()
         .map_err(|e| ApiError::internal(&e))?;
     if !projects.iter().any(|p| p.name == name) {
+        audit_deny("api_project_delete", "not_found", &name);
         return Err(ApiError::not_found("project"));
     }
     state
         .projects()
         .delete(&name)
         .map_err(|e| ApiError::internal(&e))?;
+    audit_allow("api_project_delete", &name, "remote");
     Ok(Json(json!({"deleted": name})))
 }
 
@@ -486,6 +493,7 @@ async fn git_commit(
     Json(body): Json<CommitBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if body.message.trim().is_empty() {
+        audit_deny("api_git_commit", "empty_message", "remote");
         return Err(ApiError::bad_request("commit message cannot be empty"));
     }
     let git = open_repo(&state)?;
@@ -493,6 +501,11 @@ async fn git_commit(
         .commit(&body.message)
         .await
         .map_err(|e| ApiError::internal(&e))?;
+    audit_allow(
+        "api_git_commit",
+        "remote",
+        &truncate_detail(&body.message, 60),
+    );
     Ok(Json(
         serde_json::to_value(out).unwrap_or_else(|_| json!({})),
     ))
@@ -512,16 +525,42 @@ async fn run_command(
     Json(body): Json<RunBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if body.program.trim().is_empty() {
+        audit_deny("api_terminal_run", "empty_program", "remote");
         return Err(ApiError::bad_request("program is required"));
     }
     let terminal = TerminalService::new(&state.root);
-    let outcome = terminal
-        .run(&body.program, &body.args)
-        .await
-        .map_err(|e| ApiError::internal(&e))?;
+    let outcome = terminal.run(&body.program, &body.args).await.map_err(|e| {
+        audit_deny("api_terminal_run", "spawn_failed", &body.program);
+        ApiError::internal(&e)
+    })?;
+    // Spec 22: terminal execution is high-risk and must be auditable.
+    // The program name is the subject; exit status is the detail. Args
+    // are deliberately omitted — they can carry secrets.
+    audit_allow(
+        "api_terminal_run",
+        &body.program,
+        &format!(
+            "exit={}{}",
+            outcome
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "timeout".into()),
+            if outcome.truncated { " truncated" } else { "" }
+        ),
+    );
     Ok(Json(
         serde_json::to_value(outcome).unwrap_or_else(|_| json!({})),
     ))
+}
+
+/// Truncates free-form audit detail on a char boundary.
+fn truncate_detail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let cut: String = s.chars().take(max - 1).collect();
+        format!("{cut}\u{2026}")
+    }
 }
 
 // ----- Skills & MCP (read-only listings) -----
@@ -851,5 +890,88 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v["entries"].as_array().unwrap().len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn terminal_run_records_high_risk_audit_event_without_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+        let res = app
+            .oneshot(post_json(
+                "/api/v1/terminal/run",
+                Some("test-key"),
+                json!({"program": "echo", "args": ["leak-attempt-xyz"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let recent = crate::services::audit::global().recent(50);
+        let entry = recent
+            .iter()
+            .find(|e| e.action == "api_terminal_run")
+            .expect("terminal run audited");
+        assert_eq!(entry.subject, "echo");
+        assert!(entry.detail.starts_with("exit="));
+        // Arguments are deliberately never recorded.
+        assert!(!format!("{entry:?}").contains("leak-attempt-xyz"));
+    }
+
+    #[tokio::test]
+    async fn terminal_run_denials_are_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+        let res = app
+            .oneshot(post_json(
+                "/api/v1/terminal/run",
+                Some("test-key"),
+                json!({"program": "   ", "args": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(50);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_terminal_run" && e.kind == "deny" && e.detail == "empty_program"
+        }));
+    }
+
+    #[tokio::test]
+    async fn project_create_and_delete_are_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+        let app = {
+            let res = app
+                .oneshot(post_json(
+                    "/api/v1/projects",
+                    Some("test-key"),
+                    json!({"name": "audited-proj"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            build_router(state(tmp.path()))
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/projects/audited-proj")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let recent = crate::services::audit::global().recent(50);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_project_create" && e.subject == "audited-proj"));
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_project_delete" && e.subject == "audited-proj"));
     }
 }

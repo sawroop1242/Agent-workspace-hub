@@ -7,9 +7,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use std::time::Duration;
 
-use super::backend::WorkspaceBackend;
+use super::backend::{DashboardSnapshot, WorkspaceBackend};
 use super::screens::{self, ScreenId, ScreenState, SCREENS};
+
+/// How long a Dashboard snapshot stays fresh before the bounded
+/// refresh recomputes it (spec section 7: no expensive continuous
+/// polling — the git subprocess calls run at most once per TTL).
+const DASHBOARD_TTL: Duration = Duration::from_secs(2);
 
 /// A concrete action the user asked the UI to perform. Destructive
 /// actions wait for modal confirmation before `execute` runs them.
@@ -67,6 +73,9 @@ pub struct App<B: WorkspaceBackend> {
     pub message: Option<String>,
     /// Per-screen UI state (selections, listings).
     pub ui: ScreenState,
+    /// Bounded-refresh cache for the Dashboard (spec section 7).
+    dashboard_cache: Option<DashboardSnapshot>,
+    dashboard_fresh_until: Option<std::time::Instant>,
     quit: bool,
 }
 
@@ -80,6 +89,8 @@ impl<B: WorkspaceBackend> App<B> {
             error: None,
             message: None,
             ui: ScreenState::default(),
+            dashboard_cache: None,
+            dashboard_fresh_until: None,
             quit: false,
         }
     }
@@ -98,6 +109,27 @@ impl<B: WorkspaceBackend> App<B> {
 
     pub fn set_error(&mut self, error: impl Into<String>) {
         self.error = Some(error.into());
+    }
+
+    /// Dashboard snapshot with bounded refresh: recomputes only after
+    /// the TTL elapses (or after [`Self::invalidate_dashboard`]), so
+    /// redrawing never triggers repeated git subprocess calls.
+    pub fn dashboard_cached(&mut self) -> DashboardSnapshot {
+        let fresh = self
+            .dashboard_fresh_until
+            .is_some_and(|t| std::time::Instant::now() < t);
+        if !fresh {
+            if let Ok(snap) = self.backend.dashboard() {
+                self.dashboard_cache = Some(snap);
+                self.dashboard_fresh_until = Some(std::time::Instant::now() + DASHBOARD_TTL);
+            }
+        }
+        self.dashboard_cache.clone().unwrap_or_default()
+    }
+
+    /// Forces the next [`Self::dashboard_cached`] to recompute.
+    pub fn invalidate_dashboard(&mut self) {
+        self.dashboard_fresh_until = None;
     }
 
     /// Requests an action. Destructive actions are held until the user
@@ -151,7 +183,12 @@ impl<B: WorkspaceBackend> App<B> {
             ActionKind::DiscardChanges(_) => unreachable!("handled above"),
         };
         match result {
-            Ok(()) => self.set_message(format!("done: {}", kind.describe())),
+            Ok(()) => {
+                // Workspace shape changed; the Dashboard must not serve
+                // a stale project count.
+                self.invalidate_dashboard();
+                self.set_message(format!("done: {}", kind.describe()));
+            }
             Err(e) => self.set_error(format!("{}: {e:#}", kind.describe())),
         }
     }
@@ -464,5 +501,54 @@ mod tests {
         key.modifiers = KeyModifiers::CONTROL;
         handle_key(&mut app, key);
         assert!(app.quit());
+    }
+
+    #[test]
+    fn dashboard_cache_serves_within_ttl_and_refreshes_after_expiry() {
+        let mut app = test_app();
+        let first = app.dashboard_cached();
+        assert_eq!(first.project_count, 0);
+
+        // Within the TTL the cached snapshot is served unchanged.
+        app.backend.create_project("alpha").unwrap();
+        let cached = app.dashboard_cached();
+        assert_eq!(cached.project_count, 0);
+
+        // Manual invalidation (the 'r' key path) forces a recompute.
+        app.invalidate_dashboard();
+        let fresh = app.dashboard_cached();
+        assert_eq!(fresh.project_count, 1);
+    }
+
+    #[test]
+    fn dashboard_refresh_key_invalidates_cache() {
+        let mut app = test_app();
+        app.dashboard_cached();
+        app.backend.create_project("alpha").unwrap();
+        // 'r' on the Dashboard screen must trigger a recompute.
+        super::super::screens::handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')));
+        assert_eq!(app.dashboard_cached().project_count, 1);
+        assert_eq!(app.message.as_deref(), Some("refreshed"));
+    }
+
+    #[test]
+    fn dashboard_invalidated_after_confirmed_deletion() {
+        let mut app = test_app();
+        app.backend.create_project("alpha").unwrap();
+        app.dashboard_cached();
+        app.request_action(ActionKind::DeleteProject("alpha".into()));
+        app.confirm_pending();
+        assert_eq!(app.dashboard_cached().project_count, 0);
+    }
+
+    #[test]
+    fn open_project_on_backend_tracks_current_context() {
+        let mut app = test_app();
+        app.backend.create_project("alpha").unwrap();
+        app.backend.open_project("alpha").unwrap();
+        assert_eq!(
+            app.dashboard_cached().current_project.as_deref(),
+            Some("alpha")
+        );
     }
 }

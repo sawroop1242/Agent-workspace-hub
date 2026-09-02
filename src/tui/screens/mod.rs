@@ -7,16 +7,17 @@
 pub mod editor;
 pub mod files;
 pub mod git;
+pub mod logs;
 pub mod projects;
 pub mod terminal;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::app::App;
-use super::backend::{DashboardSnapshot, WorkspaceBackend};
+use super::backend::WorkspaceBackend;
 
 /// All navigable screens, in tab-ring order (spec Section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +130,8 @@ pub struct ScreenState {
     pub editor_ui: editor::EditorUi,
     pub git_ui: git::GitUi,
     pub terminal_ui: terminal::TerminalUi,
+    /// Bounded view over the shared audit ring for the Logs screen.
+    pub logs: Vec<crate::services::audit::AuditEntry>,
     /// Content produced by a DiscardChanges action, adopted by the
     /// Editor screen on its next draw.
     pub reload_content: Option<(String, String)>,
@@ -142,12 +145,23 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: crossterm::event::
         return;
     }
     match app.screen() {
+        ScreenId::Dashboard => dashboard_key(app, key),
         ScreenId::Projects => projects::handle_key(app, key),
         ScreenId::Files => files::handle_key(app, key),
         ScreenId::Editor => editor::handle_key(app, key),
         ScreenId::Git => git::handle_key(app, key),
         ScreenId::Terminal => terminal::handle_key(app, key),
+        ScreenId::Logs => logs::handle_key(app, key),
         _ => {}
+    }
+}
+
+/// Dashboard keys: only `r` (manual refresh) — the snapshot is
+/// otherwise refreshed on the bounded TTL.
+fn dashboard_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    if key.code == KeyCode::Char('r') {
+        app.invalidate_dashboard();
+        app.set_message("refreshed");
     }
 }
 
@@ -171,6 +185,7 @@ pub fn draw<B: WorkspaceBackend>(frame: &mut ratatui::Frame, app: &mut App<B>, a
         ScreenId::Editor => editor::draw(frame, app, area, block),
         ScreenId::Git => git::draw(frame, app, area, block),
         ScreenId::Terminal => terminal::draw(frame, app, area, block),
+        ScreenId::Logs => logs::draw(frame, app, area, block),
         ScreenId::Help => draw_help(frame, area, block),
         _ => draw_placeholder(frame, app, area, block),
     }
@@ -182,9 +197,16 @@ fn draw_dashboard<B: WorkspaceBackend>(
     area: Rect,
     block: Block<'_>,
 ) {
-    let snapshot: DashboardSnapshot = app.backend.dashboard().unwrap_or_default();
+    let snapshot = app.dashboard_cached();
     let mut lines = vec![
         row("Workspace", snapshot.root.display().to_string()),
+        row(
+            "Project",
+            snapshot
+                .current_project
+                .clone()
+                .unwrap_or_else(|| "none selected".to_string()),
+        ),
         row("Projects", snapshot.project_count.to_string()),
         row("Connection", "local".to_string()),
         row(
@@ -199,15 +221,52 @@ fn draw_dashboard<B: WorkspaceBackend>(
                 "not a repository".to_string()
             },
         ),
-        row("MCP server", "not running (use awh mcp serve)".to_string()),
+        row("Sessions", snapshot.running_sessions.to_string()),
+        row("MCP plane", snapshot.mcp_status.clone()),
+        row("Control API", snapshot.api_status.clone()),
     ];
     if !snapshot.warnings.is_empty() {
-        lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-            format!("warnings: {}", snapshot.warnings.join("; ")),
-            Style::default().fg(Color::Yellow),
-        )));
+        lines.push(ratatui::text::Line::from(""));
+        for w in &snapshot.warnings {
+            lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!("warning: {w}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
     }
+    lines.push(ratatui::text::Line::from(""));
+    lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+        "Recent activity",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if snapshot.recent_activity.is_empty() {
+        lines.push(ratatui::text::Line::from(
+            "no security-relevant events recorded this session",
+        ));
+    } else {
+        for entry in &snapshot.recent_activity {
+            lines.push(ratatui::text::Line::from(format!("  {entry}")));
+        }
+    }
+    hint_line(
+        frame,
+        inner(area),
+        "[r] refresh  [Tab] next screen  [F1] help",
+    );
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Shrinks a border by one cell on each side, for hint placement that
+/// does not collide with the bordered content.
+fn inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
 }
 
 fn row<'a>(label: &str, value: String) -> ratatui::text::Line<'a> {

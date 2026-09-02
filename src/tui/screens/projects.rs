@@ -61,6 +61,10 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
             let Some(name) = selected_project(app) else {
                 return;
             };
+            if let Err(e) = app.backend.open_project(&name) {
+                app.set_error(format!("open project: {e:#}"));
+                return;
+            }
             app.ui.files_ui.cwd = name;
             app.goto(crate::tui::screens::ScreenId::Files);
         }
