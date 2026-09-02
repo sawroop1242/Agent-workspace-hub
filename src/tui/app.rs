@@ -1,5 +1,6 @@
 //! TUI application state and event loop.
 
+use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,15 +11,46 @@ use ratatui::Frame;
 use super::backend::WorkspaceBackend;
 use super::screens::{self, ScreenId, ScreenState, SCREENS};
 
-/// One interactive UI action in a screens' local queue.
+/// A concrete action the user asked the UI to perform. Destructive
+/// actions wait for modal confirmation before `execute` runs them.
+#[derive(Debug, Clone)]
+pub enum ActionKind {
+    DeleteProject(String),
+    DeletePath(String),
+    /// Discard unsaved editor changes for the given path.
+    DiscardChanges(String),
+}
+
+impl ActionKind {
+    pub fn destructive(&self) -> bool {
+        matches!(
+            self,
+            ActionKind::DeleteProject(_)
+                | ActionKind::DeletePath(_)
+                | ActionKind::DiscardChanges(_)
+        )
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            ActionKind::DeleteProject(name) => format!("delete project {name:?} and all its files"),
+            ActionKind::DeletePath(path) => format!("delete {path:?}"),
+            ActionKind::DiscardChanges(path) => format!("discard unsaved changes to {path:?}"),
+        }
+    }
+}
+
+/// One pending UI action awaiting (non-destructive) or bypassing
+/// (non-destructive) modal confirmation.
 #[derive(Debug, Clone)]
 pub struct PendingAction {
-    /// Short machine-readable action id, e.g. `confirm-delete`.
-    pub id: &'static str,
-    /// Human description shown in the confirmation bar.
-    pub description: String,
-    /// True when the action is destructive and needs an explicit `y`.
-    pub destructive: bool,
+    pub kind: ActionKind,
+}
+
+impl From<ActionKind> for PendingAction {
+    fn from(kind: ActionKind) -> Self {
+        Self { kind }
+    }
 }
 
 /// Top-level application state shared by all screens.
@@ -68,25 +100,60 @@ impl<B: WorkspaceBackend> App<B> {
         self.error = Some(error.into());
     }
 
-    /// Requests confirmation for an action; non-destructive actions run
-    /// immediately.
-    pub fn request_action(&mut self, action: PendingAction) {
-        if action.destructive {
+    /// Requests an action. Destructive actions are held until the user
+    /// confirms the modal; non-destructive ones execute immediately.
+    pub fn request_action(&mut self, kind: ActionKind) {
+        let action = PendingAction { kind };
+        if action.kind.destructive() {
             self.confirm = Some(action);
         } else {
-            self.set_message(format!("{}: done", action.description));
+            self.execute(action.kind);
         }
     }
 
-    /// Confirms the pending action by running its continuation.
+    /// Confirms the pending destructive action and executes it.
     pub fn confirm_pending(&mut self) {
         if let Some(action) = self.confirm.take() {
-            self.set_message(format!("confirmed: {}", action.description));
+            self.execute(action.kind);
         }
     }
 
     pub fn cancel_pending(&mut self) {
         self.confirm = None;
+    }
+
+    /// Runs an action against the backend and records the outcome in
+    /// the message/error bars. A discarded editor buffer is stashed in
+    /// `reload_content` so the Editor screen can adopt it on its next
+    /// draw.
+    fn execute(&mut self, kind: ActionKind) {
+        // DiscardChanges is UI-local: reload the editor buffer through
+        // the backend and stash it for the Editor screen to adopt.
+        if let ActionKind::DiscardChanges(path) = &kind {
+            match self.backend.read_file(path) {
+                Ok(fresh) => {
+                    self.ui.reload_content = Some((path.clone(), fresh));
+                    self.set_message(format!("done: {}", kind.describe()));
+                }
+                Err(e) => self.set_error(format!("{}: {e:#}", kind.describe())),
+            }
+            return;
+        }
+        let result = match &kind {
+            ActionKind::DeleteProject(name) => self
+                .backend
+                .delete_project(name)
+                .with_context(|| format!("delete project {name}")),
+            ActionKind::DeletePath(path) => self
+                .backend
+                .delete_path(path)
+                .with_context(|| format!("delete {path}")),
+            ActionKind::DiscardChanges(_) => unreachable!("handled above"),
+        };
+        match result {
+            Ok(()) => self.set_message(format!("done: {}", kind.describe())),
+            Err(e) => self.set_error(format!("{}: {e:#}", kind.describe())),
+        }
     }
 
     pub fn goto(&mut self, screen: ScreenId) {
@@ -232,10 +299,14 @@ fn draw_footer(
     };
     let mut lines: Vec<Line> = Vec::new();
     if let Some(action) = &app.confirm {
-        let verb = if action.destructive { "CONFIRM" } else { "RUN" };
+        let verb = if action.kind.destructive() {
+            "CONFIRM"
+        } else {
+            "RUN"
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{verb}: "), Style::default().fg(Color::Yellow)),
-            Span::styled(action.description.clone(), Style::default().fg(Color::Red)),
+            Span::styled(action.kind.describe(), Style::default().fg(Color::Red)),
             Span::raw("  [y] yes   [n/Esc] no"),
         ]));
     } else if let Some(error) = &app.error {
@@ -313,26 +384,55 @@ mod tests {
     #[test]
     fn destructive_actions_require_confirmation() {
         let mut app = test_app();
-        app.request_action(PendingAction {
-            id: "delete",
-            description: "delete project alpha".into(),
-            destructive: true,
-        });
+        app.request_action(ActionKind::DeleteProject("alpha".into()));
         assert!(app.confirm.is_some());
         app.confirm_pending();
         assert!(app.confirm.is_none());
     }
 
     #[test]
-    fn non_destructive_actions_run_immediately() {
+    fn confirmed_deletion_actually_deletes() {
         let mut app = test_app();
-        app.request_action(PendingAction {
-            id: "refresh",
-            description: "refresh listing".into(),
-            destructive: false,
-        });
-        assert!(app.confirm.is_none());
-        assert!(app.message.is_some());
+        app.backend.create_project("alpha").unwrap();
+        app.request_action(ActionKind::DeleteProject("alpha".into()));
+        app.confirm_pending();
+        assert!(app.backend.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_deletion_keeps_the_project() {
+        let mut app = test_app();
+        app.backend.create_project("alpha").unwrap();
+        app.request_action(ActionKind::DeleteProject("alpha".into()));
+        app.cancel_pending();
+        assert_eq!(app.backend.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discard_changes_confirms_and_reloads_buffer() {
+        let mut app = test_app();
+        app.backend.write_file("draft.txt", "original").unwrap();
+        app.ui.editor_ui.path = Some("draft.txt".into());
+        app.ui.editor_ui.buffer = "edited".into();
+        app.ui.editor_ui.saved = Some("original".into());
+        app.ui.editor_ui.dirty = true;
+
+        // Discarding unsaved work is destructive: it confirms first.
+        app.request_action(ActionKind::DiscardChanges("draft.txt".into()));
+        assert!(app.confirm.is_some());
+        app.confirm_pending();
+        // The reload stash is populated for the Editor screen.
+        let (path, content) = app.ui.reload_content.clone().unwrap();
+        assert_eq!(path, "draft.txt");
+        assert_eq!(content, "original");
+        // The Editor adopts the fresh buffer on its next key event.
+        app.goto(crate::tui::screens::ScreenId::Editor);
+        crate::tui::screens::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Null),
+        );
+        assert!(!app.ui.editor_ui.dirty);
+        assert_eq!(app.ui.editor_ui.buffer, "original");
     }
 
     #[test]
@@ -347,11 +447,7 @@ mod tests {
     #[test]
     fn modal_confirmation_intercepts_all_keys() {
         let mut app = test_app();
-        app.request_action(PendingAction {
-            id: "delete",
-            description: "delete project alpha".into(),
-            destructive: true,
-        });
+        app.request_action(ActionKind::DeleteProject("alpha".into()));
         // Tab inside a modal must NOT navigate.
         handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.screen(), ScreenId::Dashboard);

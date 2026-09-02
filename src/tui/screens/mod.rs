@@ -1,14 +1,18 @@
-//! Screen registry and shared drawing helpers.
+//! Screen registry and dispatch.
 //!
-//! Phase 2 provides the foundation: navigation across every screen with
-//! visible key hints and backend-driven content where the services
-//! already exist (Dashboard, Projects, Files). The remaining screens
-//! render a foundation placeholder and gain functionality in Phases 3-8.
+//! Each screen lives in its own module with a `handle_key` + `draw`
+//! pair operating on shared [`App`] state plus its own UI struct held
+//! in [`ScreenState`]. Phase 3 provides full Projects, Files, and
+//! Editor screens; later phases fill in Git, Terminal, and the rest.
+
+pub mod editor;
+pub mod files;
+pub mod projects;
 
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use super::app::App;
 use super::backend::{DashboardSnapshot, WorkspaceBackend};
@@ -113,46 +117,30 @@ pub const SCREENS: &[ScreenMeta] = &[
     },
 ];
 
-/// Per-screen mutable UI state (selections, listings).
+/// Per-screen mutable UI state (selections, inputs, buffers).
 #[derive(Default)]
 pub struct ScreenState {
-    pub projects: ListState,
-    pub files: ListState,
-    pub pending_project_name: String,
-    pub git_output: String,
-    pub terminal_output: String,
-    pub terminal_program: String,
-    pub terminal_args: String,
-}
-
-impl ScreenState {
-    pub fn selected(&self, state: &ListState) -> usize {
-        state.selected().unwrap_or(0)
-    }
+    pub projects: ratatui::widgets::ListState,
+    pub files: ratatui::widgets::ListState,
+    pub projects_ui: projects::ProjectsUi,
+    pub files_ui: files::FilesUi,
+    pub editor_ui: editor::EditorUi,
+    /// Content produced by a DiscardChanges action, adopted by the
+    /// Editor screen on its next draw.
+    pub reload_content: Option<(String, String)>,
 }
 
 /// Dispatches a key press to the active screen.
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: crossterm::event::KeyEvent) {
-    let screen = app.screen();
-    match (screen, key.code) {
-        // Errors are dismissed from any screen.
-        (_, KeyCode::Char('x')) if app.error.is_some() => {
-            app.error = None;
-        }
-        (ScreenId::Projects, KeyCode::Char('n')) => {
-            // Seed a placeholder name; the full form arrives in Phase 3.
-            app.set_message("new project: press Enter to confirm name 'untitled'");
-        }
-        (ScreenId::Projects, KeyCode::Delete) => {
-            app.request_action(super::app::PendingAction {
-                id: "delete-project",
-                description: "delete selected project".into(),
-                destructive: true,
-            });
-        }
-        (ScreenId::Terminal, KeyCode::Enter) => {
-            app.set_message("terminal: full execution arrives in Phase 4");
-        }
+    // Errors are dismissed from any screen.
+    if app.error.is_some() && key.code == KeyCode::Char('x') {
+        app.error = None;
+        return;
+    }
+    match app.screen() {
+        ScreenId::Projects => projects::handle_key(app, key),
+        ScreenId::Files => files::handle_key(app, key),
+        ScreenId::Editor => editor::handle_key(app, key),
         _ => {}
     }
 }
@@ -164,30 +152,19 @@ pub fn draw<B: WorkspaceBackend>(frame: &mut ratatui::Frame, app: &mut App<B>, a
         .find(|s| s.id == app.screen())
         .map(|s| s.title)
         .unwrap_or("AWH");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "))
-        .title_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+    let block = Block::bordered().title(format!(" {title} ")).title_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
 
     match app.screen() {
         ScreenId::Dashboard => draw_dashboard(frame, app, area, block),
-        ScreenId::Projects => draw_projects(frame, app, area, block),
-        ScreenId::Files => draw_files(frame, app, area, block),
+        ScreenId::Projects => projects::draw(frame, app, area, block),
+        ScreenId::Files => files::draw(frame, app, area, block),
+        ScreenId::Editor => editor::draw(frame, app, area, block),
         ScreenId::Help => draw_help(frame, area, block),
-        ScreenId::Editor
-        | ScreenId::Git
-        | ScreenId::Terminal
-        | ScreenId::Mcp
-        | ScreenId::Context
-        | ScreenId::Memory
-        | ScreenId::Skills
-        | ScreenId::Logs
-        | ScreenId::Settings
-        | ScreenId::Remote => draw_placeholder(frame, app, area, block),
+        _ => draw_placeholder(frame, app, area, block),
     }
 }
 
@@ -232,59 +209,8 @@ fn row<'a>(label: &str, value: String) -> ratatui::text::Line<'a> {
     ])
 }
 
-fn draw_projects<B: WorkspaceBackend>(
-    frame: &mut ratatui::Frame,
-    app: &mut App<B>,
-    area: Rect,
-    block: Block<'_>,
-) {
-    let projects = app.backend.list_projects().unwrap_or_default();
-    let items: Vec<ListItem> = projects
-        .iter()
-        .map(|name| ListItem::new(name.clone()))
-        .collect();
-    let empty = projects.is_empty();
-    let list = List::new(items).block(block).highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, area, &mut app.ui.projects);
-    if empty {
-        overlay_note(frame, area, "no projects — press n to create one");
-    }
-    let hint = Paragraph::new("[n] new  [Del] delete (confirms)  [Enter] open");
-    let [_, hint_area] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
-    frame.render_widget(hint, hint_area);
-}
-
-fn draw_files<B: WorkspaceBackend>(
-    frame: &mut ratatui::Frame,
-    app: &mut App<B>,
-    area: Rect,
-    block: Block<'_>,
-) {
-    let entries = app.backend.list_dir("").unwrap_or_default();
-    let items: Vec<ListItem> = entries
-        .iter()
-        .map(|entry| {
-            let marker = if entry.is_dir { "dir " } else { "file" };
-            ListItem::new(format!("{marker}  {}", entry.name))
-        })
-        .collect();
-    let list = List::new(items).block(block).highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, area, &mut app.ui.files);
-    if entries.is_empty() {
-        overlay_note(frame, area, "empty directory");
-    }
-}
-
 fn draw_help(frame: &mut ratatui::Frame, area: Rect, block: Block<'_>) {
-    let lines = vec![
+    let mut all = vec![
         ratatui::text::Line::from("Global keys"),
         key_line("Tab / BackTab", "next / previous screen"),
         key_line("Esc", "back (quit from Dashboard)"),
@@ -293,7 +219,6 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect, block: Block<'_>) {
         ratatui::text::Line::from(""),
         ratatui::text::Line::from("Screens"),
     ];
-    let mut all = lines;
     for screen in SCREENS {
         all.push(ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(
@@ -333,19 +258,14 @@ fn draw_placeholder<B: WorkspaceBackend>(
     );
 }
 
-/// Renders a dim hint inside an empty screen without stealing focus.
-fn overlay_note(frame: &mut ratatui::Frame, area: Rect, note: &str) {
-    let [note_area] = Layout::vertical([Constraint::Length(1)]).areas(area);
-    let centered = Rect {
-        x: note_area.x + 2,
-        width: note_area.width.saturating_sub(4),
-        ..note_area
-    };
+/// Renders a dim key-hint line at the bottom of a screen area.
+pub(crate) fn hint_line(frame: &mut ratatui::Frame, area: Rect, hint: &str) {
+    let [_, hint_area] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     frame.render_widget(
         Paragraph::new(ratatui::text::Span::styled(
-            note,
+            hint,
             Style::default().fg(Color::DarkGray),
         )),
-        centered,
+        hint_area,
     );
 }

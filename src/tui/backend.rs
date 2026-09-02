@@ -7,11 +7,11 @@
 //! the same UI usable against local, LAN, or cloud AWH without embedding
 //! transport-specific logic in the screens.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::services::files::ListEntry;
+use crate::services::files::{FileMeta, ListEntry, SearchHit};
 use crate::services::git::GitOutput;
 use crate::services::terminal::ExecOutcome;
 
@@ -45,6 +45,10 @@ pub trait WorkspaceBackend {
     /// Returns true when the write happened, false when it was refused.
     fn write_file(&self, relative: &str, content: &str) -> Result<bool>;
     fn delete_path(&self, relative: &str) -> Result<()>;
+    fn rename_path(&self, from: &str, to: &str) -> Result<()>;
+    fn create_dir(&self, relative: &str) -> Result<()>;
+    fn meta(&self, relative: &str) -> Result<FileMeta>;
+    fn search_files(&self, needle: &str, limit: usize) -> Result<Vec<SearchHit>>;
 
     fn git_status(&self) -> Result<GitOutput>;
     fn git_log(&self, limit: usize) -> Result<GitOutput>;
@@ -70,6 +74,11 @@ impl LocalBackend {
                 .build()
                 .expect("tokio runtime"),
         }
+    }
+
+    /// Absolute workspace root this backend operates on.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 }
 
@@ -144,6 +153,26 @@ impl WorkspaceBackend for LocalBackend {
     fn delete_path(&self, relative: &str) -> Result<()> {
         let svc = crate::services::files::FilesService::new(&self.root);
         svc.delete(relative)
+    }
+
+    fn rename_path(&self, from: &str, to: &str) -> Result<()> {
+        let svc = crate::services::files::FilesService::new(&self.root);
+        svc.rename(from, to)
+    }
+
+    fn create_dir(&self, relative: &str) -> Result<()> {
+        let svc = crate::services::files::FilesService::new(&self.root);
+        svc.create_dir(relative)
+    }
+
+    fn meta(&self, relative: &str) -> Result<FileMeta> {
+        let svc = crate::services::files::FilesService::new(&self.root);
+        svc.meta(relative)
+    }
+
+    fn search_files(&self, needle: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let svc = crate::services::files::FilesService::new(&self.root);
+        svc.search(needle, limit)
     }
 
     fn git_status(&self) -> Result<GitOutput> {

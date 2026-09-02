@@ -226,6 +226,59 @@ impl FilesService {
             }
         }
     }
+
+    /// Describes a path for UIs and agents without reading its bytes:
+    /// existence, kind, and size. The Editor uses this to refuse
+    /// oversized files and to detect binaries before loading them.
+    pub fn meta(&self, relative: &str) -> Result<FileMeta> {
+        let path = self.resolve_checked(relative)?;
+        let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        let kind = if meta.is_dir() {
+            PathKind::Directory
+        } else if is_probably_binary(&path)? {
+            PathKind::BinaryFile
+        } else {
+            PathKind::TextFile
+        };
+        Ok(FileMeta {
+            kind,
+            size: meta.len(),
+        })
+    }
+}
+
+/// Kind of a path as seen by file-oriented UIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Directory,
+    TextFile,
+    BinaryFile,
+}
+
+/// Metadata snapshot for one path.
+#[derive(Debug, Clone, Copy)]
+pub struct FileMeta {
+    pub kind: PathKind,
+    pub size: u64,
+}
+
+/// Reads the first 8 KiB and declares the file binary when it contains
+/// a NUL byte or invalid UTF-8. Binary detection must stay cheap: it
+/// runs on every file the Editor or listings probe.
+fn is_probably_binary(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut head = [0u8; 8192];
+    let mut filled = 0;
+    while filled < head.len() {
+        let n = file.read(&mut head[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let slice = &head[..filled];
+    Ok(std::str::from_utf8(slice).is_err() || slice.contains(&0))
 }
 
 #[cfg(test)]
@@ -356,6 +409,54 @@ mod tests {
         fs::write(&big, content).unwrap();
         let svc = FilesService::new(tmp.path().to_path_buf());
         assert!(svc.read("big.txt").is_err());
+    }
+
+    #[test]
+    fn meta_classifies_text_binary_and_directory() {
+        let (tmp, svc) = setup();
+        fs::write(tmp.path().join("text.md"), "hello").unwrap();
+        fs::write(tmp.path().join("blob.bin"), b"ok\x00binary").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+
+        assert_eq!(svc.meta("text.md").unwrap().kind, PathKind::TextFile);
+        assert_eq!(svc.meta("blob.bin").unwrap().kind, PathKind::BinaryFile);
+        assert_eq!(svc.meta("sub").unwrap().kind, PathKind::Directory);
+        assert_eq!(svc.meta("text.md").unwrap().size, 5);
+        assert!(svc.meta("missing.txt").is_err());
+    }
+
+    #[test]
+    fn meta_reports_oversized_text_as_too_large() {
+        let (tmp, svc) = setup();
+        let big = tmp.path().join("big.txt");
+        let mut content = String::with_capacity(MAX_FILE_BYTES as usize + 1);
+        while content.len() <= MAX_FILE_BYTES as usize {
+            content.push('x');
+        }
+        fs::write(&big, content).unwrap();
+        let meta = svc.meta("big.txt").unwrap();
+        assert_eq!(meta.kind, PathKind::TextFile);
+        assert!(meta.size > MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn rename_moves_and_refuses_existing_destination() {
+        let (tmp, svc) = setup();
+        fs::write(tmp.path().join("a.txt"), "1").unwrap();
+        fs::write(tmp.path().join("b.txt"), "2").unwrap();
+        svc.rename("a.txt", "renamed.txt").unwrap();
+        assert!(svc.read("renamed.txt").is_ok());
+        assert!(svc.read("a.txt").is_err());
+        assert!(svc.rename("b.txt", "renamed.txt").is_err());
+        assert!(svc.rename("renamed.txt", "../out.txt").is_err());
+    }
+
+    #[test]
+    fn create_dir_roundtrip() {
+        let (tmp, svc) = setup();
+        svc.create_dir("deep/nested/dir").unwrap();
+        assert!(tmp.path().join("deep/nested/dir").is_dir());
+        assert!(svc.create_dir("").is_err());
     }
 }
 
