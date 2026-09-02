@@ -3,6 +3,7 @@
 //! services call core stores and domain engines. No interface duplicates
 //! business logic.
 
+pub mod audit;
 pub mod files;
 pub mod git;
 pub mod projects;

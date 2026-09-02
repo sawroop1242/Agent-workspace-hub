@@ -138,6 +138,8 @@ pub fn build_router(state: Arc<ControlState>) -> Router {
         .route("/terminal/run", post(run_command))
         .route("/skills", get(list_skills))
         .route("/mcp", get(list_mcp))
+        .route("/audit", get(audit))
+        .route("/logs", get(logs))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
@@ -566,6 +568,42 @@ async fn list_mcp(
     Ok(Json(json!({"servers": items})))
 }
 
+// ----- Audit & logs (spec sections 16, 25) -----
+
+#[derive(Deserialize)]
+struct AuditParams {
+    /// Maximum entries to return (default 100, capped at 1000).
+    limit: Option<usize>,
+    /// Filter: `allow`, `deny`, or omitted for all.
+    kind: Option<String>,
+}
+
+/// Security-relevant events from the shared audit ring. Entries never
+/// contain secret values; only actor/action identifiers are recorded.
+async fn audit(Query(params): Query<AuditParams>) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let entries = crate::services::audit::global().recent(limit);
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|e| params.kind.as_deref().is_none_or(|k| e.kind == k))
+        .collect();
+    Ok(Json(json!({
+        "entries": entries,
+        "total": crate::services::audit::global().len(),
+    })))
+}
+
+/// Operational log view over the same bounded ring; this plane records
+/// security events, so it serves both `/logs` and `/audit` consumers.
+async fn logs(Query(params): Query<AuditParams>) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = params.limit.unwrap_or(50).min(1000);
+    let entries = crate::services::audit::global().recent(limit);
+    Ok(Json(json!({
+        "entries": entries,
+        "total": crate::services::audit::global().len(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +797,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auth_denials_are_persisted_to_the_audit_store() {
+        // Global store: prove the deny event from a 401 lands in it.
+        crate::services::audit::record_deny("probe_reset", "test_start", "test");
+        let before = crate::services::audit::global().len();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/status", Some("wrong-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(crate::services::audit::global().len() > before);
+
+        // And the endpoint itself serves the ring, requiring auth.
+        let res = app
+            .oneshot(get("/api/v1/audit?kind=deny&limit=10", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        // Newest first, and the filter kept only denials.
+        assert_eq!(entries[0]["kind"], "deny");
+        assert!(entries.iter().all(|e| e["kind"] == "deny"));
+
+        // The bearer token itself must never appear in any entry.
+        let raw = serde_json::to_string(&entries).unwrap();
+        assert!(!raw.contains("test-key"));
+        assert!(!raw.contains("wrong-key"));
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_serves_ring_with_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+        let res = app
+            .oneshot(get("/api/v1/logs?limit=5", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["entries"].as_array().unwrap().len() <= 5);
     }
 }

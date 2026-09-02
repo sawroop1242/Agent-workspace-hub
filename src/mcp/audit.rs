@@ -10,17 +10,20 @@
 /// affected actor (MCP id, tool name, path, etc.). No secret values are logged.
 pub fn audit_deny(action: &str, reason: &str, subject: &str) {
     tracing::warn!(event = "mcp_security_denied", action, reason, subject,);
+    crate::services::audit::record_deny(action, reason, subject);
 }
 
 /// Emits a structured audit event for a secret-resolution denial, logging only
 /// the secret *name* (never its value).
 pub fn audit_secret_deny(reason: &str, name: &str) {
     tracing::warn!(event = "mcp_secret_denied", reason, name,);
+    crate::services::audit::record_deny("secret_resolve", reason, name);
 }
 
 /// Emits a structured audit event for a circuit-breaker trip.
 pub fn audit_circuit_open(provider: &str) {
     tracing::warn!(event = "mcp_circuit_open", provider,);
+    crate::services::audit::record_deny("circuit_open", "open", provider);
 }
 
 /// Emits a structured audit event for a successful security-relevant action
@@ -31,6 +34,7 @@ pub fn audit_circuit_open(provider: &str) {
 /// still required for incident reconstruction (who did what, when).
 pub fn audit_allow(action: &str, subject: &str, detail: &str) {
     tracing::info!(event = "mcp_audit", action, subject, detail,);
+    crate::services::audit::record_allow(action, subject, detail);
 }
 
 #[cfg(test)]
