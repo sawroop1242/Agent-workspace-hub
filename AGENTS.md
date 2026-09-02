@@ -27,8 +27,9 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
   `projects/<name>/.agent/`; skills/MCP registries under user data dir.
 - **Security**: services reject path traversal (`../`) and validate project
   names; auth via `mcp::auth` (`load_api_key`, `verify_token` constant-time,
-  `bearer_token`); audit events via `mcp::audit` (`audit_allow`/`audit_deny`)
-  go to tracing stderr — no persistent audit store yet (Phase 6+ gap).
+  `bearer_token`); audit events via `mcp::audit` mirror into the shared
+  bounded ring `services::audit::global()` (1000 entries, newest-first) and
+  tracing stderr; served by `/api/v1/audit` and `/api/v1/logs`.
 - **MCP stdio protocol**: stdout is JSON-RPC ONLY, tracing goes to stderr.
 
 ## Service Layer (`src/services/`) — all the Control API/TUI/MCP build on these
@@ -74,8 +75,9 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 
 ## Phase Status
 
-0-5 done (committed on branch `rust`). Next: Phase 6 security/separation
-(audit persistence + `/logs` `/audit` endpoints need a new store — spec §16
-lists them as suggested resources), Phase 7 dashboard screens, Phase 8
-context/memory/skills screens (engines exist in `src/context/`), Phase 9
-ngrok tunnel, Phase 10 hardening/docs.
+0-6 done (branch rust). Next: Phase 7 dashboard/status screens (the
+audit ring `services::audit::global()` is available for recent
+activity), Phase 8 context/memory/skills screens (`src/context/`
+engines exist), Phase 9 tunnel + rate limiting (spec §25 chain:
+Auth -> Authz -> Rate Limit -> Audit -> Services), Phase 10
+hardening/docs.
