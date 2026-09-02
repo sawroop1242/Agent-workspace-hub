@@ -2,12 +2,13 @@
 //!
 //! Each screen lives in its own module with a `handle_key` + `draw`
 //! pair operating on shared [`App`] state plus its own UI struct held
-//! in [`ScreenState`]. Phase 3 provides full Projects, Files, and
-//! Editor screens; later phases fill in Git, Terminal, and the rest.
-
+//! in [`ScreenState`]. Dashboard, Projects, Files, Editor, Git, and
+//! Terminal are fully interactive; later phases fill in the rest.
 pub mod editor;
 pub mod files;
+pub mod git;
 pub mod projects;
+pub mod terminal;
 
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -122,9 +123,12 @@ pub const SCREENS: &[ScreenMeta] = &[
 pub struct ScreenState {
     pub projects: ratatui::widgets::ListState,
     pub files: ratatui::widgets::ListState,
+    pub git: ratatui::widgets::ListState,
     pub projects_ui: projects::ProjectsUi,
     pub files_ui: files::FilesUi,
     pub editor_ui: editor::EditorUi,
+    pub git_ui: git::GitUi,
+    pub terminal_ui: terminal::TerminalUi,
     /// Content produced by a DiscardChanges action, adopted by the
     /// Editor screen on its next draw.
     pub reload_content: Option<(String, String)>,
@@ -141,6 +145,8 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: crossterm::event::
         ScreenId::Projects => projects::handle_key(app, key),
         ScreenId::Files => files::handle_key(app, key),
         ScreenId::Editor => editor::handle_key(app, key),
+        ScreenId::Git => git::handle_key(app, key),
+        ScreenId::Terminal => terminal::handle_key(app, key),
         _ => {}
     }
 }
@@ -163,6 +169,8 @@ pub fn draw<B: WorkspaceBackend>(frame: &mut ratatui::Frame, app: &mut App<B>, a
         ScreenId::Projects => projects::draw(frame, app, area, block),
         ScreenId::Files => files::draw(frame, app, area, block),
         ScreenId::Editor => editor::draw(frame, app, area, block),
+        ScreenId::Git => git::draw(frame, app, area, block),
+        ScreenId::Terminal => terminal::draw(frame, app, area, block),
         ScreenId::Help => draw_help(frame, area, block),
         _ => draw_placeholder(frame, app, area, block),
     }

@@ -53,6 +53,9 @@ pub trait WorkspaceBackend {
     fn git_status(&self) -> Result<GitOutput>;
     fn git_log(&self, limit: usize) -> Result<GitOutput>;
     fn git_commit(&self, message: &str) -> Result<GitOutput>;
+    fn git_stage(&self, path: &str) -> Result<GitOutput>;
+    fn git_unstage(&self, path: &str) -> Result<GitOutput>;
+    fn git_diff(&self, staged: bool, path: Option<&str>) -> Result<GitOutput>;
 
     fn terminal_run(&self, program: &str, args: &[String]) -> Result<ExecOutcome>;
 }
@@ -188,6 +191,25 @@ impl WorkspaceBackend for LocalBackend {
     fn git_commit(&self, message: &str) -> Result<GitOutput> {
         let git = crate::services::git::GitService::open(&self.root)?;
         self.runtime.block_on(git.commit(message))
+    }
+
+    fn git_stage(&self, path: &str) -> Result<GitOutput> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        self.runtime.block_on(git.stage(path))
+    }
+
+    fn git_unstage(&self, path: &str) -> Result<GitOutput> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        self.runtime.block_on(git.unstage(path))
+    }
+
+    fn git_diff(&self, staged: bool, path: Option<&str>) -> Result<GitOutput> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        if staged {
+            self.runtime.block_on(git.diff_staged(path))
+        } else {
+            self.runtime.block_on(git.diff(path))
+        }
     }
 
     fn terminal_run(&self, program: &str, args: &[String]) -> Result<ExecOutcome> {
