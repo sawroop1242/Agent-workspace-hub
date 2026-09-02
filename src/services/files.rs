@@ -461,7 +461,7 @@ mod tests {
 }
 
 /// One directory entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ListEntry {
     pub name: String,
     pub is_dir: bool,
@@ -469,7 +469,7 @@ pub struct ListEntry {
 }
 
 /// One matched line from a search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchHit {
     pub path: String,
     pub line_number: usize,

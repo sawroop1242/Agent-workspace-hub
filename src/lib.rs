@@ -7,6 +7,7 @@
 //! management — planning, structured long-term memory, soft offloading, and
 //! token budgets — on top of the same per-project state layout.
 
+pub mod api;
 pub mod context;
 pub mod core;
 pub mod mcp;

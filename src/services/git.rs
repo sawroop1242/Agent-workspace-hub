@@ -151,6 +151,11 @@ impl GitService {
             .unwrap_or(false)
     }
 
+    /// Blocking [`Self::is_repo`] for synchronous callers (CLI/TUI).
+    pub fn is_repo_blocking(&self) -> bool {
+        self.repo.join(".git").exists()
+    }
+
     /// Working-tree status (`--porcelain`).
     pub async fn status(&self) -> Result<GitOutput> {
         self.run(&["status", "--porcelain"]).await

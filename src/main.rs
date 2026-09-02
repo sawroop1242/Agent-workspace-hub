@@ -25,6 +25,18 @@ enum Command {
     Status,
     /// Interactive terminal UI.
     Tui,
+    /// Serve the versioned HTTP Control API (`/api/v1`).
+    Serve {
+        /// Bind address for the HTTP server.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port for the HTTP server.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Environment variable holding the API key (required).
+        #[arg(long, default_value = "AWH_API_KEY")]
+        api_key_env: String,
+    },
     #[command(name = "mcp")]
     Mcp {
         #[command(subcommand)]
@@ -212,6 +224,11 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Status) => println!("Agent Workspace Hub — Rust\nstatus: bootstrap complete"),
         Some(Command::Tui) => agent_workspace_hub::tui::run_local(std::env::current_dir()?)?,
+        Some(Command::Serve {
+            host,
+            port,
+            api_key_env,
+        }) => serve_control_api(host, port, api_key_env)?,
         Some(Command::Mcp { command }) => handle_mcp_cli(command)?,
         Some(Command::Skill { command }) => match command {
             SkillCommand::Create { name, description } => {
@@ -525,6 +542,27 @@ fn search_registry(url: &str, query: &str) -> Result<()> {
     for s in rt.block_on(RegistryClient::new(url).search(query))? {
         println!("{} v{} — {}", s.name, s.version, s.description)
     }
+    Ok(())
+}
+
+/// Builds and runs the versioned HTTP Control API (`/api/v1`).
+fn serve_control_api(host: String, port: u16, api_key_env: String) -> Result<()> {
+    let api_key = load_api_key(&api_key_env)
+        .with_context(|| format!("control API requires a bearer token; set {api_key_env}"))?;
+
+    let root = std::env::current_dir()?;
+    let state = Arc::new(agent_workspace_hub::api::control::ControlState::new(
+        &root, api_key,
+    ));
+    let app = agent_workspace_hub::api::control::build_router(state);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let addr = format!("{host}:{port}");
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        eprintln!("control API listening on http://{addr}/api/v1 (health: /api/v1/healthz)");
+        axum::serve(listener, app).await
+    })?;
     Ok(())
 }
 
