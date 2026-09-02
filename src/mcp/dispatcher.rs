@@ -602,16 +602,14 @@ impl McpDispatcher {
                 );
                 serde_json::to_value(self.context()?.insert(item)?)?
             }
-            "context.get" => {
-                let id = arguments
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                match self.context()?.get_item(id) {
-                    Some(item) => serde_json::to_value(item)?,
-                    None => json!({"error": format!("no context item: {id}")}),
-                }
-            }
+            "context.get" => serde_json::to_value(
+                self.context()?.get_item(
+                    arguments
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+            )?,
             "context.remove" => json!({
                 "removed": self.context()?.remove_item(
                     arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -1065,6 +1063,14 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("large")));
+    }
+
+    #[test]
+    fn context_get_missing_id_returns_null_like_memory_get() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        let value = call(&dispatcher, "context.get", json!({"id": "nope"})).unwrap();
+        assert!(value.is_null());
     }
 
     #[test]
