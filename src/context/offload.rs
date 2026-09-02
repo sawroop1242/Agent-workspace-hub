@@ -286,9 +286,10 @@ mod tests {
     fn offload_dir_is_under_agent_state() {
         let temp = tempfile::tempdir().unwrap();
         let store = store_in(&temp);
-        let dir = store.dir.display().to_string();
-        let root = temp.path().display().to_string();
-        assert!(dir.contains(".agent/context-engine/offloads"));
-        assert!(dir.starts_with(&root));
+        // Compare path components, not rendered strings: separators differ
+        // between platforms ("\" on Windows, "/" elsewhere).
+        let expected_tail = Path::new(".agent").join("context-engine").join("offloads");
+        assert!(store.dir.ends_with(&expected_tail));
+        assert!(store.dir.starts_with(temp.path()));
     }
 }
