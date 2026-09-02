@@ -15,9 +15,11 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["tokio", "http1", "json", "matched-path", "query", "original-uri", "macros"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29.0"
 dirs = "5"
 futures-util = "0.3"
 mime = "0.3"
+ratatui = "0.30.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"

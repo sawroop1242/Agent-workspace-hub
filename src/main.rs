@@ -23,6 +23,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Status,
+    /// Interactive terminal UI.
+    Tui,
     #[command(name = "mcp")]
     Mcp {
         #[command(subcommand)]
@@ -209,6 +211,7 @@ fn main() -> Result<()> {
     let registry_store = RegistryStore::new(home.join(".agent-workspace-hub"));
     match cli.command {
         Some(Command::Status) => println!("Agent Workspace Hub — Rust\nstatus: bootstrap complete"),
+        Some(Command::Tui) => agent_workspace_hub::tui::run_local(std::env::current_dir()?)?,
         Some(Command::Mcp { command }) => handle_mcp_cli(command)?,
         Some(Command::Skill { command }) => match command {
             SkillCommand::Create { name, description } => {
