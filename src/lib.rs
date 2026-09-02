@@ -11,4 +11,5 @@ pub mod context;
 pub mod core;
 pub mod mcp;
 pub mod models;
+pub mod services;
 pub mod skills;

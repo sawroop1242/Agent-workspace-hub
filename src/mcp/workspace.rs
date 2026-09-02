@@ -27,6 +27,11 @@ impl WorkspaceMcp {
         Ok(Self { root })
     }
 
+    /// Returns the canonical workspace root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Reads the concatenated contents of `AGENTS.md`, `AGENT.md`, and `README.md`.
     pub fn context(&self) -> Result<String> {
         let mut out = String::new();

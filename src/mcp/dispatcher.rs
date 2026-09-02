@@ -15,6 +15,8 @@ use crate::mcp::{
     MemoryScope, PersistentTrustStore, ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient,
     StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
+use crate::services::git::GitService;
+use crate::services::terminal::TerminalService;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -328,7 +330,9 @@ impl McpDispatcher {
     }
 
     fn tools_list_static(&self) -> Value {
-        json!({"tools": [
+        // Split into two macro invocations to stay under the macro
+        // recursion limit; merged into one array below.
+        let core = json!([
             {"name":"skills.list","description":"List project-referenced skills","inputSchema":{"type":"object","properties":{}}},
             {"name":"skills.read","description":"Read a project-referenced skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
             {"name":"skills.add","description":"Add an installed global skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
@@ -364,7 +368,22 @@ impl McpDispatcher {
             {"name":"context.unprotect","description":"Clear protection for a context item","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
             {"name":"context.offload","description":"Soft-offload a context item (fully recoverable)","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id"]}},
             {"name":"context.restore","description":"Restore a soft-offloaded context item to active","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
-        ]})
+        ]);
+        let extended = json!([
+            {"name":"git.status","description":"Git working-tree status (porcelain)","inputSchema":{"type":"object","properties":{}}},
+            {"name":"git.branch","description":"Current Git branch","inputSchema":{"type":"object","properties":{}}},
+            {"name":"git.log","description":"Recent Git commit log","inputSchema":{"type":"object","properties":{"limit":{"type":"number"}}}},
+            {"name":"git.diff","description":"Git unified diff (working tree or staged)","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"staged":{"type":"boolean"}}}},
+            {"name":"git.stage","description":"Stage a file or all changes","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+            {"name":"git.unstage","description":"Unstage a file, leaving the working tree untouched","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+            {"name":"git.commit","description":"Commit staged changes with a message","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},
+            {"name":"terminal.run","description":"Run a bounded command in the project workspace (argv form, no shell)","inputSchema":{"type":"object","properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["program"]}}
+        ]);
+        let mut tools = core;
+        if let (Value::Array(core_arr), Value::Array(ext_arr)) = (&mut tools, &extended) {
+            core_arr.extend(ext_arr.iter().cloned());
+        }
+        json!({"tools": tools})
     }
 
     async fn call_tool(&self, params: &Value) -> Result<Value> {
@@ -687,6 +706,66 @@ impl McpDispatcher {
                         .unwrap_or_default(),
                 )?;
                 serde_json::to_value(item)?
+            }
+            "git.status" => {
+                let git = GitService::open(self.workspace.root())?;
+                serde_json::to_value(git.status().await?)?
+            }
+            "git.branch" => {
+                let git = GitService::open(self.workspace.root())?;
+                serde_json::to_value(git.branch().await?)?
+            }
+            "git.log" => {
+                let git = GitService::open(self.workspace.root())?;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 200) as usize;
+                serde_json::to_value(git.log(limit).await?)?
+            }
+            "git.diff" => {
+                let git = GitService::open(self.workspace.root())?;
+                let path = arguments.get("path").and_then(Value::as_str);
+                let staged = arguments
+                    .get("staged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let out = if staged {
+                    git.diff_staged(path).await?
+                } else {
+                    git.diff(path).await?
+                };
+                serde_json::to_value(out)?
+            }
+            "git.stage" => {
+                let git = GitService::open(self.workspace.root())?;
+                let path = strval(&arguments, "path");
+                serde_json::to_value(git.stage(&path).await?)?
+            }
+            "git.unstage" => {
+                let git = GitService::open(self.workspace.root())?;
+                let path = strval(&arguments, "path");
+                serde_json::to_value(git.unstage(&path).await?)?
+            }
+            "git.commit" => {
+                let git = GitService::open(self.workspace.root())?;
+                let message = strval(&arguments, "message");
+                serde_json::to_value(git.commit(&message).await?)?
+            }
+            "terminal.run" => {
+                let program = strval(&arguments, "program");
+                let args: Vec<String> = arguments
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let terminal = TerminalService::new(self.workspace.root());
+                serde_json::to_value(terminal.run(&program, &args).await?)?
             }
             _ if name.contains('.') => {
                 let registry = self.providers.read().await;
@@ -1103,5 +1182,96 @@ mod tests {
             .collect();
         assert!(tools.contains(&"context.status".to_string()));
         assert!(tools.contains(&"context.assemble".to_string()));
+    }
+
+    // ---- git/terminal service-backed tools -------------------------------
+
+    /// Initializes a real git repository inside `dir` so git tools can be
+    /// exercised against a working tree.
+    fn init_git_repo(dir: &std::path::Path) {
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        assert!(output.status.success(), "git init failed");
+        let output = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir)
+            .output()
+            .expect("git config");
+        assert!(output.status.success());
+        let output = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .expect("git config");
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn git_tools_round_trip_in_real_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        std::fs::write(temp.path().join("notes.md"), "hello").unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+
+        // Stage, commit, then verify status and log reflect the change.
+        call(&dispatcher, "git.stage", json!({"path": "."})).unwrap();
+        call(
+            &dispatcher,
+            "git.commit",
+            json!({"message": "initial commit"}),
+        )
+        .unwrap();
+        let status = call(&dispatcher, "git.status", json!({})).unwrap();
+        let stdout = status["stdout"].as_str().unwrap_or_default();
+        assert!(
+            stdout.is_empty(),
+            "tree should be clean after commit: {stdout}"
+        );
+        let log = call(&dispatcher, "git.log", json!({"limit": 5})).unwrap();
+        assert!(log["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("initial commit"));
+    }
+
+    #[test]
+    fn git_log_rejects_absurd_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git_repo(temp.path());
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        // limit is clamped to [1, 200]; a huge value must not panic.
+        let log = call(&dispatcher, "git.log", json!({"limit": 1000000})).unwrap();
+        assert!(log["stdout"].as_str().is_some());
+    }
+
+    #[test]
+    fn terminal_run_executes_argv_without_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        let out = call(
+            &dispatcher,
+            "terminal.run",
+            json!({"program": "printf", "args": ["argv works"]}),
+        )
+        .unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap_or_default(), "argv works");
+        assert_eq!(out["exit_code"].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn terminal_run_rejects_shell_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        // A program name containing whitespace is a shell command line,
+        // which the service refuses to interpret.
+        let result = call(
+            &dispatcher,
+            "terminal.run",
+            json!({"program": "echo hello; rm -rf /"}),
+        );
+        assert!(result.is_err());
     }
 }
