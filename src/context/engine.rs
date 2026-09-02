@@ -441,7 +441,22 @@ impl ContextEngine {
             .read()
             .expect("protected lock poisoned")
             .clone();
-        select_within_budget(&items, &scores, &self.config.budget, &protected)
+        // A per-request budget further tightens the configured budget; it
+        // never loosens it, so `token_budget` acts as an additional cap.
+        let request_budget = if request.token_budget > 0 {
+            ContextBudget {
+                max_input_tokens: self
+                    .config
+                    .budget
+                    .usable_input_tokens()
+                    .min(request.token_budget),
+                reserved_output_tokens: 0,
+                safety_margin_tokens: 0,
+            }
+        } else {
+            self.config.budget
+        };
+        select_within_budget(&items, &scores, &request_budget, &protected)
     }
 
     /// Assembles the optimized active context for a request.

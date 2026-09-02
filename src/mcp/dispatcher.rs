@@ -5,6 +5,9 @@
 //! transport — stdio, HTTP/SSE, and any future transport — funnels requests
 //! through [`McpDispatcher`] so the tool implementations are never duplicated.
 
+use crate::context::{
+    ContextEngine, ContextEngineConfig, ContextItem, ContextRequest, ContextScope, ContextSource,
+};
 use crate::mcp::{
     audit_allow, audit_deny, authorize_mcp_execution, AuthMethod, CircuitBreakerConfig,
     CircuitBreakerMcpClient, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider,
@@ -124,6 +127,7 @@ pub struct McpDispatcher {
     memory: Arc<MemoryMcp>,
     tasks: Arc<TasksMcp>,
     connectors: Arc<ConnectorsMcp>,
+    context_engine: Option<Arc<ContextEngine>>,
     providers: Arc<RwLock<ProviderRegistry>>,
 }
 
@@ -181,14 +185,31 @@ impl McpDispatcher {
             }
         }
 
+        // The context engine is opt-in per project via `AWH_CONTEXT_ENGINE`
+        // (or the config's `enabled` flag, which honors the same env vars).
+        // When construction fails the tools surface a clear error instead of
+        // taking the whole dispatcher down, so existing behavior is unchanged.
+        let context_engine = ContextEngineConfig::default()
+            .with_env_overrides()
+            .and_then(|config| ContextEngine::new(&project_root, config).map(Arc::new))
+            .ok();
+
         Ok(Self {
             skills: Arc::new(SkillMcp::new(project_root.clone())?),
             workspace: Arc::new(WorkspaceMcp::new(project_root.clone())?),
             memory: Arc::new(MemoryMcp::new(project_root.clone())?),
             tasks: Arc::new(TasksMcp::new(project_root.clone())?),
             connectors: Arc::new(ConnectorsMcp::new(project_root)?),
+            context_engine,
             providers: registry,
         })
+    }
+
+    fn context(&self) -> Result<&ContextEngine> {
+        self.context_engine
+            .as_ref()
+            .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!("context engine is disabled or failed to initialize"))
     }
 
     /// Returns the shared provider registry used to dispatch tool calls.
@@ -331,7 +352,18 @@ impl McpDispatcher {
             {"name":"connectors.remove","description":"Remove connector metadata","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
             {"name":"connector.providers","description":"List registered connector and custom MCP providers","inputSchema":{"type":"object","properties":{}}},
             {"name":"connector.tools","description":"List tools exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"}},"required":["provider"]}},
-            {"name":"connector.invoke","description":"Invoke a tool exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["provider","tool"]}}
+            {"name":"connector.invoke","description":"Invoke a tool exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["provider","tool"]}},
+            {"name":"context.status","description":"Context engine status: items, tokens, budget, offloads, memories","inputSchema":{"type":"object","properties":{}}},
+            {"name":"context.insert","description":"Insert a context item into the engine","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"source":{"type":"string","enum":["System","User","Assistant","Tool","Skill","File","Memory","Workspace","Search","Summary","Other"]},"relevance":{"type":"number"},"priority":{"type":"number"},"scope":{"type":"string","enum":["Session","Project","Global"]}},"required":["id","content"]}},
+            {"name":"context.get","description":"Get a context item by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"context.remove","description":"Remove a context item by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"context.search","description":"Search active and offloaded context items","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"}},"required":["query"]}},
+            {"name":"context.optimize","description":"Run a planning pass: keep, compress, archive, or offload items by score","inputSchema":{"type":"object","properties":{"task":{"type":"string"}},"required":["task"]}},
+            {"name":"context.assemble","description":"Assemble budget-constrained context for a task","inputSchema":{"type":"object","properties":{"task":{"type":"string"},"query":{"type":"string"},"token_budget":{"type":"number"}},"required":["task"]}},
+            {"name":"context.protect","description":"Protect a context item from offloading","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"context.unprotect","description":"Clear protection for a context item","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"context.offload","description":"Soft-offload a context item (fully recoverable)","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id"]}},
+            {"name":"context.restore","description":"Restore a soft-offloaded context item to active","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
         ]})
     }
 
@@ -536,6 +568,128 @@ impl McpDispatcher {
                 let registry = self.providers.read().await;
                 serde_json::to_value(registry.invoke(provider, tool, args).await?)?
             }
+            "context.status" => serde_json::to_value(self.context()?.status()?)?,
+            "context.insert" => {
+                let item = ContextItem::new(
+                    strval(&arguments, "id"),
+                    parse_context_source(arguments.get("source").and_then(Value::as_str)),
+                    strval(&arguments, "content"),
+                    0,
+                );
+                let item = with_optional(
+                    item,
+                    arguments.get("relevance").and_then(Value::as_f64),
+                    |mut it, v| {
+                        it.relevance = v.clamp(0.0, 1.0) as f32;
+                        it
+                    },
+                );
+                let item = with_optional(
+                    item,
+                    arguments.get("priority").and_then(Value::as_f64),
+                    |mut it, v| {
+                        it.priority = v.clamp(0.0, 1.0) as f32;
+                        it
+                    },
+                );
+                let item = with_optional(
+                    item,
+                    arguments.get("scope").and_then(Value::as_str),
+                    |mut it, v| {
+                        it.scope = parse_context_scope(Some(v));
+                        it
+                    },
+                );
+                serde_json::to_value(self.context()?.insert(item)?)?
+            }
+            "context.get" => {
+                let id = arguments
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match self.context()?.get_item(id) {
+                    Some(item) => serde_json::to_value(item)?,
+                    None => json!({"error": format!("no context item: {id}")}),
+                }
+            }
+            "context.remove" => json!({
+                "removed": self.context()?.remove_item(
+                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                )
+            }),
+            "context.search" => {
+                let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+                serde_json::to_value(
+                    self.context()?.search(
+                        arguments
+                            .get("query")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        limit,
+                    )?,
+                )?
+            }
+            "context.optimize" => serde_json::to_value(
+                self.context()?.optimize(
+                    arguments
+                        .get("task")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?,
+            )?,
+            "context.assemble" => {
+                let engine = self.context()?;
+                let request = ContextRequest {
+                    task: strval(&arguments, "task"),
+                    query: arguments
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    token_budget: engine.budget().usable_input_tokens(),
+                    scope: ContextScope::Project,
+                };
+                let request = with_optional(
+                    request,
+                    arguments.get("token_budget").and_then(Value::as_u64),
+                    |mut r, v| {
+                        r.token_budget = v as usize;
+                        r
+                    },
+                );
+                serde_json::to_value(engine.get_context(&request)?)?
+            }
+            "context.protect" => json!({
+                "protected": self.context()?.protect(
+                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                )
+            }),
+            "context.unprotect" => json!({
+                "unprotected": self.context()?.unprotect(
+                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                )
+            }),
+            "context.offload" => {
+                self.context()?.offload(
+                    arguments
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    arguments
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("manual offload via MCP tool"),
+                )?;
+                json!({"offloaded": true})
+            }
+            "context.restore" => {
+                let item = self.context()?.restore(
+                    arguments
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?;
+                serde_json::to_value(item)?
+            }
             _ if name.contains('.') => {
                 let registry = self.providers.read().await;
                 serde_json::to_value(registry.invoke_qualified(name, arguments).await?)?
@@ -627,6 +781,39 @@ fn parse_scope(value: Option<&str>) -> MemoryScope {
         "Session" => MemoryScope::Session,
         "Global" => MemoryScope::Global,
         _ => MemoryScope::Project,
+    }
+}
+
+/// Applies `f` to `value` only when the optional argument is present, so tool
+/// callers can leave engine fields at their documented defaults.
+fn with_optional<T, V>(value: T, optional: Option<V>, f: impl FnOnce(T, V) -> T) -> T {
+    match optional {
+        Some(v) => f(value, v),
+        None => value,
+    }
+}
+
+fn parse_context_source(value: Option<&str>) -> ContextSource {
+    match value.unwrap_or("Other") {
+        "System" => ContextSource::System,
+        "User" => ContextSource::User,
+        "Assistant" => ContextSource::Assistant,
+        "Tool" => ContextSource::Tool,
+        "Skill" => ContextSource::Skill,
+        "File" => ContextSource::File,
+        "Memory" => ContextSource::Memory,
+        "Workspace" => ContextSource::Workspace,
+        "Search" => ContextSource::Search,
+        "Summary" => ContextSource::Summary,
+        _ => ContextSource::Other,
+    }
+}
+
+fn parse_context_scope(value: Option<&str>) -> ContextScope {
+    match value.unwrap_or("Project") {
+        "Session" => ContextScope::Session,
+        "Global" => ContextScope::Global,
+        _ => ContextScope::Project,
     }
 }
 
@@ -759,5 +946,156 @@ mod tests {
             },
         );
         assert!(!is_authorized(&cfg, Some(&store)));
+    }
+
+    // ---- context engine MCP tool wiring ---------------------------------
+
+    fn call(dispatcher: &McpDispatcher, name: &str, arguments: Value) -> Result<Value> {
+        let rt = tokio::runtime::Runtime::new()?;
+        let text = rt.block_on(async {
+            let request = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }))?;
+            match dispatcher.dispatch_strict(&request).await {
+                Ok(DispatchResult::Response(response)) => Ok(serde_json::to_string(&response)?),
+                Ok(DispatchResult::NoResponse) => Ok(String::new()),
+                Err(error) => Err(anyhow::anyhow!(error.message)),
+            }
+        })?;
+        let response: Value = serde_json::from_str(&text)?;
+        // Unwrap the standard content envelope into the tool's JSON value.
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no content envelope"))?;
+        Ok(serde_json::from_str(text)?)
+    }
+
+    #[test]
+    fn context_tools_insert_status_offload_restore_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+
+        let inserted = call(
+            &dispatcher,
+            "context.insert",
+            json!({"id": "notes", "content": "deploy instructions for api", "source": "Tool"}),
+        )
+        .unwrap();
+        assert_eq!(inserted["id"], "notes");
+
+        let status = call(&dispatcher, "context.status", json!({})).unwrap();
+        assert_eq!(status["active_items"], 1);
+        assert!(status["active_tokens"].as_u64().unwrap() > 0);
+
+        call(
+            &dispatcher,
+            "context.offload",
+            json!({"id": "notes", "reason": "test"}),
+        )
+        .unwrap();
+        let status = call(&dispatcher, "context.status", json!({})).unwrap();
+        assert_eq!(status["active_items"], 0);
+        assert_eq!(status["offloaded_items"], 1);
+
+        let restored = call(&dispatcher, "context.restore", json!({"id": "notes"})).unwrap();
+        assert_eq!(restored["id"], "notes");
+        let status = call(&dispatcher, "context.status", json!({})).unwrap();
+        assert_eq!(status["active_items"], 1);
+    }
+
+    #[test]
+    fn context_search_finds_active_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        call(
+            &dispatcher,
+            "context.insert",
+            json!({"id": "q", "content": "kubernetes rollout strategy"}),
+        )
+        .unwrap();
+        let hits = call(
+            &dispatcher,
+            "context.search",
+            json!({"query": "kubernetes", "limit": 5}),
+        )
+        .unwrap();
+        assert!(hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| { hit["item"]["id"] == "q" || hit["id"] == "q" }));
+    }
+
+    #[test]
+    fn context_assemble_respects_budget_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        call(
+            &dispatcher,
+            "context.insert",
+            json!({"id": "small", "content": "tiny relevant snippet"}),
+        )
+        .unwrap();
+        let words: Vec<String> = (0..400).map(|i| format!("filler{i}")).collect();
+        call(
+            &dispatcher,
+            "context.insert",
+            json!({"id": "large", "content": words.join(" "), "relevance": 0.1}),
+        )
+        .unwrap();
+        // The explicit token_budget caps selection: with a 20-token budget the
+        // 400-token filler item cannot fit, so only the small item is kept.
+        let assembled = call(
+            &dispatcher,
+            "context.assemble",
+            json!({"task": "tiny relevant snippet task", "token_budget": 20}),
+        )
+        .unwrap();
+        let ids: Vec<&str> = assembled["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["small"]);
+        assert!(assembled["rejected_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("large")));
+    }
+
+    #[test]
+    fn context_tools_listed_in_tools_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let text = rt
+            .block_on(async {
+                match dispatcher
+                    .dispatch_strict(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+                    )
+                    .await
+                {
+                    Ok(DispatchResult::Response(response)) => {
+                        Ok(serde_json::to_string(&response).unwrap())
+                    }
+                    Ok(DispatchResult::NoResponse) => Ok(String::new()),
+                    Err(error) => Err(error.message),
+                }
+            })
+            .unwrap();
+        let response: Value = serde_json::from_str(&text).unwrap();
+        let tools: Vec<String> = response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(tools.contains(&"context.status".to_string()));
+        assert!(tools.contains(&"context.assemble".to_string()));
     }
 }
