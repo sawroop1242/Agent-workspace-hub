@@ -75,9 +75,11 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 
 ## Phase Status
 
-0-6 done (branch rust). Next: Phase 7 dashboard/status screens (the
-audit ring `services::audit::global()` is available for recent
-activity), Phase 8 context/memory/skills screens (`src/context/`
-engines exist), Phase 9 tunnel + rate limiting (spec §25 chain:
-Auth -> Authz -> Rate Limit -> Audit -> Services), Phase 10
-hardening/docs.
+0-7 done (branch rust). Next: Phase 8 context/memory/skills screens
+(`src/context/` engines + `src/skills/` exist), Phase 9 tunnel +
+rate limiting (spec §25 chain: Auth -> Authz -> Rate Limit -> Audit
+-> Services), Phase 10 hardening/docs.
+- **Env note**: the Rust toolchain can be wiped from this container
+  between sessions; if `cargo` is missing reinstall with rustup
+  (`--default-toolchain stable --profile minimal` then `rustup
+  component add rustfmt clippy`).
