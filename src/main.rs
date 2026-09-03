@@ -50,6 +50,10 @@ enum Command {
         #[command(subcommand)]
         command: RegistryCommand,
     },
+    Tunnel {
+        #[command(subcommand)]
+        command: TunnelCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -185,6 +189,41 @@ enum RegistryCommand {
     List,
     Remove { url: String },
     Search { query: String, url: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum TunnelCommand {
+    /// Start a tunnel exposing a local port (runs in the foreground).
+    Start {
+        /// Local address the tunnel forwards to.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Local port the tunnel forwards to.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Tunnel provider implementation.
+        #[arg(long, default_value = "ngrok")]
+        provider: String,
+        /// Path to the ngrok binary.
+        #[arg(long, default_value = "ngrok")]
+        ngrok_path: String,
+        /// ngrok authtoken (prefer `--ngrok-authtoken` over pasting
+        /// tokens into shell history; also read via this flag only).
+        #[arg(long)]
+        ngrok_authtoken: Option<String>,
+        /// ngrok region.
+        #[arg(long)]
+        ngrok_region: Option<String>,
+    },
+    /// Report the status of any tunnel the local ngrok agent exposes.
+    Status {
+        /// Tunnel provider implementation.
+        #[arg(long, default_value = "ngrok")]
+        provider: String,
+        /// Path to the ngrok binary (used to spawn a status probe).
+        #[arg(long, default_value = "ngrok")]
+        ngrok_path: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -326,6 +365,7 @@ fn main() -> Result<()> {
             }
             RegistryCommand::Search { query, url } => search_registry(&url, &query)?,
         },
+        Some(Command::Tunnel { command }) => handle_tunnel_cli(command)?,
         None => println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
     }
     Ok(())
@@ -564,6 +604,73 @@ fn serve_control_api(host: String, port: u16, api_key_env: String) -> Result<()>
         axum::serve(listener, app).await
     })?;
     Ok(())
+}
+
+/// Handles `awh tunnel start|status`. `start` runs in the foreground:
+/// the tunnel lives exactly as long as the command, Ctrl-C stops it and
+/// the ngrok child is killed on drop.
+fn handle_tunnel_cli(command: TunnelCommand) -> Result<()> {
+    use agent_workspace_hub::tunnel::{provider_by_name, TunnelStatus};
+
+    match command {
+        TunnelCommand::Start {
+            host,
+            port,
+            provider,
+            ngrok_path,
+            ngrok_authtoken,
+            ngrok_region,
+        } => {
+            if host != "127.0.0.1" && host != "localhost" {
+                eprintln!(
+                    "warning: forwarding to {host}. The Control API behind this tunnel must \
+                     still require its bearer token; the tunnel is transport, not auth."
+                );
+            }
+            let mut p = provider_by_name(&provider)?;
+            if p.name() == "ngrok" {
+                // Only the ngrok provider understands these options;
+                // the CLI stays provider-agnostic by rebuilding from
+                // name + typed options instead of matching elsewhere.
+                p = Box::new(
+                    agent_workspace_hub::tunnel::NgrokProvider::new(&ngrok_path)
+                        .with_authtoken(ngrok_authtoken)
+                        .with_region(ngrok_region),
+                );
+            }
+
+            let target = format!("{host}:{port}");
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                println!("starting {provider} tunnel to {target}…");
+                let url = p.start(&target).await?;
+                println!("public URL: {url}");
+                eprintln!("tunnel is up — Ctrl-C to stop");
+                tokio::signal::ctrl_c().await?;
+                p.stop().await?;
+                println!("tunnel stopped");
+                Ok::<(), anyhow::Error>(())
+            })
+        }
+        TunnelCommand::Status { provider, .. } => {
+            let p = provider_by_name(&provider)?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                match p.status().await {
+                    Ok(TunnelStatus::Running { public_url }) => {
+                        println!("running\npublic URL: {public_url}")
+                    }
+                    Ok(TunnelStatus::Starting) => println!("starting"),
+                    Ok(TunnelStatus::Stopped) => println!("stopped"),
+                    Err(e) => {
+                        eprintln!("status probe failed (is the ngrok agent running?): {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+        }
+    }
 }
 
 /// Runs the standard stdio MCP serve loop (the original `awh mcp serve` path).

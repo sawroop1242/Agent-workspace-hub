@@ -10,7 +10,7 @@ Rust implementation of the AI-native workspace runtime per
 source ~/.cargo/env
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test --workspace      # 304 tests as of Phase 5
+cargo test --workspace      # 354 tests as of Phase 9
 ```
 
 Git identity is NOT configured globally; commit with:
@@ -75,9 +75,28 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 
 ## Phase Status
 
-0-8 done (branch rust). Next: Phase 9 tunnel + rate limiting
-(spec §25 chain: Auth -> Authz -> Rate Limit -> Audit -> Services),
-Phase 10 hardening/docs.
+0-9 done (branch rust). Next: Phase 10 hardening/security tests/docs.
+- **Phase 9 — tunnel + rate limiting**: `src/tunnel/mod.rs` —
+  `TunnelProvider` trait (`start/stop/status`) + `NgrokProvider` spawning
+  the local `ngrok` binary via argv (never a shell); public URL resolved
+  by polling the ngrok agent API `127.0.0.1:4040/api/tunnels`
+  (`parse_agent_tunnels` prefers https, falls back to any public URL);
+  failed start leaves no half-running child. CLI: `awh tunnel start
+  --port/--provider/--ngrok-path/--ngrok-authtoken/--ngrok-region`
+  (foreground, Ctrl-C stops, child killed on drop) and `awh tunnel status`
+  (agent-API probe works across processes — no daemon/pidfile). A tunnel
+  is transport, not auth: Control API keeps bearer auth behind it; the
+  CLI warns when forwarding to non-loopback hosts.
+- **Phase 9 — rate limiting**: `src/api/rate_limit.rs` — in-process
+  sliding window (default 120 req/60s per client key), no new deps.
+  Layer order in `build_router`: rate-limit layer added BEFORE the auth
+  layer, so `authenticate` runs first (spec §25 chain) and 401s never
+  consume quota. Key = `X-Forwarded-For` first value (ngrok/proxies set
+  it; direct connections share the `direct` bucket). 429 responses carry
+  `Retry-After` + structured `rate_limited` error and record an
+  `api_rate_limit` deny in the audit ring (signature:
+  `audit_deny(action, reason, subject)` — key is the SUBJECT, not
+  reason). `/healthz` is on the public router — never throttled.
 - **Phase 8**: Context/Memory/Skills screens (`src/tui/screens/{context,
   memory,skills}.rs`) ride `WorkspaceBackend` trait methods (scope =
   focused project or workspace root); API plane gained `/api/v1/context`

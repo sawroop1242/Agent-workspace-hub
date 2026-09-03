@@ -37,9 +37,9 @@ session identifiers, headers, registry content, and external connector data.
 | **Asset** | Another client's session state and project access |
 | **Attacker** | A client guessing or reusing a `sessionId` |
 | **Attack** | POST `/mcp?sessionId=<someone-else's-id>` |
-| **Mitigation** | Sessions are opaque server-generated IDs; unknown ID → 404; each session is isolated per-connection state; concurrent sessions capped at 100 |
-| **Test** | `tests/mcp_http.rs`: `unknown_session_is_rejected`, `enforces_session_limit` |
-| **Residual risk** | IDs are unguessable but not cryptographically rate-limited per source IP; a determined attacker who *possesses* a valid token can open the session anyway (token == full trust) |
+| **Mitigation** | Sessions are opaque server-generated IDs; unknown ID → 404; each session is isolated per-connection state; concurrent sessions capped at 100. The Control API plane applies in-process sliding-window rate limiting after authentication (Phase 9): per client key (X-Forwarded-For when behind a tunnel/proxy, `direct` bucket otherwise), 429 + `Retry-After`, audited as `api_rate_limit` denials |
+| **Test** | `tests/mcp_http.rs`: `unknown_session_is_rejected`, `enforces_session_limit`; `src/api/control.rs` tests: `rate_limit_trips_429_audits_and_scopes_to_client`, `invalid_tokens_do_not_consume_rate_quota` |
+| **Residual risk** | IDs are unguessable but not cryptographically rate-limited per source IP; a determined attacker who *possesses* a valid token can open the session anyway (token == full trust). The rate limiter is best-effort in-process state keyed on a header a direct-connected attacker can spoof; it bounds abuse, it is not a security boundary |
 
 ## T3 — Path traversal / sandbox escape
 
@@ -128,6 +128,17 @@ session identifiers, headers, registry content, and external connector data.
 | **Mitigation** | Explicit authorization layer: enabled → action allowed → permission check → approval if dangerous → execute → audit; connector credentials never exposed to the MCP client; outbound calls timeout-bounded and circuit-broken |
 | **Test** | `tests/mcp_server.rs`: unknown qualified provider tool fails closed; `src/mcp/connectors.rs` unit tests for store limits and enable/disable flows |
 | **Residual risk** | Connector behavior ultimately depends on the upstream provider's own authorization model; AWH gates *whether* an action may be invoked, not what the provider then does |
+
+## T11 — Public exposure via tunnel
+
+| | |
+| --- | --- |
+| **Asset** | The Control API (projects, files, git, terminal, context/memory/skills) |
+| **Attacker** | Anyone on the internet once a tunnel is up |
+| **Attack** | Reach `https://<random>.ngrok.app/api/v1/*` and attempt unauthenticated calls or token brute force |
+| **Mitigation** | The tunnel is transport, not authentication: the same bearer-token middleware (constant-time compare) guards every route; the tunnel is only started by an explicit `awh tunnel start` (foreground, deliberate user action); ngrok authtoken passed as argv, never env; failed starts leave no half-running child; CLI warns when forwarding to non-loopback targets; post-auth rate limiting bounds token-holders' request volume |
+| **Test** | `src/tunnel/mod.rs` tests (argv construction, agent-API parsing, failed-spawn cleanup, trait lifecycle); live smoke: 401 without token through the stack; `src/api/control.rs` rate-limit tests |
+| **Residual risk** | ngrok itself is a third party in the path (it terminates TLS and sees traffic metadata); its free URLs are enumerable. Possessing the API key is full trust; the key must be treated as a secret (it is the only barrier once the tunnel is up) |
 
 ## Cross-cutting guarantees
 

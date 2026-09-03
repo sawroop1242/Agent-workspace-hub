@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
+use crate::api::rate_limit::RateLimiter;
 use crate::mcp::audit::{audit_allow, audit_deny};
 use crate::mcp::auth;
 use crate::services::{
@@ -34,6 +35,8 @@ pub struct ControlState {
     pub api_key: String,
     pub started: std::time::Instant,
     pub version: &'static str,
+    /// Sliding-window limiter applied after authentication.
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 impl ControlState {
@@ -43,6 +46,7 @@ impl ControlState {
             api_key,
             started: std::time::Instant::now(),
             version: env!("CARGO_PKG_VERSION"),
+            rate_limiter: RateLimiter::default_limiter(),
         }
     }
 
@@ -148,6 +152,14 @@ pub fn build_router(state: Arc<ControlState>) -> Router {
         .route("/mcp", get(list_mcp))
         .route("/audit", get(audit))
         .route("/logs", get(logs))
+        // Rate limiting sits after authentication in the spec §25
+        // chain: added before the auth layer, so `authenticate` (the
+        // outermost layer) runs first and only valid tokens reach the
+        // limiter. Health (public router below) is never throttled.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_guard,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
@@ -186,6 +198,49 @@ async fn authenticate(
         _ => {
             audit_deny("control_auth", "invalid_or_missing_token", "remote");
             ApiError::unauthorized().into_response()
+        }
+    }
+}
+
+/// Spec §25 rate-limit step: counts authenticated requests per client
+/// key. The key prefers `X-Forwarded-For` (set by tunnels/proxies like
+/// ngrok, which is the deployment this API expects); direct connections
+/// share the `"direct"` bucket. Auth runs before this layer, so the
+/// header cannot be used to dodge authentication — only to split
+/// buckets, which is the desired behavior behind a proxy.
+async fn rate_limit_guard(
+    State(state): State<Arc<ControlState>>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let key = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().unwrap_or("direct").trim().to_string())
+        .unwrap_or_else(|| "direct".to_string());
+    match state.rate_limiter.check(&key) {
+        Ok(remaining) => {
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert("x-ratelimit-remaining", remaining.into());
+            response
+        }
+        Err(retry_after_secs) => {
+            // Signature is (action, reason, subject): the client key is
+            // the subject of the denial, "rate_limited" the reason.
+            audit_deny("api_rate_limit", "rate_limited", &key);
+            let mut response = ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                format!("rate limit exceeded; retry in {retry_after_secs}s"),
+            )
+            .into_response();
+            response
+                .headers_mut()
+                .insert("retry-after", retry_after_secs.into());
+            response
         }
     }
 }
@@ -1253,7 +1308,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let recent = crate::services::audit::global().recent(10);
+        let recent = crate::services::audit::global().recent(500);
         assert!(recent
             .iter()
             .any(|e| e.action == "api_context_write" && e.kind == "deny"));
@@ -1320,7 +1375,7 @@ mod tests {
         assert_eq!(body["entries"][1]["content"], "second fact");
         assert!(!body["entries"][0]["timestamp"].as_str().unwrap().is_empty());
 
-        let recent = crate::services::audit::global().recent(10);
+        let recent = crate::services::audit::global().recent(500);
         assert!(recent
             .iter()
             .any(|e| e.action == "api_memory_append" && e.subject == "(root)"));
@@ -1388,7 +1443,7 @@ mod tests {
         let body = body_json(res).await;
         assert_eq!(body["skills"].as_array().unwrap().len(), 0);
 
-        let recent = crate::services::audit::global().recent(10);
+        let recent = crate::services::audit::global().recent(500);
         assert!(recent
             .iter()
             .any(|e| e.action == "api_skill_add" && e.subject == "demo"));
@@ -1415,5 +1470,126 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         std::env::remove_var("HOME");
+    }
+
+    // ----- Rate limiting (spec section 25) -----
+
+    /// State with a tiny 5-per-minute bucket so tests trip the limit fast.
+    fn tiny_state(root: &std::path::Path) -> Arc<ControlState> {
+        let mut s = Arc::new(ControlState::new(root, "test-key".to_string()));
+        Arc::get_mut(&mut s).unwrap().rate_limiter = Arc::new(
+            crate::api::rate_limit::RateLimiter::new(5, std::time::Duration::from_secs(60)),
+        );
+        s
+    }
+
+    fn get_with_ip(path: &str, ip: &str) -> Request<Body> {
+        authed(
+            Request::get(path)
+                .header("x-forwarded-for", ip)
+                .body(Body::empty())
+                .unwrap(),
+            Some("test-key"),
+        )
+    }
+
+    /// The limiter must trip only for the offending client, respond 429
+    /// with a `Retry-After` header, audit the deny, and leave health
+    /// probes throttling-free.
+    #[tokio::test]
+    async fn rate_limit_trips_429_audits_and_scopes_to_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(tiny_state(tmp.path()));
+
+        for _ in 0..5 {
+            let res = app
+                .clone()
+                .oneshot(get_with_ip("/api/v1/status", "9.9.9.9"))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert!(res.headers().contains_key("x-ratelimit-remaining"));
+        }
+
+        // 6th request from the same IP: refused with Retry-After.
+        let res = app
+            .clone()
+            .oneshot(get_with_ip("/api/v1/status", "9.9.9.9"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = res
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("retry-after header");
+        assert!((1..=60).contains(&retry));
+        let body = body_json(res).await;
+        assert_eq!(body["error"]["code"], "rate_limited");
+
+        // A different client is unaffected.
+        let res = app
+            .clone()
+            .oneshot(get_with_ip("/api/v1/status", "8.8.8.8"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Denials are audited.
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_rate_limit" && e.subject == "9.9.9.9" && e.kind == "deny"));
+
+        // Health probes stay unthrottled even for the exhausted client.
+        let res = app
+            .oneshot(get("/api/v1/healthz", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// Requests without `X-Forwarded-For` share the `direct` bucket.
+    #[tokio::test]
+    async fn rate_limit_counts_direct_connections_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_ = state(tmp.path());
+        let app = build_router(state_.clone());
+
+        assert_eq!(state_.rate_limiter.current("direct"), 0);
+        for _ in 0..3 {
+            let res = app
+                .clone()
+                .oneshot(get("/api/v1/status", Some("test-key")))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        assert_eq!(state_.rate_limiter.current("direct"), 3);
+    }
+
+    /// An invalid token is rejected by auth before the limiter, and
+    /// never consumes quota.
+    #[tokio::test]
+    async fn invalid_tokens_do_not_consume_rate_quota() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_ = state(tmp.path());
+        let limiter_count = state_.rate_limiter.current("direct");
+        let app = build_router(state_.clone());
+
+        for _ in 0..3 {
+            let res = app
+                .clone()
+                .oneshot(get("/api/v1/status", None))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            state_.rate_limiter.current("direct"),
+            limiter_count,
+            "auth failures must not touch the rate limiter"
+        );
     }
 }

@@ -15,3 +15,4 @@ pub mod models;
 pub mod services;
 pub mod skills;
 pub mod tui;
+pub mod tunnel;
