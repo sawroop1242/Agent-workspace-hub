@@ -96,6 +96,24 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(recorder.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
 
+        // Warm-up + interest rebuild. First-time callsite registration is
+        // process-global and its cached Interest is computed against the
+        // *registering thread's* dispatcher when any scoped dispatcher is
+        // live anywhere in the process. So a sibling test first-touching
+        // these same warn callsites while our guard is held on this thread
+        // resolves to no dispatcher at all and permanently caches
+        // Interest::never for them (observed as a CI flake on Windows).
+        // Emitting once here guarantees the callsites are registered
+        // already, and rebuilding the cache while our guard is held
+        // re-caches every callsite against this recorder.
+        audit_allow("session_create", "sid-1", "/sse");
+        audit_deny("http_auth", "invalid_or_missing_token", "remote");
+        audit_secret_deny("not_approved", "my_secret");
+        audit_circuit_open("provider-1");
+        audit_allow("tool_invoke", "memory.store", "tools/call");
+        tracing::callsite::rebuild_interest_cache();
+        recorder.0.lock().unwrap().clear();
+
         audit_allow("session_create", "sid-1", "/sse");
         audit_deny("http_auth", "invalid_or_missing_token", "remote");
         audit_secret_deny("not_approved", "my_secret");
@@ -103,24 +121,13 @@ mod tests {
         audit_allow("tool_invoke", "memory.store", "tools/call");
 
         let recorded = recorder.0.lock().unwrap().clone();
-        assert!(recorded.contains(&"mcp_audit".to_string()), "{recorded:?}");
-        assert!(
-            recorded.contains(&"mcp_security_denied".to_string()),
-            "{recorded:?}"
-        );
-        assert!(
-            recorded.contains(&"mcp_secret_denied".to_string()),
-            "{recorded:?}"
-        );
-        assert!(
-            recorded.contains(&"mcp_circuit_open".to_string()),
-            "{recorded:?}"
-        );
-        // Allow-side events fire once per call: two audit_allow calls above.
-        assert_eq!(
-            recorded.iter().filter(|e| *e == "mcp_audit").count(),
-            2,
-            "{recorded:?}"
-        );
+        let count = |name: &str| recorded.iter().filter(|e| e.as_str() == name).count();
+        // Every helper must land exactly once, with the right event name:
+        // this also catches double-emission and level mix-ups.
+        assert_eq!(count("mcp_audit"), 2, "{recorded:?}");
+        assert_eq!(count("mcp_security_denied"), 1, "{recorded:?}");
+        assert_eq!(count("mcp_secret_denied"), 1, "{recorded:?}");
+        assert_eq!(count("mcp_circuit_open"), 1, "{recorded:?}");
+        assert_eq!(recorded.len(), 5, "{recorded:?}");
     }
 }
