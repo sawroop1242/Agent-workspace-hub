@@ -79,6 +79,14 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
   needing a home directory must inject a root (`ControlState.
   global_skills_root`) rather than `set_var("HOME", …)`, which
   silently no-ops on Windows and races parallel tests everywhere.
+  (3) tracing caches per-callsite Interest process-wide from the
+  FIRST macro execution, evaluated against the registering thread's
+  dispatcher (scoped `set_default` guards are invisible to sibling
+  threads — they resolve to NoSubscriber → Interest::never). Tests
+  asserting on tracing events must warm up all callsites, then
+  `tracing::callsite::rebuild_interest_cache()` while holding their
+  guard, then clear and re-emit (see mcp/audit.rs test for the
+  pattern). Otherwise parallel sibling tests poison shared callsites.
 - Cargo deps: axum 0.8, tower 0.5 (util), tower-http 0.6 already present —
   no new deps were needed through Phase 5 (spec: avoid unjustified crates).
 
