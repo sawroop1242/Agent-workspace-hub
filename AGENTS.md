@@ -75,10 +75,16 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 
 ## Phase Status
 
-0-7 done (branch rust). Next: Phase 8 context/memory/skills screens
-(`src/context/` engines + `src/skills/` exist), Phase 9 tunnel +
-rate limiting (spec §25 chain: Auth -> Authz -> Rate Limit -> Audit
--> Services), Phase 10 hardening/docs.
+0-8 done (branch rust). Next: Phase 9 tunnel + rate limiting
+(spec §25 chain: Auth -> Authz -> Rate Limit -> Audit -> Services),
+Phase 10 hardening/docs.
+- **Phase 8**: Context/Memory/Skills screens (`src/tui/screens/{context,
+  memory,skills}.rs`) ride `WorkspaceBackend` trait methods (scope =
+  focused project or workspace root); API plane gained `/api/v1/context`
+  (GET/PUT, 512 KiB cap), `/api/v1/memory` (GET/POST), `/api/v1/skills/
+  project` (GET/POST/DELETE) with `store_scope` validating project names
+  before path joins; mutations audited (`api_context_write`,
+  `api_memory_append`, `api_skill_add`, `api_skill_remove`).
 - **Env note**: the Rust toolchain can be wiped from this container
   between sessions; if `cargo` is missing reinstall with rustup
   (`--default-toolchain stable --profile minimal` then `rustup

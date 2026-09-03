@@ -136,7 +136,15 @@ pub fn build_router(state: Arc<ControlState>) -> Router {
         .route("/git/unstage", post(git_unstage))
         .route("/git/commit", post(git_commit))
         .route("/terminal/run", post(run_command))
+        .route("/context", get(read_context).put(write_context))
+        .route("/memory", get(list_memory).post(append_memory))
         .route("/skills", get(list_skills))
+        .route(
+            "/skills/project",
+            get(list_project_skills)
+                .post(add_project_skill)
+                .delete(remove_project_skill),
+        )
         .route("/mcp", get(list_mcp))
         .route("/audit", get(audit))
         .route("/logs", get(logs))
@@ -563,6 +571,190 @@ fn truncate_detail(s: &str, max: usize) -> String {
     }
 }
 
+// ----- Context / Memory / Skills (spec sections 12-14) -----
+
+/// Query scope for context/memory/project-skill reads and writes.
+#[derive(Deserialize, Default)]
+struct ScopeParams {
+    project: Option<String>,
+}
+
+/// Resolves the store root for a scope: the named project (validated,
+/// traversal-safe) or the workspace root when unset.
+fn store_scope(
+    state: &ControlState,
+    project: Option<&str>,
+) -> Result<std::path::PathBuf, ApiError> {
+    match project {
+        Some(name) => {
+            crate::services::projects::validate_project_name(name)
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+            let path = crate::core::workspace::Workspace::new(&state.root).project_path(name);
+            if !path.is_dir() {
+                return Err(ApiError::not_found("project"));
+            }
+            Ok(path)
+        }
+        None => Ok(state.root.clone()),
+    }
+}
+
+/// Safety cap matching the TUI editor's large-file posture.
+const MAX_CONTEXT_BYTES: usize = 512 * 1024;
+
+async fn read_context(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<ScopeParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = store_scope(&state, params.project.as_deref())?;
+    let content = crate::core::context::ContextStore::for_project(&root)
+        .read()
+        .map_err(|e| ApiError::internal(&e))?;
+    Ok(Json(json!({
+        "project": params.project,
+        "content": content,
+    })))
+}
+
+#[derive(Deserialize)]
+struct WriteContextBody {
+    content: String,
+}
+
+async fn write_context(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<ScopeParams>,
+    Json(body): Json<WriteContextBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let scope = scope_name(&params);
+    if body.content.len() > MAX_CONTEXT_BYTES {
+        audit_deny("api_context_write", "too_large", &scope);
+        return Err(ApiError::bad_request("context exceeds 512 KiB cap"));
+    }
+    let root = store_scope(&state, params.project.as_deref())?;
+    crate::core::context::ContextStore::for_project(&root)
+        .write(&body.content)
+        .map_err(|e| ApiError::internal(&e))?;
+    audit_allow("api_context_write", &scope, "remote");
+    Ok(Json(json!({"written": true})))
+}
+
+async fn list_memory(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<ScopeParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = store_scope(&state, params.project.as_deref())?;
+    let entries = crate::core::memory::MemoryStore::for_project(&root)
+        .read_all()
+        .map_err(|e| ApiError::internal(&e))?;
+    let total = entries.len();
+    Ok(Json(json!({
+        "project": params.project,
+        "total": total,
+        "entries": entries,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AppendMemoryBody {
+    content: String,
+}
+
+async fn append_memory(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<ScopeParams>,
+    Json(body): Json<AppendMemoryBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.content.trim().is_empty() {
+        return Err(ApiError::bad_request("content is required"));
+    }
+    let root = store_scope(&state, params.project.as_deref())?;
+    let entry = crate::models::MemoryEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        content: body.content,
+    };
+    crate::core::memory::MemoryStore::for_project(&root)
+        .append(&entry)
+        .map_err(|e| ApiError::internal(&e))?;
+    audit_allow("api_memory_append", scope_name(&params).as_str(), "remote");
+    Ok(Json(json!({"appended": true})))
+}
+
+/// Scope label for audit subjects (never includes paths).
+fn scope_name(params: &ScopeParams) -> String {
+    params
+        .project
+        .clone()
+        .unwrap_or_else(|| "(root)".to_owned())
+}
+
+async fn list_project_skills(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<ScopeParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = store_scope(&state, params.project.as_deref())?;
+    let registry = GlobalSkillRegistry::discover().map_err(|e| ApiError::internal(&e))?;
+    let skills = crate::skills::ProjectSkillReferences::new(&root)
+        .resolve(&registry)
+        .map_err(|e| ApiError::internal(&e))?;
+    let items: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "description": s.description,
+                "version": s.version.as_deref().unwrap_or("unknown"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"project": params.project, "skills": items})))
+}
+
+#[derive(Deserialize)]
+struct ProjectSkillBody {
+    project: Option<String>,
+    name: String,
+}
+
+async fn add_project_skill(
+    State(state): State<Arc<ControlState>>,
+    Json(body): Json<ProjectSkillBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = store_scope(&state, body.project.as_deref())?;
+    let registry = GlobalSkillRegistry::discover().map_err(|e| ApiError::internal(&e))?;
+    crate::skills::ProjectSkillReferences::new(&root)
+        .add(&body.name, &registry)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    audit_allow("api_skill_add", &body.name, &scope_name_body(&body));
+    Ok(Json(json!({"added": body.name})))
+}
+
+async fn remove_project_skill(
+    State(state): State<Arc<ControlState>>,
+    Query(body): Query<ProjectSkillQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = store_scope(&state, body.project.as_deref())?;
+    crate::skills::ProjectSkillReferences::new(&root)
+        .remove(&body.name)
+        .map_err(|e| ApiError::internal(&e))?;
+    audit_allow("api_skill_remove", &body.name, &scope_name_body_q(&body));
+    Ok(Json(json!({"removed": body.name})))
+}
+
+#[derive(Deserialize, Default)]
+struct ProjectSkillQuery {
+    project: Option<String>,
+    name: String,
+}
+
+fn scope_name_body(body: &ProjectSkillBody) -> String {
+    body.project.clone().unwrap_or_else(|| "(root)".to_owned())
+}
+
+fn scope_name_body_q(body: &ProjectSkillQuery) -> String {
+    body.project.clone().unwrap_or_else(|| "(root)".to_owned())
+}
+
 // ----- Skills & MCP (read-only listings) -----
 
 /// Lists globally installed skills. Project-level skill references are
@@ -973,5 +1165,255 @@ mod tests {
         assert!(recent
             .iter()
             .any(|e| e.action == "api_project_delete" && e.subject == "audited-proj"));
+    }
+
+    // ----- Context / Memory / Skills -----
+
+    fn put_json(path: &str, token: Option<&str>, body: serde_json::Value) -> Request<Body> {
+        let req = Request::put(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        authed(req, token)
+    }
+
+    fn delete(path: &str, token: Option<&str>) -> Request<Body> {
+        authed(
+            Request::builder()
+                .method("DELETE")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+            token,
+        )
+    }
+
+    async fn body_json(res: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn context_roundtrip_and_scope_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_ = state(tmp.path());
+        let app = build_router(state_.clone());
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/projects",
+                Some("test-key"),
+                json!({"name": "scoped"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/context?project=scoped",
+                Some("test-key"),
+                json!({"content": "scoped conventions"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/context?project=scoped", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["content"], "scoped conventions");
+
+        // Root scope must not see the project's context.
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/context", Some("test-key")))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["content"], "");
+
+        // Oversized write is refused and audited as a deny.
+        let big = "x".repeat(MAX_CONTEXT_BYTES + 1);
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/context?project=scoped",
+                Some("test-key"),
+                json!({"content": big}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(10);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_context_write" && e.kind == "deny"));
+    }
+
+    #[tokio::test]
+    async fn context_write_rejects_traversal_and_missing_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/context?project=..%2F..%2Fetc",
+                Some("test-key"),
+                json!({"content": "escape"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = app
+            .oneshot(get("/api/v1/context?project=nope", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn memory_append_lists_and_audits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memory",
+                Some("test-key"),
+                json!({"content": "first fact"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memory",
+                Some("test-key"),
+                json!({"content": "second fact"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/memory", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["entries"][0]["content"], "first fact");
+        assert_eq!(body["entries"][1]["content"], "second fact");
+        assert!(!body["entries"][0]["timestamp"].as_str().unwrap().is_empty());
+
+        let recent = crate::services::audit::global().recent(10);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_memory_append" && e.subject == "(root)"));
+
+        // Empty content is rejected.
+        let res = app
+            .oneshot(post_json(
+                "/api/v1/memory",
+                Some("test-key"),
+                json!({"content": "   "}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn project_skill_references_managed_via_api() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Global registry discovery uses $HOME; point it at a temp home
+        // so this test cannot see or mutate the real user registry.
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        std::fs::create_dir_all(home.path().join(".agent-workspace-hub/skills/demo")).unwrap();
+        std::fs::write(
+            home.path()
+                .join(".agent-workspace-hub/skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\nversion: 0.1.0\n---\n\n# demo\n",
+        )
+        .unwrap();
+
+        let app = build_router(state(tmp.path()));
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/skills/project",
+                Some("test-key"),
+                json!({"name": "demo"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/skills/project", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["skills"][0]["name"], "demo");
+
+        let res = app
+            .clone()
+            .oneshot(delete("/api/v1/skills/project?name=demo", Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(get("/api/v1/skills/project", Some("test-key")))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["skills"].as_array().unwrap().len(), 0);
+
+        let recent = crate::services::audit::global().recent(10);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_skill_add" && e.subject == "demo"));
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_skill_remove" && e.subject == "demo"));
+
+        std::env::remove_var("HOME");
+    }
+
+    #[tokio::test]
+    async fn adding_uninstalled_global_skill_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let app = build_router(state(tmp.path()));
+        let res = app
+            .oneshot(post_json(
+                "/api/v1/skills/project",
+                Some("test-key"),
+                json!({"name": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        std::env::remove_var("HOME");
     }
 }

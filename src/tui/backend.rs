@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::models::MemoryEntry;
 use crate::services::files::{FileMeta, ListEntry, SearchHit};
 use crate::services::git::GitOutput;
 use crate::services::terminal::ExecOutcome;
+use crate::skills::Skill;
 
 /// Snapshot of workspace state for the Dashboard screen.
 #[derive(Debug, Clone, Default)]
@@ -71,6 +73,29 @@ pub trait WorkspaceBackend {
     fn git_diff(&self, staged: bool, path: Option<&str>) -> Result<GitOutput>;
 
     fn terminal_run(&self, program: &str, args: &[String]) -> Result<ExecOutcome>;
+
+    // ----- Context / Memory / Skills (spec sections 12-14) -----
+
+    /// Reads the focused project's `.agent/context.md` (empty if absent).
+    fn read_context(&self, project: Option<&str>) -> Result<String>;
+    /// Overwrites the focused project's `.agent/context.md`.
+    fn write_context(&self, project: Option<&str>, content: &str) -> Result<()>;
+    /// Lists the focused project's memory entries, oldest first.
+    fn list_memory(&self, project: Option<&str>) -> Result<Vec<MemoryEntry>>;
+    /// Appends one memory entry, stamped with the current time.
+    fn append_memory(&self, project: Option<&str>, content: &str) -> Result<()>;
+    /// Global skills visible to every project.
+    fn list_global_skills(&self) -> Result<Vec<Skill>>;
+    /// Skills referenced by the focused project, resolved against the
+    /// global registry.
+    fn list_project_skills(&self, project: Option<&str>) -> Result<Vec<Skill>>;
+    /// Adds or removes a project skill reference; returns true when the
+    /// reference set changed.
+    fn toggle_project_skill(&self, project: Option<&str>, name: &str) -> Result<bool>;
+
+    /// The project the operator last focused, if any (spec section 7:
+    /// context, memory, and skill views follow the current project).
+    fn current_project_hint(&self) -> Option<String>;
 }
 
 /// Local implementation over the shared application services. The TUI event
@@ -103,6 +128,20 @@ impl LocalBackend {
     /// Records the project the operator opened, for the dashboard.
     pub fn set_current_project(&mut self, name: &str) {
         self.current_project = Some(name.to_owned());
+    }
+
+    /// The project the operator last opened, if any.
+    pub fn current_project(&self) -> Option<&str> {
+        self.current_project.as_deref()
+    }
+
+    /// Directory context/memory/skill stores operate on: the focused
+    /// project when one is open, otherwise the workspace root.
+    fn store_root(&self, project: Option<&str>) -> PathBuf {
+        match project {
+            Some(name) => crate::core::workspace::Workspace::new(&self.root).project_path(name),
+            None => self.root.clone(),
+        }
     }
 }
 
@@ -278,7 +317,60 @@ impl WorkspaceBackend for LocalBackend {
         );
         Ok(outcome)
     }
+
+    // ----- Context / Memory / Skills -----
+
+    fn read_context(&self, project: Option<&str>) -> Result<String> {
+        crate::core::context::ContextStore::for_project(&self.store_root(project)).read()
+    }
+
+    fn write_context(&self, project: Option<&str>, content: &str) -> Result<()> {
+        if content.len() > MAX_CONTEXT_BYTES {
+            anyhow::bail!("context exceeds {} byte safety cap", MAX_CONTEXT_BYTES);
+        }
+        crate::core::context::ContextStore::for_project(&self.store_root(project)).write(content)
+    }
+
+    fn list_memory(&self, project: Option<&str>) -> Result<Vec<MemoryEntry>> {
+        crate::core::memory::MemoryStore::for_project(&self.store_root(project)).read_all()
+    }
+
+    fn append_memory(&self, project: Option<&str>, content: &str) -> Result<()> {
+        let entry = MemoryEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: content.to_owned(),
+        };
+        crate::core::memory::MemoryStore::for_project(&self.store_root(project)).append(&entry)
+    }
+
+    fn list_global_skills(&self) -> Result<Vec<Skill>> {
+        crate::skills::GlobalSkillRegistry::discover()?.list()
+    }
+
+    fn list_project_skills(&self, project: Option<&str>) -> Result<Vec<Skill>> {
+        let registry = crate::skills::GlobalSkillRegistry::discover()?;
+        let refs = crate::skills::ProjectSkillReferences::new(self.store_root(project));
+        refs.resolve(&registry)
+    }
+
+    fn toggle_project_skill(&self, project: Option<&str>, name: &str) -> Result<bool> {
+        let registry = crate::skills::GlobalSkillRegistry::discover()?;
+        let refs = crate::skills::ProjectSkillReferences::new(self.store_root(project));
+        if refs.load()?.skills.iter().any(|s| s == name) {
+            refs.remove(name)
+        } else {
+            refs.add(name, &registry)
+        }
+    }
+
+    fn current_project_hint(&self) -> Option<String> {
+        self.current_project.clone()
+    }
 }
+
+/// Safety cap for operator-edited context files (matches the editor's
+/// large-file refusal posture).
+const MAX_CONTEXT_BYTES: usize = 512 * 1024;
 
 /// Truncates free-form audit detail on a char boundary.
 fn truncate_detail(s: &str, max: usize) -> String {

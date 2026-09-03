@@ -4,11 +4,14 @@
 //! pair operating on shared [`App`] state plus its own UI struct held
 //! in [`ScreenState`]. Dashboard, Projects, Files, Editor, Git, and
 //! Terminal are fully interactive; later phases fill in the rest.
+pub mod context;
 pub mod editor;
 pub mod files;
 pub mod git;
 pub mod logs;
+pub mod memory;
 pub mod projects;
+pub mod skills;
 pub mod terminal;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -130,6 +133,9 @@ pub struct ScreenState {
     pub editor_ui: editor::EditorUi,
     pub git_ui: git::GitUi,
     pub terminal_ui: terminal::TerminalUi,
+    pub context_ui: context::ContextUi,
+    pub memory_ui: memory::MemoryUi,
+    pub skills_ui: skills::SkillsUi,
     /// Bounded view over the shared audit ring for the Logs screen.
     pub logs: Vec<crate::services::audit::AuditEntry>,
     /// Content produced by a DiscardChanges action, adopted by the
@@ -152,6 +158,9 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: crossterm::event::
         ScreenId::Git => git::handle_key(app, key),
         ScreenId::Terminal => terminal::handle_key(app, key),
         ScreenId::Logs => logs::handle_key(app, key),
+        ScreenId::Context => context::handle_key(app, key),
+        ScreenId::Memory => memory::handle_key(app, key),
+        ScreenId::Skills => skills::handle_key(app, key),
         _ => {}
     }
 }
@@ -186,6 +195,9 @@ pub fn draw<B: WorkspaceBackend>(frame: &mut ratatui::Frame, app: &mut App<B>, a
         ScreenId::Git => git::draw(frame, app, area, block),
         ScreenId::Terminal => terminal::draw(frame, app, area, block),
         ScreenId::Logs => logs::draw(frame, app, area, block),
+        ScreenId::Context => context::draw(frame, app, area, block),
+        ScreenId::Memory => memory::draw(frame, app, area, block),
+        ScreenId::Skills => skills::draw(frame, app, area, block),
         ScreenId::Help => draw_help(frame, area, block),
         _ => draw_placeholder(frame, app, area, block),
     }
