@@ -70,8 +70,8 @@ pub fn provider_by_name(name: &str) -> Result<Box<dyn TunnelProvider>> {
 /// (no shell), then polls its agent API for the assigned public URL.
 pub struct NgrokProvider {
     ngrok_path: PathBuf,
-    /// Auth token passed via `--authtoken` (flag form; never an env
-    /// var, which would leak to child processes of ngrok).
+    /// Auth token passed to the ngrok child via `NGROK_AUTHTOKEN`
+    /// (never argv — `/proc/<pid>/cmdline` is world-readable).
     authtoken: Option<String>,
     /// Region flag, forwarded verbatim if set.
     region: Option<String>,
@@ -108,7 +108,10 @@ impl NgrokProvider {
     }
 
     /// Argument vector for `ngrok http <addr>`. Exposed for tests;
-    /// never build this through a shell.
+    /// never build this through a shell. The authtoken is deliberately
+    /// NOT in argv — argv is world-readable via `/proc/<pid>/cmdline`
+    /// and `ps`, so the token goes to the child's environment instead
+    /// (`NGROK_AUTHTOKEN`, which ngrok v3 reads natively).
     pub fn build_args(&self, target_addr: &str) -> Vec<String> {
         let mut args = vec![
             "http".to_string(),
@@ -116,15 +119,26 @@ impl NgrokProvider {
             "--log".to_string(),
             "stdout".to_string(),
         ];
-        if let Some(token) = &self.authtoken {
-            args.push("--authtoken".to_string());
-            args.push(token.clone());
-        }
         if let Some(region) = &self.region {
             args.push("--region".to_string());
             args.push(region.clone());
         }
         args
+    }
+
+    /// Secret environment passed to the ngrok child (authtoken only).
+    fn child_env(&self) -> Vec<(&'static str, String)> {
+        self.authtoken
+            .as_ref()
+            .map(|t| vec![("NGROK_AUTHTOKEN", t.clone())])
+            .unwrap_or_default()
+    }
+
+    /// Test-only view of [`Self::child_env`]: proves the secret is
+    /// delivered via env, not argv.
+    #[cfg(test)]
+    pub fn child_env_for_test(&self) -> Vec<(&'static str, String)> {
+        self.child_env()
     }
 
     /// Polls the agent API until an HTTP tunnel with a public URL
@@ -165,8 +179,13 @@ impl TunnelProvider for NgrokProvider {
             bail!("tunnel already running");
         }
         let mut cmd = Command::new(&self.ngrok_path);
-        cmd.args(self.build_args(target_addr))
-            .stdout(Stdio::null())
+        cmd.args(self.build_args(target_addr));
+        for (k, v) in self.child_env() {
+            // Env additions (not env_clear): the token must NOT appear in
+            // argv where any process on the host can read it.
+            cmd.env(k, v);
+        }
+        cmd.stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let child = cmd
@@ -261,9 +280,11 @@ mod tests {
     #[test]
     fn args_are_structured_and_ordered() {
         let p = NgrokProvider::new("/usr/local/bin/ngrok")
-            .with_authtoken(Some("tok".into()))
+            .with_authtoken(Some("super-secret-token".into()))
             .with_region(Some("eu".into()));
         let args = p.build_args("127.0.0.1:8080");
+        // The authtoken must never appear in argv: /proc/<pid>/cmdline
+        // is world-readable, so secrets ride in the child's env instead.
         assert_eq!(
             args,
             vec![
@@ -271,18 +292,24 @@ mod tests {
                 "127.0.0.1:8080",
                 "--log",
                 "stdout",
-                "--authtoken",
-                "tok",
                 "--region",
                 "eu"
             ]
+        );
+        assert!(!args.iter().any(|a| a.contains("super-secret-token")));
+        let env = p.child_env_for_test();
+        assert_eq!(
+            env,
+            vec![("NGROK_AUTHTOKEN", "super-secret-token".to_string())]
         );
     }
 
     #[test]
     fn default_args_have_no_optional_flags() {
-        let args = NgrokProvider::default().build_args("127.0.0.1:8080");
+        let p = NgrokProvider::default();
+        let args = p.build_args("127.0.0.1:8080");
         assert_eq!(args, vec!["http", "127.0.0.1:8080", "--log", "stdout"]);
+        assert!(p.child_env_for_test().is_empty());
     }
 
     #[test]

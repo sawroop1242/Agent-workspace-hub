@@ -207,8 +207,8 @@ enum TunnelCommand {
         /// Path to the ngrok binary.
         #[arg(long, default_value = "ngrok")]
         ngrok_path: String,
-        /// ngrok authtoken (prefer `--ngrok-authtoken` over pasting
-        /// tokens into shell history; also read via this flag only).
+        /// ngrok authtoken (prefer AWH_NGROK_AUTHTOKEN over pasting
+        /// tokens into shell history or exposing them in `ps` output).
         #[arg(long)]
         ngrok_authtoken: Option<String>,
         /// ngrok region.
@@ -632,9 +632,17 @@ fn handle_tunnel_cli(command: TunnelCommand) -> Result<()> {
                 // Only the ngrok provider understands these options;
                 // the CLI stays provider-agnostic by rebuilding from
                 // name + typed options instead of matching elsewhere.
+                // The authtoken prefers the CLI flag but falls back to
+                // AWH_NGROK_AUTHTOKEN so the secret never needs to
+                // appear in `awh`'s own (world-readable) argv.
+                let authtoken = ngrok_authtoken.or_else(|| {
+                    std::env::var("AWH_NGROK_AUTHTOKEN")
+                        .ok()
+                        .filter(|t| !t.is_empty())
+                });
                 p = Box::new(
                     agent_workspace_hub::tunnel::NgrokProvider::new(&ngrok_path)
-                        .with_authtoken(ngrok_authtoken)
+                        .with_authtoken(authtoken)
                         .with_region(ngrok_region),
                 );
             }

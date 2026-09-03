@@ -10,7 +10,7 @@ Rust implementation of the AI-native workspace runtime per
 source ~/.cargo/env
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test --workspace      # 354 tests as of Phase 9
+cargo test --workspace      # 359 tests as of Phase 10
 ```
 
 Git identity is NOT configured globally; commit with:
@@ -75,7 +75,24 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 
 ## Phase Status
 
-0-9 done (branch rust). Next: Phase 10 hardening/security tests/docs.
+0-10 done (branch rust). Next: none — implementation plan complete;
+future phases would be new spec work.
+- **Phase 10 — hardening**: three security fixes. (1) Rate-limiter
+  bounded memory: `check()` prunes expired-key entries and caps
+  distinct keys (default 10,000; `with_max_keys`), refusing unseen
+  keys fail-closed once saturated — prune runs BEFORE the admission
+  gate so expired windows free their slots. (2) ngrok authtoken now
+  travels to the child via `NGROK_AUTHTOKEN` env, never argv
+  (`/proc/<pid>/cmdline` is world-readable); CLI also reads
+  `AWH_NGROK_AUTHTOKEN` so the token need not appear in `awh`'s argv
+  either; `build_args` excludes the token, `child_env()` carries it.
+  (3) Audit redaction at the choke point: `AuditLog::record` runs
+  `redact_token_like` over subject/detail (≥16-char base62 runs →
+  `[redacted]`; IPs/paths/short identifiers pass through), so no call
+  site can leak token-shaped material into the ring. Live-verified:
+  10,200 sprayed keys in one window → 10,000 admitted/200 429/RSS flat;
+  fake-ngrok asserts token in env not argv; 359/359 tests, fmt+clippy
+  clean.
 - **Phase 9 — tunnel + rate limiting**: `src/tunnel/mod.rs` —
   `TunnelProvider` trait (`start/stop/status`) + `NgrokProvider` spawning
   the local `ngrok` binary via argv (never a shell); public URL resolved

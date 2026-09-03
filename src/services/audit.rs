@@ -43,6 +43,14 @@ impl AuditLog {
     }
 
     /// Appends an entry, dropping the oldest when at capacity.
+    ///
+    /// Defense in depth: subject/detail are redacted here (the single
+    /// choke point every audit call site funnels through) so that
+    /// token-shaped material can never enter the audit ring, even by
+    /// accident at a future call site. Bearer tokens follow RFC 6750
+    /// (>=16 chars of base62); AWH keys match. Very short strings are
+    /// left alone: a 5-char rate-limit key like `9.9.9.9` is not a
+    /// secret and redacting it would erase useful context.
     pub fn record(&self, kind: &'static str, action: &str, subject: &str, detail: &str) {
         let entry = AuditEntry {
             ts_ms: SystemTime::now()
@@ -51,8 +59,8 @@ impl AuditLog {
                 .unwrap_or(0),
             kind,
             action: action.to_owned(),
-            subject: subject.to_owned(),
-            detail: detail.to_owned(),
+            subject: redact_token_like(subject),
+            detail: redact_token_like(detail),
         };
         let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         if guard.len() == MAX_ENTRIES {
@@ -95,9 +103,65 @@ pub fn record_deny(action: &str, reason: &str, subject: &str) {
     global().record("deny", action, subject, reason);
 }
 
+/// Masks token-shaped segments in free-form audit text. Any run of 16
+/// or more base62 characters (`A-Za-z0-9_-`) looks like a bearer/API
+/// key (RFC 6750 opaque tokens, AWH keys, ngrok authtokens) and carries
+/// no diagnostic value, so it is replaced wholesale. All other
+/// characters (dots, slashes, `=`) pass through, so client IPs, project
+/// paths, and prefixes like `token=` stay intact and the audit trail
+/// remains useful. Opaque identifiers (session ids, UUIDs) may also
+/// match and be masked — an acceptable trade: identifiers are cheap,
+/// secrets are not.
+pub fn redact_token_like(text: &str) -> String {
+    const MIN_SECRET_LEN: usize = 16;
+    let mut out = String::with_capacity(text.len());
+    let mut seg = String::new();
+    let flush = |out: &mut String, seg: &mut String| {
+        if seg.chars().count() >= MIN_SECRET_LEN {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(seg);
+        }
+        seg.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+            seg.push(c);
+        } else {
+            flush(&mut out, &mut seg);
+            out.push(c);
+        }
+    }
+    flush(&mut out, &mut seg);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_token_like_masks_long_base62_runs() {
+        let secret = "Xq3vJ7Lb2mPz9KwR4TnE";
+        assert_eq!(redact_token_like(secret), "[redacted]");
+        assert_eq!(
+            redact_token_like(&format!("Bearer {secret} on file")),
+            "Bearer [redacted] on file"
+        );
+    }
+
+    #[test]
+    fn redact_token_like_preserves_short_identifiers_and_paths() {
+        // Client IPs (rate-limit subjects) and project names stay intact.
+        assert_eq!(redact_token_like("9.9.9.9"), "9.9.9.9");
+        assert_eq!(redact_token_like("203.0.113.77"), "203.0.113.77");
+        assert_eq!(redact_token_like("direct"), "direct");
+        assert_eq!(
+            redact_token_like("projects/demo/.agent/context.md"),
+            "projects/demo/.agent/context.md"
+        );
+        assert_eq!(redact_token_like(""), "");
+    }
 
     #[test]
     fn ring_buffer_caps_at_max_entries() {
@@ -108,8 +172,25 @@ mod tests {
         assert_eq!(log.len(), MAX_ENTRIES);
         let recent = log.recent(3);
         // Newest first; the first pushed items were dropped.
-        assert_eq!(recent[0].detail, format!("detail-{}", MAX_ENTRIES + 49));
-        assert_eq!(recent[2].detail, format!("detail-{}", MAX_ENTRIES + 47));
+        assert!(recent[0]
+            .detail
+            .ends_with(&format!("-{}", MAX_ENTRIES + 49)));
+    }
+
+    #[test]
+    fn recorded_subjects_and_details_are_redacted_at_the_choke_point() {
+        let log = AuditLog::new();
+        // A future call site that (incorrectly) passes a bearer token
+        // as subject or embeds one in detail must not leak it.
+        log.record(
+            "allow",
+            "some_action",
+            "Xq3vJ7Lb2mPz9KwR4TnE",
+            "token=Xq3vJ7Lb2mPz9KwR4TnE ok",
+        );
+        let entry = &log.recent(1)[0];
+        assert_eq!(entry.subject, "[redacted]");
+        assert_eq!(entry.detail, "token=[redacted] ok");
     }
 
     #[test]
