@@ -37,6 +37,12 @@ pub struct ControlState {
     pub version: &'static str,
     /// Sliding-window limiter applied after authentication.
     pub rate_limiter: Arc<RateLimiter>,
+    /// Test seam: overrides the global skills-registry root so tests
+    /// can exercise registry endpoints without mutating the real
+    /// user home (which `GlobalSkillRegistry::discover()` would use,
+    /// and which on Windows ignores `HOME` entirely — it resolves via
+    /// the known-folders API). `None` in production.
+    pub global_skills_root: Option<PathBuf>,
 }
 
 impl ControlState {
@@ -47,6 +53,16 @@ impl ControlState {
             started: std::time::Instant::now(),
             version: env!("CARGO_PKG_VERSION"),
             rate_limiter: RateLimiter::default_limiter(),
+            global_skills_root: None,
+        }
+    }
+
+    /// The global skills registry: the injected test root when set,
+    /// the discovered user home otherwise.
+    fn global_skill_registry(&self) -> Result<GlobalSkillRegistry, ApiError> {
+        match &self.global_skills_root {
+            Some(root) => Ok(GlobalSkillRegistry::new(root)),
+            None => GlobalSkillRegistry::discover().map_err(|e| ApiError::internal(&e)),
         }
     }
 
@@ -748,7 +764,7 @@ async fn list_project_skills(
     Query(params): Query<ScopeParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root = store_scope(&state, params.project.as_deref())?;
-    let registry = GlobalSkillRegistry::discover().map_err(|e| ApiError::internal(&e))?;
+    let registry = state.global_skill_registry()?;
     let skills = crate::skills::ProjectSkillReferences::new(&root)
         .resolve(&registry)
         .map_err(|e| ApiError::internal(&e))?;
@@ -776,7 +792,7 @@ async fn add_project_skill(
     Json(body): Json<ProjectSkillBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root = store_scope(&state, body.project.as_deref())?;
-    let registry = GlobalSkillRegistry::discover().map_err(|e| ApiError::internal(&e))?;
+    let registry = state.global_skill_registry()?;
     crate::skills::ProjectSkillReferences::new(&root)
         .add(&body.name, &registry)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
@@ -815,9 +831,9 @@ fn scope_name_body_q(body: &ProjectSkillQuery) -> String {
 /// Lists globally installed skills. Project-level skill references are
 /// managed via the CLI/TUI, which are the trust-owning planes.
 async fn list_skills(
-    State(_state): State<Arc<ControlState>>,
+    State(state): State<Arc<ControlState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let registry = GlobalSkillRegistry::discover().map_err(|e| ApiError::internal(&e))?;
+    let registry = state.global_skill_registry()?;
     let skills = registry.list().map_err(|e| ApiError::internal(&e))?;
     let items: Vec<serde_json::Value> = skills
         .iter()
@@ -1395,19 +1411,26 @@ mod tests {
     #[tokio::test]
     async fn project_skill_references_managed_via_api() {
         let tmp = tempfile::tempdir().unwrap();
-        // Global registry discovery uses $HOME; point it at a temp home
-        // so this test cannot see or mutate the real user registry.
+        // Global registry discovery uses the user home; point it at a
+        // temp root via the ControlState seam so this test cannot see
+        // or mutate the real user registry on ANY platform (on
+        // Windows, `dirs` ignores `HOME` entirely and resolves via the
+        // known-folders API, so env mutation would leak into the real
+        // home there).
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home.path());
-        std::fs::create_dir_all(home.path().join(".agent-workspace-hub/skills/demo")).unwrap();
+        std::fs::create_dir_all(home.path().join("skills/demo")).unwrap();
         std::fs::write(
-            home.path()
-                .join(".agent-workspace-hub/skills/demo/SKILL.md"),
+            home.path().join("skills/demo/SKILL.md"),
             "---\nname: demo\ndescription: Demo skill\nversion: 0.1.0\n---\n\n# demo\n",
         )
         .unwrap();
 
-        let app = build_router(state(tmp.path()));
+        let state = {
+            let mut s = ControlState::new(tmp.path(), "test-key".to_string());
+            s.global_skills_root = Some(home.path().join("skills"));
+            Arc::new(s)
+        };
+        let app = build_router(state);
 
         let res = app
             .clone()
@@ -1450,16 +1473,18 @@ mod tests {
         assert!(recent
             .iter()
             .any(|e| e.action == "api_skill_remove" && e.subject == "demo"));
-
-        std::env::remove_var("HOME");
     }
 
     #[tokio::test]
     async fn adding_uninstalled_global_skill_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home.path());
-        let app = build_router(state(tmp.path()));
+        let state = {
+            let mut s = ControlState::new(tmp.path(), "test-key".to_string());
+            s.global_skills_root = Some(home.path().join("skills"));
+            Arc::new(s)
+        };
+        let app = build_router(state);
         let res = app
             .oneshot(post_json(
                 "/api/v1/skills/project",
@@ -1469,7 +1494,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        std::env::remove_var("HOME");
     }
 
     // ----- Rate limiting (spec section 25) -----

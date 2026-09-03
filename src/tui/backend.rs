@@ -391,7 +391,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(tmp.path().to_path_buf());
         let snap = backend.dashboard().unwrap();
-        assert_eq!(snap.root, tmp.path().canonicalize().unwrap());
+        // The snapshot reports the root the backend was constructed
+        // with — NOT a canonicalized form, which would differ per
+        // platform (macOS resolves /var -> /private/var; Windows yields
+        // \\?\-prefixed verbatim paths).
+        assert_eq!(snap.root, tmp.path());
         assert_eq!(snap.project_count, 0);
         assert!(!snap.is_git_repo);
         assert_eq!(snap.current_project, None);

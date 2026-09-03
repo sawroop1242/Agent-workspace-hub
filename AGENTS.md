@@ -70,6 +70,15 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 - git.rs TUI: scope borrows narrowly to avoid E0499; test fixtures need
   persistent git identity (`git config` in repo, not `-c` per-invocation).
 - Files test fixture: seed 7 chars, must clear all before rename test.
+- Cross-platform CI gotchas (rust.yml runs tests on ubuntu/macos/windows):
+  (1) never assert raw-path == canonicalize() — macOS resolves
+  `/var`→`/private/var` and Windows yields `\\?\`-prefixed verbatim
+  paths; compare canonical-to-canonical or raw-to-raw instead.
+  (2) the `dirs` crate resolves home on Windows via the known-folders
+  API (`SHGetKnownFolderPath`), NOT `HOME`/`USERPROFILE` env — tests
+  needing a home directory must inject a root (`ControlState.
+  global_skills_root`) rather than `set_var("HOME", …)`, which
+  silently no-ops on Windows and races parallel tests everywhere.
 - Cargo deps: axum 0.8, tower 0.5 (util), tower-http 0.6 already present —
   no new deps were needed through Phase 5 (spec: avoid unjustified crates).
 
