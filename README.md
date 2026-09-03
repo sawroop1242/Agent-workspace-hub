@@ -5,7 +5,7 @@
 - [Architecture](docs/architecture.md) — components, request flow, security layers
 - [Security policy and threat model](docs/security.md)
 - [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
-- [MCP integration](docs/mcp.md) — transports, 24 tools, interop evidence
+- [MCP integration](docs/mcp.md) — transports, 43 tools, interop evidence
 - [Configuration](docs/configuration.md) — every `AWH_*` variable and precedence
 - [Development guide](docs/development.md) — conventions, commands, PR process
 - [Testing guide](docs/testing.md) — suite map and regression policy

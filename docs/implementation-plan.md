@@ -11,7 +11,7 @@ Already present and preserved as-is:
 
 - CLI: `awh status|mcp|skill|registry` (`src/main.rs`) — command
   semantics unchanged.
-- MCP: 24 tools, stdio + HTTP/SSE transports, bearer auth, TLS,
+- MCP: 43 tools, stdio + HTTP/SSE transports, bearer auth, TLS,
   permissions, trust store, sandbox, circuit breaker, audit, limits
   (`src/mcp/*`). stdio stdout already protocol-only (stderr writer).
 - Context engine: planning, offload, token budgets (`src/context/*`).

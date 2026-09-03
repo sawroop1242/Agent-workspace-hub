@@ -17,7 +17,7 @@ use crate::mcp::{
 };
 use crate::services::git::GitService;
 use crate::services::terminal::TerminalService;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -284,6 +284,8 @@ impl McpDispatcher {
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "agent-workspace-hub", "version": env!("CARGO_PKG_VERSION")}
             }),
+            // MCP liveness probe: the protocol requires an empty response.
+            "ping" => json!({}),
             "tools/list" => self
                 .tools_list_aggregated()
                 .await
@@ -434,22 +436,26 @@ impl McpDispatcher {
             )?,
             "workspace.context" => serde_json::to_value(self.workspace.context()?)?,
             "workspace.list_files" => serde_json::to_value(
-                self.workspace
-                    .list_files(arguments.get("path").and_then(Value::as_str).unwrap_or("."))?,
+                self.workspace.list_files(
+                    arguments
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("missing or non-string 'path' argument"))?,
+                )?,
             )?,
             "workspace.read_file" => serde_json::to_value(
                 self.workspace.read_file(
                     arguments
                         .get("path")
                         .and_then(Value::as_str)
-                        .unwrap_or_default(),
+                        .ok_or_else(|| anyhow::anyhow!("missing or non-string 'path' argument"))?,
                 )?,
             )?,
             "memory.store" => {
-                let scope = parse_scope(arguments.get("scope").and_then(Value::as_str));
+                let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
                 serde_json::to_value(self.memory.store(
-                    strval(&arguments, "id"),
-                    strval(&arguments, "content"),
+                    strval(&arguments, "id")?,
+                    strval(&arguments, "content")?,
                     scope,
                     strings(&arguments, "tags"),
                 )?)?
@@ -463,7 +469,8 @@ impl McpDispatcher {
                     arguments
                         .get("scope")
                         .and_then(Value::as_str)
-                        .map(|scope| parse_scope(Some(scope))),
+                        .map(|scope| parse_scope(Some(scope)))
+                        .transpose()?,
                 )?,
             )?,
             "memory.get" => serde_json::to_value(
@@ -480,10 +487,10 @@ impl McpDispatcher {
                 )?
             }),
             "tasks.create" => serde_json::to_value(self.tasks.create(
-                strval(&arguments, "id"),
-                strval(&arguments, "title"),
-                strval(&arguments, "description"),
-                parse_priority(arguments.get("priority").and_then(Value::as_str)),
+                strval(&arguments, "id")?,
+                strval(&arguments, "title")?,
+                strval(&arguments, "description")?,
+                parse_priority(arguments.get("priority").and_then(Value::as_str))?,
                 strings(&arguments, "tags"),
             )?)?,
             "tasks.list" => serde_json::to_value(
@@ -491,7 +498,8 @@ impl McpDispatcher {
                     arguments
                         .get("status")
                         .and_then(Value::as_str)
-                        .map(parse_status),
+                        .map(parse_status)
+                        .transpose()?,
                 )?,
             )?,
             "tasks.update" => serde_json::to_value(
@@ -503,11 +511,13 @@ impl McpDispatcher {
                     arguments
                         .get("status")
                         .and_then(Value::as_str)
-                        .map(parse_status),
+                        .map(parse_status)
+                        .transpose()?,
                     arguments
                         .get("priority")
                         .and_then(Value::as_str)
-                        .map(|value| parse_priority(Some(value))),
+                        .map(|value| parse_priority(Some(value)))
+                        .transpose()?,
                     arguments
                         .get("assignee")
                         .map(|value| value.as_str().map(str::to_string)),
@@ -521,10 +531,10 @@ impl McpDispatcher {
             "connectors.list" => serde_json::to_value(self.connectors.list()?)?,
             "connectors.add" => {
                 let connector = Connector {
-                    id: strval(&arguments, "id"),
-                    name: strval(&arguments, "name"),
-                    provider: strval(&arguments, "provider"),
-                    auth: parse_auth(arguments.get("auth").and_then(Value::as_str)),
+                    id: strval(&arguments, "id")?,
+                    name: strval(&arguments, "name")?,
+                    provider: strval(&arguments, "provider")?,
+                    auth: parse_auth(arguments.get("auth").and_then(Value::as_str))?,
                     scopes: strings(&arguments, "scopes"),
                     enabled: arguments
                         .get("enabled")
@@ -590,9 +600,9 @@ impl McpDispatcher {
             "context.status" => serde_json::to_value(self.context()?.status()?)?,
             "context.insert" => {
                 let item = ContextItem::new(
-                    strval(&arguments, "id"),
+                    strval(&arguments, "id")?,
                     parse_context_source(arguments.get("source").and_then(Value::as_str)),
-                    strval(&arguments, "content"),
+                    strval(&arguments, "content")?,
                     0,
                 );
                 let item = with_optional(
@@ -613,9 +623,13 @@ impl McpDispatcher {
                 );
                 let item = with_optional(
                     item,
-                    arguments.get("scope").and_then(Value::as_str),
+                    arguments
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .map(|v| parse_context_scope(Some(v)))
+                        .transpose()?,
                     |mut it, v| {
-                        it.scope = parse_context_scope(Some(v));
+                        it.scope = v;
                         it
                     },
                 );
@@ -657,7 +671,7 @@ impl McpDispatcher {
             "context.assemble" => {
                 let engine = self.context()?;
                 let request = ContextRequest {
-                    task: strval(&arguments, "task"),
+                    task: strval(&arguments, "task")?,
                     query: arguments
                         .get("query")
                         .and_then(Value::as_str)
@@ -740,21 +754,27 @@ impl McpDispatcher {
             }
             "git.stage" => {
                 let git = GitService::open(self.workspace.root())?;
-                let path = strval(&arguments, "path");
+                let path = strval(&arguments, "path")?;
+                if path.is_empty() {
+                    bail!("git.stage requires a non-empty 'path' (use \".\" to stage all changes)");
+                }
                 serde_json::to_value(git.stage(&path).await?)?
             }
             "git.unstage" => {
                 let git = GitService::open(self.workspace.root())?;
-                let path = strval(&arguments, "path");
+                let path = strval(&arguments, "path")?;
+                if path.is_empty() {
+                    bail!("git.unstage requires a non-empty 'path' (use \".\" to unstage all changes)");
+                }
                 serde_json::to_value(git.unstage(&path).await?)?
             }
             "git.commit" => {
                 let git = GitService::open(self.workspace.root())?;
-                let message = strval(&arguments, "message");
+                let message = strval(&arguments, "message")?;
                 serde_json::to_value(git.commit(&message).await?)?
             }
             "terminal.run" => {
-                let program = strval(&arguments, "program");
+                let program = strval(&arguments, "program")?;
                 let args: Vec<String> = arguments
                     .get("args")
                     .and_then(Value::as_array)
@@ -831,12 +851,15 @@ fn is_authorized(cfg: &CustomMcpServerConfig, trust_store: Option<&PersistentTru
     }
 }
 
-fn strval(arguments: &Value, key: &str) -> String {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+/// Extracts a required string argument. Fails closed when the argument is
+/// absent or not a JSON string: silently coercing a non-string to "" would
+/// let callers store corrupt state (e.g. an empty-content memory) while
+/// still receiving a success response.
+fn strval(arguments: &Value, key: &str) -> Result<String> {
+    match arguments.get(key).and_then(Value::as_str) {
+        Some(value) => Ok(value.to_string()),
+        None => bail!("missing or non-string '{key}' argument"),
+    }
 }
 
 fn strings(arguments: &Value, key: &str) -> Vec<String> {
@@ -853,11 +876,12 @@ fn strings(arguments: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn parse_scope(value: Option<&str>) -> MemoryScope {
+fn parse_scope(value: Option<&str>) -> Result<MemoryScope> {
     match value.unwrap_or("Project") {
-        "Session" => MemoryScope::Session,
-        "Global" => MemoryScope::Global,
-        _ => MemoryScope::Project,
+        "Session" => Ok(MemoryScope::Session),
+        "Project" => Ok(MemoryScope::Project),
+        "Global" => Ok(MemoryScope::Global),
+        other => bail!("invalid scope '{other}': expected Session, Project, or Global"),
     }
 }
 
@@ -886,37 +910,41 @@ fn parse_context_source(value: Option<&str>) -> ContextSource {
     }
 }
 
-fn parse_context_scope(value: Option<&str>) -> ContextScope {
+fn parse_context_scope(value: Option<&str>) -> Result<ContextScope> {
     match value.unwrap_or("Project") {
-        "Session" => ContextScope::Session,
-        "Global" => ContextScope::Global,
-        _ => ContextScope::Project,
+        "Session" => Ok(ContextScope::Session),
+        "Project" => Ok(ContextScope::Project),
+        "Global" => Ok(ContextScope::Global),
+        other => bail!("invalid scope '{other}': expected Session, Project, or Global"),
     }
 }
 
-fn parse_status(value: &str) -> TaskStatus {
+fn parse_status(value: &str) -> Result<TaskStatus> {
     match value {
-        "InProgress" => TaskStatus::InProgress,
-        "Blocked" => TaskStatus::Blocked,
-        "Done" => TaskStatus::Done,
-        _ => TaskStatus::Todo,
+        "Todo" => Ok(TaskStatus::Todo),
+        "InProgress" => Ok(TaskStatus::InProgress),
+        "Blocked" => Ok(TaskStatus::Blocked),
+        "Done" => Ok(TaskStatus::Done),
+        _ => bail!("invalid status '{value}': expected Todo, InProgress, Blocked, or Done"),
     }
 }
 
-fn parse_priority(value: Option<&str>) -> TaskPriority {
+fn parse_priority(value: Option<&str>) -> Result<TaskPriority> {
     match value.unwrap_or("Normal") {
-        "Low" => TaskPriority::Low,
-        "High" => TaskPriority::High,
-        "Critical" => TaskPriority::Critical,
-        _ => TaskPriority::Normal,
+        "Low" => Ok(TaskPriority::Low),
+        "Normal" => Ok(TaskPriority::Normal),
+        "High" => Ok(TaskPriority::High),
+        "Critical" => Ok(TaskPriority::Critical),
+        other => bail!("invalid priority '{other}': expected Low, Normal, High, or Critical"),
     }
 }
 
-fn parse_auth(value: Option<&str>) -> AuthMethod {
+fn parse_auth(value: Option<&str>) -> Result<AuthMethod> {
     match value.unwrap_or("None") {
-        "OAuth" => AuthMethod::OAuth,
-        "ApiKey" => AuthMethod::ApiKey,
-        _ => AuthMethod::None,
+        "OAuth" => Ok(AuthMethod::OAuth),
+        "ApiKey" => Ok(AuthMethod::ApiKey),
+        "None" => Ok(AuthMethod::None),
+        other => bail!("invalid auth '{other}': expected OAuth, ApiKey, or None"),
     }
 }
 
@@ -1048,6 +1076,178 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("no content envelope"))?;
         Ok(serde_json::from_str(text)?)
+    }
+
+    /// The MCP protocol requires servers to answer `ping` with an empty
+    /// result so clients can probe liveness.
+    #[test]
+    fn ping_returns_empty_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let response = rt
+            .block_on(async {
+                match dispatcher
+                    .dispatch_strict(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+                    .await
+                {
+                    Ok(DispatchResult::Response(response)) => Ok(serde_json::to_value(response)?),
+                    other => Err(anyhow::anyhow!("unexpected dispatch result: {other:?}")),
+                }
+            })
+            .unwrap();
+        assert_eq!(response["result"], json!({}));
+        assert!(response.get("error").is_none());
+    }
+
+    /// Enum-typed arguments must be rejected at dispatch when they carry a
+    /// value outside the schema's declared enum, instead of being silently
+    /// coerced to a default (which would corrupt persisted state while
+    /// reporting success to the caller).
+    #[test]
+    fn enum_arguments_reject_values_outside_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+
+        // Task lifecycle must accept the documented values...
+        call(
+            &dispatcher,
+            "tasks.create",
+            json!({"id": "t1", "title": "title", "description": "d"}),
+        )
+        .unwrap();
+        let updated = call(
+            &dispatcher,
+            "tasks.update",
+            json!({"id": "t1", "status": "InProgress"}),
+        )
+        .unwrap();
+        assert_eq!(updated["status"], "InProgress");
+
+        // ...and reject anything else — including snake_case look-alikes
+        // ("in-progress") and outright garbage ("bogus").
+        for status in ["in-progress", "completed", "bogus", "todo", "done"] {
+            let error = call(
+                &dispatcher,
+                "tasks.update",
+                json!({"id": "t1", "status": status}),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("invalid status"),
+                "status '{status}' should be rejected, got: {error}"
+            );
+        }
+
+        let error = call(
+            &dispatcher,
+            "tasks.update",
+            json!({"id": "t1", "priority": "urgent"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid priority"));
+
+        let error = call(
+            &dispatcher,
+            "tasks.create",
+            json!({"id": "t2", "title": "title", "description": "d", "priority": "mega"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid priority"));
+
+        let error = call(&dispatcher, "tasks.list", json!({"status": "done"})).unwrap_err();
+        assert!(error.to_string().contains("invalid status"));
+
+        let error = call(
+            &dispatcher,
+            "memory.store",
+            json!({"id": "m1", "content": "c", "scope": "project"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid scope"));
+
+        let error = call(
+            &dispatcher,
+            "memory.search",
+            json!({"query": "q", "scope": "workspace"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid scope"));
+
+        let error = call(
+            &dispatcher,
+            "connectors.add",
+            json!({"id": "c1", "name": "n", "provider": "p", "auth": "bogus"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid auth"));
+
+        let error = call(
+            &dispatcher,
+            "context.insert",
+            json!({"id": "i1", "content": "c", "source": "Tool", "scope": "workspace"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid scope"));
+
+        // Sanity: valid enum values still pass through every one of the
+        // parsers exercised above.
+        call(
+            &dispatcher,
+            "memory.store",
+            json!({"id": "m1", "content": "c", "scope": "Session"}),
+        )
+        .unwrap();
+        call(
+            &dispatcher,
+            "connectors.add",
+            json!({"id": "c1", "name": "n", "provider": "p", "auth": "OAuth"}),
+        )
+        .unwrap();
+
+        // Required string arguments must produce a clear dispatch error,
+        // not a confusing underlying-tool failure.
+        let error = call(&dispatcher, "git.stage", json!({})).unwrap_err();
+        assert!(error.to_string().contains("non-string 'path'"));
+        let error = call(&dispatcher, "git.unstage", json!({})).unwrap_err();
+        assert!(error.to_string().contains("non-string 'path'"));
+        let error = call(&dispatcher, "git.stage", json!({"path": ""})).unwrap_err();
+        assert!(error.to_string().contains("non-empty 'path'"));
+        let error = call(&dispatcher, "git.unstage", json!({"path": ""})).unwrap_err();
+        assert!(error.to_string().contains("non-empty 'path'"));
+
+        // Non-string values for string-typed arguments must be rejected,
+        // never silently coerced to empty strings (which would store corrupt
+        // state while reporting success).
+        let error = call(
+            &dispatcher,
+            "memory.store",
+            json!({"id": "x", "content": 123}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-string 'content'"));
+
+        let error = call(
+            &dispatcher,
+            "tasks.create",
+            json!({"id": "t3", "title": ["array"], "description": "d"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-string 'title'"));
+
+        let error = call(&dispatcher, "workspace.read_file", json!({"path": 123})).unwrap_err();
+        assert!(error.to_string().contains("non-string 'path'"));
+
+        let error = call(&dispatcher, "workspace.read_file", json!({})).unwrap_err();
+        assert!(error.to_string().contains("non-string 'path'"));
+
+        let error = call(
+            &dispatcher,
+            "terminal.run",
+            json!({"program": 42, "args": []}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-string 'program'"));
     }
 
     #[test]

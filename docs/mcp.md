@@ -2,7 +2,7 @@
 
 `awh mcp serve` exposes Agent Workspace Hub as a standards-compliant MCP
 server. This document describes the protocol surface, both transports, the
-24-tool catalog, and the interoperability evidence.
+43-tool catalog, and the interoperability evidence.
 
 ## Transports
 
@@ -38,7 +38,7 @@ matching `AWH_API_KEY` (constant-time comparison). Sessions are capped at
 every 15 s. TLS is strongly recommended; without `--tls-cert/--tls-key` the
 server runs plain HTTP, which is only acceptable on a private network.
 
-## Tool catalog (24 tools)
+## Tool catalog (43 tools)
 
 | Tool | Purpose |
 | --- | --- |
@@ -66,7 +66,7 @@ Recorded results (full harness output in `examples/mcp-interop/`):
 ```text
 $ node examples/mcp-interop/stdio-client.mjs
 PASS connect + initialize                      (server: agent-workspace-hub 0.1.0)
-PASS tools/list (24 tools)
+PASS tools/list (43 tools)
 PASS every tool has an inputSchema
 PASS tools/call workspace.context
 PASS tools/call skills.list
@@ -77,7 +77,7 @@ STDIO INTEROP: ALL CHECKS PASSED
 
 $ node examples/mcp-interop/sse-client.mjs
 PASS SSE connect + initialize (server: agent-workspace-hub 0.1.0)   [HTTPS + bearer]
-PASS SSE tools/list (24 tools)
+PASS SSE tools/list (43 tools)
 PASS SSE tools/call workspace.context
 PASS unknown sessionId rejected with 404
 PASS wrong bearer token rejected with 401
