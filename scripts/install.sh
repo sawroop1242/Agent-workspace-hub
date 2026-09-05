@@ -17,7 +17,7 @@
 set -Eeuo pipefail
 
 REPO="${AWH_REPO:-sawroop1242/Agent-workspace-hub}"
-REF="${AWH_REF:-main}"
+REF="${AWH_REF:-rust}"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${REF}/scripts/install.sh"
 
 INSTALL_SOURCE="${AWH_SOURCE:-release}"
