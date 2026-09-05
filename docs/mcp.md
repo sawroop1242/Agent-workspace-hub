@@ -2,7 +2,7 @@
 
 `awh mcp serve` exposes Agent Workspace Hub as a standards-compliant MCP
 server. This document describes the protocol surface, both transports, the
-43-tool catalog, and the interoperability evidence.
+44-tool catalog, and the interoperability evidence.
 
 ## Transports
 
@@ -38,16 +38,19 @@ matching `AWH_API_KEY` (constant-time comparison). Sessions are capped at
 every 15 s. TLS is strongly recommended; without `--tls-cert/--tls-key` the
 server runs plain HTTP, which is only acceptable on a private network.
 
-## Tool catalog (43 tools)
+## Tool catalog (44 tools)
 
 | Tool | Purpose |
 | --- | --- |
 | `skills.list` / `skills.read` / `skills.add` / `skills.remove` / `skills.search` | Skill discovery and management |
 | `workspace.context` / `workspace.list_files` / `workspace.read_file` | Workspace inspection |
-| `memory.store` / `memory.search` / `memory.get` / `memory.delete` | Project-scoped memory |
+| `memory.store` / `memory.search` / `memory.get` / `memory.update` / `memory.delete` | Project-scoped memory |
 | `tasks.create` / `tasks.list` / `tasks.update` / `tasks.delete` | Task management |
 | `connectors.list` / `connectors.add` / `connectors.enable` / `connectors.disable` / `connectors.remove` | External connector management |
 | `connector.providers` / `connector.tools` / `connector.invoke` | External connector invocation |
+| `git.status` / `git.log` / `git.diff` / `git.stage` / `git.unstage` / `git.commit` / `git.branch` | Repository operations |
+| `terminal.run` | Sandboxed command execution |
+| `context.status` / `context.insert` / `context.get` / `context.remove` / `context.search` / `context.optimize` / `context.assemble` / `context.protect` / `context.unprotect` / `context.offload` / `context.restore` | Context engine: token budget, offload, and item protection |
 
 Every tool advertises a JSON `inputSchema`; malformed arguments are rejected
 at dispatch with a JSON-RPC error rather than a panic.
@@ -66,7 +69,7 @@ Recorded results (full harness output in `examples/mcp-interop/`):
 ```text
 $ node examples/mcp-interop/stdio-client.mjs
 PASS connect + initialize                      (server: agent-workspace-hub 0.1.0)
-PASS tools/list (43 tools)
+PASS tools/list (44 tools)
 PASS every tool has an inputSchema
 PASS tools/call workspace.context
 PASS tools/call skills.list
@@ -77,7 +80,7 @@ STDIO INTEROP: ALL CHECKS PASSED
 
 $ node examples/mcp-interop/sse-client.mjs
 PASS SSE connect + initialize (server: agent-workspace-hub 0.1.0)   [HTTPS + bearer]
-PASS SSE tools/list (43 tools)
+PASS SSE tools/list (44 tools)
 PASS SSE tools/call workspace.context
 PASS unknown sessionId rejected with 404
 PASS wrong bearer token rejected with 401

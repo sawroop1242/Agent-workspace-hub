@@ -39,7 +39,7 @@ verified in this environment is marked **NOT VERIFIED**.
 
 ### MCP protocol & transports — COMPLETE
 
-- 43 tools, all with `inputSchema`; malformed args → JSON-RPC errors
+- 44 tools, all with `inputSchema`; malformed args → JSON-RPC errors
   (`tests/mcp_server.rs`, 11 tests).
 - Deterministic error codes: -32600/-32601/-32603 for bad version / unknown
   method / unknown tool; never a panic.
