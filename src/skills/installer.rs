@@ -1,5 +1,8 @@
-use crate::skills::{validate_skill_package, GlobalSkillRegistry, RegistryClient, RegistrySkill};
+use crate::skills::{
+    validate_sha256, validate_skill_package, GlobalSkillRegistry, RegistryClient, RegistrySkill,
+};
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +48,8 @@ impl SkillInstaller {
         }
 
         let bytes = response.bytes().await?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        validate_sha256(entry.sha256.as_deref(), &digest)?;
         let package_dir = self.cache_dir.join(&entry.name);
         if package_dir.exists() {
             fs::remove_dir_all(&package_dir)?;

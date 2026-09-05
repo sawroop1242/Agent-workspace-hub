@@ -190,9 +190,13 @@ impl GitService {
         {
             return Ok(out);
         }
-        // A repository with zero commits exits 128 here; that is an empty
-        // history, not an error — confirm HEAD truly does not resolve and
-        // return empty output instead.
+        // `git log` exits 128 both for a repository with zero commits and
+        // for a directory that is not a repository at all. Distinguish the
+        // two: a missing HEAD inside a real repo is an empty history, while
+        // a missing `.git` is an error the caller must see.
+        if self.run(&["rev-parse", "--git-dir"]).await.is_err() {
+            bail!("not a git repository");
+        }
         if self.run(&["rev-parse", "--verify", "HEAD"]).await.is_err() {
             Ok(GitOutput {
                 stdout: String::new(),
@@ -324,6 +328,12 @@ mod tests {
         assert!(
             err.contains("not a git repository") || err.contains("failed"),
             "unexpected error: {err}"
+        );
+        // log must not masquerade as an empty history in a non-repo.
+        let err = svc.log(5).await.unwrap_err().to_string();
+        assert!(
+            err.contains("not a git repository"),
+            "log outside a repo must fail loudly: {err}"
         );
         // A message starting with `-` is rejected upstream of git as a
         // sanity check but never executed as an option: it fails with the

@@ -94,6 +94,23 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 
 0-10 done (branch rust). Next: none — implementation plan complete;
 future phases would be new spec work.
+- **Registry semantics (QA-validated)**: two distinct planes. SKILL
+  registries: URL is a BASE dir; client appends `/registry.json`
+  ({name,version,skills:[{name,description,version,path,sha256}]}) and
+  fetches packages at base+path; default = `DEFAULT_SKILL_REGISTRY`
+  (.../rust/registry/skills; repo publishes it with the seeded
+  `commit-hygiene` skill). MCP registries: URL is the FULL index.json
+  ({schema_version,mcps:[…]}), fetched directly; default =
+  `DEFAULT_MCP_REGISTRY` (.../mcps/index.json; seeded with the harmless
+  `echo-helper` stdio entry). `skill install` verifies the manifest's
+  sha256 against the downloaded bytes (`validate_sha256`), so a stale
+  digest fails closed with "skill integrity check failed". CLI
+  ghost-ID ops (skill read/uninstall, registry add-dup/remove-missing,
+  mcp remove/enable/disable/uninstall) exit 1 via `bail!` — do not
+  regress to println-and-exit-0.
+- **GitService::log**: `git log` exits 128 for BOTH empty history and
+  non-repo; log() now rev-parses `--git-dir` first and bails
+  "not a git repository" instead of returning empty output.
 - **Phase 10 — hardening**: three security fixes. (1) Rate-limiter
   bounded memory: `check()` prunes expired-key entries and caps
   distinct keys (default 10,000; `with_max_keys`), refusing unseen

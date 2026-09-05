@@ -1,0 +1,14 @@
+{
+  "name": "awh-community-skills",
+  "version": "0.1.0",
+  "description": "Community skills published by the Agent Workspace Hub project",
+  "skills": [
+    {
+      "name": "commit-hygiene",
+      "description": "Keep commits and pull requests clean before pushing shared history",
+      "version": "0.1.0",
+      "path": "commit-hygiene/SKILL.md",
+      "sha256": "d9a18e1d35e38eea676dd778964cbf5f7439db2ac456d240e7880f5ed1d7ba8f"
+    }
+  ]
+}

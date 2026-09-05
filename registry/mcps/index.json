@@ -1,5 +1,19 @@
 {
   "schema_version": 1,
   "registry_version": "0.1.0",
-  "mcps": []
+  "mcps": [
+    {
+      "id": "echo-helper",
+      "name": "Echo Helper",
+      "description": "Minimal stdio MCP example that echoes its arguments; useful for smoke-testing MCP plumbing",
+      "version": "0.1.0",
+      "author": "AWH",
+      "transport": "stdio",
+      "command": "echo",
+      "args": ["hello"],
+      "env": {},
+      "homepage": "https://github.com/sawroop1242/Agent-workspace-hub",
+      "repository": "https://github.com/sawroop1242/Agent-workspace-hub"
+    }
+  ]
 }

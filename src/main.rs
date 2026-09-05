@@ -7,11 +7,13 @@ use agent_workspace_hub::mcp::{
 use agent_workspace_hub::skills::{
     GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
 const DEFAULT_MCP_REGISTRY: &str = "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/mcps/index.json";
+const DEFAULT_SKILL_REGISTRY: &str =
+    "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/skills";
 
 #[derive(Debug, Parser)]
 #[command(name = "awh", version, about = "Agent Workspace Hub")]
@@ -182,12 +184,12 @@ enum SkillCommand {
     Project,
     Search {
         query: String,
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_SKILL_REGISTRY)]
         registry: String,
     },
     Install {
         name: String,
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_SKILL_REGISTRY)]
         registry: String,
         #[arg(long)]
         add: bool,
@@ -319,7 +321,7 @@ fn main() -> Result<()> {
                     s.version.as_deref().unwrap_or("unknown"),
                     s.path.display()
                 ),
-                None => println!("skill not found: {name}"),
+                None => bail!("skill not found: {name}"),
             },
             SkillCommand::Add { name } => {
                 project.add(&name, &global)?;
@@ -329,7 +331,7 @@ fn main() -> Result<()> {
                 if project.remove(&name)? {
                     println!("removed project skill reference: {name}")
                 } else {
-                    println!("skill reference not found: {name}")
+                    bail!("skill reference not found: {name}")
                 }
             }
             SkillCommand::Project => {
@@ -367,7 +369,7 @@ fn main() -> Result<()> {
                     std::fs::remove_dir_all(path)?;
                     println!("uninstalled global skill: {name}")
                 } else {
-                    println!("skill not installed: {name}")
+                    bail!("skill not installed: {name}")
                 }
             }
         },
@@ -376,7 +378,7 @@ fn main() -> Result<()> {
                 if registry_store.add(&url)? {
                     println!("registry added: {url}")
                 } else {
-                    println!("registry already exists: {url}")
+                    bail!("registry already exists: {url}")
                 }
             }
             RegistryCommand::List => {
@@ -388,7 +390,7 @@ fn main() -> Result<()> {
                 if registry_store.remove(&url)? {
                     println!("registry removed: {url}")
                 } else {
-                    println!("registry not found: {url}")
+                    bail!("registry not found: {url}")
                 }
             }
             RegistryCommand::Search { query, url } => search_registry(&url, &query)?,
@@ -460,16 +462,22 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
             if registry.remove(&id)? {
                 println!("removed MCP: {id}")
             } else {
-                println!("MCP not found: {id}")
+                bail!("MCP not found: {id}")
             }
         }
         McpCommand::Enable { id } => {
-            registry.set_enabled(&id, true)?;
-            println!("enabled MCP: {id}")
+            if registry.set_enabled(&id, true)?.is_some() {
+                println!("enabled MCP: {id}")
+            } else {
+                bail!("MCP not found: {id}")
+            }
         }
         McpCommand::Disable { id } => {
-            registry.set_enabled(&id, false)?;
-            println!("disabled MCP: {id}")
+            if registry.set_enabled(&id, false)?.is_some() {
+                println!("disabled MCP: {id}")
+            } else {
+                bail!("MCP not found: {id}")
+            }
         }
         McpCommand::Search {
             query,
@@ -518,7 +526,7 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
             if global.remove(&id)? {
                 println!("uninstalled global MCP: {id}")
             } else {
-                println!("global MCP not found: {id}")
+                bail!("global MCP not found: {id}")
             }
         }
         McpCommand::Trust { id, version } => {
