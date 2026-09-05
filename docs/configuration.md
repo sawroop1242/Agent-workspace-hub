@@ -54,6 +54,35 @@ Non-numeric values are rejected with a clear error (and audited as
 `config_invalid`), never silently ignored. Fixed server-side values:
 `max_sessions: 100` concurrent SSE sessions, `sse_keepalive: 15s`.
 
+## Context engine
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AWH_CONTEXT_ENABLED` | `true` | Master switch; `false` makes every engine operation a no-op |
+| `AWH_CONTEXT_MAX_INPUT_TOKENS` | `128000` | Maximum context window input tokens |
+| `AWH_CONTEXT_RESERVED_OUTPUT_TOKENS` | `8192` | Tokens reserved for model output |
+| `AWH_CONTEXT_SAFETY_MARGIN_TOKENS` | `4096` | Extra headroom before offload/compression triggers |
+| `AWH_CONTEXT_AUTO_OFFLOAD` | `true` | Allow optimize passes to offload items |
+| `AWH_CONTEXT_AUTO_COMPRESS` | `true` | Allow optimize passes to compress items |
+| `AWH_CONTEXT_MEMORY_ENABLED` | `true` | Enable long-term memory extraction |
+
+Boolean variables accept `1`/`true`/`yes`/`on` (case-insensitive).
+Token counts must parse as unsigned integers; invalid values fail with a
+typed error naming the variable.
+
+## Tunnel
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AWH_NGROK_AUTHTOKEN` | *(unset)* | ngrok authtoken for `awh tunnel start` |
+
+The token is passed to the ngrok child through its environment
+(`NGROK_AUTHTOKEN`) — never through argv, which is world-readable via
+`/proc/<pid>/cmdline`. Precedence: `--ngrok-authtoken` CLI flag >
+`AWH_NGROK_AUTHTOKEN` environment variable; prefer the variable so the
+secret never appears in `ps` output or shell history. `awh tunnel start`
+runs in the foreground and stops the child on Ctrl-C.
+
 ## Sandbox
 
 | Variable | Default | Meaning |

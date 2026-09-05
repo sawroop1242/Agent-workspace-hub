@@ -191,9 +191,15 @@ impl McpDispatcher {
         // (or the config's `enabled` flag, which honors the same env vars).
         // When construction fails the tools surface a clear error instead of
         // taking the whole dispatcher down, so existing behavior is unchanged.
+        // The cause (e.g. an invalid AWH_CONTEXT_* value) still reaches
+        // stderr via tracing; the JSON-RPC error stays generic.
         let context_engine = ContextEngineConfig::default()
             .with_env_overrides()
             .and_then(|config| ContextEngine::new(&project_root, config).map(Arc::new))
+            .map_err(|e| {
+                tracing::error!("context engine disabled: {e:#}");
+                e
+            })
             .ok();
 
         Ok(Self {
