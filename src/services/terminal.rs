@@ -17,7 +17,7 @@ pub const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Outcome of a bounded execution.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ExecOutcome {
     pub exit_code: Option<i32>,
     pub timed_out: bool,

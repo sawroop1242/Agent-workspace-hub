@@ -38,7 +38,7 @@ impl HighRiskGitOp {
 }
 
 /// Result of one git invocation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct GitOutput {
     pub stdout: String,
     pub stderr: String,

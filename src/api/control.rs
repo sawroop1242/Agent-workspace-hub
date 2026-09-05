@@ -21,9 +21,9 @@ use std::sync::Arc;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::api::rate_limit::RateLimiter;
 use crate::mcp::audit::{audit_allow, audit_deny};
 use crate::mcp::auth;
+use crate::services::rate_limit::RateLimiter;
 use crate::services::{
     files::FilesService, git::GitService, projects::ProjectsService, terminal::TerminalService,
 };
@@ -145,6 +145,7 @@ pub fn build_router(state: Arc<ControlState>) -> Router {
         .route("/files", get(list_files))
         .route("/files/content", get(read_file).put(write_file))
         .route("/files/search", get(search_files))
+        .route("/files/meta", get(file_meta))
         .route(
             "/files/entry",
             delete(delete_entry).post(rename_entry).put(create_dir),
@@ -152,6 +153,10 @@ pub fn build_router(state: Arc<ControlState>) -> Router {
         .route("/git/status", get(git_status))
         .route("/git/log", get(git_log))
         .route("/git/diff", get(git_diff))
+        .route("/git/branch", get(git_branch))
+        .route("/git/branches", get(git_branches))
+        .route("/git/push", post(git_push))
+        .route("/git/pull", post(git_pull))
         .route("/git/stage", post(git_stage))
         .route("/git/unstage", post(git_unstage))
         .route("/git/commit", post(git_commit))
@@ -405,6 +410,22 @@ struct SearchParams {
     q: String,
 }
 
+async fn file_meta(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = params
+        .get("path")
+        .ok_or_else(|| ApiError::bad_request("path query parameter is required"))?;
+    let meta = state
+        .files()
+        .meta(path)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(
+        serde_json::to_value(meta).unwrap_or_else(|_| json!({})),
+    ))
+}
+
 async fn search_files(
     State(state): State<Arc<ControlState>>,
     Query(params): Query<SearchParams>,
@@ -499,6 +520,66 @@ async fn git_log(
         .min(200);
     let git = GitService::open(&state.root).map_err(|e| ApiError::internal(&e))?;
     let out = git.log(limit).await.map_err(|e| ApiError::internal(&e))?;
+    Ok(Json(
+        serde_json::to_value(out).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+async fn git_branch(
+    State(state): State<Arc<ControlState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let git = open_repo(&state)?;
+    let out = git.branch().await.map_err(|e| ApiError::internal(&e))?;
+    Ok(Json(
+        serde_json::to_value(out).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+async fn git_branches(
+    State(state): State<Arc<ControlState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let git = open_repo(&state)?;
+    let out = git.branches().await.map_err(|e| ApiError::internal(&e))?;
+    Ok(Json(
+        serde_json::to_value(out).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+#[derive(Deserialize)]
+struct GitRemoteParams {
+    remote: Option<String>,
+    branch: Option<String>,
+}
+
+async fn git_push(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<GitRemoteParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let git = open_repo(&state)?;
+    let out = git
+        .push(
+            params.remote.as_deref().unwrap_or("origin"),
+            params.branch.as_deref().unwrap_or("HEAD"),
+        )
+        .await
+        .map_err(|e| ApiError::internal(&e))?;
+    Ok(Json(
+        serde_json::to_value(out).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+async fn git_pull(
+    State(state): State<Arc<ControlState>>,
+    Query(params): Query<GitRemoteParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let git = open_repo(&state)?;
+    let out = git
+        .pull(
+            params.remote.as_deref().unwrap_or("origin"),
+            params.branch.as_deref().unwrap_or("HEAD"),
+        )
+        .await
+        .map_err(|e| ApiError::internal(&e))?;
     Ok(Json(
         serde_json::to_value(out).unwrap_or_else(|_| json!({})),
     ))
@@ -1502,7 +1583,7 @@ mod tests {
     fn tiny_state(root: &std::path::Path) -> Arc<ControlState> {
         let mut s = Arc::new(ControlState::new(root, "test-key".to_string()));
         Arc::get_mut(&mut s).unwrap().rate_limiter = Arc::new(
-            crate::api::rate_limit::RateLimiter::new(5, std::time::Duration::from_secs(60)),
+            crate::services::rate_limit::RateLimiter::new(5, std::time::Duration::from_secs(60)),
         );
         s
     }

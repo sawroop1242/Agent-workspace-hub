@@ -248,7 +248,7 @@ impl FilesService {
 }
 
 /// Kind of a path as seen by file-oriented UIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PathKind {
     Directory,
     TextFile,
@@ -256,7 +256,7 @@ pub enum PathKind {
 }
 
 /// Metadata snapshot for one path.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct FileMeta {
     pub kind: PathKind,
     pub size: u64,

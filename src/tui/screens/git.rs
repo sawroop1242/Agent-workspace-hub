@@ -20,6 +20,7 @@ pub enum GitPane {
     DiffWorktree,
     DiffStaged,
     Log,
+    Branches,
 }
 
 #[derive(Default)]
@@ -101,6 +102,10 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
             app.ui.git_ui.pane = GitPane::Log;
             load_pane(app, GitPane::Log);
         }
+        KeyCode::Char('5') | KeyCode::Char('b') => {
+            app.ui.git_ui.pane = GitPane::Branches;
+            load_pane(app, GitPane::Branches);
+        }
         KeyCode::Up => {
             if selected > 0 {
                 app.ui.git.select(Some(selected - 1));
@@ -143,6 +148,29 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
             app.ui.git_ui.commit_active = true;
             app.ui.git_ui.commit_input.clear();
         }
+        KeyCode::Char('p') => {
+            // Push current branch to origin; git failures surface in the
+            // message bar rather than crashing the TUI.
+            match app.backend.git_push("origin", "HEAD") {
+                Ok(out) if out.exit_code.unwrap_or(0) == 0 => {
+                    app.set_message(format!("pushed: {}", out.stdout.trim()));
+                }
+                Ok(out) => {
+                    app.set_error(format!("git push: {}", out.stderr.trim()));
+                }
+                Err(e) => app.set_error(format!("git push: {e:#}")),
+            }
+        }
+        KeyCode::Char('P') => match app.backend.git_pull("origin", "HEAD") {
+            Ok(out) if out.exit_code.unwrap_or(0) == 0 => {
+                app.set_message(format!("pulled: {}", out.stdout.trim()));
+                app.ui.git_ui.refresh_status(&app.backend);
+            }
+            Ok(out) => {
+                app.set_error(format!("git pull: {}", out.stderr.trim()));
+            }
+            Err(e) => app.set_error(format!("git pull: {e:#}")),
+        },
         KeyCode::Backspace => {
             app.ui.git_ui.refresh_status(&app.backend);
         }
@@ -161,6 +189,7 @@ fn load_pane<B: WorkspaceBackend>(app: &mut App<B>, pane: GitPane) {
         GitPane::DiffWorktree => app.backend.git_diff(false, path.as_deref()),
         GitPane::DiffStaged => app.backend.git_diff(true, path.as_deref()),
         GitPane::Log => app.backend.git_log(50),
+        GitPane::Branches => app.backend.git_branches(),
         GitPane::Status => Ok(crate::services::git::GitOutput {
             stdout: String::new(),
             stderr: String::new(),
@@ -186,6 +215,7 @@ pub fn draw<B: WorkspaceBackend>(
         GitPane::DiffWorktree => "2:diff worktree",
         GitPane::DiffStaged => "3:diff staged",
         GitPane::Log => "4:log",
+        GitPane::Branches => "5:branches",
     };
     let block = block.title(format!(" Git — {pane_label} "));
 
@@ -232,7 +262,7 @@ pub fn draw<B: WorkspaceBackend>(
             );
             frame.render_stateful_widget(list, main, &mut app.ui.git);
         }
-        GitPane::DiffWorktree | GitPane::DiffStaged | GitPane::Log => {
+        GitPane::DiffWorktree | GitPane::DiffStaged | GitPane::Log | GitPane::Branches => {
             frame.render_widget(
                 Paragraph::new(ui.output.as_str())
                     .style(Style::default().fg(Color::Gray))
@@ -244,7 +274,7 @@ pub fn draw<B: WorkspaceBackend>(
 
     frame.render_widget(
         Paragraph::new(
-            "[1]status [2]diff [3]staged-diff [4]log  [+/-]stage/unstage  [c]commit  [Bksp]refresh",
+            "[1]status [2]diff [3]staged-diff [4]log [5]branches  [+/-]stage/unstage  [c]commit  [p]push [P]pull  [Bksp]refresh",
         )
         .style(Style::default().fg(Color::DarkGray)),
         hint,
@@ -368,6 +398,47 @@ mod tests {
         assert!(
             app.ui.git_ui.output.contains("init"),
             "log shows first commit"
+        );
+    }
+
+    #[test]
+    fn branches_pane_lists_current_branch() {
+        let mut app = git_app();
+        app.goto(ScreenId::Git);
+        press(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.ui.git_ui.pane, GitPane::Branches);
+        assert!(
+            !app.ui.git_ui.output.trim().is_empty(),
+            "branches pane should list at least the current branch"
+        );
+        // 'b' is the mnemonic alias for the same pane.
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.ui.git_ui.pane, GitPane::Branches);
+    }
+
+    #[test]
+    fn push_without_remote_reports_git_error_not_panic() {
+        let mut app = git_app();
+        app.goto(ScreenId::Git);
+        // No 'origin' configured in the fixture repo: git push must
+        // fail with a surfaced error message, never a panic.
+        press(&mut app, KeyCode::Char('p'));
+        let msg = app
+            .error
+            .clone()
+            .or_else(|| app.message.clone())
+            .expect("push must report something");
+        assert!(
+            msg.to_lowercase().contains("push") || msg.to_lowercase().contains("origin"),
+            "push feedback should mention the failing op: {msg}"
+        );
+        assert!(app.error.is_some(), "push without origin must error: {msg}");
+
+        press(&mut app, KeyCode::Char('P'));
+        assert!(
+            app.error.is_some(),
+            "pull without origin must error, not panic"
         );
     }
 }

@@ -24,7 +24,20 @@ struct Cli {
 enum Command {
     Status,
     /// Interactive terminal UI.
-    Tui,
+    Tui {
+        /// Run against a remote AWH Control API (e.g. https://host:8080)
+        /// instead of the local workspace.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Bearer API key for the remote server. Prefer `--api-key-env`
+        /// so the key never appears in shell history or process listings.
+        #[arg(long, conflicts_with = "api_key_env")]
+        api_key: Option<String>,
+        /// Environment variable holding the remote API key (default
+        /// AWH_API_KEY).
+        #[arg(long, default_value = "AWH_API_KEY")]
+        api_key_env: String,
+    },
     /// Serve the versioned HTTP Control API (`/api/v1`).
     Serve {
         /// Bind address for the HTTP server.
@@ -262,7 +275,22 @@ fn main() -> Result<()> {
     let registry_store = RegistryStore::new(home.join(".agent-workspace-hub"));
     match cli.command {
         Some(Command::Status) => println!("Agent Workspace Hub — Rust\nstatus: bootstrap complete"),
-        Some(Command::Tui) => agent_workspace_hub::tui::run_local(std::env::current_dir()?)?,
+        Some(Command::Tui {
+            remote,
+            api_key,
+            api_key_env,
+        }) => match remote {
+            Some(base) => {
+                let key = api_key
+                    .or_else(|| std::env::var(&api_key_env).ok())
+                    .filter(|k| !k.is_empty())
+                    .with_context(|| {
+                        format!("remote mode needs an API key: pass --api-key or set {api_key_env}")
+                    })?;
+                agent_workspace_hub::tui::run_remote(&base, &key)?
+            }
+            None => agent_workspace_hub::tui::run_local(std::env::current_dir()?)?,
+        },
         Some(Command::Serve {
             host,
             port,

@@ -71,6 +71,11 @@ pub trait WorkspaceBackend {
     fn git_stage(&self, path: &str) -> Result<GitOutput>;
     fn git_unstage(&self, path: &str) -> Result<GitOutput>;
     fn git_diff(&self, staged: bool, path: Option<&str>) -> Result<GitOutput>;
+    fn git_branches(&self) -> Result<GitOutput>;
+    /// Push/pull contact a remote; failures surface as `GitOutput` with a
+    /// non-zero exit code rather than an `Err` whenever git itself ran.
+    fn git_push(&self, remote: &str, branch: &str) -> Result<GitOutput>;
+    fn git_pull(&self, remote: &str, branch: &str) -> Result<GitOutput>;
 
     fn terminal_run(&self, program: &str, args: &[String]) -> Result<ExecOutcome>;
 
@@ -96,6 +101,27 @@ pub trait WorkspaceBackend {
     /// The project the operator last focused, if any (spec section 7:
     /// context, memory, and skill views follow the current project).
     fn current_project_hint(&self) -> Option<String>;
+
+    /// Rows for the MCP screen (global registry). Defaults to an
+    /// empty registry for backends that cannot list one.
+    fn list_mcp_servers(&self) -> Result<Vec<crate::tui::remote::McpInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// Where this backend operates: local filesystem or a remote API.
+    fn mode(&self) -> BackendMode;
+
+    /// Base URL for remote backends; `None` locally.
+    fn remote_base(&self) -> Option<String> {
+        None
+    }
+}
+
+/// How a backend reaches the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendMode {
+    Local,
+    Remote,
 }
 
 /// Local implementation over the shared application services. The TUI event
@@ -299,6 +325,33 @@ impl WorkspaceBackend for LocalBackend {
         }
     }
 
+    fn git_branches(&self) -> Result<GitOutput> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        self.runtime.block_on(git.branches())
+    }
+
+    fn git_push(&self, remote: &str, branch: &str) -> Result<GitOutput> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        let out = self.runtime.block_on(git.push(remote, branch))?;
+        crate::services::audit::record_allow(
+            "tui_git_push",
+            "operator",
+            &truncate_detail(&format!("{remote}/{branch}"), 60),
+        );
+        Ok(out)
+    }
+
+    fn git_pull(&self, remote: &str, branch: &str) -> Result<GitOutput> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        let out = self.runtime.block_on(git.pull(remote, branch))?;
+        crate::services::audit::record_allow(
+            "tui_git_pull",
+            "operator",
+            &truncate_detail(&format!("{remote}/{branch}"), 60),
+        );
+        Ok(out)
+    }
+
     fn terminal_run(&self, program: &str, args: &[String]) -> Result<ExecOutcome> {
         let terminal = crate::services::terminal::TerminalService::new(&self.root);
         let outcome = self.runtime.block_on(terminal.run(program, args))?;
@@ -365,6 +418,24 @@ impl WorkspaceBackend for LocalBackend {
 
     fn current_project_hint(&self) -> Option<String> {
         self.current_project.clone()
+    }
+
+    fn list_mcp_servers(&self) -> Result<Vec<crate::tui::remote::McpInfo>> {
+        let registry = crate::mcp::GlobalMcpRegistry::new()?;
+        Ok(registry
+            .list()?
+            .into_iter()
+            .map(|entry| crate::tui::remote::McpInfo {
+                id: entry.config.id,
+                transport: format!("{:?}", entry.config.transport),
+                enabled: entry.config.enabled,
+                version: entry.version,
+            })
+            .collect())
+    }
+
+    fn mode(&self) -> BackendMode {
+        BackendMode::Local
     }
 }
 

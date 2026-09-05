@@ -9,8 +9,11 @@ pub mod editor;
 pub mod files;
 pub mod git;
 pub mod logs;
+pub mod mcp;
 pub mod memory;
 pub mod projects;
+pub mod remote;
+pub mod settings;
 pub mod skills;
 pub mod terminal;
 
@@ -136,6 +139,8 @@ pub struct ScreenState {
     pub context_ui: context::ContextUi,
     pub memory_ui: memory::MemoryUi,
     pub skills_ui: skills::SkillsUi,
+    pub mcp_ui: mcp::McpUi,
+    pub remote_ui: remote::RemoteUi,
     /// Bounded view over the shared audit ring for the Logs screen.
     pub logs: Vec<crate::services::audit::AuditEntry>,
     /// Content produced by a DiscardChanges action, adopted by the
@@ -161,6 +166,9 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: crossterm::event::
         ScreenId::Context => context::handle_key(app, key),
         ScreenId::Memory => memory::handle_key(app, key),
         ScreenId::Skills => skills::handle_key(app, key),
+        ScreenId::Mcp => mcp::handle_key(app, key),
+        ScreenId::Settings => settings::handle_key(app, key),
+        ScreenId::Remote => remote::handle_key(app, key),
         _ => {}
     }
 }
@@ -198,8 +206,10 @@ pub fn draw<B: WorkspaceBackend>(frame: &mut ratatui::Frame, app: &mut App<B>, a
         ScreenId::Context => context::draw(frame, app, area, block),
         ScreenId::Memory => memory::draw(frame, app, area, block),
         ScreenId::Skills => skills::draw(frame, app, area, block),
+        ScreenId::Mcp => mcp::draw(frame, app, area, block),
+        ScreenId::Settings => settings::draw(frame, app, area, block),
+        ScreenId::Remote => remote::draw(frame, app, area, block),
         ScreenId::Help => draw_help(frame, area, block),
-        _ => draw_placeholder(frame, app, area, block),
     }
 }
 
@@ -315,26 +325,6 @@ fn key_line(key: &str, description: &str) -> ratatui::text::Line<'static> {
         ratatui::text::Span::styled(format!("  {key:<14}"), Style::default().fg(Color::Green)),
         ratatui::text::Span::raw(description.to_string()),
     ])
-}
-
-fn draw_placeholder<B: WorkspaceBackend>(
-    frame: &mut ratatui::Frame,
-    app: &mut App<B>,
-    area: Rect,
-    block: Block<'_>,
-) {
-    let screen = SCREENS.iter().find(|s| s.id == app.screen()).unwrap();
-    frame.render_widget(
-        Paragraph::new(vec![
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(format!("{} foundation ready.", screen.title)),
-            ratatui::text::Line::from(screen.blurb),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from("This screen gains its full interface in a later phase."),
-        ])
-        .block(block),
-        area,
-    );
 }
 
 /// Renders a dim key-hint line at the bottom of a screen area.

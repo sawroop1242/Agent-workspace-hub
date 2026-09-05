@@ -294,6 +294,15 @@ impl McpDispatcher {
                 .call_tool(&req.params)
                 .await
                 .map_err(to_dispatch_error)?,
+            // MCP resources: project context, memory entries, and
+            // referenced skills exposed as addressable, readable URIs.
+            "resources/list" => self.resources_list().map_err(to_dispatch_error)?,
+            "resources/read" => self
+                .resources_read(&req.params)
+                .map_err(to_dispatch_error)?,
+            // This server ships no prompt templates; the protocol
+            // expects an empty list rather than an error.
+            "prompts/list" => json!({"prompts": []}),
             _ => {
                 // Unknown method: a proper JSON-RPC "method not found" error.
                 return Ok(DispatchResult::Response(RpcResponse {
@@ -347,6 +356,7 @@ impl McpDispatcher {
             {"name":"memory.search","description":"Search memory","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]}},"required":["query"]}},
             {"name":"memory.get","description":"Get memory by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
             {"name":"memory.delete","description":"Delete memory","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"memory.update","description":"Update an existing memory entry's content and tags","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"scope":{"type":"string","enum":["Session","Project","Global"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","content"]}},
             {"name":"tasks.create","description":"Create a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string","enum":["Low","Normal","High","Critical"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","title","description"]}},
             {"name":"tasks.list","description":"List tasks","inputSchema":{"type":"object","properties":{"status":{"type":"string","enum":["Todo","InProgress","Blocked","Done"]}}}},
             {"name":"tasks.update","description":"Update a task","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["Todo","InProgress","Blocked","Done"]},"priority":{"type":"string","enum":["Low","Normal","High","Critical"]},"assignee":{"type":["string","null"]}},"required":["id"]}},
@@ -386,6 +396,83 @@ impl McpDispatcher {
             core_arr.extend(ext_arr.iter().cloned());
         }
         json!({"tools": tools})
+    }
+
+    /// MCP resources exposed by this server: the project's context
+    /// files, every memory entry, and each project-referenced skill.
+    /// Resources are read-only views over existing services — they add
+    /// no new filesystem surface (skills.read already enforces project
+    /// references; memory ids are validated by the memory store).
+    fn resources_list(&self) -> Result<Value> {
+        let mut resources = Vec::new();
+
+        resources.push(json!({
+            "uri": "awh://context",
+            "name": "Project context",
+            "description": "Concatenated AGENTS.md / AGENT.md / README.md",
+            "mimeType": "text/markdown",
+        }));
+
+        for entry in self.memory.list_all()? {
+            resources.push(json!({
+                "uri": format!("awh://memory/{}", entry.id),
+                "name": format!("Memory {}", entry.id),
+                "description": truncate_chars(&entry.content, 60),
+                "mimeType": "text/plain",
+            }));
+        }
+
+        for skill in self.skills.list()? {
+            resources.push(json!({
+                "uri": format!("awh://skills/{}", skill.name),
+                "name": format!("Skill {}", skill.name),
+                "description": truncate_chars(&skill.description, 60),
+                "mimeType": "text/markdown",
+            }));
+        }
+
+        Ok(json!({"resources": resources}))
+    }
+
+    /// Reads one resource by URI. Unknown or malformed URIs are a
+    /// protocol-level error the client can surface. The bare
+    /// `awh://context` resource (no id segment) is accepted because
+    /// `resources/list` advertises it that way.
+    fn resources_read(&self, params: &Value) -> Result<Value> {
+        let uri = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("resources/read requires a uri parameter"))?;
+        let path = uri
+            .strip_prefix("awh://")
+            .ok_or_else(|| anyhow::anyhow!("unsupported resource uri: {uri}"))?;
+        let (kind, rest) = match path.split_once('/') {
+            Some((kind, rest)) => (kind, rest),
+            None => (path, ""),
+        };
+
+        let (content, mime) = match kind {
+            "context" => (self.workspace.context()?, "text/markdown"),
+            "memory" => {
+                let entry = self
+                    .memory
+                    .get(rest)?
+                    .ok_or_else(|| anyhow::anyhow!("memory entry not found: {rest}"))?;
+                (entry.content, "text/plain")
+            }
+            "skills" => {
+                let skill = self.skills.read(rest)?;
+                (skill.description, "text/markdown")
+            }
+            other => anyhow::bail!("unsupported resource kind: {other}"),
+        };
+        Ok(json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": mime,
+                "text": content,
+            }]
+        }))
     }
 
     async fn call_tool(&self, params: &Value) -> Result<Value> {
@@ -486,6 +573,22 @@ impl McpDispatcher {
                     arguments.get("id").and_then(Value::as_str).unwrap_or_default()
                 )?
             }),
+            "memory.update" => {
+                // Updating must not silently create: the entry has to
+                // exist, otherwise the caller gets a clear error.
+                let id = strval(&arguments, "id")?;
+                if self.memory.get(&id)?.is_none() {
+                    anyhow::bail!("memory entry not found: {id}");
+                }
+                let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
+                let entry = self.memory.store(
+                    id,
+                    strval(&arguments, "content")?,
+                    scope,
+                    strings(&arguments, "tags"),
+                )?;
+                serde_json::to_value(entry)?
+            }
             "tasks.create" => serde_json::to_value(self.tasks.create(
                 strval(&arguments, "id")?,
                 strval(&arguments, "title")?,
@@ -859,6 +962,16 @@ fn strval(arguments: &Value, key: &str) -> Result<String> {
     match arguments.get(key).and_then(Value::as_str) {
         Some(value) => Ok(value.to_string()),
         None => bail!("missing or non-string '{key}' argument"),
+    }
+}
+
+/// One-line preview for resource descriptions, cut on a char boundary.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let cut: String = s.chars().take(max - 1).collect();
+        format!("{cut}\u{2026}")
     }
 }
 

@@ -1,4 +1,4 @@
-//! In-process sliding-window rate limiter for the Control API
+//! In-process sliding-window rate limiter shared by both API planes
 //! (spec section 25 chain: Auth -> Authz -> Rate Limit -> Audit ->
 //! Services).
 //!

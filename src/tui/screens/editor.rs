@@ -26,6 +26,10 @@ pub struct EditorUi {
     /// Path typed into the open-file prompt.
     pub open_input: String,
     pub open_active: bool,
+    /// Incremental search: query, prompt state, and last match offset.
+    pub search_input: String,
+    pub search_active: bool,
+    pub last_match: Option<usize>,
     /// Message explaining why a file was refused (too large / binary).
     pub refusal: Option<String>,
 }
@@ -62,6 +66,10 @@ impl EditorUi {
         self.buffer = content;
         self.cursor = self.buffer.len();
         self.dirty = false;
+        // Offsets from the previously open buffer are meaningless here.
+        self.search_active = false;
+        self.search_input.clear();
+        self.last_match = None;
         self.refusal = None;
         Ok(())
     }
@@ -145,6 +153,38 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
         return;
     }
 
+    // Search prompt: '/' opens it, Enter jumps to the next match,
+    // Esc cancels, typing edits the query. Live-updating the match
+    // keeps the found offset in sync while the query evolves.
+    if ui.search_active {
+        match key.code {
+            KeyCode::Enter => {
+                jump_to_next_match(app);
+            }
+            KeyCode::Esc => {
+                ui.search_active = false;
+                ui.search_input.clear();
+                ui.last_match = None;
+            }
+            KeyCode::Backspace => {
+                ui.search_input.pop();
+                ui.last_match = None;
+            }
+            KeyCode::Char(c) => {
+                ui.search_input.push(c);
+                ui.last_match = None;
+            }
+            _ => {}
+        }
+        return;
+    }
+    if key.code == KeyCode::Char('/') {
+        ui.search_active = true;
+        ui.search_input.clear();
+        ui.last_match = None;
+        return;
+    }
+
     match key.code {
         KeyCode::Char('o')
             if key
@@ -200,6 +240,9 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
                 ui.saved = None;
                 ui.buffer.clear();
                 ui.cursor = 0;
+                ui.search_active = false;
+                ui.search_input.clear();
+                ui.last_match = None;
             }
         }
         KeyCode::Char(c) => ui.insert_char(c),
@@ -209,6 +252,37 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+/// Jumps the cursor to the next occurrence of the search query,
+/// starting after the current match and wrapping around once. An empty
+/// query or no-match is reported through the message bar, not a panic.
+fn jump_to_next_match<B: WorkspaceBackend>(app: &mut App<B>) {
+    let ui = &mut app.ui.editor_ui;
+    let query = ui.search_input.clone();
+    if query.is_empty() {
+        app.set_error("search: empty query");
+        return;
+    }
+    let from = ui.last_match.map_or(0, |m| m + 1);
+    let buffer = ui.buffer.clone();
+    let wrapped = buffer[from..].find(&query).map(|i| from + i).or_else(|| {
+        if from > 0 {
+            buffer[..from].find(&query)
+        } else {
+            None
+        }
+    });
+    match wrapped {
+        Some(offset) => {
+            ui.cursor = offset;
+            ui.last_match = Some(offset);
+            app.set_message(format!("match at byte {offset}"));
+        }
+        None => {
+            app.set_error(format!("search: '{query}' not found"));
+        }
     }
 }
 
@@ -263,6 +337,21 @@ pub fn draw<B: WorkspaceBackend>(
         return;
     }
 
+    if ui.search_active {
+        let match_note = ui
+            .last_match
+            .map(|m| format!("  at byte {m}"))
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(format!("search: {}{match_note}", ui.search_input))
+                .style(Style::default().fg(Color::Cyan))
+                .block(block),
+            area,
+        );
+        hint_line(frame, area, "[Enter] next match  [Esc] cancel");
+        return;
+    }
+
     let Some(path) = &ui.path else {
         let mut lines = vec![
             ratatui::text::Line::from("no file open"),
@@ -298,7 +387,7 @@ pub fn draw<B: WorkspaceBackend>(
     hint_line(
         frame,
         area,
-        "[C-s] save  [C-w] close  [C-o] open  [chars] type  [arrows/Home/End] move",
+        "[C-s] save  [C-w] close  [C-o] open  / search  [chars] type  [arrows/Home/End] move",
     );
 }
 
@@ -315,6 +404,16 @@ mod tests {
         let app = App::new(LocalBackend::new(root));
         app.backend.write_file("doc.md", content).unwrap();
         app
+    }
+
+    fn press(app: &mut App<LocalBackend>, code: KeyCode) {
+        super::handle_key(app, KeyEvent::from(code));
+    }
+
+    fn type_into(app: &mut App<LocalBackend>, s: &str) {
+        for c in s.chars() {
+            super::handle_key(app, KeyEvent::from(KeyCode::Char(c)));
+        }
     }
 
     #[test]
@@ -400,5 +499,69 @@ mod tests {
         ui.cursor = line_start(&ui.buffer, 2);
         assert_eq!(ui.line_col(), (2, 1));
         assert_eq!(&ui.buffer[ui.cursor..ui.cursor + 3], "two");
+    }
+
+    #[test]
+    fn search_finds_next_match_and_wraps() {
+        let mut app = app_with_file("alpha beta alpha gamma\nalpha end");
+        app.ui.editor_ui.load(&app.backend, "doc.md").unwrap();
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.ui.editor_ui.search_active);
+        type_into(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.ui.editor_ui.cursor, 0, "first match at byte 0");
+        assert_eq!(app.ui.editor_ui.last_match, Some(0));
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.ui.editor_ui.cursor, 11, "second match after 'beta '");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.ui.editor_ui.cursor, 23, "third match on line 2");
+        // Wraps to the start on the next Enter.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.ui.editor_ui.cursor, 0, "search wraps around");
+    }
+
+    #[test]
+    fn search_missing_query_reports_error_and_esc_exits() {
+        let mut app = app_with_file("hello world");
+        app.ui.editor_ui.load(&app.backend, "doc.md").unwrap();
+        press(&mut app, KeyCode::Char('/'));
+        type_into(&mut app, "zzz");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.error.is_some(), "no match must surface an error");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.ui.editor_ui.search_active);
+        assert!(app.ui.editor_ui.search_input.is_empty());
+        assert_eq!(app.ui.editor_ui.last_match, None);
+        // Esc'd search must not capture the next '/'-less keypress —
+        // typing goes back into the buffer.
+        let before = app.ui.editor_ui.buffer.clone();
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.ui.editor_ui.buffer, format!("{before}x"));
+    }
+
+    #[test]
+    fn search_empty_query_is_rejected() {
+        let mut app = app_with_file("content");
+        app.ui.editor_ui.load(&app.backend, "doc.md").unwrap();
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.error.is_some(), "empty query must be refused");
+    }
+
+    #[test]
+    fn opening_another_file_clears_search_state() {
+        let mut app = app_with_file("alpha alpha");
+        app.ui.editor_ui.load(&app.backend, "doc.md").unwrap();
+        press(&mut app, KeyCode::Char('/'));
+        type_into(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.ui.editor_ui.last_match, Some(0));
+
+        app.backend.write_file("other.txt", "beta").unwrap();
+        app.ui.editor_ui.load(&app.backend, "other.txt").unwrap();
+        assert!(!app.ui.editor_ui.search_active);
+        assert_eq!(app.ui.editor_ui.last_match, None);
     }
 }

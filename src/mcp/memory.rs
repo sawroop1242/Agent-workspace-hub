@@ -118,6 +118,11 @@ impl MemoryMcp {
         Ok(entry)
     }
 
+    /// Lists every entry across all scopes, oldest first.
+    pub fn list_all(&self) -> Result<Vec<MemoryEntry>> {
+        Ok(self.load()?.entries)
+    }
+
     /// Searches entries by content or tag, optionally constrained to a scope.
     pub fn search(&self, query: &str, scope: Option<MemoryScope>) -> Result<Vec<MemoryEntry>> {
         let q = query.to_ascii_lowercase();

@@ -82,6 +82,10 @@ pub struct AppState {
     pub api_key: Arc<str>,
     pub max_sessions: usize,
     pub sse_keepalive: Duration,
+    /// Sliding-window limiter for authenticated MCP traffic (spec §25
+    /// chain applies to both planes). Keyed like the Control API:
+    /// first `X-Forwarded-For` value, else the shared "direct" bucket.
+    pub rate_limiter: Arc<crate::services::rate_limit::RateLimiter>,
 }
 
 /// Serves the remote MCP server over HTTP (optionally TLS) until shutdown.
@@ -97,6 +101,7 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
         api_key: Arc::from(config.api_key.as_str()),
         max_sessions: config.max_sessions,
         sse_keepalive: config.sse_keepalive,
+        rate_limiter: crate::services::rate_limit::RateLimiter::default_limiter(),
     };
 
     let app = build_router(state, &config);
@@ -167,9 +172,15 @@ pub fn build_router(state: AppState, config: &HttpServerConfig) -> Router {
     let cors = build_cors(config);
 
     // `/sse` and `/mcp` require a valid bearer token; `/health` does not.
+    // Rate limiting runs after authentication (spec §25): 401s never
+    // consume quota, and only valid tokens reach the limiter.
     let protected = Router::new()
         .route("/sse", get(sse_handler))
         .route("/mcp", post(mcp_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_guard,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
@@ -234,7 +245,6 @@ async fn authenticate(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| auth::bearer_token(Some(s)));
-
     match token {
         Some(t) if auth::verify_token(&state.api_key, t) => {
             audit_allow("http_auth", "remote", "success");
@@ -247,6 +257,47 @@ async fn authenticate(
                 Json(json!({"error": "unauthorized"})),
             )
                 .into_response()
+        }
+    }
+}
+
+/// Rate-limit middleware (spec §25: runs after authentication, so
+/// rejected 401s never burn quota). Keyed on `X-Forwarded-For`'s first
+/// value — tunnels and reverse proxies set it — falling back to the
+/// shared "direct" bucket for connections with no proxy header.
+async fn rate_limit_guard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let key = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("direct")
+        .to_owned();
+
+    match state.rate_limiter.check(&key) {
+        Ok(_) => next.run(request).await,
+        Err(retry_after) => {
+            audit_deny("mcp_rate_limit", "rate_limited", &key);
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "rate_limited",
+                    "retry_after_secs": retry_after,
+                })),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&retry_after.to_string())
+                    .expect("retry-after is numeric"),
+            );
+            response
         }
     }
 }
