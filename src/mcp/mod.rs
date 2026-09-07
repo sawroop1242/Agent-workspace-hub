@@ -19,6 +19,8 @@ pub mod community_registry;
 pub mod composio;
 /// Composio authentication.
 pub mod composio_auth;
+/// Global registry of Composio connected accounts.
+pub mod composio_registry;
 /// Runtime configuration and resource limits with precedence rules.
 pub mod config;
 /// Connector metadata store.
@@ -55,6 +57,8 @@ pub mod server;
 pub mod skills;
 /// Server-Sent Events sessions for the remote transport.
 pub mod sse;
+/// Cross-process advisory locking for JSON-backed project stores.
+pub mod store_lock;
 /// MCP task store.
 pub mod tasks;
 /// TLS configuration for the remote transport.
@@ -75,6 +79,7 @@ pub use community_registry::{
 };
 pub use composio::ComposioProvider;
 pub use composio_auth::{AuthLink, ComposioAuth, ConnectedAccount};
+pub use composio_registry::{ComposioAccount, ComposioRegistry};
 pub use config::{build_http_client, ResourceLimits};
 pub use connectors::{AuthMethod, Connector, ConnectorsMcp};
 pub use context::{load_context, WorkspaceContext};
@@ -111,6 +116,7 @@ pub use security::{
 pub use server::StdioMcpServer;
 pub use skills::SkillMcp;
 pub use sse::{Session, SessionRegistry, SseEvent};
+pub use store_lock::StoreLock;
 pub use tasks::{Task, TaskPriority, TaskStatus, TasksMcp};
 pub use tls::TlsConfig;
 pub use trust::{can_enable, McpApproval, TrustLevel, TrustStore};

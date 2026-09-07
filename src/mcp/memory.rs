@@ -1,3 +1,4 @@
+use crate::mcp::store_lock::StoreLock;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -71,8 +72,22 @@ impl MemoryMcp {
         )?)
     }
 
+    /// Writes `store` atomically: the new content lands in a temp file in
+    /// the same directory, then replaces the target via rename, so a reader
+    /// (including a sibling agent process) never observes a truncated or
+    /// partially written file.
     fn save(&self, store: &MemoryStore) -> Result<()> {
-        fs::write(&self.path, serde_json::to_string_pretty(store)?)?;
+        let parent = self
+            .path
+            .parent()
+            .context("memory store path has no parent directory")?;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent).context("failed to create temp file")?;
+        std::io::Write::write_all(&mut temp, serde_json::to_string_pretty(store)?.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically write memory store")?;
         Ok(())
     }
 
@@ -81,6 +96,11 @@ impl MemoryMcp {
     /// Fails closed when the entry would exceed the store's enforced size
     /// limits (entry count, content bytes, id length, tag count/length), so a
     /// misbehaving client cannot grow the on-disk store without bound.
+    ///
+    /// Holds a [`StoreLock`] across the whole load-modify-save cycle so a
+    /// second agent process calling `store`/`delete` on this same project at
+    /// the same time serializes behind it instead of racing (see
+    /// `crate::mcp::store_lock` for why this matters across processes).
     pub fn store(
         &self,
         id: String,
@@ -89,6 +109,7 @@ impl MemoryMcp {
         tags: Vec<String>,
     ) -> Result<MemoryEntry> {
         validate_memory_input(&id, &content, &tags)?;
+        let _lock = StoreLock::acquire(&self.path)?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut db = self.load()?;
         if db.entries.iter().any(|e| e.id == id) {
@@ -118,6 +139,39 @@ impl MemoryMcp {
         Ok(entry)
     }
 
+    /// Updates an existing entry's content, scope, and tags, failing if no
+    /// entry with `id` exists yet.
+    ///
+    /// This performs the existence check and the write under the same
+    /// [`StoreLock`] hold, unlike a caller doing `get` then `store`: that
+    /// two-step version has a check-then-act gap where a second agent could
+    /// delete the entry in between, turning what looked like an "update"
+    /// into a silent re-creation. Locking across both steps here closes it.
+    pub fn update_existing(
+        &self,
+        id: String,
+        content: String,
+        scope: MemoryScope,
+        tags: Vec<String>,
+    ) -> Result<MemoryEntry> {
+        validate_memory_input(&id, &content, &tags)?;
+        let _lock = StoreLock::acquire(&self.path)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut db = self.load()?;
+        let entry = db
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("memory entry not found: {id}"))?;
+        entry.content = content;
+        entry.tags = tags;
+        entry.scope = scope;
+        entry.updated_at = now;
+        let result = entry.clone();
+        self.save(&db)?;
+        Ok(result)
+    }
+
     /// Lists every entry across all scopes, oldest first.
     pub fn list_all(&self) -> Result<Vec<MemoryEntry>> {
         Ok(self.load()?.entries)
@@ -145,6 +199,7 @@ impl MemoryMcp {
 
     /// Deletes the memory entry with the given `id`, returning whether it existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut db = self.load()?;
         let before = db.entries.len();
         db.entries.retain(|e| e.id != id);
@@ -280,6 +335,34 @@ mod tests {
             .store("id".into(), "content".into(), MemoryScope::Project, vec![])
             .is_err());
         assert!(store.search("query", None).is_err());
+    }
+
+    #[test]
+    fn update_existing_rejects_missing_entry_and_updates_present_one() {
+        let (store, _dir) = temp_store();
+        assert!(store
+            .update_existing(
+                "missing".into(),
+                "content".into(),
+                MemoryScope::Project,
+                vec![]
+            )
+            .is_err());
+
+        store
+            .store("id".into(), "original".into(), MemoryScope::Project, vec![])
+            .unwrap();
+        let updated = store
+            .update_existing(
+                "id".into(),
+                "revised".into(),
+                MemoryScope::Global,
+                vec!["tag".into()],
+            )
+            .unwrap();
+        assert_eq!(updated.content, "revised");
+        assert_eq!(updated.scope, MemoryScope::Global);
+        assert_eq!(updated.tags, vec!["tag".to_string()]);
     }
 
     #[test]

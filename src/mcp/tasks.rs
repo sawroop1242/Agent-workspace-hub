@@ -1,4 +1,5 @@
-use anyhow::{bail, Result};
+use crate::mcp::store_lock::StoreLock;
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -93,8 +94,20 @@ impl TasksMcp {
         Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
 
+    /// Writes `store` atomically (temp file + rename) so a sibling agent
+    /// process reading `.agent/tasks.json` never observes a torn write.
     fn save(&self, store: &TaskStore) -> Result<()> {
-        fs::write(&self.path, serde_json::to_string_pretty(store)?)?;
+        let parent = self
+            .path
+            .parent()
+            .context("task store path has no parent directory")?;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent).context("failed to create temp file")?;
+        std::io::Write::write_all(&mut temp, serde_json::to_string_pretty(store)?.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically write task store")?;
         Ok(())
     }
 
@@ -103,6 +116,10 @@ impl TasksMcp {
     /// Fails closed when the task would exceed the store's enforced size
     /// limits (task count, id/title/description length, tag count/length),
     /// so a misbehaving client cannot grow the on-disk store without bound.
+    ///
+    /// Holds a [`StoreLock`] across the load-modify-save cycle so a second
+    /// agent process working the same project at the same time serializes
+    /// behind it instead of racing (see `crate::mcp::store_lock`).
     pub fn create(
         &self,
         id: String,
@@ -112,6 +129,7 @@ impl TasksMcp {
         tags: Vec<String>,
     ) -> Result<Task> {
         validate_task_input(&id, &title, &description, &tags)?;
+        let _lock = StoreLock::acquire(&self.path)?;
         let now = Utc::now().to_rfc3339();
         let task = Task {
             id,
@@ -153,6 +171,7 @@ impl TasksMcp {
         priority: Option<TaskPriority>,
         assignee: Option<Option<String>>,
     ) -> Result<Option<Task>> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let task = match store.tasks.iter_mut().find(|t| t.id == id) {
             Some(t) => t,
@@ -175,6 +194,7 @@ impl TasksMcp {
 
     /// Deletes the task with the given `id`, returning whether it existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let before = store.tasks.len();
         store.tasks.retain(|t| t.id != id);

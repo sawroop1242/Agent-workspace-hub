@@ -1,8 +1,9 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
 use super::custom_mcp::{CustomMcpServerConfig, McpTransport};
+use super::store_lock::StoreLock;
 
 /// A globally installed MCP server entry with its version and source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +55,17 @@ impl GlobalMcpRegistry {
         Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
     fn save(&self, store: &GlobalMcpStore) -> Result<()> {
-        fs::write(&self.path, serde_json::to_string_pretty(store)?)?;
+        let parent = self
+            .path
+            .parent()
+            .context("global MCP store path has no parent directory")?;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent).context("failed to create temp file")?;
+        std::io::Write::write_all(&mut temp, serde_json::to_string_pretty(store)?.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically write global MCP store")?;
         Ok(())
     }
     /// Lists all globally installed MCP servers.
@@ -67,6 +78,10 @@ impl GlobalMcpRegistry {
         Ok(self.load()?.servers.into_iter().find(|x| x.config.id == id))
     }
     /// Installs (or replaces) an MCP server with the given version and source.
+    ///
+    /// Holds a [`StoreLock`] across the load-modify-save cycle: this store is
+    /// user-wide (not per-project), so it can be touched concurrently by the
+    /// CLI and by any agent's dispatcher across every project on the machine.
     pub fn install(
         &self,
         config: CustomMcpServerConfig,
@@ -81,6 +96,7 @@ impl GlobalMcpRegistry {
             version: version.into(),
             source: source.into(),
         };
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         store.servers.retain(|x| x.config.id != entry.config.id);
         store.servers.push(entry.clone());
@@ -89,6 +105,7 @@ impl GlobalMcpRegistry {
     }
     /// Removes an MCP server, returning whether it existed.
     pub fn remove(&self, id: &str) -> Result<bool> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let before = store.servers.len();
         store.servers.retain(|x| x.config.id != id);
@@ -97,6 +114,7 @@ impl GlobalMcpRegistry {
     }
     /// Toggles an MCP server's enabled state, returning the updated entry.
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Option<GlobalMcpEntry>> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let item = match store.servers.iter_mut().find(|x| x.config.id == id) {
             Some(x) => x,
@@ -136,7 +154,17 @@ impl ProjectMcpReferences {
         Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
     fn save(&self, refs: &ProjectMcpRefs) -> Result<()> {
-        fs::write(&self.path, serde_json::to_string_pretty(refs)?)?;
+        let parent = self
+            .path
+            .parent()
+            .context("project MCP refs path has no parent directory")?;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent).context("failed to create temp file")?;
+        std::io::Write::write_all(&mut temp, serde_json::to_string_pretty(refs)?.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically write project MCP refs")?;
         Ok(())
     }
     /// Lists the referenced MCP ids.
@@ -149,6 +177,7 @@ impl ProjectMcpReferences {
         if id.is_empty() {
             bail!("MCP id is required");
         }
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut refs = self.load()?;
         if refs.mcps.iter().any(|x| x == id) {
             return Ok(false);
@@ -160,6 +189,7 @@ impl ProjectMcpReferences {
     }
     /// Removes an MCP reference, returning whether it was present.
     pub fn remove(&self, id: &str) -> Result<bool> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut refs = self.load()?;
         let before = refs.mcps.len();
         refs.mcps.retain(|x| x != id);
@@ -183,4 +213,76 @@ impl ProjectMcpReferences {
 #[allow(dead_code)]
 fn _transport_is_exhaustive(t: McpTransport) -> bool {
     matches!(t, McpTransport::Stdio | McpTransport::StreamableHttp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::McpPermissions;
+
+    fn config(id: &str) -> CustomMcpServerConfig {
+        CustomMcpServerConfig {
+            id: id.into(),
+            name: "name".into(),
+            transport: McpTransport::Stdio,
+            command: Some("true".into()),
+            args: vec![],
+            url: None,
+            env: Default::default(),
+            permissions: McpPermissions::default(),
+            enabled: true,
+        }
+    }
+
+    fn temp_registry() -> (GlobalMcpRegistry, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = GlobalMcpRegistry::with_path(dir.path().join("mcps.json")).unwrap();
+        (registry, dir)
+    }
+
+    #[test]
+    fn install_get_remove_round_trip() {
+        let (registry, _dir) = temp_registry();
+        registry.install(config("srv"), "1.0.0", "test").unwrap();
+        assert!(registry.get("srv").unwrap().is_some());
+        assert_eq!(registry.list().unwrap().len(), 1);
+
+        assert!(
+            !registry
+                .set_enabled("srv", false)
+                .unwrap()
+                .unwrap()
+                .config
+                .enabled
+        );
+
+        assert!(registry.remove("srv").unwrap());
+        assert!(registry.get("srv").unwrap().is_none());
+        assert!(!registry.remove("srv").unwrap());
+    }
+
+    #[test]
+    fn project_refs_add_remove_and_resolve_enabled_only() {
+        let (registry, _dir) = temp_registry();
+        registry
+            .install(config("enabled-srv"), "1.0.0", "test")
+            .unwrap();
+        let mut disabled = config("disabled-srv");
+        disabled.enabled = false;
+        registry.install(disabled, "1.0.0", "test").unwrap();
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let refs = ProjectMcpReferences::new(project_dir.path()).unwrap();
+        assert!(refs.add("enabled-srv").unwrap());
+        assert!(refs.add("disabled-srv").unwrap());
+        // Adding the same id twice reports "not newly added".
+        assert!(!refs.add("enabled-srv").unwrap());
+
+        let resolved = refs.resolve(&registry).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "enabled-srv");
+
+        assert!(refs.remove("enabled-srv").unwrap());
+        assert!(refs.resolve(&registry).unwrap().is_empty());
+    }
 }
