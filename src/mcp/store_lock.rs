@@ -80,6 +80,24 @@ impl StoreLock {
                     }
                     thread::sleep(RETRY_INTERVAL);
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // Windows can transiently report ACCESS_DENIED (os error
+                    // 5) instead of AlreadyExists when create_new races a
+                    // concurrent holder's delete of the same lock file: the
+                    // directory entry is momentarily in a delete-pending
+                    // state under NTFS. It resolves within microseconds, so
+                    // treat it like AlreadyExists (retry within the same
+                    // deadline) rather than failing the whole acquire — a
+                    // hard failure here would spuriously break exactly the
+                    // multi-agent contention this lock exists to serialize.
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "timed out waiting for another agent to release the lock on {}",
+                            target.display()
+                        );
+                    }
+                    thread::sleep(RETRY_INTERVAL);
+                }
                 Err(e) => {
                     return Err(e).with_context(|| {
                         format!("failed to create lock file {}", lock_path.display())
