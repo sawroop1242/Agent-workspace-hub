@@ -10,10 +10,11 @@ use crate::context::{
 };
 use crate::mcp::{
     audit_allow, audit_deny, authorize_mcp_execution, AuthMethod, CircuitBreakerConfig,
-    CircuitBreakerMcpClient, ComposioProvider, Connector, ConnectorsMcp, CustomMcpProvider,
-    CustomMcpRegistry, CustomMcpServerConfig, McpExecutionRequest, McpTransport, MemoryMcp,
-    MemoryScope, PersistentTrustStore, ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient,
-    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
+    CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider, ComposioRegistry,
+    Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, CustomMcpServerConfig,
+    McpExecutionRequest, McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore,
+    ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient, StreamableHttpMcpClient,
+    TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
 use crate::services::git::GitService;
 use crate::services::terminal::TerminalService;
@@ -142,6 +143,29 @@ impl McpDispatcher {
         if std::env::var("COMPOSIO_API_KEY").is_ok() {
             if let Ok(provider) = ComposioProvider::from_env() {
                 registry.blocking_write().register(Box::new(provider));
+            }
+        }
+
+        // Additional connected accounts registered once via
+        // `connector.composio_register` (see `ComposioRegistry`) are global
+        // to the machine, not this project, so every project's dispatcher
+        // picks them all up here without the human reconnecting per
+        // project. All accounts share one `COMPOSIO_API_KEY`; an account is
+        // skipped (not an error) if that key isn't set, since it would fail
+        // every call anyway.
+        if let Ok(api_key) = std::env::var("COMPOSIO_API_KEY") {
+            if !api_key.trim().is_empty() {
+                if let Ok(accounts) = ComposioRegistry::new().and_then(|r| r.list()) {
+                    let mut write = registry.blocking_write();
+                    for account in accounts {
+                        write.register(Box::new(ComposioProvider::new(
+                            format!("composio:{}", account.label),
+                            api_key.clone(),
+                            Some(account.connected_account_id),
+                            account.toolkit,
+                        )));
+                    }
+                }
             }
         }
 
@@ -388,6 +412,10 @@ impl McpDispatcher {
             {"name":"context.restore","description":"Restore a soft-offloaded context item to active","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
         ]);
         let extended = json!([
+            {"name":"connector.composio_link","description":"Start a Composio OAuth link for a new connected account; open the returned redirect_url to finish authorizing, then register the resulting connected_account_id with connector.composio_register","inputSchema":{"type":"object","properties":{"auth_config_id":{"type":"string"},"user_id":{"type":"string"},"alias":{"type":"string"},"callback_url":{"type":"string"}},"required":["auth_config_id","user_id"]}},
+            {"name":"connector.composio_accounts","description":"List Composio connected accounts visible to this API key, optionally filtered by user or toolkit","inputSchema":{"type":"object","properties":{"user_id":{"type":"string"},"toolkit":{"type":"string"}}}},
+            {"name":"connector.composio_register","description":"Register a Composio connected account globally under a label, so every project and agent on this machine can use it via connector.invoke as 'composio:<label>' without reconnecting","inputSchema":{"type":"object","properties":{"label":{"type":"string"},"connected_account_id":{"type":"string"},"toolkit":{"type":"string"}},"required":["label","connected_account_id"]}},
+            {"name":"connector.composio_remove","description":"Remove a globally registered Composio connected account by label","inputSchema":{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}},
             {"name":"git.status","description":"Git working-tree status (porcelain)","inputSchema":{"type":"object","properties":{}}},
             {"name":"git.branch","description":"Current Git branch","inputSchema":{"type":"object","properties":{}}},
             {"name":"git.log","description":"Recent Git commit log","inputSchema":{"type":"object","properties":{"limit":{"type":"number"}}}},
@@ -581,13 +609,14 @@ impl McpDispatcher {
             }),
             "memory.update" => {
                 // Updating must not silently create: the entry has to
-                // exist, otherwise the caller gets a clear error.
+                // exist, otherwise the caller gets a clear error. The
+                // existence check and the write happen under one lock hold
+                // inside `update_existing`, so a concurrent delete from
+                // another agent can't race a separate get+store into
+                // resurrecting the entry.
                 let id = strval(&arguments, "id")?;
-                if self.memory.get(&id)?.is_none() {
-                    anyhow::bail!("memory entry not found: {id}");
-                }
                 let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
-                let entry = self.memory.store(
+                let entry = self.memory.update_existing(
                     id,
                     strval(&arguments, "content")?,
                     scope,
@@ -705,6 +734,66 @@ impl McpDispatcher {
                 audit_allow("connector_invoke", provider, tool);
                 let registry = self.providers.read().await;
                 serde_json::to_value(registry.invoke(provider, tool, args).await?)?
+            }
+            "connector.composio_link" => {
+                let auth_config_id = strval(&arguments, "auth_config_id")?;
+                let user_id = strval(&arguments, "user_id")?;
+                let alias = arguments.get("alias").and_then(Value::as_str);
+                let callback_url = arguments.get("callback_url").and_then(Value::as_str);
+                audit_allow("composio_link", &auth_config_id, &user_id);
+                let link = ComposioAuth::from_env()?
+                    .create_link(&auth_config_id, &user_id, alias, callback_url)
+                    .await?;
+                serde_json::to_value(link)?
+            }
+            "connector.composio_accounts" => {
+                let user_id = arguments.get("user_id").and_then(Value::as_str);
+                let toolkit = arguments.get("toolkit").and_then(Value::as_str);
+                let accounts = ComposioAuth::from_env()?
+                    .list_accounts(user_id, toolkit)
+                    .await?;
+                serde_json::to_value(accounts)?
+            }
+            "connector.composio_register" => {
+                let label = strval(&arguments, "label")?;
+                let connected_account_id = strval(&arguments, "connected_account_id")?;
+                let toolkit = arguments
+                    .get("toolkit")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                audit_allow("composio_register", &label, &connected_account_id);
+                let account = ComposioRegistry::new()?.register(ComposioAccount {
+                    label: label.clone(),
+                    connected_account_id: connected_account_id.clone(),
+                    toolkit: toolkit.clone(),
+                })?;
+                // Make the account usable in *this* running session immediately,
+                // not just for dispatchers built after this one starts: every
+                // other project's next `McpDispatcher::new` will also pick it
+                // up from the persistent registry above.
+                if let Ok(api_key) = std::env::var("COMPOSIO_API_KEY") {
+                    if !api_key.trim().is_empty() {
+                        self.providers
+                            .write()
+                            .await
+                            .register(Box::new(ComposioProvider::new(
+                                format!("composio:{label}"),
+                                api_key,
+                                Some(connected_account_id),
+                                toolkit,
+                            )));
+                    }
+                }
+                serde_json::to_value(account)?
+            }
+            "connector.composio_remove" => {
+                let label = strval(&arguments, "label")?;
+                let removed = ComposioRegistry::new()?.remove(&label)?;
+                self.providers
+                    .write()
+                    .await
+                    .unregister(&format!("composio:{label}"));
+                json!({ "removed": removed })
             }
             "context.status" => serde_json::to_value(self.context()?.status()?)?,
             "context.insert" => {

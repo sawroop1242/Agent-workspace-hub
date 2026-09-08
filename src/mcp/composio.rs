@@ -7,7 +7,15 @@ use serde_json::{json, Value};
 const BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
 
 /// A [`ConnectorProvider`] backed by the Composio API.
+///
+/// One `ComposioProvider` wraps exactly one connected account (one external
+/// toolkit connection, e.g. one GitHub account or one Slack workspace), all
+/// sharing a single Composio API key. Multiple accounts run as multiple
+/// providers registered under distinct ids (`composio`, `composio:github`,
+/// `composio:slack`, ...) — see [`crate::mcp::composio_registry`] for how
+/// those extra accounts get registered once and reused by every project.
 pub struct ComposioProvider {
+    id: String,
     api_key: String,
     connected_account_id: Option<String>,
     toolkit: Option<String>,
@@ -16,6 +24,8 @@ pub struct ComposioProvider {
 
 impl ComposioProvider {
     /// Builds a provider from the `COMPOSIO_API_KEY` (and optional account/toolkit) env vars.
+    /// Registered under the fixed id `composio`, kept for backward compatibility with
+    /// single-account setups predating [`crate::mcp::composio_registry::ComposioRegistry`].
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var("COMPOSIO_API_KEY")
             .context("COMPOSIO_API_KEY is required to enable the Composio provider")?;
@@ -23,19 +33,25 @@ impl ComposioProvider {
             bail!("COMPOSIO_API_KEY is empty");
         }
         Ok(Self::new(
+            "composio",
             api_key,
             std::env::var("COMPOSIO_CONNECTED_ACCOUNT_ID").ok(),
             std::env::var("COMPOSIO_TOOLKIT").ok(),
         ))
     }
 
-    /// Creates a provider from an API key and optional account/toolkit filters.
+    /// Creates a provider from an explicit id, API key, and optional account/toolkit filters.
+    ///
+    /// `id` becomes this provider's [`ConnectorProvider::provider_id`], so an
+    /// agent addresses its tools as `<id>.<tool>` via `connector.invoke`.
     pub fn new(
+        id: impl Into<String>,
         api_key: String,
         connected_account_id: Option<String>,
         toolkit: Option<String>,
     ) -> Self {
         Self {
+            id: id.into(),
             api_key,
             connected_account_id,
             toolkit,
@@ -65,7 +81,7 @@ impl ComposioProvider {
 #[async_trait]
 impl ConnectorProvider for ComposioProvider {
     fn provider_id(&self) -> &str {
-        "composio"
+        &self.id
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {

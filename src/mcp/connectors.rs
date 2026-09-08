@@ -1,4 +1,5 @@
-use anyhow::{bail, Result};
+use crate::mcp::store_lock::StoreLock;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -68,8 +69,20 @@ impl ConnectorsMcp {
         Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
 
+    /// Writes `store` atomically (temp file + rename) so a sibling agent
+    /// process reading `.agent/connectors.json` never observes a torn write.
     fn save(&self, store: &ConnectorStore) -> Result<()> {
-        fs::write(&self.path, serde_json::to_string_pretty(store)?)?;
+        let parent = self
+            .path
+            .parent()
+            .context("connector store path has no parent directory")?;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent).context("failed to create temp file")?;
+        std::io::Write::write_all(&mut temp, serde_json::to_string_pretty(store)?.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically write connector store")?;
         Ok(())
     }
 
@@ -80,8 +93,13 @@ impl ConnectorsMcp {
 
     /// Adds (or replaces) a connector after validating its required fields
     /// and enforcing the store's size limits.
+    ///
+    /// Holds a [`StoreLock`] across the load-modify-save cycle so a second
+    /// agent process registering connectors on the same project at the same
+    /// time serializes behind it instead of racing.
     pub fn add(&self, connector: Connector) -> Result<Connector> {
         validate_connector(&connector)?;
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let exists = store.connectors.iter().any(|c| c.id == connector.id);
         if !exists && store.connectors.len() >= MAX_CONNECTORS {
@@ -95,6 +113,7 @@ impl ConnectorsMcp {
 
     /// Removes a connector, returning whether it existed.
     pub fn remove(&self, id: &str) -> Result<bool> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let before = store.connectors.len();
         store.connectors.retain(|c| c.id != id);
@@ -104,6 +123,7 @@ impl ConnectorsMcp {
 
     /// Toggles a connector's enabled state, returning the updated connector.
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<Option<Connector>> {
+        let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let connector = match store.connectors.iter_mut().find(|c| c.id == id) {
             Some(c) => c,

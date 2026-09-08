@@ -65,6 +65,11 @@ impl ProviderRegistry {
         self.providers.insert(p.provider_id().to_string(), p);
     }
 
+    /// Unregisters a provider by id, returning whether it was present.
+    pub fn unregister(&mut self, provider_id: &str) -> bool {
+        self.providers.remove(provider_id).is_some()
+    }
+
     /// Returns the sorted list of registered provider ids.
     pub fn providers(&self) -> Vec<String> {
         let mut v: Vec<_> = self.providers.keys().cloned().collect();
@@ -247,5 +252,42 @@ where
     }
     async fn invoke(&self, t: &str, a: Value) -> Result<ToolCallResult> {
         (self.invoke_fn)(t, a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(name: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_then_unregister_removes_provider() {
+        let mut registry = ProviderRegistry::default();
+        registry.register(Box::new(GatewayProvider::new(
+            "demo",
+            || Ok(vec![descriptor("ping")]),
+            |_t, _a| {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            },
+        )));
+        assert_eq!(registry.providers(), vec!["demo".to_string()]);
+        assert!(registry.tools("demo").await.is_ok());
+
+        assert!(registry.unregister("demo"));
+        assert!(registry.providers().is_empty());
+        assert!(registry.tools("demo").await.is_err());
+        // Unregistering an id that was never (or no longer) present reports
+        // false rather than erroring, mirroring the *Mcp stores' remove().
+        assert!(!registry.unregister("demo"));
     }
 }
