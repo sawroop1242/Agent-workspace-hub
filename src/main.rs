@@ -484,7 +484,7 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
             registry: url,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            for m in rt.block_on(CommunityMcpRegistryClient::new(url).search(&query))? {
+            for m in rt.block_on(CommunityMcpRegistryClient::new(url)?.search(&query))? {
                 println!(
                     "{} v{} — {}",
                     m.id,
@@ -505,7 +505,7 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let global = GlobalMcpRegistry::new()?;
             let project = ProjectMcpReferences::new(std::env::current_dir()?)?;
-            let entry = rt.block_on(CommunityMcpRegistryClient::new(url).install(&global, &id))?;
+            let entry = rt.block_on(CommunityMcpRegistryClient::new(url)?.install(&global, &id))?;
             println!(
                 "installed global MCP: {} v{}",
                 entry.config.id, entry.version
@@ -518,7 +518,7 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
         McpCommand::Update { id, registry: url } => {
             let rt = tokio::runtime::Runtime::new()?;
             let global = GlobalMcpRegistry::new()?;
-            let entry = rt.block_on(CommunityMcpRegistryClient::new(url).update(&global, &id))?;
+            let entry = rt.block_on(CommunityMcpRegistryClient::new(url)?.update(&global, &id))?;
             println!("updated MCP: {} v{}", entry.config.id, entry.version);
         }
         McpCommand::Uninstall { id } => {
@@ -720,6 +720,7 @@ fn handle_tunnel_cli(command: TunnelCommand) -> Result<()> {
 /// Runs the standard stdio MCP serve loop (the original `awh mcp serve` path).
 fn serve_stdio() -> Result<()> {
     let server = StdioMcpServer::new(std::env::current_dir()?)?;
+    agent_workspace_hub::mcp::audit_allow("server_start", "stdio", "mcp");
     use std::io::{self, BufRead, Write};
     for line in io::stdin().lock().lines() {
         let line = line?;
@@ -732,6 +733,7 @@ fn serve_stdio() -> Result<()> {
             io::stdout().flush()?;
         }
     }
+    agent_workspace_hub::mcp::audit_allow("server_stop", "stdio", "eof");
     Ok(())
 }
 
@@ -782,10 +784,20 @@ fn serve_sse(
     };
     config.tls.validate()?;
 
-    let dispatcher = Arc::new(McpDispatcher::new(std::env::current_dir()?)?);
-
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(agent_workspace_hub::mcp::http::serve(config, dispatcher))
+    rt.block_on(async {
+        // Build the dispatcher on the runtime it will serve (no nested
+        // runtime; see McpDispatcher::new_async).
+        let dispatcher = Arc::new(
+            McpDispatcher::new_async(std::env::current_dir()?)
+                .await
+                .map_err(|e| {
+                    tracing::error!("dispatcher construction failed: {e:#}");
+                    e
+                })?,
+        );
+        agent_workspace_hub::mcp::http::serve(config, dispatcher).await
+    })
 }
 
 /// Parses the `AWH_ALLOWED_ORIGINS` comma-separated allow-list.

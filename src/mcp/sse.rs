@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
+use super::dispatcher::SessionLifecycle;
+
 /// An event emitted on an SSE stream to a single client.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
@@ -37,6 +39,8 @@ pub struct Session {
     pub id: String,
     /// Where the client POSTs JSON-RPC messages for this session.
     pub endpoint: String,
+    /// Per-session MCP initialization lifecycle state.
+    pub lifecycle: Arc<SessionLifecycle>,
     /// Broadcast sender for events destined to this session's SSE stream.
     tx: broadcast::Sender<SseEvent>,
 }
@@ -75,6 +79,7 @@ impl SessionRegistry {
         let session = Session {
             id: id.clone(),
             endpoint,
+            lifecycle: Arc::new(SessionLifecycle::default()),
             tx,
         };
         self.sessions.lock().await.insert(id, session.clone());

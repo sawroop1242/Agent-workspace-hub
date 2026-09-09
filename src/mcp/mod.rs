@@ -89,7 +89,10 @@ pub use custom_mcp::{
     CustomMcpRegistry, CustomMcpServerConfig, CustomMcpStore, McpTransport, StdioMcpClient,
     StreamableHttpMcpClient,
 };
-pub use dispatcher::{DispatchResult, McpDispatcher, MCP_PROTOCOL_VERSION};
+pub use dispatcher::{
+    DispatchResult, McpDispatcher, SessionLifecycle, MCP_PROTOCOL_VERSION,
+    SERVER_NOT_INITIALIZED_CODE,
+};
 pub use error::McpAuthorizationError;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
 pub use github::{resolve_repo_target, GithubProvider, RepoTarget};

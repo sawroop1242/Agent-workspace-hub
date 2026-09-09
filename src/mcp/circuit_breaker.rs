@@ -31,17 +31,36 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-/// Half-open probe state, tracking a single trial call.
+/// Upper bound on how long a half-open probe may stay in flight before it is
+/// considered lost (e.g. the caller's future was dropped mid-call) and a
+/// fresh probe may be admitted. Keeps the breaker self-healing without
+/// manual intervention.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The breaker's phase within the classic three-state machine.
+enum Phase {
+    /// Calls pass through; consecutive failures increment a counter.
+    Closed,
+    /// The failure threshold was exceeded; calls are rejected until the
+    /// cooldown elapses.
+    Open { opened_at: Instant },
+    /// Cooldown has elapsed: exactly one trial call is admitted at a time.
+    /// `Some(started)` marks an in-flight probe; `None` means the next call
+    /// becomes the probe.
+    HalfOpen { probe: Option<Instant> },
+}
+
+/// Circuit breaker state: failure counter plus current phase.
 struct State {
     failures: u32,
-    opened_at: Option<Instant>,
+    phase: Phase,
 }
 
 impl State {
     fn new() -> Self {
         Self {
             failures: 0,
-            opened_at: None,
+            phase: Phase::Closed,
         }
     }
 }
@@ -73,23 +92,44 @@ impl CircuitBreaker {
     }
 
     /// Whether a call should be permitted right now.
+    ///
+    /// Deterministic transitions (§17): after the breaker opens and the
+    /// cooldown elapses, exactly ONE half-open probe is admitted. Concurrent
+    /// callers are rejected until the probe resolves (success closes the
+    /// breaker, failure re-opens it), so recovery traffic can never stampede
+    /// a recovering provider. A probe stuck longer than [`PROBE_TIMEOUT`]
+    /// (dropped caller) is considered lost and a fresh probe is admitted.
     fn allow(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(opened_at) = state.opened_at {
+        // Open → HalfOpen when the cooldown has fully elapsed.
+        if let Phase::Open { opened_at } = state.phase {
             if opened_at.elapsed() < self.config.cooldown {
                 return false; // still open
             }
-            // Transition to half-open: permit exactly one trial call.
-            state.opened_at = None;
+            state.phase = Phase::HalfOpen { probe: None };
         }
-        true
+        match state.phase {
+            Phase::Closed => true,
+            // A probe is already in flight and has not timed out: reject.
+            Phase::HalfOpen {
+                probe: Some(started),
+            } if started.elapsed() < PROBE_TIMEOUT => false,
+            // No probe yet (or a lost one): this caller becomes the probe.
+            Phase::HalfOpen { .. } => {
+                state.phase = Phase::HalfOpen {
+                    probe: Some(Instant::now()),
+                };
+                true
+            }
+            Phase::Open { .. } => false, // re-checked above; unreachable guard
+        }
     }
 
     /// Records a successful call, closing the breaker.
     fn record_success(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.failures = 0;
-        state.opened_at = None;
+        state.phase = Phase::Closed;
     }
 
     /// Records a failure, incrementing the counter and possibly opening the breaker.
@@ -97,8 +137,16 @@ impl CircuitBreaker {
     fn record_failure(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.failures += 1;
-        if state.failures >= self.config.failure_threshold {
-            state.opened_at = Some(Instant::now());
+        // A failed half-open probe re-opens immediately regardless of the
+        // counter (it already reached the threshold to open originally).
+        let tripped = match state.phase {
+            Phase::HalfOpen { .. } => true,
+            _ => state.failures >= self.config.failure_threshold,
+        };
+        if tripped {
+            state.phase = Phase::Open {
+                opened_at: Instant::now(),
+            };
             self.opened_count.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -269,5 +317,101 @@ mod tests {
             .is_err());
         assert!(breaker.tools_call("x", serde_json::json!({})).await.is_ok());
         assert_eq!(breaker.breaker().opened_count(), 0);
+    }
+
+    /// After the breaker opens and cooldown elapses, exactly ONE half-open
+    /// probe is admitted; concurrent callers are rejected until the probe
+    /// resolves. This pins the deterministic single-probe transition (§17).
+    #[tokio::test]
+    async fn half_open_admits_exactly_one_probe() {
+        // Zero cooldown so the breaker is immediately half-open after tripping.
+        let cfg = CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(0),
+        };
+
+        /// Call-scripted mock: the first call fails (trips the breaker),
+        /// the second blocks until released (the in-flight half-open probe),
+        /// every later call succeeds immediately.
+        struct ScriptedClient {
+            calls: std::sync::atomic::AtomicU32,
+            started: tokio::sync::mpsc::Sender<()>,
+            release: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>,
+        }
+        #[async_trait::async_trait]
+        impl McpClient for ScriptedClient {
+            async fn tools_list(&self) -> Result<Value> {
+                self.scripted().await
+            }
+            async fn tools_call(&self, _tool: &str, _args: Value) -> Result<Value> {
+                self.scripted().await
+            }
+        }
+        impl ScriptedClient {
+            async fn scripted(&self) -> Result<Value> {
+                match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Err(anyhow::anyhow!("boom")),
+                    1 => {
+                        // The half-open probe: announce and hold until released.
+                        self.started.send(()).await.unwrap();
+                        self.release.lock().await.recv().await.unwrap();
+                        Ok(serde_json::json!({"ok": true}))
+                    }
+                    _ => Ok(serde_json::json!({"ok": true})),
+                }
+            }
+        }
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::mpsc::channel(1);
+        let client = std::sync::Arc::new(ScriptedClient {
+            calls: std::sync::atomic::AtomicU32::new(0),
+            started: started_tx,
+            release: tokio::sync::Mutex::new(release_rx),
+        });
+        let breaker = std::sync::Arc::new(CircuitBreakerMcpClient::new(
+            "mock",
+            client as std::sync::Arc<ScriptedClient>,
+            cfg,
+        ));
+
+        // Call 1 fails and trips the breaker open (threshold 1).
+        assert!(breaker
+            .tools_call("trip", serde_json::json!({}))
+            .await
+            .is_err());
+
+        // Call 2 is the half-open probe (cooldown is zero): it goes to the
+        // client and blocks there, holding the single probe slot.
+        let probe = {
+            let breaker = breaker.clone();
+            tokio::spawn(async move {
+                breaker
+                    .tools_call("probe", serde_json::json!({}))
+                    .await
+                    .expect("probe call succeeds once released")
+            })
+        };
+        started_rx.recv().await.unwrap();
+
+        // While the probe is in flight, a concurrent call must be rejected
+        // by the breaker — it must never reach the client.
+        let err = breaker
+            .tools_call("concurrent", serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("circuit breaker open"),
+            "concurrent call during half-open probe must be rejected: {err}"
+        );
+
+        // Release the probe; it succeeds and closes the breaker.
+        release_tx.send(()).await.unwrap();
+        probe.await.unwrap();
+
+        // Post-recovery calls flow normally again.
+        let ok = breaker.tools_call("recovered", serde_json::json!({})).await;
+        assert!(ok.is_ok(), "breaker must close after a successful probe");
     }
 }
