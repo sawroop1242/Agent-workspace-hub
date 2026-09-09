@@ -32,31 +32,34 @@ impl ComposioProvider {
         if api_key.trim().is_empty() {
             bail!("COMPOSIO_API_KEY is empty");
         }
-        Ok(Self::new(
+        Self::new(
             "composio",
             api_key,
             std::env::var("COMPOSIO_CONNECTED_ACCOUNT_ID").ok(),
             std::env::var("COMPOSIO_TOOLKIT").ok(),
-        ))
+        )
     }
 
     /// Creates a provider from an explicit id, API key, and optional account/toolkit filters.
     ///
     /// `id` becomes this provider's [`ConnectorProvider::provider_id`], so an
     /// agent addresses its tools as `<id>.<tool>` via `connector.invoke`.
+    ///
+    /// Fails only if the shared HTTP client cannot be constructed (see
+    /// [`crate::mcp::config::build_http_client`]) — fail-closed, not panic.
     pub fn new(
         id: impl Into<String>,
         api_key: String,
         connected_account_id: Option<String>,
         toolkit: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             id: id.into(),
             api_key,
             connected_account_id,
             toolkit,
-            client: super::config::build_http_client(),
-        }
+            client: super::config::build_http_client()?,
+        })
     }
 
     async fn request(&self, builder: reqwest::RequestBuilder) -> Result<Value> {

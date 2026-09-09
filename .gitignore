@@ -1,1 +1,13 @@
-Nothing needs to be added to .gitignore since only a markdown file (AWH_FORENSIC_REPORT.md) was added, which is a source/config file and should not be ignored.
+# Rust build artifacts
+/target
+
+# Test output
+**/*.rs.bk
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db

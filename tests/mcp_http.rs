@@ -18,12 +18,17 @@ use tempfile::tempdir;
 use tower::util::ServiceExt;
 
 /// Builds a router and its (inspectable) state over a fresh temp project.
-fn harness(api_key: &str) -> (axum::Router, AppState) {
+async fn harness(api_key: &str) -> (axum::Router, AppState) {
     let dir = tempdir().expect("tempdir");
     // Keep the temp dir alive for the duration of the test by leaking its path.
     let root = std::mem::ManuallyDrop::new(dir);
-    let dispatcher =
-        Arc::new(McpDispatcher::new(root.path().to_path_buf()).expect("build dispatcher"));
+    // Async construction: this harness runs inside #[tokio::test], and the
+    // sync constructor deliberately fails closed from async contexts.
+    let dispatcher = Arc::new(
+        McpDispatcher::new_async(root.path().to_path_buf())
+            .await
+            .expect("build dispatcher"),
+    );
     let state = AppState {
         dispatcher,
         sessions: Arc::new(SessionRegistry::new()),
@@ -64,7 +69,7 @@ async fn send(
 
 #[tokio::test]
 async fn health_returns_ok_without_auth() {
-    let (router, _) = harness("secret");
+    let (router, _) = harness("secret").await;
     let (status, body) = send(router.clone(), "GET", "/health", String::new(), None).await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_str(&body).unwrap();
@@ -77,7 +82,7 @@ async fn health_returns_ok_without_auth() {
 
 #[tokio::test]
 async fn mcp_requires_authentication() {
-    let (router, _) = harness("secret");
+    let (router, _) = harness("secret").await;
     // Missing authorization header.
     let (status, _) = send(
         router.clone(),
@@ -103,7 +108,7 @@ async fn mcp_requires_authentication() {
 
 #[tokio::test]
 async fn mcp_accepts_valid_token() {
-    let (router, state) = harness("secret");
+    let (router, state) = harness("secret").await;
     let session = state.sessions.create("/mcp").await;
     let uri = format!("/mcp?sessionId={}", session.id);
     let (status, _) = send(
@@ -119,7 +124,7 @@ async fn mcp_accepts_valid_token() {
 
 #[tokio::test]
 async fn sse_requires_authentication() {
-    let (router, _) = harness("secret");
+    let (router, _) = harness("secret").await;
     let (status, _) = send(router.clone(), "GET", "/sse", String::new(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
@@ -145,7 +150,7 @@ async fn send_raw_auth(
 
 #[tokio::test]
 async fn rejects_non_bearer_and_malformed_bearer_headers() {
-    let (router, _) = harness("secret");
+    let (router, _) = harness("secret").await;
     let body = "{}".to_string();
 
     // Non-Bearer scheme.
@@ -214,8 +219,11 @@ async fn rejects_non_bearer_and_malformed_bearer_headers() {
 #[tokio::test]
 async fn enforces_session_limit() {
     let dir = tempdir().unwrap();
-    let dispatcher =
-        Arc::new(McpDispatcher::new(dir.path().to_path_buf()).expect("build dispatcher"));
+    let dispatcher = Arc::new(
+        McpDispatcher::new_async(dir.path().to_path_buf())
+            .await
+            .expect("build dispatcher"),
+    );
     let state = AppState {
         dispatcher,
         sessions: Arc::new(SessionRegistry::new()),
@@ -243,7 +251,7 @@ async fn enforces_session_limit() {
 
 #[tokio::test]
 async fn unknown_session_is_rejected() {
-    let (router, _) = harness("secret");
+    let (router, _) = harness("secret").await;
     let (status, _) = send(
         router.clone(),
         "POST",
@@ -257,7 +265,7 @@ async fn unknown_session_is_rejected() {
 
 #[tokio::test]
 async fn malformed_json_body_returns_bad_request() {
-    let (router, state) = harness("secret");
+    let (router, state) = harness("secret").await;
     let session = state.sessions.create("/mcp").await;
     let (status, _) = send(
         router.clone(),
@@ -278,7 +286,11 @@ async fn oversized_request_body_is_rejected() {
         ..HttpServerConfig::default()
     };
     let dir = tempdir().unwrap();
-    let dispatcher = Arc::new(McpDispatcher::new(dir.path().to_path_buf()).expect("dispatcher"));
+    let dispatcher = Arc::new(
+        McpDispatcher::new_async(dir.path().to_path_buf())
+            .await
+            .expect("dispatcher"),
+    );
     let state = AppState {
         dispatcher,
         sessions: Arc::new(SessionRegistry::new()),
@@ -299,7 +311,7 @@ async fn oversized_request_body_is_rejected() {
 async fn dispatcher_round_trips_over_sse_session() {
     // Drive the shared dispatcher directly through an SSE session's channel and
     // verify a tools/list + initialize round trip without any stdio involvement.
-    let (_, state) = harness("secret");
+    let (_, state) = harness("secret").await;
     let session = state.sessions.create("/mcp").await;
     let mut rx = session.subscribe();
 
@@ -335,8 +347,11 @@ async fn dispatcher_round_trips_over_sse_session() {
 #[tokio::test]
 async fn rate_limit_applies_only_after_auth() {
     let dir = tempdir().unwrap();
-    let dispatcher =
-        Arc::new(McpDispatcher::new(dir.path().to_path_buf()).expect("build dispatcher"));
+    let dispatcher = Arc::new(
+        McpDispatcher::new_async(dir.path().to_path_buf())
+            .await
+            .expect("build dispatcher"),
+    );
     let state = AppState {
         dispatcher,
         sessions: Arc::new(SessionRegistry::new()),
@@ -401,7 +416,7 @@ async fn rate_limit_applies_only_after_auth() {
 /// Responses travel over the session's SSE channel (HTTP is 202).
 #[tokio::test]
 async fn resources_list_and_read_round_trip() {
-    let (router, state) = harness("secret");
+    let (router, state) = harness("secret").await;
     let session = state.sessions.create("/mcp").await;
     let mut rx = session.subscribe();
     // Drain the endpoint announcement event.
@@ -432,6 +447,10 @@ async fn resources_list_and_read_round_trip() {
 
     // All well-formed requests are HTTP 202; the JSON-RPC result (or
     // error) arrives on the SSE channel keyed by the request id.
+    // The session must be initialized before other requests (§8).
+    let (status, _) = post(req(0, "initialize", json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
     let (status, _) = post(req(1, "prompts/list", json!({}))).await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
@@ -455,7 +474,7 @@ async fn resources_list_and_read_round_trip() {
     assert_eq!(status, StatusCode::ACCEPTED);
 
     let mut by_id = std::collections::HashMap::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         match rx.try_recv() {
             Ok(agent_workspace_hub::mcp::SseEvent::Message(v)) => {
                 let id = v["id"].as_i64().unwrap_or(-1);
@@ -549,4 +568,58 @@ fn by_id_from(
         }
     }
     None
+}
+
+/// The MCP initialization lifecycle is enforced per SSE session: a request
+/// before `initialize` is answered with -32002 over the stream (HTTP stays
+/// 202 so the connection survives), and the session flips to initialized
+/// only after a successful exchange. A second, separate session is
+/// independently uninitialized — no state leaks across sessions.
+#[tokio::test]
+async fn sse_session_lifecycle_is_enforced_per_session() {
+    let (router, state) = harness("secret").await;
+    let session = state.sessions.create("/mcp").await;
+    let mut rx = session.subscribe();
+    let _ = rx.try_recv(); // drain endpoint announcement
+
+    let post = |body: String| {
+        let fut = router.clone().oneshot(
+            Request::post(format!("/mcp?sessionId={}", session.id))
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        async move { fut.await.unwrap().status() }
+    };
+
+    // tools/call before initialize: HTTP 202, JSON-RPC -32002 on the stream.
+    let pre = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"skills.list","arguments":{}}}).to_string();
+    assert_eq!(post(pre).await, StatusCode::ACCEPTED);
+    let rejected = by_id_from(&mut rx, 1).expect("pre-init rejection delivered");
+    assert_eq!(rejected["error"]["code"], -32002, "got: {rejected}");
+
+    // Initialize the session over the same stream.
+    let init = json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}).to_string();
+    assert_eq!(post(init).await, StatusCode::ACCEPTED);
+    let opened = by_id_from(&mut rx, 2).expect("initialize response");
+    assert!(opened.get("error").is_none(), "got: {opened}");
+    assert_eq!(opened["result"]["protocolVersion"], "2025-06-18");
+
+    // Duplicate initialize: deterministic -32600, session stays usable.
+    let dup = json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}).to_string();
+    assert_eq!(post(dup).await, StatusCode::ACCEPTED);
+    let dup_resp = by_id_from(&mut rx, 3).expect("duplicate initialize response");
+    assert_eq!(dup_resp["error"]["code"], -32600, "got: {dup_resp}");
+
+    // The same call that was rejected now succeeds.
+    let ok = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"skills.list","arguments":{}}}).to_string();
+    assert_eq!(post(ok).await, StatusCode::ACCEPTED);
+    let listed = by_id_from(&mut rx, 4).expect("tools/list response");
+    assert!(listed["result"]["content"].is_array(), "got: {listed}");
+
+    // A fresh session is independently uninitialized: no cross-session leak.
+    let other = state.sessions.create("/mcp").await;
+    assert!(!other.lifecycle.is_initialized());
+    assert!(session.lifecycle.is_initialized());
 }

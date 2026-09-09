@@ -116,18 +116,34 @@ where
 /// its connection pool is reused across all requests for its lifetime. This is
 /// the single canonical client configuration; callers should use this rather
 /// than `reqwest::Client::new()` so timeout and identity policy stay uniform.
-pub fn build_http_client() -> reqwest::Client {
+///
+/// Construction can fail if the TLS backend cannot initialize (or the user
+/// agent is rejected, which the fallback path below eliminates); the failure
+/// is surfaced as an [`Err`] so provider construction degrades to "provider
+/// unavailable" instead of panicking the runtime (fail-closed, §20).
+pub fn build_http_client() -> Result<reqwest::Client> {
     let limits = ResourceLimits::default()
         .with_env_overrides()
         .unwrap_or_else(|e| {
             tracing::warn!(event = "config_invalid", error = %e);
             ResourceLimits::default()
         });
+    let user_agent = format!("agent-workspace-hub/{}", env!("CARGO_PKG_VERSION"));
     reqwest::Client::builder()
         .timeout(limits.http_client_timeout)
-        .user_agent(format!("agent-workspace-hub/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(&user_agent)
         .build()
-        .expect("static reqwest client configuration is valid")
+        .or_else(|error| {
+            // The user agent is the only custom header; drop it and retry
+            // with a bare (timeout-only) client before giving up.
+            tracing::error!(event = "http_client_build_failed", error = %error);
+            reqwest::Client::builder()
+                .timeout(limits.http_client_timeout)
+                .build()
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("failed to initialize HTTP client (TLS backend?): {error}")
+        })
 }
 
 #[cfg(test)]

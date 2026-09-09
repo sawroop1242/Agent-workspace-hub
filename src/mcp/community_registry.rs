@@ -57,11 +57,14 @@ pub struct CommunityMcpRegistryClient {
 
 impl CommunityMcpRegistryClient {
     /// Creates a client for the registry at `index_url`.
-    pub fn new(index_url: impl Into<String>) -> Self {
-        Self {
-            client: super::config::build_http_client(),
+    ///
+    /// Fails only if the shared HTTP client cannot be constructed —
+    /// fail-closed, not panic (§20).
+    pub fn new(index_url: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            client: super::config::build_http_client()?,
             index_url: index_url.into(),
-        }
+        })
     }
 
     /// Fetches the registry index.
