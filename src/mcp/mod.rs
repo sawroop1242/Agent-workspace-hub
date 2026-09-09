@@ -35,6 +35,8 @@ pub mod dispatcher;
 pub mod error;
 /// MCP execution authorization gate.
 pub mod execution_gate;
+/// First-class GitHub provider (`github.*` tools).
+pub mod github;
 /// Globally installed MCP servers.
 pub mod global_mcp;
 /// HTTP/SSE remote transport server.
@@ -90,6 +92,7 @@ pub use custom_mcp::{
 pub use dispatcher::{DispatchResult, McpDispatcher, MCP_PROTOCOL_VERSION};
 pub use error::McpAuthorizationError;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
+pub use github::{resolve_repo_target, GithubProvider, RepoTarget};
 pub use global_mcp::{
     GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs,
 };

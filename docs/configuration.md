@@ -83,6 +83,21 @@ The token is passed to the ngrok child through its environment
 secret never appears in `ps` output or shell history. `awh tunnel start`
 runs in the foreground and stops the child on Ctrl-C.
 
+## GitHub provider (`github.*` MCP tools)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GITHUB_TOKEN` | *(unset → tools disabled)* | Classic PAT or fine-grained token; enables the 12 `github.*` MCP tools |
+| `GITHUB_API_URL` | `https://api.github.com` | API base URL (override for GitHub Enterprise Server) |
+| `GITHUB_DEFAULT_OWNER` / `GITHUB_DEFAULT_REPO` | *(unset)* | Optional `owner/repo` fallback for `github.*` calls that pass neither |
+
+If `GITHUB_TOKEN` is unset or empty the provider simply isn't registered:
+the `github.*` tools are absent from `tools/list` and calls fail closed with
+a clear error — the same pattern as every optional provider. `owner`/`repo`
+resolve per call as explicit arguments → the project's `origin` git remote
+→ the `GITHUB_DEFAULT_*` pair; sources are never mixed across that
+resolution.
+
 ## Sandbox
 
 | Variable | Default | Meaning |

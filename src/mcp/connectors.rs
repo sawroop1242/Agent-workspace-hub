@@ -91,6 +91,12 @@ impl ConnectorsMcp {
         Ok(self.load()?.connectors)
     }
 
+    /// Returns the connector with the given `id`, if present — the
+    /// single-item counterpart to [`Self::list`].
+    pub fn get(&self, id: &str) -> Result<Option<Connector>> {
+        Ok(self.load()?.connectors.into_iter().find(|c| c.id == id))
+    }
+
     /// Adds (or replaces) a connector after validating its required fields
     /// and enforcing the store's size limits.
     ///
@@ -260,6 +266,16 @@ mod tests {
 
         assert!(store.remove("c1").unwrap());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_returns_matching_connector_and_none_for_missing() {
+        let (store, _dir) = temp_store();
+        assert!(store.add(connector("c1")).is_ok());
+        let found = store.get("c1").unwrap().expect("connector c1 should exist");
+        assert_eq!(found.id, "c1");
+        assert!(store.get("missing").unwrap().is_none());
+        assert!(store.get("").unwrap().is_none());
     }
 
     #[test]

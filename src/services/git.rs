@@ -235,6 +235,23 @@ impl GitService {
         }
     }
 
+    /// URL of a configured remote (`git remote get-url <name>`), for
+    /// inferring the GitHub `owner/repo` target of the `github.*` MCP tools.
+    /// Missing remotes and non-repo dirs return `None`, not an error: the
+    /// caller treats the remote as one optional input among several.
+    pub async fn remote_url(&self, name: &str) -> Option<String> {
+        let output = self.run_raw(&["remote", "get-url", name]).await.ok()?;
+        if output.exit_code != Some(0) {
+            return None;
+        }
+        let url = output.stdout.trim().to_string();
+        if url.is_empty() {
+            None
+        } else {
+            Some(url)
+        }
+    }
+
     /// Pushes the current branch with upstream tracking.
     pub async fn push(&self, remote: &str, branch: &str) -> Result<GitOutput> {
         self.run(&["push", "-u", remote, branch]).await
