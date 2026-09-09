@@ -92,8 +92,31 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 
 ## Phase Status
 
-0-10 done (branch rust). Next: none — implementation plan complete;
-future phases would be new spec work.
+0-11 done (branch rust; Phase 11 via PR #10, CI green on all 3 platforms).
+Next: none — implementation plan complete; future phases would be new spec
+work.
+- **Phase 11 — GitHub provider + gaps**: `src/mcp/github.rs` (12
+  `github.*` tools, direct REST, gated on `GITHUB_TOKEN`; `GITHUB_API_URL`
+  overrides base for GHES; target resolution explicit args → origin
+  remote via `GitService::remote_url` → `GITHUB_DEFAULT_OWNER/REPO`,
+  sources never mixed — half-specified pairs resolve as a pair or fail
+  closed). Dispatcher: `github: Option<Arc<GithubProvider>>`,
+  `github_tool_schemas()` is a THIRD json! array (recursion limit —
+  never fold into the existing two), audit action is `github_invoke`
+  (subject=tool, detail=owner/repo; never bodies). Also added
+  `workspace.write_file` (5 MiB cap, atomic, `safe_new_path` — canonicalize
+  deepest existing ancestor then join; symlink-out rejected),
+  `workspace.delete_file` (Ok(false) missing), `tasks.get`/`connectors.get`
+  (`get(&str) -> Result<Option<_>>`, missing → null not error). Catalog:
+  52 core / 64 with github.*; docs/mcp.md + configuration.md + README
+  counts all updated together. Testing gotchas: dispatcher tests inject a
+  stubbed provider via private field (no env mutation, no races); the
+  stub's tokio runtime must be leaked (`std::mem::forget`) or it dies with
+  the helper; MCP SDK's StdioClientTransport SANITIZES env by default —
+  pass `env: {...process.env}` when a test needs GITHUB_TOKEN to reach the
+  child. Secret auto-injection only exports a key when the command text
+  names it, and a wiped container loses `~/.cargo` mid-session (reinstall
+  via rustup; `source ~/.cargo/env` per shell).
 - **Registry semantics (QA-validated)**: two distinct planes. SKILL
   registries: URL is a BASE dir; client appends `/registry.json`
   ({name,version,skills:[{name,description,version,path,sha256}]}) and

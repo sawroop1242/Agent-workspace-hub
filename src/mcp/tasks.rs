@@ -163,6 +163,13 @@ impl TasksMcp {
             .collect())
     }
 
+    /// Returns the task with the given `id`, if present — the single-item
+    /// counterpart to [`Self::list`], so a caller doesn't have to list every
+    /// task and filter client-side.
+    pub fn get(&self, id: &str) -> Result<Option<Task>> {
+        Ok(self.load()?.tasks.into_iter().find(|t| t.id == id))
+    }
+
     /// Updates a task's status, priority, and/or assignee, returning the updated task.
     pub fn update(
         &self,
@@ -406,6 +413,22 @@ mod tests {
             .unwrap();
         assert!(store.delete("t1").unwrap());
         assert!(!store.delete("t1").unwrap());
+    }
+
+    #[test]
+    fn get_returns_matching_task_and_none_for_missing() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+        let task = store.get("t1").unwrap().expect("task t1 should exist");
+        assert_eq!(task.id, "t1");
+        assert_eq!(task.title, "title");
+        assert!(store.get("missing").unwrap().is_none());
+        // A missing id is distinct from an empty one: both are lookups, not
+        // errors — the caller distinguishes by the Option.
+        assert!(store.get("").unwrap().is_none());
     }
 
     #[test]

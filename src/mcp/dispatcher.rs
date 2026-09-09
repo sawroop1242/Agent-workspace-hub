@@ -12,9 +12,9 @@ use crate::mcp::{
     audit_allow, audit_deny, authorize_mcp_execution, AuthMethod, CircuitBreakerConfig,
     CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider, ComposioRegistry,
     Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, CustomMcpServerConfig,
-    McpExecutionRequest, McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore,
-    ProviderRegistry, ResourceLimits, SkillMcp, StdioMcpClient, StreamableHttpMcpClient,
-    TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
+    GithubProvider, McpExecutionRequest, McpTransport, MemoryMcp, MemoryScope,
+    PersistentTrustStore, ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp, StdioMcpClient,
+    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
 };
 use crate::services::git::GitService;
 use crate::services::terminal::TerminalService;
@@ -131,6 +131,7 @@ pub struct McpDispatcher {
     tasks: Arc<TasksMcp>,
     connectors: Arc<ConnectorsMcp>,
     context_engine: Option<Arc<ContextEngine>>,
+    github: Option<Arc<GithubProvider>>,
     providers: Arc<RwLock<ProviderRegistry>>,
 }
 
@@ -226,6 +227,15 @@ impl McpDispatcher {
             })
             .ok();
 
+        // GitHub is enabled purely by the presence of GITHUB_TOKEN and fails
+        // closed the same way: a missing token simply leaves the github.*
+        // tools unadvertised (and their calls rejected) rather than failing
+        // dispatcher construction.
+        let github = GithubProvider::from_env()
+            .map(Arc::new)
+            .map_err(|e| tracing::warn!("github provider disabled: {e:#}"))
+            .ok();
+
         Ok(Self {
             skills: Arc::new(SkillMcp::new(project_root.clone())?),
             workspace: Arc::new(WorkspaceMcp::new(project_root.clone())?),
@@ -233,6 +243,7 @@ impl McpDispatcher {
             tasks: Arc::new(TasksMcp::new(project_root.clone())?),
             connectors: Arc::new(ConnectorsMcp::new(project_root)?),
             context_engine,
+            github,
             providers: registry,
         })
     }
@@ -242,6 +253,23 @@ impl McpDispatcher {
             .as_ref()
             .map(Arc::as_ref)
             .ok_or_else(|| anyhow::anyhow!("context engine is disabled or failed to initialize"))
+    }
+
+    /// The GitHub provider, when `GITHUB_TOKEN` enabled it.
+    fn github(&self) -> Result<&GithubProvider> {
+        self.github.as_ref().map(Arc::as_ref).ok_or_else(|| {
+            anyhow::anyhow!("github tools are disabled: set GITHUB_TOKEN to enable them")
+        })
+    }
+
+    /// Resolves the `owner/repo` target for a `github.*` call: explicit
+    /// arguments win, then the project's `origin` remote, then
+    /// `GITHUB_DEFAULT_OWNER`/`GITHUB_DEFAULT_REPO`. Mixed sources are never
+    /// combined — each invocation uses exactly one source for both fields.
+    async fn resolve_github_target(&self, arguments: &Value) -> Result<RepoTarget> {
+        let owner = arguments.get("owner").and_then(Value::as_str);
+        let repo = arguments.get("repo").and_then(Value::as_str);
+        crate::mcp::github::resolve_repo_target(owner, repo, self.workspace.root()).await
     }
 
     /// Returns the shared provider registry used to dispatch tool calls.
@@ -423,11 +451,26 @@ impl McpDispatcher {
             {"name":"git.stage","description":"Stage a file or all changes","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
             {"name":"git.unstage","description":"Unstage a file, leaving the working tree untouched","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
             {"name":"git.commit","description":"Commit staged changes with a message","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},
-            {"name":"terminal.run","description":"Run a bounded command in the project workspace (argv form, no shell)","inputSchema":{"type":"object","properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["program"]}}
+            {"name":"terminal.run","description":"Run a bounded command in the project workspace (argv form, no shell)","inputSchema":{"type":"object","properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["program"]}},
+            {"name":"workspace.write_file","description":"Write (create or overwrite) a workspace file","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
+            {"name":"workspace.delete_file","description":"Delete a workspace file; reports whether it existed","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+            {"name":"tasks.get","description":"Get a task by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"connectors.get","description":"Get connector metadata by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
         ]);
         let mut tools = core;
         if let (Value::Array(core_arr), Value::Array(ext_arr)) = (&mut tools, &extended) {
             core_arr.extend(ext_arr.iter().cloned());
+        }
+        // The github.* surface is a third macro invocation (the recursion
+        // limit documented for the core/extended split binds here too) and is
+        // merged only when GITHUB_TOKEN enabled the provider, so clients
+        // never see tools that would reject every call.
+        if self.github.is_some() {
+            if let Value::Array(core_arr) = &mut tools {
+                if let Value::Array(gh_arr) = github_tool_schemas() {
+                    core_arr.extend(gh_arr);
+                }
+            }
         }
         json!({"tools": tools})
     }
@@ -572,6 +615,20 @@ impl McpDispatcher {
                         .ok_or_else(|| anyhow::anyhow!("missing or non-string 'path' argument"))?,
                 )?,
             )?,
+            "workspace.write_file" => {
+                let path = strval(&arguments, "path")?;
+                let content = strval(&arguments, "content")?;
+                // File mutation is exactly what the audit log exists for;
+                // the content itself is never logged.
+                audit_allow("workspace_write", &path, "");
+                self.workspace.write_file(&path, &content)?;
+                json!({"written": true})
+            }
+            "workspace.delete_file" => {
+                let path = strval(&arguments, "path")?;
+                audit_allow("workspace_delete", &path, "");
+                json!({"deleted": self.workspace.delete_file(&path)?})
+            }
             "memory.store" => {
                 let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
                 serde_json::to_value(self.memory.store(
@@ -640,6 +697,7 @@ impl McpDispatcher {
                         .transpose()?,
                 )?,
             )?,
+            "tasks.get" => serde_json::to_value(self.tasks.get(&strval(&arguments, "id")?)?)?,
             "tasks.update" => serde_json::to_value(
                 self.tasks.update(
                     arguments
@@ -667,6 +725,9 @@ impl McpDispatcher {
                 )?
             }),
             "connectors.list" => serde_json::to_value(self.connectors.list()?)?,
+            "connectors.get" => {
+                serde_json::to_value(self.connectors.get(&strval(&arguments, "id")?)?)?
+            }
             "connectors.add" => {
                 let connector = Connector {
                     id: strval(&arguments, "id")?,
@@ -919,6 +980,179 @@ impl McpDispatcher {
                 )?;
                 serde_json::to_value(item)?
             }
+            "github.pr_list" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.pr_list", &target);
+                serde_json::to_value(
+                    github
+                        .pr_list(
+                            &target,
+                            arguments.get("state").and_then(Value::as_str),
+                            arguments.get("base").and_then(Value::as_str),
+                        )
+                        .await?,
+                )?
+            }
+            "github.pr_get" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.pr_get", &target);
+                serde_json::to_value(
+                    github
+                        .pr_get(&target, u64val(&arguments, "number")?)
+                        .await?,
+                )?
+            }
+            "github.pr_create" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.pr_create", &target);
+                serde_json::to_value(
+                    github
+                        .pr_create(
+                            &target,
+                            &strval(&arguments, "title")?,
+                            &strval(&arguments, "head")?,
+                            &strval(&arguments, "base")?,
+                            arguments.get("body").and_then(Value::as_str),
+                            arguments.get("draft").and_then(Value::as_bool),
+                        )
+                        .await?,
+                )?
+            }
+            "github.pr_merge" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.pr_merge", &target);
+                serde_json::to_value(
+                    github
+                        .pr_merge(
+                            &target,
+                            u64val(&arguments, "number")?,
+                            arguments.get("merge_method").and_then(Value::as_str),
+                        )
+                        .await?,
+                )?
+            }
+            "github.pr_review" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.pr_review", &target);
+                serde_json::to_value(
+                    github
+                        .pr_review(
+                            &target,
+                            u64val(&arguments, "number")?,
+                            &strval(&arguments, "event")?,
+                            arguments.get("body").and_then(Value::as_str),
+                        )
+                        .await?,
+                )?
+            }
+            "github.issue_list" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.issue_list", &target);
+                serde_json::to_value(
+                    github
+                        .issue_list(
+                            &target,
+                            arguments.get("state").and_then(Value::as_str),
+                            arguments.get("labels").and_then(Value::as_str),
+                        )
+                        .await?,
+                )?
+            }
+            "github.issue_get" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.issue_get", &target);
+                serde_json::to_value(
+                    github
+                        .issue_get(&target, u64val(&arguments, "number")?)
+                        .await?,
+                )?
+            }
+            "github.issue_create" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.issue_create", &target);
+                serde_json::to_value(
+                    github
+                        .issue_create(
+                            &target,
+                            &strval(&arguments, "title")?,
+                            arguments.get("body").and_then(Value::as_str),
+                            arguments
+                                .get("labels")
+                                .and_then(Value::as_array)
+                                .map(|values| {
+                                    values
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_string)
+                                        .collect()
+                                }),
+                        )
+                        .await?,
+                )?
+            }
+            "github.issue_comment" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.issue_comment", &target);
+                serde_json::to_value(
+                    github
+                        .issue_comment(
+                            &target,
+                            u64val(&arguments, "number")?,
+                            &strval(&arguments, "body")?,
+                        )
+                        .await?,
+                )?
+            }
+            "github.checks_status" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.checks_status", &target);
+                serde_json::to_value(
+                    github
+                        .checks_status(&target, &strval(&arguments, "ref")?)
+                        .await?,
+                )?
+            }
+            "github.workflow_dispatch" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.workflow_dispatch", &target);
+                serde_json::to_value(
+                    github
+                        .workflow_dispatch(
+                            &target,
+                            &strval(&arguments, "workflow_file")?,
+                            &strval(&arguments, "ref")?,
+                        )
+                        .await?,
+                )?
+            }
+            "github.release_create" => {
+                let github = self.github()?;
+                let target = self.resolve_github_target(&arguments).await?;
+                audit_github_invocation("github.release_create", &target);
+                serde_json::to_value(
+                    github
+                        .release_create(
+                            &target,
+                            &strval(&arguments, "tag_name")?,
+                            arguments.get("name").and_then(Value::as_str),
+                            arguments.get("body").and_then(Value::as_str),
+                            arguments.get("draft").and_then(Value::as_bool),
+                            arguments.get("prerelease").and_then(Value::as_bool),
+                        )
+                        .await?,
+                )?
+            }
             "git.status" => {
                 let git = GitService::open(self.workspace.root())?;
                 serde_json::to_value(git.status().await?)?
@@ -1002,6 +1236,39 @@ impl McpDispatcher {
     }
 }
 
+/// Records a `github.*` tool call in the audit ring. Only the tool name and
+/// the `owner/repo` target are recorded — never the token, never any freeform
+/// argument (bodies, titles, and reviews can hold user content).
+fn audit_github_invocation(tool: &str, target: &RepoTarget) {
+    // Mirrors `connector_invoke` (action, provider, tool): the action is the
+    // filterable event name, the tool goes in subject, and the repo target in
+    // detail. Request bodies/titles are never audited.
+    audit_allow(
+        "github_invoke",
+        tool,
+        &format!("{}/{}", target.owner, target.repo),
+    );
+}
+
+/// The `github.*` tool schemas, kept in their own macro invocation so the
+/// `tools_list_static` arrays stay under the macro recursion limit.
+fn github_tool_schemas() -> Value {
+    json!([
+        {"name":"github.pr_list","description":"List pull requests (state defaults to open; owner/repo default to the origin remote or GITHUB_DEFAULT_OWNER/GITHUB_DEFAULT_REPO)","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"state":{"type":"string","enum":["open","closed","all"]},"base":{"type":"string"}}}},
+        {"name":"github.pr_get","description":"Get a single pull request","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"number"}},"required":["number"]}},
+        {"name":"github.pr_create","description":"Create a pull request","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"title":{"type":"string"},"head":{"type":"string"},"base":{"type":"string"},"body":{"type":"string"},"draft":{"type":"boolean"}},"required":["title","head","base"]}},
+        {"name":"github.pr_merge","description":"Merge a pull request","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"number"},"merge_method":{"type":"string","enum":["merge","squash","rebase"]}},"required":["number"]}},
+        {"name":"github.pr_review","description":"Submit a pull request review","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"number"},"event":{"type":"string","enum":["APPROVE","REQUEST_CHANGES","COMMENT"]},"body":{"type":"string"}},"required":["number","event"]}},
+        {"name":"github.issue_list","description":"List issues (pull requests are filtered out)","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"state":{"type":"string","enum":["open","closed","all"]},"labels":{"type":"string"}}}},
+        {"name":"github.issue_get","description":"Get a single issue or pull request","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"number"}},"required":["number"]}},
+        {"name":"github.issue_create","description":"Create an issue","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}}},"required":["title"]}},
+        {"name":"github.issue_comment","description":"Comment on an issue or pull request","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"number"},"body":{"type":"string"}},"required":["number","body"]}},
+        {"name":"github.checks_status","description":"Get combined CI/check status (legacy statuses plus check runs) for a commit or branch","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"ref":{"type":"string"}},"required":["ref"]}},
+        {"name":"github.workflow_dispatch","description":"Manually trigger a workflow_dispatch run on a branch","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"workflow_file":{"type":"string"},"ref":{"type":"string"}},"required":["workflow_file","ref"]}},
+        {"name":"github.release_create","description":"Create a release","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"tag_name":{"type":"string"},"name":{"type":"string"},"body":{"type":"string"},"draft":{"type":"boolean"},"prerelease":{"type":"boolean"}},"required":["tag_name"]}}
+    ])
+}
+
 /// Converts a dispatch error to a [`DispatchError`], preserving an existing
 /// error code (e.g. `-32602` for an unknown tool) and defaulting other failures
 /// to `-32603` internal error.
@@ -1057,6 +1324,15 @@ fn strval(arguments: &Value, key: &str) -> Result<String> {
     match arguments.get(key).and_then(Value::as_str) {
         Some(value) => Ok(value.to_string()),
         None => bail!("missing or non-string '{key}' argument"),
+    }
+}
+
+/// Extracts a required non-negative integer argument. Fails closed on
+/// absence or non-numeric input, matching `strval`'s fail-closed contract.
+fn u64val(arguments: &Value, key: &str) -> Result<u64> {
+    match arguments.get(key).and_then(Value::as_u64) {
+        Some(value) => Ok(value),
+        None => bail!("missing or non-integer '{key}' argument"),
     }
 }
 
@@ -1174,6 +1450,8 @@ fn circuit_breaker_config() -> CircuitBreakerConfig {
 mod tests {
     use super::*;
     use crate::mcp::{McpPermissions, TrustLevel, TrustStore};
+    use axum::response::IntoResponse;
+    use std::sync::Mutex;
 
     fn config(id: &str, permissions: McpPermissions) -> CustomMcpServerConfig {
         CustomMcpServerConfig {
@@ -1681,5 +1959,272 @@ mod tests {
             json!({"program": "echo hello; rm -rf /"}),
         );
         assert!(result.is_err());
+    }
+
+    // ---- github.* dispatcher wiring ---------------------------------------
+    //
+    // These build the dispatcher directly with a stubbed provider (a local
+    // axum server standing in for api.github.com) so they never touch the
+    // network, never require GITHUB_TOKEN, and never race other tests over
+    // environment variables.
+
+    /// Builds a dispatcher whose github field points at a local stub server
+    /// answering every request with `body`, and records the paths it saw.
+    /// The server's tokio runtime is intentionally leaked: it must outlive
+    /// this helper (each later `call` runs on its own runtime) for the
+    /// lifetime of the test.
+    fn dispatcher_with_github_stub(
+        temp: &tempfile::TempDir,
+        body: serde_json::Value,
+    ) -> (McpDispatcher, Arc<Mutex<Vec<String>>>) {
+        let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let paths_for_handler = Arc::clone(&paths);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let base_url = rt.block_on(async {
+            let router = axum::Router::new().fallback(move |req: axum::extract::Request| {
+                let paths = Arc::clone(&paths_for_handler);
+                async move {
+                    let path = req.uri().path().to_string();
+                    paths.lock().unwrap().push(path);
+                    axum::Json(body.clone()).into_response()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            format!("http://{addr}")
+        });
+        std::mem::forget(rt);
+
+        // Same construction path as `McpDispatcher::new`, then the github
+        // provider is swapped for one bound to the stub server.
+        let mut dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        dispatcher.github = Some(Arc::new(GithubProvider::new("stub-token", &base_url)));
+        (dispatcher, paths)
+    }
+
+    #[test]
+    fn github_tools_are_listed_when_provider_is_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let (dispatcher, _paths) = dispatcher_with_github_stub(&temp, serde_json::json!([]));
+        let tools = dispatcher.tools_list_static();
+        let names: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for expected in [
+            "github.pr_list",
+            "github.pr_get",
+            "github.pr_create",
+            "github.pr_merge",
+            "github.pr_review",
+            "github.issue_list",
+            "github.issue_get",
+            "github.issue_create",
+            "github.issue_comment",
+            "github.checks_status",
+            "github.workflow_dispatch",
+            "github.release_create",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from tools/list ({} advertised)",
+                names.len()
+            );
+        }
+    }
+
+    #[test]
+    fn github_tools_are_absent_when_provider_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        // Force the disabled state regardless of the ambient environment:
+        // the field is private, but this test module can set it directly.
+        let mut dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        dispatcher.github = None;
+        let tools = dispatcher.tools_list_static();
+        let names: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("github.")),
+            "github tools advertised while disabled: {names:?}"
+        );
+    }
+
+    #[test]
+    fn github_call_round_trips_through_the_stub_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let (dispatcher, paths) = dispatcher_with_github_stub(
+            &temp,
+            serde_json::json!([{"number": 7, "title": "stubbed"}]),
+        );
+        let result = call(
+            &dispatcher,
+            "github.pr_list",
+            json!({"owner": "o", "repo": "r", "state": "open"}),
+        )
+        .unwrap();
+        assert_eq!(result[0]["number"], 7);
+        let recorded = paths.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["/repos/o/r/pulls".to_string()],
+            "expected exactly one GET /repos/o/r/pulls, saw {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn github_call_fails_closed_when_provider_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        dispatcher.github = None;
+        let error = call(
+            &dispatcher,
+            "github.pr_list",
+            json!({"owner": "o", "repo": "r"}),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("set GITHUB_TOKEN"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn github_half_specified_target_never_mixes_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let (dispatcher, _paths) = dispatcher_with_github_stub(&temp, serde_json::json!([]));
+        // owner given, repo missing: the call must fail closed rather than
+        // pair the explicit owner with a repo from some other source.
+        let error = call(&dispatcher, "github.pr_list", json!({"owner": "o"})).unwrap_err();
+        assert!(
+            error.to_string().contains("owner/repo"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn github_target_resolves_from_the_origin_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/remote-o/remote-r.git",
+            ])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        let (dispatcher, paths) = dispatcher_with_github_stub(&temp, serde_json::json!([]));
+        call(&dispatcher, "github.pr_list", json!({})).unwrap();
+        let recorded = paths.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["/repos/remote-o/remote-r/pulls".to_string()],
+            "expected the origin remote to resolve, saw {recorded:?}"
+        );
+    }
+
+    // ---- workspace.write_file / delete_file dispatcher wiring ------------
+
+    #[test]
+    fn workspace_write_and_delete_round_trip_through_tools_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+
+        let written = call(
+            &dispatcher,
+            "workspace.write_file",
+            json!({"path": "docs/notes.md", "content": "# notes"}),
+        )
+        .unwrap();
+        assert_eq!(written["written"], true);
+        assert!(temp.path().join("docs/notes.md").is_file());
+
+        let read = call(
+            &dispatcher,
+            "workspace.read_file",
+            json!({"path": "docs/notes.md"}),
+        )
+        .unwrap();
+        assert!(read.as_str().unwrap_or_default().contains("# notes"));
+
+        let deleted = call(
+            &dispatcher,
+            "workspace.delete_file",
+            json!({"path": "docs/notes.md"}),
+        )
+        .unwrap();
+        assert_eq!(deleted["deleted"], true);
+        assert!(!temp.path().join("docs/notes.md").exists());
+
+        // Deleting a missing file reports false, not an error.
+        let missing = call(
+            &dispatcher,
+            "workspace.delete_file",
+            json!({"path": "docs/notes.md"}),
+        )
+        .unwrap();
+        assert_eq!(missing["deleted"], false);
+    }
+
+    #[test]
+    fn workspace_write_rejects_traversal_through_tools_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        let error = call(
+            &dispatcher,
+            "workspace.write_file",
+            json!({"path": "../escape.txt", "content": "nope"}),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unsafe workspace path"),
+            "unexpected: {error}"
+        );
+        assert!(!temp.path().join("../escape.txt").exists());
+    }
+
+    // ---- tasks.get / connectors.get dispatcher wiring --------------------
+
+    #[test]
+    fn tasks_get_and_connectors_get_serve_single_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        call(
+            &dispatcher,
+            "tasks.create",
+            json!({"id": "t-1", "title": "title", "description": "d"}),
+        )
+        .unwrap();
+        let task = call(&dispatcher, "tasks.get", json!({"id": "t-1"})).unwrap();
+        assert_eq!(task["id"], "t-1");
+        let missing_task = call(&dispatcher, "tasks.get", json!({"id": "nope"})).unwrap();
+        assert!(missing_task.is_null());
+
+        call(
+            &dispatcher,
+            "connectors.add",
+            json!({"id": "c-1", "name": "n", "provider": "p", "auth": "None"}),
+        )
+        .unwrap();
+        let connector = call(&dispatcher, "connectors.get", json!({"id": "c-1"})).unwrap();
+        assert_eq!(connector["id"], "c-1");
+        let missing_connector = call(&dispatcher, "connectors.get", json!({"id": "nope"})).unwrap();
+        assert!(missing_connector.is_null());
     }
 }
