@@ -55,7 +55,7 @@ both wrap the same service + store layer.
 | --- | --- | --- | --- |
 | MCP | stdio transport | complete | `src/mcp/server.rs`; 11 integration tests |
 | MCP | HTTP/SSE transport | complete | `src/mcp/http.rs` (auth, sessions, TLS, limits); 12 tests |
-| MCP | Tool catalog | complete | 52 core + 12 `github.*` (64 when `GITHUB_TOKEN` set) — `dispatcher.rs:401-476`, `:1255` |
+| MCP | Tool catalog | complete | 53 core + 12 `github.*` (65 when `GITHUB_TOKEN` set) — `dispatcher.rs:401-476`, `:1255` |
 | MCP | MCP server registry (global + project) | complete | `global_mcp.rs`, `custom_mcp.rs`; `StoreLock`-guarded |
 | MCP | Trust / approval of external servers | complete | `trust.rs`, `trust_store.rs`, `execution_gate.rs`; 14 tests |
 | MCP | Permissions (env/fs/net/secrets) for external servers | complete | `permissions.rs`; fail-closed |

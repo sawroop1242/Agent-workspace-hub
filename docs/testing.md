@@ -18,7 +18,8 @@ implemented with consolidated files; the mapping is:
 
 | Hardening-plan suite | Actual file | Coverage |
 | --- | --- | --- |
-| `mcp_protocol` | `tests/mcp_server.rs` | initialize handshake, tools/list, JSON-RPC error codes (-32600/-32601/-32603), malformed JSON, unsupported version, unknown method, unknown tool |
+| `mcp_protocol` | `tests/mcp_server.rs` + `tests/mcp_protocol.rs` | initialize handshake, tools/list, JSON-RPC error codes (-32600/-32601/-32602/-32603), malformed JSON, version negotiation matrix, unsupported version, unknown method, unknown tool, notification silence (incl. invalid notifications), JSON-RPC batch rejection, session state machine + isolation, schema-first argument validation end-to-end, mcp.status bounded health snapshot, tools/list category/version metadata, observer hooks |
+| `mcp_executable` | `tests/mcp_executable.rs` | real compiled binary over stdio: stdout protocol purity (every line parses as JSON-RPC), initialize → tools/list → tools/call round-trip, -32602 for schema-invalid arguments, -32700 recovery, EOF clean shutdown (exit 0), notification-only sessions produce zero output |
 | `mcp_auth` | `tests/mcp_http.rs` | missing/invalid/wrong bearer token, malformed Bearer header, valid token acceptance, `/health` without auth |
 | `mcp_sessions` | `tests/mcp_http.rs` | session limit (100), unknown session ID → 404, isolated per-session state |
 | `mcp_paths` / `mcp_sandbox` | `tests/mcp_sandbox.rs` | relative project root rejected, absolute-path requirement, relative filesystem path rejected, fail-closed when `bwrap` missing, limit bounds validation |
@@ -33,6 +34,15 @@ implemented with consolidated files; the mapping is:
 
 - **`mcp_server.rs` (11 tests)** — protocol correctness: every malformed or
   unknown input yields a deterministic JSON-RPC error code, never a panic.
+- **`mcp_protocol.rs` (15 tests)** — spec-conformance pinning: version
+  negotiation fallback, notification silence, batch rejection, session
+  state machine (`-32002` before initialize, `-32600` on duplicates),
+  per-session isolation, schema-first `-32602`, `mcp.status`, tool
+  metadata, and observer hooks.
+- **`mcp_executable.rs` (3 tests)** — the compiled artifact itself: spawning
+  the real `awh` binary over stdio and asserting every behavior the
+  in-process suites claim, plus stdout protocol purity (notifications-only
+  sessions emit zero bytes) and EOF-driven clean shutdown.
 - **`mcp_http.rs` (10 tests)** — remote attack surface: authentication is
   mandatory and constant-time-wrong tokens behave identically to missing
   ones; oversized bodies and session floods are rejected.

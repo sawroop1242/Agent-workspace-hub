@@ -2,7 +2,7 @@
 
 `awh mcp serve` exposes Agent Workspace Hub as a standards-compliant MCP
 server. This document describes the protocol surface, both transports, the
-tool catalog (52 core tools, plus 12 optional `github.*` tools for a 64-tool
+tool catalog (53 core tools, plus 12 optional `github.*` tools for a 65-tool
 catalog when `GITHUB_TOKEN` is set), and the interoperability evidence.
 
 ## Transports
@@ -39,7 +39,7 @@ matching `AWH_API_KEY` (constant-time comparison). Sessions are capped at
 every 15 s. TLS is strongly recommended; without `--tls-cert/--tls-key` the
 server runs plain HTTP, which is only acceptable on a private network.
 
-## Tool catalog (52 core tools; 64 with `github.*`)
+## Tool catalog (53 core tools; 65 with `github.*`)
 
 The core catalog below is always advertised. The 12 `github.*` tools in the
 last row appear in `tools/list` **only when `GITHUB_TOKEN` is set** (a classic
@@ -57,6 +57,7 @@ callable, and callers get a clear error if they try.
 | `connector.composio_link` / `connector.composio_accounts` / `connector.composio_register` / `connector.composio_remove` | Composio connected-account management |
 | `git.status` / `git.log` / `git.diff` / `git.stage` / `git.unstage` / `git.commit` / `git.branch` | Repository operations |
 | `terminal.run` | Sandboxed command execution |
+| `mcp.status` | Read-only server health snapshot: protocol versions, tool/provider counts, per-tool call metrics, uptime. No secrets. |
 | `context.status` / `context.insert` / `context.get` / `context.remove` / `context.search` / `context.optimize` / `context.assemble` / `context.protect` / `context.unprotect` / `context.offload` / `context.restore` | Context engine: token budget, offload, and item protection |
 | `github.pr_list` / `github.pr_get` / `github.pr_create` / `github.pr_merge` / `github.pr_review` / `github.issue_list` / `github.issue_get` / `github.issue_create` / `github.issue_comment` / `github.checks_status` / `github.workflow_dispatch` / `github.release_create` | GitHub-native pull request, issue, CI, and release operations (require `GITHUB_TOKEN`) |
 
@@ -90,6 +91,43 @@ except `initialize` and `ping` — is rejected with JSON-RPC error `-32002`
 uninitialized so the client can retry; a duplicate `initialize` on a live
 session is a deterministic `-32600`. Notifications are accepted silently at
 every stage, matching the MCP reference servers.
+
+### Protocol version negotiation
+
+The server advertises `SUPPORTED_PROTOCOL_VERSIONS` (currently
+`2024-11-05`, `2025-03-26`, `2025-06-18`). On `initialize` it echoes the
+client's requested version when it is supported and falls back to the
+latest supported version otherwise — clients that need a specific version
+can detect the downgrade. Unparseable requests get `-32700` with `id: null`;
+JSON-RPC batches (arrays) are not part of MCP and are rejected as parse
+errors, pinned by test.
+
+### Argument validation (schema-first, -32602)
+
+Tool arguments are validated against the tool's declared `inputSchema`
+**before** the handler runs: unknown fields, missing required fields, wrong
+types, non-string enum values, and `additionalProperties` violations all
+return a single standardized `-32602` (invalid params) error whose message
+names the failing field — for example
+`MCP argument validation failed at arguments.status: value is not allowed`.
+Handler code never has to re-check types it declared in its schema, and
+deeply nested payloads are capped by a depth guard.
+
+### Tool metadata and observability
+
+Every advertised tool carries a `category` and a `version` in its
+`tools/list` entry, so clients can group and gate on stable metadata rather
+than name-prefix parsing. The dispatcher keeps bounded per-tool metrics
+(call counts, failure counts, average duration — a fixed-size map, never a
+per-tool-name allocation from untrusted input) exposed via the read-only
+`mcp.status` tool alongside protocol versions, tool/provider counts, and
+uptime.
+
+Lifecycle events (tool calls, resource reads, prompt requests,
+notifications) are also delivered to registered **observer-only hooks**
+(`McpEvent`). Hooks cannot veto, mutate, or reorder dispatch — they exist
+for local observability, and a panicking hook is contained without breaking
+the registry.
 
 ### Custom MCP servers: trust is enforced, not stored
 
@@ -175,7 +213,7 @@ Recorded results (full harness output in `examples/mcp-interop/`):
 ```text
 $ node examples/mcp-interop/stdio-client.mjs
 PASS connect + initialize                      (server: agent-workspace-hub 0.1.0)
-PASS tools/list (64 tools)
+PASS tools/list (53 tools)
 PASS every tool has an inputSchema
 PASS tools/call workspace.context
 PASS tools/call skills.list
@@ -186,7 +224,7 @@ STDIO INTEROP: ALL CHECKS PASSED
 
 $ node examples/mcp-interop/sse-client.mjs
 PASS SSE connect + initialize (server: agent-workspace-hub 0.1.0)   [HTTPS + bearer]
-PASS SSE tools/list (64 tools)
+PASS SSE tools/list (53 tools)
 PASS SSE tools/call workspace.context
 PASS unknown sessionId rejected with 404
 PASS wrong bearer token rejected with 401
@@ -196,10 +234,11 @@ PASS server exits on SIGTERM
 SSE INTEROP: ALL CHECKS PASSED
 ```
 
-> The recorded runs above were taken with `GITHUB_TOKEN` set, so all 12
-> `github.*` tools are advertised (64 total). Without it the same harnesses
-> advertise 52 tools and pass identically — the count is expected to vary
-> with the environment, which is why the harness prints it dynamically.
+> The recorded runs above were taken **without** `GITHUB_TOKEN`, so the 12
+> `github.*` tools are hidden and 53 tools are advertised. With a token the
+> same harnesses advertise 65 tools and pass identically — the count is
+> expected to vary with the environment, which is why the harness prints it
+> dynamically.
 
 The MCP Inspector (the reference testing client) also round-trips a call:
 

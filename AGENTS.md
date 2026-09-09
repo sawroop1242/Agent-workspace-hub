@@ -108,7 +108,7 @@ work.
   deepest existing ancestor then join; symlink-out rejected),
   `workspace.delete_file` (Ok(false) missing), `tasks.get`/`connectors.get`
   (`get(&str) -> Result<Option<_>>`, missing → null not error). Catalog:
-  52 core / 64 with github.*; docs/mcp.md + configuration.md + README
+  53 core / 65 with github.*; docs/mcp.md + configuration.md + README
   counts all updated together. Testing gotchas: dispatcher tests inject a
   stubbed provider via private field (no env mutation, no races); the
   stub's tokio runtime must be leaked (`std::mem::forget`) or it dies with
@@ -178,6 +178,47 @@ work.
   project` (GET/POST/DELETE) with `store_scope` validating project names
   before path joins; mutations audited (`api_context_write`,
   `api_memory_append`, `api_skill_add`, `api_skill_remove`).
+- **Phase 12 — MCP hardening (Ruflo-informed, AWH-native)**: implements only
+  concepts that materially improved AWH's MCP surface. (1) `SessionLifecycle`
+  explicit state machine (Uninitialized→Initializing→Ready; `-32002` for
+  pre-init requests, `-32600` duplicate initialize; notifications silent at
+  every state incl. invalid ones). (2) `SUPPORTED_PROTOCOL_VERSIONS` const
+  (dispatcher.rs:89) + version negotiation: echo client version if
+  supported, else fall back to latest; unknown → fallback NOT error (spec
+  allows either; test pins the choice). (3) Schema-first argument
+  validation BEFORE handlers run (`src/mcp/schema.rs`, depth-capped 32):
+  wrong type/unknown field/missing required/non-string enum/
+  additionalProperties=false → standardized `-32602` naming the failing
+  field — this FIXED a real bug where `workspace.read_file {path: 42}`
+  panicked-ish into -32603 instead of -32602. (4) Tool metadata: every
+  `tools/list` entry carries `category` + `version` (json! third arrays per
+  family — watch dispatcher.rs recursion limits, never fold them). (5)
+  `mcp.status` tool (category "system") + `ToolMetrics` bounded fixed-size
+  map (no per-tool-name allocation from untrusted input; avg duration via
+  checked_div). (6) `McpEvent` observer-only hooks in `src/mcp/
+  observability.rs` — hooks CANNOT veto/mutate/reorder; panicking hook is
+  contained (catch_unwind) without breaking the registry. REJECTED from
+  Ruflo: agent-runtime/policy/tool-broker architecture (premature per spec
+  hard constraint), tool result streaming/cancellation, dynamic
+  registration. Test gotchas: (a) tools/call results are wrapped in MCP
+  `content` text envelope (dispatcher.rs:1831) — parse `result.content[0]
+  .text` then serde_json::from_str; (b) mcp.status can't count itself —
+  metrics record AFTER serialization; call another tool first then assert
+  `metrics.tool_calls >= 1`; (c) notifications MUST omit `id` — sending
+  `id` with notifications/initialized yields -32601 (JSON-RPC req); (d)
+  `StdioClientTransport` sanitizes env — pass `{...process.env, HOME}` in
+  interop harness; (e) binary stdio tests: `ChildStdin` lacks
+  Default/take-once — hold it as `Option<ChildStdin>`, set `server.stdin =
+  None` to close for EOF shutdown test; (f) initialize needs clientInfo
+  (client SDK always sends it — hand-rolled JSON must too); (g) container
+  wiped `~/.cargo` MID-SESSION after 460 green tests — rustup reinstall
+  (`--profile minimal`, add rustfmt+clippy) then `source ~/.cargo/env`
+  works; SSE interop needs self-signed certs at /tmp/awh-tls (README
+  documents openssl command) — after reinstall, `cargo build --release`
+  before `node examples/mcp-interop/*.mjs` (harness spawns the release
+  binary). Suite now: 461 tests (385 lib + 15 protocol + 3 executable +
+  3+3+13 integration + 39 doc-adjacent), interop: stdio+SSE harnesses pass
+  with 53 tools advertised (no GITHUB_TOKEN).
 - **Env note**: the Rust toolchain can be wiped from this container
   between sessions; if `cargo` is missing reinstall with rustup
   (`--default-toolchain stable --profile minimal` then `rustup

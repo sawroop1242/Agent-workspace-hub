@@ -76,10 +76,13 @@ impl SessionRegistry {
         // Each session gets its own channel, so no cross-client message leakage.
         let (tx, _) = broadcast::channel(256);
         let endpoint = format!("{endpoint_path}?sessionId={id}");
+        let lifecycle = Arc::new(SessionLifecycle::default());
+        lifecycle.set_session_id(id.clone());
+        lifecycle.set_transport("sse");
         let session = Session {
             id: id.clone(),
             endpoint,
-            lifecycle: Arc::new(SessionLifecycle::default()),
+            lifecycle,
             tx,
         };
         self.sessions.lock().await.insert(id, session.clone());
@@ -92,10 +95,12 @@ impl SessionRegistry {
         self.sessions.lock().await.get(id).cloned()
     }
 
-    /// Removes and drops a session (on disconnect or shutdown).
+    /// Removes and drops a session (on disconnect or shutdown), closing its
+    /// lifecycle so later requests observe a deterministic closed state.
     pub async fn remove(&self, id: &str) {
-        let existed = self.sessions.lock().await.remove(id).is_some();
-        if existed {
+        let existing = self.sessions.lock().await.remove(id);
+        if let Some(session) = existing {
+            session.lifecycle.mark_closed();
             crate::mcp::audit_allow("session_destroy", id, "disconnect");
         }
     }

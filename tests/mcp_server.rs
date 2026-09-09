@@ -324,28 +324,33 @@ fn version_negotiation_responds_with_supported_version() {
     let dir = tempdir().unwrap();
     let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
 
-    // Requesting an (unsupported) older protocol version still returns the
-    // server's supported version — the client decides whether to continue.
+    // Requesting an (unsupported) protocol version returns the server's
+    // latest supported version — the client decides whether to continue.
     let old = rpc_raw(
         &server,
         1,
         "initialize",
-        json!({"protocolVersion": "2024-11-05"}),
+        json!({"protocolVersion": "1999-01-01"}),
     );
     assert_eq!(old["result"]["protocolVersion"], "2025-06-18", "got: {old}");
 
-    // Requesting the supported version echoes it exactly.
-    let dir2 = tempdir().unwrap();
-    let server2 = StdioMcpServer::new(dir2.path().to_path_buf()).unwrap();
-    let exact = rpc_raw(
-        &server2,
-        1,
-        "initialize",
-        json!({"protocolVersion": "2025-06-18"}),
-    );
-    assert_eq!(exact["result"]["protocolVersion"], "2025-06-18");
-    assert!(exact["result"]["capabilities"]["resources"].is_object());
-    assert!(exact["result"]["capabilities"]["prompts"].is_object());
+    // Every advertised version is echoed back exactly (negotiation rule).
+    for supported in agent_workspace_hub::mcp::SUPPORTED_PROTOCOL_VERSIONS {
+        let dir2 = tempdir().unwrap();
+        let server2 = StdioMcpServer::new(dir2.path().to_path_buf()).unwrap();
+        let exact = rpc_raw(
+            &server2,
+            1,
+            "initialize",
+            json!({"protocolVersion": supported}),
+        );
+        assert_eq!(
+            exact["result"]["protocolVersion"], supported,
+            "supported version must be echoed, got: {exact}"
+        );
+        assert!(exact["result"]["capabilities"]["resources"].is_object());
+        assert!(exact["result"]["capabilities"]["prompts"].is_object());
+    }
 }
 
 #[test]

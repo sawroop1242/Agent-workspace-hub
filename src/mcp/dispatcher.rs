@@ -9,12 +9,14 @@ use crate::context::{
     ContextEngine, ContextEngineConfig, ContextItem, ContextRequest, ContextScope, ContextSource,
 };
 use crate::mcp::{
-    audit_allow, audit_deny, authorize_mcp_execution, AuthMethod, CircuitBreakerConfig,
-    CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider, ComposioRegistry,
-    Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, CustomMcpServerConfig,
-    GithubProvider, McpExecutionRequest, McpTransport, MemoryMcp, MemoryScope,
-    PersistentTrustStore, ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp, StdioMcpClient,
-    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, WorkspaceMcp,
+    audit_allow, audit_deny, authorize_mcp_execution, client_name_version, validate_tool_arguments,
+    AuthMethod, CircuitBreakerConfig, CircuitBreakerMcpClient, ComposioAccount, ComposioAuth,
+    ComposioProvider, ComposioRegistry, Connector, ConnectorsMcp, CustomMcpProvider,
+    CustomMcpRegistry, CustomMcpServerConfig, GithubProvider, McpEvent, McpExecutionRequest,
+    McpHook, McpHooks, McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore,
+    ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp, StdioMcpClient,
+    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, ToolMetrics, WorkspaceMcp,
+    MAX_TRACKED_TOOLS,
 };
 use crate::services::git::GitService;
 use crate::services::terminal::TerminalService;
@@ -77,38 +79,194 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
-/// JSON-RPC protocol version negotiated by this server.
-pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// JSON-RPC protocol versions supported by this server, newest first.
+///
+/// The dispatcher's JSON-RPC method surface (initialize, ping, tools/*,
+/// resources/*, prompts/*) is identical across these revisions, so a client
+/// requesting any of them gets that exact version echoed back. A client
+/// requesting anything else receives the server's latest supported version
+/// and decides whether to continue (the MCP negotiation rule).
+pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The latest supported protocol version (the server's default answer when
+/// a client requests an unsupported or missing version).
+pub const MCP_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
 
 /// JSON-RPC server-error code for requests that arrive before the MCP
 /// session is initialized (the same code the MCP reference SDKs borrow
 /// from LSP's `ServerNotInitialized`).
 pub const SERVER_NOT_INITIALIZED_CODE: i64 = -32002;
 
-/// Per-session MCP initialization state, shared between a transport and the
-/// dispatcher's lifecycle gate.
+/// The lifecycle state of one MCP session (the conceptual `NEW →
+/// INITIALIZING → READY → CLOSING/CLOSED/FAILED` machine, reduced to the
+/// states the transports actually drive).
 ///
 /// The state flips to initialized exactly once — when a valid `initialize`
 /// request has been answered with a success response. `notifications/
 /// initialized` is accepted silently (matching the MCP reference servers,
 /// which gate on the `initialize` exchange, not the follow-up notification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    /// Created, waiting for the `initialize` request.
+    New,
+    /// A malformed or failed `initialize` left the session retryable.
+    Initializing,
+    /// The `initialize` exchange completed successfully.
+    Ready,
+    /// The transport is shutting the session down.
+    Closing,
+    /// The session is closed; further requests are protocol errors.
+    Closed,
+    /// The session failed structurally (e.g. the transport died).
+    Failed,
+}
+
+/// Per-session MCP state, shared between a transport and the dispatcher's
+/// lifecycle gate.
+///
+/// Carries the session identity and protocol metadata (transport, negotiated
+/// protocol version, client info) alongside the initialization flag, so
+/// observability surfaces can describe a session without exposing secrets.
+/// All fields are optional/derived: transports that only need the
+/// initialization gate continue to work unchanged.
 #[derive(Debug, Default)]
 pub struct SessionLifecycle {
-    initialized: std::sync::atomic::AtomicBool,
+    state: std::sync::atomic::AtomicU8,
+    /// Stable internal identity (transport-assigned; e.g. the SSE session id).
+    session_id: std::sync::Mutex<Option<String>>,
+    /// Transport label ("stdio", "sse", "http") for diagnostics.
+    transport: std::sync::Mutex<Option<String>>,
+    /// Protocol version negotiated during the initialize exchange.
+    protocol_version: std::sync::Mutex<Option<String>>,
+    /// Client-reported name/version from the initialize request.
+    client_info: std::sync::Mutex<Option<Value>>,
+    /// Session creation and last-activity timestamps.
+    created_at: std::sync::Mutex<Option<std::time::Instant>>,
+    last_activity: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl SessionLifecycle {
+    // Reduced-state encoding for the atomic: `New` and `Initializing` both
+    // mean "not yet admitted" (the gate only distinguishes them for
+    // observability), `Ready` and `Closing` both mean "admitted".
+    const NEW: u8 = 0;
+    const READY: u8 = 1;
+    const CLOSED: u8 = 2;
+    const FAILED: u8 = 3;
+
+    /// The current session state.
+    pub fn state(&self) -> SessionState {
+        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            Self::NEW => SessionState::New,
+            Self::READY => SessionState::Ready,
+            Self::CLOSED => SessionState::Closed,
+            _ => SessionState::Failed,
+        }
+    }
+
     /// Whether the `initialize` exchange has completed for this session.
     pub fn is_initialized(&self) -> bool {
-        self.initialized.load(std::sync::atomic::Ordering::Acquire)
+        self.state() == SessionState::Ready
     }
 
     /// Marks the session initialized. Idempotent; returns whether this call
     /// was the transition (i.e. the session was previously uninitialized).
     pub fn mark_initialized(&self) -> bool {
         !self
-            .initialized
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            .state
+            .compare_exchange(
+                Self::NEW,
+                Self::READY,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Marks the session closed (a graceful shutdown path).
+    pub fn mark_closed(&self) {
+        self.state
+            .store(Self::CLOSED, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Marks the session failed (a transport-level failure).
+    pub fn mark_failed(&self) {
+        self.state
+            .store(Self::FAILED, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Assigns the stable internal session identity (transport-assigned).
+    pub fn set_session_id(&self, id: impl Into<String>) {
+        *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.into());
+    }
+
+    /// The transport-assigned session identity, when known.
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Records the transport label ("stdio", "sse", "http").
+    pub fn set_transport(&self, transport: impl Into<String>) {
+        *self.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(transport.into());
+    }
+
+    /// Records the protocol version negotiated at initialize time.
+    pub fn set_negotiated_version(&self, version: impl Into<String>) {
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(version.into());
+    }
+
+    /// The negotiated protocol version, once the initialize exchange ran.
+    pub fn negotiated_version(&self) -> Option<String> {
+        self.protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Records the client info (`clientInfo`) accepted at initialize time.
+    pub fn set_client_info(&self, client_info: Value) {
+        *self.client_info.lock().unwrap_or_else(|e| e.into_inner()) = Some(client_info);
+    }
+
+    /// The client-reported identity, once the initialize exchange ran.
+    pub fn client_info(&self) -> Option<Value> {
+        self.client_info
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Notes that activity happened on this session (updates `last_activity`).
+    pub fn touch(&self) {
+        let now = std::time::Instant::now();
+        let mut created = self.created_at.lock().unwrap_or_else(|e| e.into_inner());
+        if created.is_none() {
+            *created = Some(now);
+        }
+        drop(created);
+        *self.last_activity.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    }
+
+    /// How long this session has existed, once first touched.
+    pub fn age(&self) -> Option<std::time::Duration> {
+        self.created_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|created| created.elapsed())
+    }
+
+    /// How long since the last activity on this session.
+    pub fn idle_for(&self) -> Option<std::time::Duration> {
+        self.last_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|last| last.elapsed())
     }
 }
 
@@ -165,6 +323,12 @@ pub struct McpDispatcher {
     context_engine: Option<Arc<ContextEngine>>,
     github: Option<Arc<GithubProvider>>,
     providers: Arc<RwLock<ProviderRegistry>>,
+    /// Observer-only lifecycle hooks (see [`McpHooks`]).
+    hooks: Arc<McpHooks>,
+    /// Bounded per-tool call metrics (observability, never a gate).
+    metrics: Arc<ToolMetrics>,
+    /// When this dispatcher was constructed (health/uptime reporting).
+    started_at: std::time::Instant,
 }
 
 impl McpDispatcher {
@@ -307,6 +471,9 @@ impl McpDispatcher {
             context_engine,
             github,
             providers: registry,
+            hooks: Arc::new(McpHooks::new()),
+            metrics: Arc::new(ToolMetrics::new(MAX_TRACKED_TOOLS)),
+            started_at: std::time::Instant::now(),
         })
     }
 
@@ -337,6 +504,30 @@ impl McpDispatcher {
     /// Returns the shared provider registry used to dispatch tool calls.
     pub fn provider_registry(&self) -> Arc<RwLock<ProviderRegistry>> {
         Arc::clone(&self.providers)
+    }
+
+    /// The observer-only lifecycle hook registry for this dispatcher.
+    ///
+    /// Hooks observe events (`initialize` completed, tool calls, resource
+    /// reads, notifications); they can neither veto calls nor alter
+    /// arguments. Security decisions are made independently of hooks.
+    pub fn hooks(&self) -> Arc<McpHooks> {
+        Arc::clone(&self.hooks)
+    }
+
+    /// The bounded per-tool metrics registry (observability only).
+    pub fn metrics(&self) -> Arc<ToolMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Registers an observer hook (bounded at [`MAX_HOOKS`]).
+    pub fn register_hook(&self, hook: McpHook) -> Result<(), String> {
+        self.hooks.register(hook)
+    }
+
+    /// How long this dispatcher has been running (health/uptime reporting).
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     /// Dispatches a single raw JSON-RPC message (request or notification).
@@ -424,17 +615,38 @@ impl McpDispatcher {
     /// (pre-initialization requests, duplicate initialization) are *known*
     /// JSON-RPC failure modes and come back as well-formed error responses.
     ///
-    /// A successful `initialize` exchange flips the session to initialized;
-    /// a failed one leaves it uninitialized so the client can retry.
+    /// A successful `initialize` exchange flips the session to initialized
+    /// and records its negotiated metadata; a failed one leaves it
+    /// uninitialized so the client can retry.
+    ///
+    /// Notification semantics (JSON-RPC 2.0): any parseable message without
+    /// an `id` is a notification and never receives a response — even when
+    /// it is otherwise invalid (e.g. a wrong `jsonrpc` version) — because
+    /// the spec forbids replying to notifications. The method name is still
+    /// observed (audited) for diagnostics; its arguments are not.
     pub async fn dispatch_strict_with_lifecycle(
         &self,
         input: &str,
         lifecycle: &SessionLifecycle,
     ) -> Result<DispatchResult, DispatchError> {
-        // Parse and version-check first so structural errors keep their
-        // precise codes regardless of session state.
+        // Parse first so structural errors keep their precise codes.
         let req: RpcRequest = serde_json::from_str(input)
             .map_err(|e| DispatchError::parse(format!("invalid JSON: {e}")))?;
+
+        // Notifications (parseable messages with no `id`) produce no
+        // response at any lifecycle stage — including `notifications/
+        // initialized` (state flips on the initialize exchange, matching
+        // the MCP reference servers) and notifications that arrive while
+        // the session is closed or uninitialized. The method name is
+        // recorded for observability; arguments are never logged.
+        let id = req.id;
+        if id.is_none() {
+            self.hooks.fire(&McpEvent::NotificationReceived {
+                method: &req.method,
+            });
+            return Ok(DispatchResult::NoResponse);
+        }
+
         if req.jsonrpc != "2.0" {
             return Err(DispatchError::invalid_request(format!(
                 "unsupported JSON-RPC version: {}",
@@ -442,53 +654,88 @@ impl McpDispatcher {
             )));
         }
 
-        // Notifications (no `id`) produce no response at any lifecycle stage;
-        // `notifications/initialized` included (state flips on the
-        // initialize exchange, matching the MCP reference servers).
-        let id = req.id;
-        if id.is_none() {
-            return Ok(DispatchResult::NoResponse);
-        }
-
-        if lifecycle.is_initialized() {
-            if req.method == "initialize" {
-                audit_deny("session_initialize", "duplicate_initialize", "initialize");
+        lifecycle.touch();
+        match lifecycle.state() {
+            // A closed or failed session no longer accepts requests.
+            SessionState::Closed | SessionState::Failed => {
+                audit_deny("session_closed_rejected", "session_closed", &req.method);
                 return Ok(DispatchResult::Response(RpcResponse {
                     jsonrpc: "2.0",
                     id,
                     result: None,
                     error: Some(json!({
                         "code": codes::INVALID_REQUEST,
-                        "message": "session already initialized",
+                        "message": "session is closed",
                     })),
                 }));
             }
-        } else if req.method != "initialize" && req.method != "ping" {
-            audit_deny(
-                "session_preinit_rejected",
-                "server_not_initialized",
-                &req.method,
-            );
-            return Ok(DispatchResult::Response(RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(json!({
-                    "code": SERVER_NOT_INITIALIZED_CODE,
-                    "message": "server not initialized: send an initialize request first",
-                })),
-            }));
+            SessionState::Ready => {
+                if req.method == "initialize" {
+                    audit_deny("session_initialize", "duplicate_initialize", "initialize");
+                    return Ok(DispatchResult::Response(RpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: None,
+                        error: Some(json!({
+                            "code": codes::INVALID_REQUEST,
+                            "message": "session already initialized",
+                        })),
+                    }));
+                }
+            }
+            SessionState::New | SessionState::Initializing => {
+                if req.method != "initialize" && req.method != "ping" {
+                    audit_deny(
+                        "session_preinit_rejected",
+                        "server_not_initialized",
+                        &req.method,
+                    );
+                    return Ok(DispatchResult::Response(RpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: None,
+                        error: Some(json!({
+                            "code": SERVER_NOT_INITIALIZED_CODE,
+                            "message": "server not initialized: send an initialize request first",
+                        })),
+                    }));
+                }
+            }
+            SessionState::Closing => { /* requests still admitted while closing */ }
         }
 
         let result = self.dispatch_inner(input).await?;
         // The initialize exchange completed successfully: flip the session
-        // to initialized. (A failure response keeps the session
-        // uninitialized so the client can retry.)
+        // to initialized and record what was negotiated. (A failure
+        // response keeps the session uninitialized so the client can retry.)
         if req.method == "initialize" && result_is_ok(&result) {
             lifecycle.mark_initialized();
+            let negotiated = self
+                .initialize_metadata(&req.params)
+                .unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_string());
+            lifecycle.set_negotiated_version(negotiated.clone());
+            lifecycle.set_client_info(req.params.get("clientInfo").cloned().unwrap_or(json!({})));
+            lifecycle.touch();
             audit_allow("session_initialize", "initialize", "lifecycle");
+            let stored_client_info = lifecycle.client_info();
+            let client_info = client_name_version(stored_client_info.as_ref());
+            self.hooks.fire(&McpEvent::InitializeCompleted {
+                protocol_version: negotiated.as_str(),
+                client_info,
+            });
         }
         Ok(result)
+    }
+
+    /// The protocol version the `initialize` exchange would negotiate for
+    /// these parameters (mirrors [`Self::initialize_response`]).
+    fn initialize_metadata(&self, params: &Value) -> Option<String> {
+        match params.get("protocolVersion").and_then(Value::as_str) {
+            Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => {
+                Some(version.to_string())
+            }
+            _ => Some(MCP_PROTOCOL_VERSION.to_string()),
+        }
     }
 
     async fn dispatch_inner(&self, input: &str) -> Result<DispatchResult, DispatchError> {
@@ -505,12 +752,15 @@ impl McpDispatcher {
         let id = req.id;
         let is_notification = id.is_none();
 
-        // `notifications/initialized` is the standard post-initialize
-        // notification; accept it (and any other notification) silently.
+        // Notifications produce no response (JSON-RPC 2.0). `notifications/
+        // initialized` is the standard post-initialize notification; every
+        // other notification (known or unknown) is accepted silently too —
+        // the protocol forbids replying to notifications.
         if is_notification {
             return Ok(DispatchResult::NoResponse);
         }
 
+        let started = std::time::Instant::now();
         let result = match req.method.as_str() {
             "initialize" => self.initialize_response(&req.params)?,
             // MCP liveness probe: the protocol requires an empty response.
@@ -519,23 +769,37 @@ impl McpDispatcher {
                 .tools_list_aggregated()
                 .await
                 .map_err(to_dispatch_error)?,
-            "tools/call" => self
-                .call_tool(&req.params)
-                .await
-                .inspect_err(|_| {
-                    // Structured record of the failed dispatch; see
-                    // audit_tool_failure for what is (not) captured.
-                    if let Some(name) = req.params.get("name").and_then(Value::as_str) {
+            "tools/call" => {
+                let outcome = self.call_tool(&req.params).await;
+                let name = req.params.get("name").and_then(Value::as_str);
+                if let Some(name) = name {
+                    let ok = outcome.is_ok();
+                    let duration = started.elapsed();
+                    self.metrics.record(name, ok, duration);
+                    self.hooks
+                        .fire(&McpEvent::ToolCallCompleted { name, ok, duration });
+                    if !ok {
+                        // Structured record of the failed dispatch; see
+                        // audit_tool_failure for what is (not) captured.
                         audit_tool_failure(name);
                     }
-                })
-                .map_err(to_dispatch_error)?,
+                }
+                outcome.map_err(to_dispatch_error)?
+            }
             // MCP resources: project context, memory entries, and
             // referenced skills exposed as addressable, readable URIs.
             "resources/list" => self.resources_list().map_err(to_dispatch_error)?,
-            "resources/read" => self
-                .resources_read(&req.params)
-                .map_err(to_dispatch_error)?,
+            "resources/read" => {
+                let uri = req.params.get("uri").and_then(Value::as_str);
+                let outcome = self.resources_read(&req.params);
+                if outcome.is_ok() {
+                    if let Some(uri) = uri {
+                        audit_allow("mcp_resource_read", uri, "resources/read");
+                        self.hooks.fire(&McpEvent::ResourceRead { uri });
+                    }
+                }
+                outcome.map_err(to_dispatch_error)?
+            }
             // This server ships no prompt templates; the protocol
             // expects an empty list rather than an error.
             "prompts/list" => json!({"prompts": []}),
@@ -550,6 +814,8 @@ impl McpDispatcher {
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                audit_deny("mcp_prompt_requested", "unknown_prompt", name);
+                self.hooks.fire(&McpEvent::PromptRequested { name });
                 return Err(DispatchError::invalid_params(format!(
                     "unknown prompt: {name} (this server ships no prompt templates)"
                 )));
@@ -585,25 +851,26 @@ impl McpDispatcher {
     ///
     /// Negotiation follows the MCP specification: if the client requests a
     /// version this server supports, that exact version is echoed; otherwise
-    /// the server responds with its own supported version and the client
-    /// decides whether to continue.
+    /// the server responds with its own latest supported version and the
+    /// client decides whether to continue.
     fn initialize_response(&self, params: &Value) -> Result<Value, DispatchError> {
         if !params.is_null() && !params.is_object() {
             return Err(DispatchError::invalid_params(
                 "initialize params must be a JSON object",
             ));
         }
-        if let Some(requested) = params.get("protocolVersion") {
+        let requested = params.get("protocolVersion");
+        if let Some(requested) = requested {
             if !requested.is_string() {
                 return Err(DispatchError::invalid_params(
                     "initialize protocolVersion must be a string",
                 ));
             }
         }
-        // Single supported protocol version: requesting any other version
-        // yields the server's own (the MCP negotiation rule — the client
-        // then decides whether to continue).
-        let negotiated = MCP_PROTOCOL_VERSION;
+        let negotiated = match requested.and_then(Value::as_str) {
+            Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
+            _ => MCP_PROTOCOL_VERSION,
+        };
         Ok(json!({
             "protocolVersion": negotiated,
             // Honest advertisement: tools, resources, and prompts/list are
@@ -620,6 +887,18 @@ impl McpDispatcher {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        // Attach catalog metadata (category, tool version) to every static
+        // tool entry. Extra fields on a Tool object are ignored by MCP
+        // clients (the SDK schemas are permissive), so this is additive.
+        for tool in &mut base {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                let (category, version) = tool_metadata(name);
+                if let Some(tool) = tool.as_object_mut() {
+                    tool.insert("category".to_string(), json!(category));
+                    tool.insert("version".to_string(), json!(version));
+                }
+            }
+        }
         let registry = self.providers.read().await;
         let dynamic = registry.aggregate_tools().await?;
         for tool in dynamic {
@@ -685,7 +964,8 @@ impl McpDispatcher {
             {"name":"workspace.write_file","description":"Write (create or overwrite) a workspace file","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
             {"name":"workspace.delete_file","description":"Delete a workspace file; reports whether it existed","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
             {"name":"tasks.get","description":"Get a task by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
-            {"name":"connectors.get","description":"Get connector metadata by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
+            {"name":"connectors.get","description":"Get connector metadata by id","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+            {"name":"mcp.status","description":"Read-only MCP server health and status: protocol versions, tool/provider counts, tool-call metrics, uptime. Exposes no secrets.","inputSchema":{"type":"object","properties":{}}}
         ]);
         let mut tools = core;
         if let (Value::Array(core_arr), Value::Array(ext_arr)) = (&mut tools, &extended) {
@@ -703,6 +983,20 @@ impl McpDispatcher {
             }
         }
         json!({"tools": tools})
+    }
+
+    /// Looks up one static-catalog tool's `tools/list` envelope by name
+    /// (the `{"tools": [...]}` shape `validate_tool_arguments` expects).
+    /// Dynamic provider tools are not visible here — their schemas live in
+    /// the provider registry and are validated by the provider clients.
+    fn static_tool_schema(&self, name: &str) -> Option<Value> {
+        let catalog = self.tools_list_static();
+        let found = catalog
+            .get("tools")?
+            .as_array()?
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name));
+        found.then_some(catalog)
     }
 
     /// MCP resources exposed by this server: the project's context
@@ -746,13 +1040,14 @@ impl McpDispatcher {
     /// `awh://context` resource (no id segment) is accepted because
     /// `resources/list` advertises it that way.
     fn resources_read(&self, params: &Value) -> Result<Value> {
-        let uri = params
-            .get("uri")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("resources/read requires a uri parameter"))?;
-        let path = uri
-            .strip_prefix("awh://")
-            .ok_or_else(|| anyhow::anyhow!("unsupported resource uri: {uri}"))?;
+        let uri = params.get("uri").and_then(Value::as_str).ok_or_else(|| {
+            // A request without a usable uri is a client-side protocol
+            // violation, not a server failure: -32602, not -32603.
+            DispatchError::invalid_params("resources/read requires a string 'uri' parameter")
+        })?;
+        let path = uri.strip_prefix("awh://").ok_or_else(|| {
+            DispatchError::invalid_params(format!("unsupported resource uri: {uri}"))
+        })?;
         let (kind, rest) = match path.split_once('/') {
             Some((kind, rest)) => (kind, rest),
             None => (path, ""),
@@ -761,17 +1056,21 @@ impl McpDispatcher {
         let (content, mime) = match kind {
             "context" => (self.workspace.context()?, "text/markdown"),
             "memory" => {
-                let entry = self
-                    .memory
-                    .get(rest)?
-                    .ok_or_else(|| anyhow::anyhow!("memory entry not found: {rest}"))?;
+                let entry = self.memory.get(rest)?.ok_or_else(|| {
+                    DispatchError::invalid_params(format!("memory entry not found: {rest}"))
+                })?;
                 (entry.content, "text/plain")
             }
             "skills" => {
                 let skill = self.skills.read(rest)?;
                 (skill.description, "text/markdown")
             }
-            other => anyhow::bail!("unsupported resource kind: {other}"),
+            other => {
+                return Err(DispatchError::invalid_params(format!(
+                    "unsupported resource kind: {other}"
+                ))
+                .into());
+            }
         };
         Ok(json!({
             "contents": [{
@@ -792,11 +1091,83 @@ impl McpDispatcher {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        // Fail closed on a malformed envelope before any dispatch: `name`
+        // must be a non-empty string and `arguments`, when present, an
+        // object. (An absent `arguments` defaults to `{}` — some clients
+        // omit it for no-parameter tools.)
+        if name.is_empty() {
+            return Err(DispatchError::invalid_params(
+                "tools/call requires a non-empty 'name' parameter",
+            )
+            .into());
+        }
+        if !arguments.is_object() {
+            return Err(DispatchError::invalid_params(
+                "tools/call 'arguments' must be a JSON object when present",
+            )
+            .into());
+        }
+
+        // Schema-first validation (before dispatch): a tool executes only
+        // when its arguments match the schema advertised in tools/list. This
+        // runs for the static catalog below; dynamic provider tools are
+        // validated by the provider client itself (see
+        // `StdioMcpClient::tools_call`), which fetches the provider's live
+        // schema. Either way, no tool runs solely because its name exists.
+        if let Some(schema) = self.static_tool_schema(name) {
+            if let Err(error) = validate_tool_arguments(&schema, name, &arguments) {
+                // Argument-validation failures are invalid-params
+                // protocol errors (-32602), not internal errors.
+                audit_deny("tool_validation", "schema_mismatch", name);
+                return Err(DispatchError::invalid_params(format!(
+                    "invalid arguments for '{name}': {error:#}"
+                ))
+                .into());
+            }
+        }
+
         // Audit every tool invocation by name only. Arguments are deliberately
         // never logged: they may contain file contents or secret material.
         audit_allow("tool_invoke", name, "tools/call");
 
         let value = match name {
+            // Read-only MCP health/status: bounded, secret-free snapshot
+            // of this server's catalog, providers, and observability state.
+            "mcp.status" => {
+                let registry = self.providers.read().await;
+                let provider_ids = registry.providers();
+                let static_count = self
+                    .tools_list_static()
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map(|tools| tools.len())
+                    .unwrap_or(0);
+                let dynamic_count = registry
+                    .aggregate_tools()
+                    .await
+                    .map(|tools| tools.len())
+                    .unwrap_or(0);
+                let (tracked, calls, failures) = self.metrics.totals();
+                serde_json::to_value(json!({
+                    "status": "healthy",
+                    "protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
+                    "tools": {
+                        "static": static_count,
+                        "dynamic": dynamic_count,
+                        "total": static_count + dynamic_count,
+                    },
+                    "providers": provider_ids,
+                    "github_enabled": self.github.is_some(),
+                    "context_engine_enabled": self.context_engine.is_some(),
+                    "hooks_registered": self.hooks.len(),
+                    "metrics": {
+                        "tools_tracked": tracked,
+                        "tool_calls": calls,
+                        "tool_failures": failures,
+                    },
+                    "uptime_secs": self.uptime().as_secs(),
+                }))?
+            }
             "skills.list" => serde_json::to_value(self.skills.list()?)?,
             "skills.read" => serde_json::to_value(
                 self.skills.read(
@@ -1506,6 +1877,29 @@ fn github_tool_schemas() -> Value {
     ])
 }
 
+/// Catalog metadata for one tool: its category (for discovery and
+/// observability — never a security boundary) and its tool version.
+///
+/// The version is the *tool's* evolution version, `"1.0.0"` for the whole
+/// catalog today; it changes only when a tool's schema or behavior changes
+/// and lets clients detect deprecations deterministically.
+pub fn tool_metadata(name: &str) -> (&'static str, &'static str) {
+    let category = match name {
+        "mcp.status" => "system",
+        _ if name.starts_with("skills.") => "skills",
+        _ if name.starts_with("workspace.") => "workspace",
+        _ if name.starts_with("memory.") => "memory",
+        _ if name.starts_with("tasks.") => "tasks",
+        _ if name.starts_with("connectors.") || name.starts_with("connector.") => "connector",
+        _ if name.starts_with("context.") => "context",
+        _ if name.starts_with("git.") => "git",
+        _ if name.starts_with("terminal.") => "terminal",
+        _ if name.starts_with("github.") => "github",
+        _ => "workspace",
+    };
+    (category, "1.0.0")
+}
+
 /// Whether a dispatch result is a success response (no `error` field). Used
 /// by the lifecycle gate: only a *successful* `initialize` completes the
 /// session handshake; an error response leaves the session uninitialized so
@@ -1856,7 +2250,9 @@ mod tests {
         assert_eq!(updated["status"], "InProgress");
 
         // ...and reject anything else — including snake_case look-alikes
-        // ("in-progress") and outright garbage ("bogus").
+        // ("in-progress") and outright garbage ("bogus"). Schema-first
+        // validation catches these before dispatch, so the error names the
+        // failing argument instead of a tool-specific message.
         for status in ["in-progress", "completed", "bogus", "todo", "done"] {
             let error = call(
                 &dispatcher,
@@ -1865,8 +2261,8 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error.to_string().contains("invalid status"),
-                "status '{status}' should be rejected, got: {error}"
+                error.to_string().contains("arguments.status"),
+                "status '{status}' should be rejected at the schema layer, got: {error}"
             );
         }
 
@@ -1876,7 +2272,7 @@ mod tests {
             json!({"id": "t1", "priority": "urgent"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid priority"));
+        assert!(error.to_string().contains("arguments.priority"));
 
         let error = call(
             &dispatcher,
@@ -1884,10 +2280,10 @@ mod tests {
             json!({"id": "t2", "title": "title", "description": "d", "priority": "mega"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid priority"));
+        assert!(error.to_string().contains("arguments.priority"));
 
         let error = call(&dispatcher, "tasks.list", json!({"status": "done"})).unwrap_err();
-        assert!(error.to_string().contains("invalid status"));
+        assert!(error.to_string().contains("arguments.status"));
 
         let error = call(
             &dispatcher,
@@ -1895,7 +2291,7 @@ mod tests {
             json!({"id": "m1", "content": "c", "scope": "project"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid scope"));
+        assert!(error.to_string().contains("arguments.scope"));
 
         let error = call(
             &dispatcher,
@@ -1903,7 +2299,7 @@ mod tests {
             json!({"query": "q", "scope": "workspace"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid scope"));
+        assert!(error.to_string().contains("arguments.scope"));
 
         let error = call(
             &dispatcher,
@@ -1911,7 +2307,7 @@ mod tests {
             json!({"id": "c1", "name": "n", "provider": "p", "auth": "bogus"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid auth"));
+        assert!(error.to_string().contains("arguments.auth"));
 
         let error = call(
             &dispatcher,
@@ -1919,7 +2315,7 @@ mod tests {
             json!({"id": "i1", "content": "c", "source": "Tool", "scope": "workspace"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid scope"));
+        assert!(error.to_string().contains("arguments.scope"));
 
         // Sanity: valid enum values still pass through every one of the
         // parsers exercised above.
@@ -1936,12 +2332,19 @@ mod tests {
         )
         .unwrap();
 
-        // Required string arguments must produce a clear dispatch error,
-        // not a confusing underlying-tool failure.
+        // Required string arguments must produce a clear invalid-params
+        // error at the schema layer (missing required property), not a
+        // confusing underlying-tool failure or an internal-error code.
         let error = call(&dispatcher, "git.stage", json!({})).unwrap_err();
-        assert!(error.to_string().contains("non-string 'path'"));
+        assert!(
+            error.to_string().contains("missing required field 'path'"),
+            "got: {error}"
+        );
         let error = call(&dispatcher, "git.unstage", json!({})).unwrap_err();
-        assert!(error.to_string().contains("non-string 'path'"));
+        assert!(
+            error.to_string().contains("missing required field 'path'"),
+            "got: {error}"
+        );
         let error = call(&dispatcher, "git.stage", json!({"path": ""})).unwrap_err();
         assert!(error.to_string().contains("non-empty 'path'"));
         let error = call(&dispatcher, "git.unstage", json!({"path": ""})).unwrap_err();
@@ -1949,14 +2352,19 @@ mod tests {
 
         // Non-string values for string-typed arguments must be rejected,
         // never silently coerced to empty strings (which would store corrupt
-        // state while reporting success).
+        // state while reporting success). The schema layer catches these
+        // before dispatch with an "expected schema type" failure.
         let error = call(
             &dispatcher,
             "memory.store",
-            json!({"id": "x", "content": 123}),
+            json!({"id": "x", "content": 123, "scope": "Project"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("non-string 'content'"));
+        assert!(
+            error.to_string().contains("arguments.content")
+                && error.to_string().contains("expected schema type"),
+            "got: {error}"
+        );
 
         let error = call(
             &dispatcher,
@@ -1964,13 +2372,24 @@ mod tests {
             json!({"id": "t3", "title": ["array"], "description": "d"}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("non-string 'title'"));
+        assert!(
+            error.to_string().contains("arguments.title")
+                && error.to_string().contains("expected schema type"),
+            "got: {error}"
+        );
 
         let error = call(&dispatcher, "workspace.read_file", json!({"path": 123})).unwrap_err();
-        assert!(error.to_string().contains("non-string 'path'"));
+        assert!(
+            error.to_string().contains("arguments.path")
+                && error.to_string().contains("expected schema type"),
+            "got: {error}"
+        );
 
         let error = call(&dispatcher, "workspace.read_file", json!({})).unwrap_err();
-        assert!(error.to_string().contains("non-string 'path'"));
+        assert!(
+            error.to_string().contains("missing required field 'path'"),
+            "got: {error}"
+        );
 
         let error = call(
             &dispatcher,
@@ -1978,7 +2397,11 @@ mod tests {
             json!({"program": 42, "args": []}),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("non-string 'program'"));
+        assert!(
+            error.to_string().contains("arguments.program")
+                && error.to_string().contains("expected schema type"),
+            "got: {error}"
+        );
     }
 
     #[test]

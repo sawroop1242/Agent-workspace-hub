@@ -43,6 +43,8 @@ pub mod global_mcp;
 pub mod http;
 /// MCP memory store.
 pub mod memory;
+/// Lifecycle events, bounded observer hooks, and tool metrics.
+pub mod observability;
 /// MCP permission validation.
 pub mod permissions;
 /// Connector provider registry.
@@ -90,8 +92,8 @@ pub use custom_mcp::{
     StreamableHttpMcpClient,
 };
 pub use dispatcher::{
-    DispatchResult, McpDispatcher, SessionLifecycle, MCP_PROTOCOL_VERSION,
-    SERVER_NOT_INITIALIZED_CODE,
+    DispatchResult, McpDispatcher, SessionLifecycle, SessionState, MCP_PROTOCOL_VERSION,
+    SERVER_NOT_INITIALIZED_CODE, SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use error::McpAuthorizationError;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
@@ -101,6 +103,10 @@ pub use global_mcp::{
 };
 pub use http::{build_router, serve, AppState, HttpServerConfig};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
+pub use observability::{
+    client_name_version, McpEvent, McpHook, McpHooks, ToolMetrics, ToolMetricsSnapshot, MAX_HOOKS,
+    MAX_TRACKED_TOOLS,
+};
 pub use permissions::{
     is_blocked_environment, is_valid_env_name, require as require_permission, McpPermissions,
     Permission,

@@ -30,10 +30,15 @@ impl StdioMcpServer {
         // Build the dispatcher on this server's own runtime — never a nested
         // one (see McpDispatcher::new_async).
         let dispatcher = runtime.block_on(McpDispatcher::new_async(project_root))?;
+        let lifecycle = SessionLifecycle::default();
+        // The stdio transport is one client per process; the session id is
+        // a stable internal label (never sent to the client).
+        lifecycle.set_transport("stdio");
+        lifecycle.set_session_id("stdio");
         Ok(Self {
             dispatcher,
             runtime,
-            lifecycle: SessionLifecycle::default(),
+            lifecycle,
         })
     }
 
@@ -45,6 +50,18 @@ impl StdioMcpServer {
     /// Whether this server's session has completed the `initialize` exchange.
     pub fn is_initialized(&self) -> bool {
         self.lifecycle.is_initialized()
+    }
+
+    /// The session state machine for this server's single stdio client.
+    pub fn session_state(&self) -> crate::mcp::SessionState {
+        self.lifecycle.state()
+    }
+
+    /// Closes the session deterministically (stdin EOF / shutdown): the
+    /// lifecycle is marked closed so any late request observes a closed
+    /// session instead of a silent drop.
+    pub fn close(&self) {
+        self.lifecycle.mark_closed();
     }
 
     /// Handles a single JSON-RPC request line, returning the JSON response.

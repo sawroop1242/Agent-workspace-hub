@@ -733,6 +733,9 @@ fn serve_stdio() -> Result<()> {
             io::stdout().flush()?;
         }
     }
+    // Deterministic shutdown: the client closed stdin (EOF), so the session
+    // is closed and the server stops cleanly.
+    server.close();
     agent_workspace_hub::mcp::audit_allow("server_stop", "stdio", "eof");
     Ok(())
 }
