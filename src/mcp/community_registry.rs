@@ -160,6 +160,7 @@ fn manifest_to_config(m: &CommunityMcpManifest) -> Result<CustomMcpServerConfig>
         args: m.args.clone(),
         url: m.url.clone(),
         env: m.env.clone(),
+        headers: Default::default(),
         permissions: Default::default(),
         enabled: true,
     })
