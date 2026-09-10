@@ -2390,6 +2390,7 @@ mod tests {
             args: Vec::new(),
             url: None,
             env: Default::default(),
+            headers: Default::default(),
             permissions,
             enabled: true,
         }

@@ -252,6 +252,30 @@ configuration → enabled? → trust decision → permission validation
   allow-listed environment keys; secret values are injected only when the
   secret name appears in the server's own configuration, and only when the
   matching secret permission was granted.
+* **HTTP servers carry configured headers.** `awh mcp add` accepts
+  `--header NAME=VALUE` (repeatable) for streamable-HTTP servers; every
+  header is sent on each request. Header names must be RFC 7230 tokens and
+  values must be control-character-free (CR/LF would smuggle extra
+  headers into the request — rejected at config time, not request time).
+  The recommended pattern keeps credentials out of `.agent/mcps.json`
+  entirely:
+
+  ```bash
+  awh mcp add composio-hosted --name "Composio hosted MCP" \
+      --transport streamablehttp --url https://connect.composio.dev/mcp \
+      --header 'x-consumer-api-key=${secret:COMPOSIO_CONSUMER_API_KEY}' \
+      --secret COMPOSIO_CONSUMER_API_KEY
+  awh mcp trust composio-hosted
+  COMPOSIO_CONSUMER_API_KEY=ck_… awh mcp serve
+  ```
+
+  `${secret:NAME}` values are resolved from the serving process's
+  environment only when the server was granted that secret via
+  `--secret` (which grants both `secrets` and `environment` read
+  permission — `McpPermissions::validate` requires the pair); an
+  unapproved reference fails closed at registration, and a paste of a
+  raw credential into `--header` prints a warning recommending the
+  `${secret:…}` indirection.
 * No automatic trust escalation: nothing a server does at runtime can
   upgrade its approval.
 
