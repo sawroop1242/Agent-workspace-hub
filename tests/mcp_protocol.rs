@@ -629,6 +629,164 @@ async fn notification_without_id_is_silent() {
 }
 
 #[tokio::test]
+async fn malformed_jsonrpc_members_get_invalid_request() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let bad: Vec<(&str, &str)> = vec![
+        ("missing", r#"{"id":1,"method":"ping"}"#),
+        ("null", r#"{"jsonrpc":null,"id":1,"method":"ping"}"#),
+        ("number", r#"{"jsonrpc":123,"id":1,"method":"ping"}"#),
+        ("boolean", r#"{"jsonrpc":true,"id":1,"method":"ping"}"#),
+        ("array", r#"{"jsonrpc":["2.0"],"id":1,"method":"ping"}"#),
+        (
+            "object",
+            r#"{"jsonrpc":{"v":"2.0"},"id":1,"method":"ping"}"#,
+        ),
+        (
+            "wrong version",
+            r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+        ),
+        ("empty string", r#"{"jsonrpc":"","id":1,"method":"ping"}"#),
+    ];
+    for (case, input) in bad {
+        let response = dispatch(&dispatcher, input, &lifecycle).await;
+        assert_eq!(
+            response["error"]["code"], -32600,
+            "jsonrpc {case} must be -32600, got: {response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("jsonrpc"),
+            "{case}: message must name the jsonrpc member: {response}"
+        );
+        assert!(response["result"].is_null(), "{case}: no result on error");
+    }
+    // The valid form still works.
+    let response = dispatch(
+        &dispatcher,
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        &lifecycle,
+    )
+    .await;
+    assert!(response["result"].is_object(), "got: {response}");
+}
+
+/// Malformed `method` members must produce `-32600` — a structurally
+/// invalid method is NOT a "method not found" (-32601) case.
+#[tokio::test]
+async fn malformed_method_members_get_invalid_request_not_method_not_found() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let bad: Vec<(&str, &str)> = vec![
+        ("missing", r#"{"jsonrpc":"2.0","id":1}"#),
+        ("null", r#"{"jsonrpc":"2.0","id":1,"method":null}"#),
+        ("number", r#"{"jsonrpc":"2.0","id":1,"method":123}"#),
+        ("boolean", r#"{"jsonrpc":"2.0","id":1,"method":true}"#),
+        ("array", r#"{"jsonrpc":"2.0","id":1,"method":["ping"]}"#),
+        (
+            "object",
+            r#"{"jsonrpc":"2.0","id":1,"method":{"m":"ping"}}"#,
+        ),
+        ("empty string", r#"{"jsonrpc":"2.0","id":1,"method":""}"#),
+    ];
+    for (case, input) in bad {
+        let response = dispatch(&dispatcher, input, &lifecycle).await;
+        assert_eq!(
+            response["error"]["code"], -32600,
+            "method {case} must be -32600, got: {response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("method"),
+            "{case}: message must name the method member: {response}"
+        );
+    }
+    // A well-formed but UNKNOWN method stays -32601 (not -32600) — once
+    // the session is initialized so the lifecycle gate doesn't preempt.
+    let init = request(Some(json!(8)), "initialize", init_params());
+    let response = dispatch(&dispatcher, &init, &lifecycle).await;
+    assert!(response["result"].is_object(), "init failed: {response}");
+    let response = dispatch(
+        &dispatcher,
+        r#"{"jsonrpc":"2.0","id":1,"method":"no/such/method"}"#,
+        &lifecycle,
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32601, "got: {response}");
+}
+
+/// MCP request ids: strings and numbers are valid (and echoed back);
+/// booleans, arrays, and objects are malformed ids → `-32600`. The
+/// notification (absent id) vs request (present id) distinction is
+/// preserved — including `id: null` staying a REQUEST.
+#[tokio::test]
+async fn invalid_id_types_get_invalid_request_and_valid_ids_are_echoed() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let bad: Vec<(&str, &str)> = vec![
+        (
+            "boolean true",
+            r#"{"jsonrpc":"2.0","id":true,"method":"ping"}"#,
+        ),
+        (
+            "boolean false",
+            r#"{"jsonrpc":"2.0","id":false,"method":"ping"}"#,
+        ),
+        ("array", r#"{"jsonrpc":"2.0","id":[],"method":"ping"}"#),
+        ("object", r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#),
+    ];
+    for (case, input) in bad {
+        let response = dispatch(&dispatcher, input, &lifecycle).await;
+        assert_eq!(
+            response["error"]["code"], -32600,
+            "id {case} must be -32600, got: {response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("string or number"),
+            "{case}: message must describe valid id types: {response}"
+        );
+    }
+
+    // Valid ids: strings (even empty), integers (0, negative, large), and
+    // fractional numbers are all accepted and echoed verbatim.
+    let valid: Vec<(&str, Value)> = vec![
+        ("string", json!("abc")),
+        ("empty string", json!("")),
+        ("zero", json!(0)),
+        ("one", json!(1)),
+        ("negative", json!(-1)),
+        ("large integer", json!(9007199254740993i64)),
+        ("float", json!(1.5)),
+    ];
+    for (case, id) in valid {
+        let input = json!({"jsonrpc": "2.0", "id": id, "method": "ping"}).to_string();
+        let response = dispatch(&dispatcher, &input, &lifecycle).await;
+        assert_eq!(
+            response["id"], id,
+            "{case}: valid id must be echoed back, got: {response}"
+        );
+        assert!(
+            response["result"].is_object(),
+            "{case}: ping must succeed, got: {response}"
+        );
+    }
+
+    // Pre-init the session so the lifecycle gate is READY for the pings
+    // above too (the -32600/-32601 structural errors must fire regardless
+    // of lifecycle state — the envelope is validated before the gate).
+    let init = request(Some(json!(999)), "initialize", init_params());
+    let response = dispatch(&dispatcher, &init, &lifecycle).await;
+    assert!(response["result"].is_object());
+}
+
+#[tokio::test]
 async fn request_with_numeric_id_returns_response_with_same_id() {
     let (dispatcher, _dir) = new_dispatcher().await;
     let lifecycle = SessionLifecycle::default();
@@ -1105,4 +1263,109 @@ async fn tool_metadata_categories_are_explicit() {
         agent_workspace_hub::mcp::tool_metadata("mcp.status").0,
         "system"
     );
+}
+
+/// The registry replaces name-prefix heuristics: NO tool may inherit a
+/// category from its name prefix. `workspace.weird_new_tool` (not in the
+/// registry) must be "uncategorized", while registered tools resolve
+/// exactly by name.
+#[tokio::test]
+async fn registry_lookup_has_no_prefix_inference() {
+    use agent_workspace_hub::mcp::tool_registry;
+    // A plausible-but-unregistered name must NOT resolve.
+    assert!(tool_registry::registry_lookup("workspace.new_unregistered").is_none());
+    assert!(tool_registry::registry_lookup("github.future_tool").is_none());
+    assert!(tool_registry::registry_lookup("git").is_none());
+    // And tool_metadata therefore reports it as uncategorized — not
+    // "workspace"/"github" by prefix.
+    assert_eq!(
+        agent_workspace_hub::mcp::tool_metadata("workspace.new_unregistered").0,
+        "uncategorized"
+    );
+    // Registered names resolve exactly.
+    let def = tool_registry::registry_lookup("terminal.run").unwrap();
+    assert_eq!(def.category, "terminal");
+    assert_eq!(def.provider, "awh");
+}
+
+/// Every tool in the static catalog MUST have explicit registry metadata
+/// (category, versions, provider, risk, permissions). This test is the
+/// registry/catalog contract: adding a tool to `tools_list_static`
+/// without a registry entry fails the build.
+#[tokio::test]
+async fn every_static_tool_has_registry_metadata() {
+    use agent_workspace_hub::mcp::tool_registry;
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let static_catalog = dispatcher.tools_list_static();
+    let tools = static_catalog
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !tools.is_empty(),
+        "static catalog must not be empty — the dispatcher fixture is broken"
+    );
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or_default().to_string();
+        let def = tool_registry::registry_lookup(&name).unwrap_or_else(|| {
+            panic!("tool '{name}' has no registry entry — add one to tool_registry.rs")
+        });
+        assert!(
+            !def.category.is_empty() && def.category != "uncategorized",
+            "{name}: registry category must be explicit"
+        );
+        assert!(
+            !def.tool_version.is_empty(),
+            "{name}: tool version must be present"
+        );
+        assert_eq!(def.schema_version, tool_registry::SCHEMA_FORMAT_VERSION);
+        assert_eq!(def.provider, "awh");
+    }
+}
+
+/// tools/list must expose the registry metadata per tool: category,
+/// version, schemaVersion, provider, risk, and requiredPermissions for
+/// static tools. Dynamic tools get category/version/schemaVersion/provider
+/// but NO risk (AWH must not guess it).
+#[tokio::test]
+async fn tools_list_carries_registry_metadata() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let init = request(Some(json!(6)), "initialize", init_params());
+    let response = dispatch(&dispatcher, &init, &lifecycle).await;
+    assert!(response["result"].is_object(), "init failed: {response}");
+    let response = dispatch(
+        &dispatcher,
+        &request(Some(json!(7)), "tools/list", json!({})),
+        &lifecycle,
+    )
+    .await;
+    let tools = response["result"]["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!tools.is_empty());
+
+    let terminal = tools
+        .iter()
+        .find(|t| t["name"] == "terminal.run")
+        .expect("terminal.run listed");
+    assert_eq!(terminal["category"], "terminal");
+    assert_eq!(terminal["provider"], "awh");
+    assert_eq!(terminal["risk"], "high");
+    assert_eq!(terminal["schemaVersion"], 1);
+    assert_eq!(terminal["requiredPermissions"], json!(["process"]));
+    assert!(
+        !terminal["version"].as_str().unwrap_or_default().is_empty(),
+        "tool version emitted: {terminal}"
+    );
+
+    let read = tools
+        .iter()
+        .find(|t| t["name"] == "workspace.read_file")
+        .expect("workspace.read_file listed");
+    assert_eq!(read["category"], "workspace");
+    assert_eq!(read["risk"], "low");
+    assert_eq!(read["requiredPermissions"], json!(["filesystem"]));
 }

@@ -31,9 +31,29 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-/// Upper bound on how long a half-open probe may stay in flight before it is
-/// considered lost (e.g. the caller's future was dropped mid-call) and a
-/// fresh probe may be admitted. Keeps the breaker self-healing without
+/// Saturating metric increment: counters must pin at `u64::MAX`, never
+/// wrap to 0 (which would report a healthy provider). The CAS loop in
+/// `fetch_update` keeps concurrent increments correct.
+fn saturating_increment_u64(counter: &AtomicU64) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        })
+        .ok();
+}
+
+/// Same, for the u32 open-counter.
+fn saturating_increment_u32(counter: &AtomicU32) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        })
+        .ok();
+}
+
+/// Upper bound on how long a half-open probe may stay in flight before it
+/// is considered lost (e.g. the caller's future was dropped mid-call) and
+/// a fresh probe may be admitted. Keeps the breaker self-healing without
 /// manual intervention.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -147,7 +167,7 @@ impl CircuitBreaker {
             state.phase = Phase::Open {
                 opened_at: Instant::now(),
             };
-            self.opened_count.fetch_add(1, Ordering::Relaxed);
+            saturating_increment_u32(&self.opened_count);
             true
         } else {
             false
@@ -199,7 +219,7 @@ impl<C: McpClient> McpClient for CircuitBreakerMcpClient<C> {
         let result = if self.breaker.allow() {
             self.client.tools_list().await
         } else {
-            self.breaker.rejected_count.fetch_add(1, Ordering::Relaxed);
+            saturating_increment_u64(&self.breaker.rejected_count);
             return Err(anyhow!(
                 "MCP provider '{}' is unavailable (circuit breaker open)",
                 self.id
@@ -212,7 +232,7 @@ impl<C: McpClient> McpClient for CircuitBreakerMcpClient<C> {
         let result = if self.breaker.allow() {
             self.client.tools_call(tool, args).await
         } else {
-            self.breaker.rejected_count.fetch_add(1, Ordering::Relaxed);
+            saturating_increment_u64(&self.breaker.rejected_count);
             return Err(anyhow!(
                 "MCP provider '{}' is unavailable (circuit breaker open)",
                 self.id
@@ -243,6 +263,66 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
+
+    #[test]
+    fn rejected_count_saturates_at_max() {
+        // The breaker's rejection metric must pin at u64::MAX near the
+        // boundary (MAX-2, MAX-1, MAX) rather than wrap to 0 — a wrapped
+        // rejection count would report a healthy provider.
+        for start in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+                failure_threshold: 1,
+                cooldown: Duration::from_secs(3600),
+            });
+            breaker.rejected_count.store(start, Ordering::Relaxed);
+            for _ in 0..3 {
+                saturating_increment_u64(&breaker.rejected_count);
+            }
+            assert_eq!(
+                breaker.rejected_count(),
+                u64::MAX,
+                "rejected_count must saturate from {start:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_count_concurrent_increments_never_wrap() {
+        // Concurrent CAS increments at the boundary must converge on MAX.
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(3600),
+        }));
+        breaker
+            .rejected_count
+            .store(u64::MAX - 2, Ordering::Relaxed);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let breaker = Arc::clone(&breaker);
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        saturating_increment_u64(&breaker.rejected_count);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("thread panicked");
+        }
+        assert_eq!(breaker.rejected_count(), u64::MAX);
+    }
+
+    #[test]
+    fn opened_count_saturates_at_max() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(3600),
+        });
+        breaker.opened_count.store(u32::MAX - 1, Ordering::Relaxed);
+        saturating_increment_u32(&breaker.opened_count);
+        saturating_increment_u32(&breaker.opened_count);
+        assert_eq!(breaker.opened_count(), u32::MAX);
+    }
 
     /// A test client whose behavior is driven by atomic flags.
     struct MockClient {

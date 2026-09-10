@@ -131,6 +131,27 @@ impl McpHooks {
     }
 }
 
+/// Saturating atomic increment: a metric counter must never wrap to 0
+/// (that would silently report "no failures"); it pins at `u64::MAX`.
+/// `fetch_update` is a CAS loop, so concurrent increments are all applied —
+/// no lost updates, no torn counts, no ordering hazard.
+fn saturating_increment(counter: &AtomicU64) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        })
+        .ok();
+}
+
+/// Saturating atomic add for duration accounting.
+fn saturating_add_to(counter: &AtomicU64, amount: u64) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(amount))
+        })
+        .ok();
+}
+
 /// Per-tool call metrics (observability only — never a gate).
 #[derive(Debug, Default)]
 struct ToolStats {
@@ -187,17 +208,15 @@ impl ToolMetrics {
                 return;
             }
         };
-        stats.calls.fetch_add(1, Ordering::Relaxed);
+        saturating_increment(&stats.calls);
         if !ok {
-            stats.failures.fetch_add(1, Ordering::Relaxed);
+            saturating_increment(&stats.failures);
         }
         // Saturating u128→u64 conversion: a duration past u64::MAX
         // nanoseconds (~584 years) is recorded as the cap rather than
         // truncating modulo 2^64 (which would silently corrupt averages).
         let duration_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
-        stats
-            .total_duration_ns
-            .fetch_add(duration_ns, Ordering::Relaxed);
+        saturating_add_to(&stats.total_duration_ns, duration_ns);
     }
 
     /// A snapshot of every tracked tool's metrics, sorted by name.
@@ -247,6 +266,119 @@ pub fn client_name_version(client_info: Option<&Value>) -> Option<(&str, &str)> 
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Test-only seeding: drives one tracked tool's counters to given
+    /// values so overflow behavior can be exercised without performing
+    /// 2^64 real calls.
+    fn seed_counters(metrics: &ToolMetrics, name: &str, calls: u64, failures: u64) {
+        let stats = metrics.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = stats.get(name).expect("tool must be tracked first");
+        entry.calls.store(calls, Ordering::Relaxed);
+        entry.failures.store(failures, Ordering::Relaxed);
+    }
+
+    /// Test-only seeding for the duration counter.
+    fn seed_duration(metrics: &ToolMetrics, name: &str, total_ns: u64) {
+        let stats = metrics.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = stats.get(name).expect("tool must be tracked first");
+        entry.total_duration_ns.store(total_ns, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn tool_failure_counter_saturates_at_max() {
+        // The boundary triple u64::MAX-2, MAX-1, MAX: each recorded
+        // failure pins at MAX instead of wrapping to 0.
+        for start in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            let metrics = ToolMetrics::new(8);
+            metrics.record("tool", true, Duration::from_nanos(1)); // track it
+            seed_counters(&metrics, "tool", 1, start);
+            metrics.record("tool", false, Duration::from_nanos(1));
+            metrics.record("tool", false, Duration::from_nanos(1));
+            let snapshot = &metrics.snapshot()[0];
+            assert_eq!(
+                snapshot.failures,
+                u64::MAX,
+                "failures must saturate from {start:#x}"
+            );
+            assert_eq!(snapshot.calls, 3, "calls still counted from zero");
+        }
+    }
+
+    #[test]
+    fn tool_call_counter_saturates_at_max() {
+        for start in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            let metrics = ToolMetrics::new(8);
+            metrics.record("tool", true, Duration::from_nanos(1));
+            seed_counters(&metrics, "tool", start, 0);
+            metrics.record("tool", true, Duration::from_nanos(1));
+            metrics.record("tool", false, Duration::from_nanos(1));
+            let snapshot = &metrics.snapshot()[0];
+            assert_eq!(
+                snapshot.calls,
+                u64::MAX,
+                "calls must saturate from {start:#x}"
+            );
+            assert_eq!(snapshot.failures, 1);
+        }
+    }
+
+    #[test]
+    fn duration_counter_saturates_at_max() {
+        let metrics = ToolMetrics::new(8);
+        metrics.record("tool", true, Duration::from_nanos(1));
+        seed_duration(&metrics, "tool", u64::MAX - 1);
+        // Adding any nonzero duration must pin at MAX, not wrap.
+        metrics.record("tool", true, Duration::from_nanos(2));
+        let stats = metrics.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = stats.get("tool").expect("tracked");
+        assert_eq!(entry.total_duration_ns.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn totals_aggregate_saturates_at_max() {
+        let metrics = ToolMetrics::new(8);
+        metrics.record("a", true, Duration::from_nanos(1));
+        metrics.record("b", true, Duration::from_nanos(1));
+        seed_counters(&metrics, "a", u64::MAX, 0);
+        seed_counters(&metrics, "b", u64::MAX, 0);
+        // The aggregate must saturate rather than wrap past MAX.
+        let (tools, calls, _failures) = metrics.totals();
+        assert_eq!(tools, 2);
+        assert_eq!(calls, u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_increments_at_the_boundary_never_wrap() {
+        // Many threads increment a counter already at u64::MAX-2. Every
+        // increment is a CAS that either saturates or retries; the final
+        // value must be exactly MAX — a value BELOW the starting point
+        // (or below MAX) would prove a wrap/lost-update race.
+        let metrics = ToolMetrics::new(8);
+        metrics.record("tool", true, Duration::from_nanos(1));
+        seed_counters(&metrics, "tool", 0, u64::MAX - 2);
+        let metrics = Arc::new(metrics);
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let metrics = Arc::clone(&metrics);
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        metrics.record("tool", false, Duration::from_nanos(1));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("thread panicked");
+        }
+        let snapshot = &metrics.snapshot()[0];
+        assert_eq!(
+            snapshot.failures,
+            u64::MAX,
+            "concurrent increments must saturate at MAX, not wrap: {}",
+            snapshot.failures
+        );
+    }
 
     #[test]
     fn hooks_observe_events_in_order() {

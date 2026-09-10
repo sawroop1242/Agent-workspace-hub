@@ -117,6 +117,21 @@ strings or numbers, so `"id": null` is rejected with `-32600` (invalid
 request) rather than silently swallowed as a notification. Both semantics
 are pinned by named tests.
 
+### Structural envelope validation (-32600)
+
+Every request is structurally validated at parse time before any
+lifecycle, auth, or method dispatch: the `jsonrpc` member must be the
+string `"2.0"` (missing, `null`, non-string, or a wrong version string →
+`-32600`), the `method` member must be a non-empty string (missing, `null`,
+non-string, or empty → `-32600`, NOT `-32601`: a structurally invalid
+method is not a "method not found" case), and the `id`, when present, must
+be a string or a number (booleans, arrays, objects → `-32600`). Valid ids
+— including `0`, negative numbers, large integers, floats, and even the
+empty string `""` — are echoed back verbatim. A well-formed but unknown
+method remains `-32601`. Every rejection message names the offending
+member, so clients can fix envelopes deterministically; each class is
+pinned by test.
+
 ### Argument validation (schema-first, -32602)
 
 Tool arguments are validated against the tool's declared `inputSchema`
@@ -146,20 +161,61 @@ validate identifiers).
 
 ### Tool metadata and observability
 
-Every advertised tool carries a `category` and a `version` in its
-`tools/list` entry, so clients can group tools on stable metadata rather
-than name-prefix parsing. Categories are descriptive only — never a
-permission or capability — and any tool that matches no known category is
-labeled `uncategorized` rather than silently borrowing another category.
-The `version` is the catalog/format version shared by all static tools,
-not a per-tool release version. The dispatcher keeps bounded per-tool
-metrics (call counts, failure counts, average duration — a fixed-size map,
-never a per-tool-name allocation from untrusted input; all counters use
-saturating arithmetic so overflow can never panic or wrap) exposed via the
-read-only `mcp.status` tool alongside protocol versions, tool/provider
-counts, and uptime. `mcp.status` reports the SERVER PROCESS state
-(`running`); it is not a subsystem-health verdict — in-process subsystems
-(filesystem, skills, memory) fail per-call and surface as tool errors.
+Every static tool's `tools/list` entry carries the metadata from the
+**canonical Tool Registry** (`src/mcp/tool_registry.rs`): `category`,
+`version` (the tool's own evolution version), `schemaVersion` (the format
+version of the `inputSchema` language — currently `1`, bumped only when
+the schema language itself changes), `provider` (`awh`), `risk`
+(`low`/`medium`/`high`), and `requiredPermissions` (labels from the same
+`Permission` vocabulary the execution gate uses: `network`, `filesystem`,
+`environment`, `process`, `secrets`). The registry is addressed by EXACT
+tool name — there is no prefix inference anywhere: a tool that is not in
+the registry is `uncategorized` rather than silently borrowing a category
+from its name prefix, and an unregistered `workspace.something_new` never
+masquerades as a workspace tool. A test pins that every tool in the
+static catalog has a registry entry, so a tool cannot ship without
+explicit metadata. All of this metadata is descriptive — for discovery and
+observability; it is never a capability, permission, or security decision
+(`risk` in particular is documentation for operators, and authorization
+is unchanged by it).
+
+Dynamic tools (from connector/custom MCP providers, addressed as
+`provider.tool`) carry `category: "connector"`, the central AWH tool API
+version as their `version` (until a provider declares its own),
+`schemaVersion`, and the actual provider id as `provider`. Risk is
+deliberately NOT emitted for dynamic tools: providers do not declare it
+and AWH will not guess.
+
+The dispatcher keeps bounded per-tool metrics (call counts, failure
+counts, average duration — a fixed-size map, never a per-tool-name
+allocation from untrusted input; all counters are CAS-loop saturating
+atomics, so concurrent increments are never lost and overflow pins at
+`u64::MAX` instead of wrapping to 0) exposed via the read-only
+`mcp.status` tool alongside protocol versions, tool/provider counts, and
+uptime. `mcp.status` reports the SERVER PROCESS state (`running`); it is
+not a subsystem-health verdict — in-process subsystems (filesystem,
+skills, memory) fail per-call and surface as tool errors.
+
+### Dynamic provider tools: exposure and invocation gates
+
+Connector/custom-MCP tools are validated at TWO independent layers, and
+AWH never relies solely on the provider:
+
+* **Exposure gate.** `tools/list` drops any dynamic tool whose advertised
+  `inputSchema` is structurally malformed (a schema that is not an
+  object, `required` that is not an array of strings, an uncompilable
+  `pattern`, a nested subschema that is not an object, or keywords this
+  validator does not support such as `$ref`). The rejection is per-tool —
+  one bad advertisement never hides a provider's healthy siblings — and
+  each drop is audited (`dynamic_tool_rejected`) and logged.
+* **Invocation gate.** `tools/call` on a `provider.tool` name — and the
+  equivalent generic `connector.invoke` path, which cannot be used to
+  bypass the direct path — looks up the advertised schema and validates
+  the arguments AWH-side BEFORE the provider is invoked. Mismatches fail
+  closed with `-32602` and an audit deny (`tool_validation`); a schema
+  that could not be advertised is also not invocable directly. Provider-
+  side validation (e.g. the stdio client's own schema check) remains as
+  defense-in-depth.
 
 Lifecycle events (tool calls, resource reads, prompt requests,
 notifications) are also delivered to registered **observer-only hooks**

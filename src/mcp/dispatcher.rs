@@ -9,15 +9,16 @@ use crate::context::{
     ContextEngine, ContextEngineConfig, ContextItem, ContextRequest, ContextScope, ContextSource,
 };
 use crate::mcp::{
-    audit_allow, audit_deny, authorize_mcp_execution, client_name_version, validate_tool_arguments,
-    AuthMethod, CircuitBreakerConfig, CircuitBreakerMcpClient, ComposioAccount, ComposioAuth,
-    ComposioProvider, ComposioRegistry, Connector, ConnectorsMcp, CustomMcpProvider,
-    CustomMcpRegistry, CustomMcpServerConfig, GithubProvider, McpEvent, McpExecutionRequest,
-    McpHook, McpHooks, McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore,
-    ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp, StdioMcpClient,
-    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, ToolMetrics, WorkspaceMcp,
-    MAX_TRACKED_TOOLS,
+    audit_allow, audit_deny, authorize_mcp_execution, client_name_version, validate_schema,
+    validate_schema_syntax, validate_tool_arguments, AuthMethod, CircuitBreakerConfig,
+    CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider, ComposioRegistry,
+    Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, CustomMcpServerConfig,
+    GithubProvider, McpEvent, McpExecutionRequest, McpHook, McpHooks, McpTransport, MemoryMcp,
+    MemoryScope, PersistentTrustStore, ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp,
+    StdioMcpClient, StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, ToolMetrics,
+    WorkspaceMcp, MAX_TRACKED_TOOLS,
 };
+use crate::mcp::{permissions, tool_registry};
 use crate::services::git::GitService;
 use crate::services::terminal::TerminalService;
 use anyhow::{bail, Result};
@@ -284,6 +285,12 @@ pub struct RpcRequest {
     pub id_present: bool,
     pub method: String,
     pub params: Value,
+    /// Whether `jsonrpc` was present, a string, and exactly `"2.0"`.
+    /// A malformed member must surface as `-32600` with a precise message,
+    /// never silently default to `""`.
+    pub jsonrpc_valid: bool,
+    /// Whether `method` was present, a string, and non-empty.
+    pub method_valid: bool,
 }
 
 impl<'de> Deserialize<'de> for RpcRequest {
@@ -295,22 +302,63 @@ impl<'de> Deserialize<'de> for RpcRequest {
         let object = raw
             .as_object()
             .ok_or_else(|| serde::de::Error::custom("request must be a JSON object"))?;
+        let jsonrpc = object.get("jsonrpc");
+        let method = object.get("method");
         Ok(RpcRequest {
-            jsonrpc: object
-                .get("jsonrpc")
+            jsonrpc: jsonrpc
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
             id: object.get("id").cloned(),
             id_present: object.contains_key("id"),
-            method: object
-                .get("method")
+            method: method
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
             params: object.get("params").cloned().unwrap_or_else(|| json!({})),
+            // Structural validity is captured at parse time so dispatch can
+            // reject malformed members with precise -32600 messages instead
+            // of discovering a silently-defaulted "" later.
+            jsonrpc_valid: jsonrpc.and_then(Value::as_str) == Some("2.0"),
+            method_valid: method
+                .and_then(Value::as_str)
+                .is_some_and(|m| !m.is_empty()),
         })
     }
+}
+
+/// Structural JSON-RPC validation shared by every dispatch path: `jsonrpc`
+/// must be the string `"2.0"`, `method` must be a non-empty string, and a
+/// present `id` must be a string or number (MCP). Returns the `-32600`
+/// error for the first violation, or `None` when the envelope is valid.
+///
+/// Called after the notification/`id: null` checks (which must keep their
+/// own precedence: an absent id is a notification even when the rest of
+/// the message is malformed, and the protocol forbids replying to it).
+fn validate_envelope(req: &RpcRequest) -> Option<DispatchError> {
+    if !req.jsonrpc_valid {
+        return Some(DispatchError::invalid_request(
+            "'jsonrpc' must be the string \"2.0\"",
+        ));
+    }
+    if !req.method_valid {
+        return Some(DispatchError::invalid_request(
+            "'method' must be a non-empty string",
+        ));
+    }
+    // MCP request ids: strings or numbers only. Booleans, arrays, and
+    // objects are malformed request ids (-32600), never echoed as valid.
+    if req.id_present
+        && !matches!(
+            req.id.as_ref(),
+            Some(Value::String(_)) | Some(Value::Number(_))
+        )
+    {
+        return Some(DispatchError::invalid_request(
+            "request 'id' must be a string or number",
+        ));
+    }
+    None
 }
 
 /// A JSON-RPC response envelope.
@@ -676,7 +724,7 @@ impl McpDispatcher {
         // A PRESENT `id` makes the message a request — even `id: null`
         // (JSON-RPC 2.0 §Request object: notifications lack the id member;
         // MCP additionally forbids null request ids, handled below).
-        let id = req.id;
+        let id = req.id.clone();
         if !req.id_present {
             self.hooks.fire(&McpEvent::NotificationReceived {
                 method: &req.method,
@@ -699,11 +747,12 @@ impl McpDispatcher {
             }));
         }
 
-        if req.jsonrpc != "2.0" {
-            return Err(DispatchError::invalid_request(format!(
-                "unsupported JSON-RPC version: {}",
-                req.jsonrpc
-            )));
+        // Full structural validation (jsonrpc member, method member, id
+        // type) with precise -32600 messages, replacing the bare
+        // version-only check.
+        if let Some(error) = validate_envelope(&req) {
+            audit_deny("request_rejected", "invalid_envelope", &req.method);
+            return Err(error);
         }
 
         lifecycle.touch();
@@ -808,15 +857,9 @@ impl McpDispatcher {
     async fn dispatch_inner(&self, input: &str) -> Result<DispatchResult, DispatchError> {
         let req: RpcRequest = serde_json::from_str(input)
             .map_err(|e| DispatchError::parse(format!("invalid JSON: {e}")))?;
-        if req.jsonrpc != "2.0" {
-            return Err(DispatchError::invalid_request(format!(
-                "unsupported JSON-RPC version: {}",
-                req.jsonrpc
-            )));
-        }
 
         // Notifications (no `id` member) produce no response.
-        let id = req.id;
+        let id = req.id.clone();
         let is_notification = !req.id_present;
 
         // Notifications produce no response (JSON-RPC 2.0). `notifications/
@@ -825,6 +868,15 @@ impl McpDispatcher {
         // the protocol forbids replying to notifications.
         if is_notification {
             return Ok(DispatchResult::NoResponse);
+        }
+
+        // Structural validation AFTER the notification check: a request
+        // (id present) with a malformed `jsonrpc`/`method` member or an
+        // invalid id type gets a precise `-32600`, never a silently
+        // defaulted "" flowing into method dispatch.
+        if let Some(error) = validate_envelope(&req) {
+            audit_deny("request_rejected", "invalid_envelope", &req.method);
+            return Err(error);
         }
 
         let started = std::time::Instant::now();
@@ -954,27 +1006,62 @@ impl McpDispatcher {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        // Attach catalog metadata (category, tool version) to every static
+        // Attach the canonical Tool Registry metadata to every static
         // tool entry. Extra fields on a Tool object are ignored by MCP
         // clients (the SDK schemas are permissive), so this is additive.
         for tool in &mut base {
-            if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                let (category, version) = tool_metadata(name);
-                if let Some(tool) = tool.as_object_mut() {
-                    tool.insert("category".to_string(), json!(category));
-                    tool.insert("version".to_string(), json!(version));
+            let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let Some(tool_entry) = tool.as_object_mut() else {
+                continue;
+            };
+            match tool_registry::registry_lookup(&name) {
+                Some(def) => {
+                    tool_entry.insert("category".to_string(), json!(def.category));
+                    tool_entry.insert("version".to_string(), json!(def.tool_version));
+                    tool_entry.insert("schemaVersion".to_string(), json!(def.schema_version));
+                    tool_entry.insert("provider".to_string(), json!(def.provider));
+                    tool_entry.insert("risk".to_string(), json!(def.risk.as_str()));
+                    let permissions: Vec<&str> = def
+                        .required_permissions
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect();
+                    tool_entry.insert("requiredPermissions".to_string(), json!(permissions));
+                }
+                // A static catalog tool with no registry entry is a bug:
+                // fail loudly in tests, never silently emit unclassified
+                // metadata. (The exhaustiveness test pins this.)
+                None => {
+                    let (category, version) = tool_metadata(&name);
+                    tool_entry.insert("category".to_string(), json!(category));
+                    tool_entry.insert("version".to_string(), json!(version));
                 }
             }
         }
         let registry = self.providers.read().await;
         let dynamic = registry.aggregate_tools().await?;
         for tool in dynamic {
-            base.push(serde_json::to_value(tool)?);
+            let meta = dynamic_tool_metadata(&tool.name);
+            let mut entry = serde_json::to_value(tool)?;
+            if let Some(entry) = entry.as_object_mut() {
+                entry.insert("category".to_string(), json!(meta.category));
+                entry.insert("version".to_string(), json!(meta.tool_version));
+                entry.insert("schemaVersion".to_string(), json!(meta.schema_version));
+                entry.insert("provider".to_string(), json!(meta.provider));
+                // Risk is deliberately NOT emitted for dynamic tools: the
+                // provider does not declare it and AWH must not guess.
+            }
+            base.push(entry);
         }
         Ok(json!({"tools": base}))
     }
 
-    fn tools_list_static(&self) -> Value {
+    /// The static AWH tool catalog (no registry metadata attached, no
+    /// dynamic provider tools). Public so tests and tooling can verify
+    /// catalog/registry exhaustiveness.
+    pub fn tools_list_static(&self) -> Value {
         // Split into two macro invocations to stay under the macro
         // recursion limit; merged into one array below.
         let core = json!([
@@ -1515,6 +1602,12 @@ impl McpDispatcher {
                 // External connector invocations are security-relevant: log the
                 // provider and tool (never the arguments, which may hold secrets).
                 audit_allow("connector_invoke", provider, tool);
+                // AWH-side validation for the generic invoke path too: the
+                // same schema gate as direct `provider.tool` calls. A dynamic
+                // tool cannot bypass schema validation by addressing itself
+                // through `connector.invoke`.
+                let qualified = format!("{provider}.{tool}");
+                self.validate_dynamic_arguments(&qualified, &args).await?;
                 let registry = self.providers.read().await;
                 serde_json::to_value(registry.invoke(provider, tool, args).await?)?
             }
@@ -1942,6 +2035,11 @@ impl McpDispatcher {
                 serde_json::to_value(terminal.run(&program, &args).await?)?
             }
             _ if name.contains('.') => {
+                // AWH-side argument validation for dynamic tools: the
+                // arguments must match the schema the provider advertised
+                // (the same one tools/list gates). Provider-side validation
+                // remains as defense-in-depth; AWH does not rely on it.
+                self.validate_dynamic_arguments(name, &arguments).await?;
                 let registry = self.providers.read().await;
                 serde_json::to_value(registry.invoke_qualified(name, arguments).await?)?
             }
@@ -1955,6 +2053,48 @@ impl McpDispatcher {
         Ok(json!({
             "content": [{"type": "text", "text": serde_json::to_string(&value)?}]
         }))
+    }
+
+    /// Looks up a dynamic (`provider.tool`) tool's advertised schema and
+    /// validates the call arguments against it BEFORE the provider is
+    /// invoked. Malformed advertised schemas and schema mismatches both
+    /// fail closed as `-32602` invalid params.
+    async fn validate_dynamic_arguments(
+        &self,
+        qualified_name: &str,
+        arguments: &Value,
+    ) -> Result<()> {
+        let Some((provider, tool)) = qualified_name.split_once('.') else {
+            bail!("tool must use provider.tool format");
+        };
+        let descriptors = {
+            let registry = self.providers.read().await;
+            registry.tools(provider).await?
+        };
+        let Some(descriptor) = descriptors.iter().find(|d| d.name == tool) else {
+            audit_deny("tool_validation", "unknown_dynamic_tool", qualified_name);
+            return Err(
+                DispatchError::invalid_params(format!("unknown tool: {qualified_name}")).into(),
+            );
+        };
+        // Both the schema's syntax and the arguments against it: a schema
+        // that could not be advertised (tools/list drops it) must also not
+        // be invocable directly.
+        if let Err(error) = validate_schema_syntax(&descriptor.input_schema, "#") {
+            audit_deny("tool_validation", "malformed_tool_schema", qualified_name);
+            return Err(DispatchError::invalid_params(format!(
+                "tool '{qualified_name}' has a malformed input schema: {error}"
+            ))
+            .into());
+        }
+        if let Err(error) = validate_schema(&descriptor.input_schema, arguments, "arguments", "#") {
+            audit_deny("tool_validation", "dynamic_schema_mismatch", qualified_name);
+            return Err(DispatchError::invalid_params(format!(
+                "invalid arguments for '{qualified_name}': {error}"
+            ))
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -2001,31 +2141,52 @@ fn github_tool_schemas() -> Value {
 /// Catalog metadata for one tool: its category (for discovery and
 /// observability — never a security boundary) and its tool version.
 ///
-/// The version is the *tool's* evolution version, `"1.0.0"` for the whole
-/// catalog today; it changes only when a tool's schema or behavior changes
-/// and lets clients detect deprecations deterministically.
+/// Categories are purely descriptive metadata for clients — they are
+/// never capabilities, permissions, or policy.
+///
+/// The static catalog is resolved EXACTLY by name through the canonical
+/// Tool Registry ([`crate::mcp::tool_registry`]). There is deliberately
+/// NO name-prefix fallback: a name that is not a registered tool is
+/// "uncategorized" rather than silently inheriting a category from its
+/// prefix — a future or dynamic tool must never masquerade as, say, a
+/// "workspace" tool just because its name starts with `workspace.`.
 pub fn tool_metadata(name: &str) -> (&'static str, &'static str) {
-    // Categories are purely descriptive metadata for clients — they are
-    // never capabilities, permissions, or policy. Every tool in the static
-    // catalog matches one arm; anything else gets an EXPLICIT
-    // "uncategorized" label rather than silently masquerading as
-    // "workspace" (a future tool must never inherit a misleading category).
-    // The version is the catalog/format version shared by all static
-    // tools, not a per-tool release version.
-    let category = match name {
-        "mcp.status" => "system",
-        _ if name.starts_with("skills.") => "skills",
-        _ if name.starts_with("workspace.") => "workspace",
-        _ if name.starts_with("memory.") => "memory",
-        _ if name.starts_with("tasks.") => "tasks",
-        _ if name.starts_with("connectors.") || name.starts_with("connector.") => "connector",
-        _ if name.starts_with("context.") => "context",
-        _ if name.starts_with("git.") => "git",
-        _ if name.starts_with("terminal.") => "terminal",
-        _ if name.starts_with("github.") => "github",
-        _ => "uncategorized",
-    };
-    (category, "1.0.0")
+    match tool_registry::registry_lookup(name) {
+        Some(tool) => (tool.category, tool.tool_version),
+        None => ("uncategorized", tool_registry::AWH_TOOL_API_VERSION),
+    }
+}
+
+/// The full explicit metadata record for a tool: registry entry for
+/// static tools; a synthesized record for dynamic (`provider.tool`)
+/// tools carrying what the provider declared plus the central AWH tool
+/// API version as the tool version fallback.
+pub struct DynamicToolMetadata {
+    pub category: &'static str,
+    pub tool_version: &'static str,
+    pub schema_version: u32,
+    pub provider: String,
+    pub risk: Option<tool_registry::ToolRisk>,
+    pub required_permissions: &'static [permissions::Permission],
+}
+
+/// Metadata for a dynamic tool: the provider id is explicit from the
+/// qualified name; the category is the dedicated `connector` category;
+/// risk is NOT asserted (providers do not declare it and AWH must not
+/// guess); the tool version defaults to the central AWH tool API version
+/// until the provider declares its own.
+pub fn dynamic_tool_metadata(qualified_name: &str) -> DynamicToolMetadata {
+    DynamicToolMetadata {
+        category: "connector",
+        tool_version: tool_registry::AWH_TOOL_API_VERSION,
+        schema_version: tool_registry::SCHEMA_FORMAT_VERSION,
+        provider: qualified_name
+            .split_once('.')
+            .map(|(provider, _)| provider.to_string())
+            .unwrap_or_default(),
+        risk: None,
+        required_permissions: &[],
+    }
 }
 
 /// Whether a dispatch result is a success response (no `error` field). Used

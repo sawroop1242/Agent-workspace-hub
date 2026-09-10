@@ -38,6 +38,19 @@ pub enum Permission {
     Secrets,
 }
 
+impl Permission {
+    /// Stable wire label used in tool metadata (`requiredPermissions`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::Network => "network",
+            Permission::Filesystem => "filesystem",
+            Permission::Environment => "environment",
+            Permission::Process => "process",
+            Permission::Secrets => "secrets",
+        }
+    }
+}
+
 const BLOCKED_ENVIRONMENT: &[&str] = &[
     "PATH",
     "LD_PRELOAD",

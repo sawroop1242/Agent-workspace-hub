@@ -67,6 +67,8 @@ pub mod store_lock;
 pub mod tasks;
 /// TLS configuration for the remote transport.
 pub mod tls;
+/// Canonical Tool Registry: explicit per-tool metadata.
+pub mod tool_registry;
 /// MCP trust and approval policy.
 pub mod trust;
 /// Persistent trust store.
@@ -120,7 +122,7 @@ pub use providers::{
 #[cfg(target_os = "linux")]
 pub use sandbox::wrap_command_with;
 pub use sandbox::{sandbox_available, wrap_command, SandboxConfig, SandboxLimits};
-pub use schema::validate_tool_arguments;
+pub use schema::{validate_schema, validate_schema_syntax, validate_tool_arguments};
 pub use security::{
     atomic_write, secure_destination, secure_path, sha256_file, validate_command, validate_id,
     validate_url, verify_sha256, PackageIntegrity,
