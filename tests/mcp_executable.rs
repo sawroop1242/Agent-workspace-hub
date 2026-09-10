@@ -130,7 +130,7 @@ fn stdio_round_trip_initialize_call_status_shutdown() {
         );
     }
 
-    // mcp.status via tools/call → healthy snapshot inside the envelope.
+    // mcp.status via tools/call → running-state snapshot inside the envelope.
     // A prior successful tool call must show up in the metrics snapshot
     // (the status call itself is recorded only after its own result is
     // serialized, so it cannot count itself).
@@ -154,7 +154,7 @@ fn stdio_round_trip_initialize_call_status_shutdown() {
         .as_str()
         .expect("mcp.status content envelope");
     let status: Value = serde_json::from_str(text).expect("status payload is JSON");
-    assert_eq!(status["status"], "healthy");
+    assert_eq!(status["status"], "running");
     assert!(
         status["metrics"]["tool_calls"].as_u64().unwrap() >= 1,
         "prior memory.search call must be counted: {status}"

@@ -89,7 +89,10 @@ except `initialize` and `ping` — is rejected with JSON-RPC error `-32002`
 (server not initialized), and the denial is audited. A malformed
 `initialize` (bad params) returns `-32602` and leaves the session
 uninitialized so the client can retry; a duplicate `initialize` on a live
-session is a deterministic `-32600`. Notifications are accepted silently at
+session is a deterministic `-32600` — including under concurrency: the
+New→Ready transition is a single atomic compare-and-swap, so of two racing
+`initialize` requests exactly one wins and the loser receives `-32600`
+(pinned by test). Notifications are accepted silently at
 every stage, matching the MCP reference servers.
 
 ### Protocol version negotiation
@@ -102,32 +105,68 @@ can detect the downgrade. Unparseable requests get `-32700` with `id: null`;
 JSON-RPC batches (arrays) are not part of MCP and are rejected as parse
 errors, pinned by test.
 
+### Request ids: absent means notification, `null` means invalid
+
+The `id` member's PRESENCE — not its value — distinguishes a request from
+a notification (JSON-RPC 2.0). A message with no `id` member is a
+notification: the method is observed, and no response is ever emitted —
+including for `tools/call` and for notifications that arrive while the
+session is closed or uninitialized. A message with a PRESENT `id` is a
+request, even when the value is `null`; MCP requires request ids to be
+strings or numbers, so `"id": null` is rejected with `-32600` (invalid
+request) rather than silently swallowed as a notification. Both semantics
+are pinned by named tests.
+
 ### Argument validation (schema-first, -32602)
 
 Tool arguments are validated against the tool's declared `inputSchema`
-**before** the handler runs: unknown fields, missing required fields, wrong
-types, non-string enum values, and `additionalProperties` violations all
-return a single standardized `-32602` (invalid params) error whose message
-names the failing field — for example
+**before** the handler runs: missing required fields, wrong types,
+non-string enum values, and structurally malformed payloads (arrays where
+objects are required, nulls where values are required) all return a single
+standardized `-32602` (invalid params) error whose message names the
+failing field — for example
 `MCP argument validation failed at arguments.status: value is not allowed`.
 Handler code never has to re-check types it declared in its schema, and
-deeply nested payloads are capped by a depth guard.
+deeply nested payloads are capped by a depth guard. Note that schemas
+deliberately do NOT set `additionalProperties: false`: unknown but
+well-typed extra fields are ignored (standard JSON-Schema permissiveness),
+so real clients may pass optional metadata without breaking — structural
+violations still fail closed before the handler runs.
+
+### Resource URIs are validated at the MCP boundary
+
+`resources/read` accepts only `awh://<kind>[/single-segment-id]` where the
+id may not contain path separators, traversal patterns (literal or
+percent-encoded `..`), percent signs, NUL, or control characters, and the
+total uri is length-capped. `awh://context` is the only segment-less form.
+Malformed uris are rejected with `-32602` at the protocol boundary —
+never passed downstream for the filesystem to reject — so traversal is a
+protocol error, not an fs-layer concern (defense in depth: stores still
+validate identifiers).
 
 ### Tool metadata and observability
 
 Every advertised tool carries a `category` and a `version` in its
-`tools/list` entry, so clients can group and gate on stable metadata rather
-than name-prefix parsing. The dispatcher keeps bounded per-tool metrics
-(call counts, failure counts, average duration — a fixed-size map, never a
-per-tool-name allocation from untrusted input) exposed via the read-only
-`mcp.status` tool alongside protocol versions, tool/provider counts, and
-uptime.
+`tools/list` entry, so clients can group tools on stable metadata rather
+than name-prefix parsing. Categories are descriptive only — never a
+permission or capability — and any tool that matches no known category is
+labeled `uncategorized` rather than silently borrowing another category.
+The `version` is the catalog/format version shared by all static tools,
+not a per-tool release version. The dispatcher keeps bounded per-tool
+metrics (call counts, failure counts, average duration — a fixed-size map,
+never a per-tool-name allocation from untrusted input; all counters use
+saturating arithmetic so overflow can never panic or wrap) exposed via the
+read-only `mcp.status` tool alongside protocol versions, tool/provider
+counts, and uptime. `mcp.status` reports the SERVER PROCESS state
+(`running`); it is not a subsystem-health verdict — in-process subsystems
+(filesystem, skills, memory) fail per-call and surface as tool errors.
 
 Lifecycle events (tool calls, resource reads, prompt requests,
 notifications) are also delivered to registered **observer-only hooks**
 (`McpEvent`). Hooks cannot veto, mutate, or reorder dispatch — they exist
-for local observability, and a panicking hook is contained without breaking
-the registry.
+for local observability, and a panicking hook is contained: the panic is
+recorded, the hook is skipped, and the remaining hooks and the dispatch
+itself proceed unaffected.
 
 ### Custom MCP servers: trust is enforced, not stored
 

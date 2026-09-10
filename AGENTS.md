@@ -93,8 +93,35 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 ## Phase Status
 
 0-11 done (branch rust; Phase 11 via PR #10, CI green on all 3 platforms).
-Next: none — implementation plan complete; future phases would be new spec
-work.
+**PR #15 (mcp-protocol-hardening) — MCP protocol hardening round**: landed
+per-hook `catch_unwind` isolation in `McpHooks::fire` (panic recorded via
+tracing with `method_hint`, hook skipped, registry stays usable — pinned
+end-to-end: a panicking hook cannot change any dispatch outcome);
+`RpcRequest` gained `id_present` via custom `Deserialize` (absent id =
+notification silence; PRESENT id even `null` = request; `id:null` → -32600
+per MCP, echoed id null); `SessionState` reduced to atomic-backed
+New/Ready/Closed/Failed; `mark_initialized()` returns whether THIS call did
+the New→Ready CAS, and the initialize completion path consumes it so
+concurrent duplicate initialize deterministically loses with -32600
+(one-winner pinned by `tokio::join!` test); `resources/read` validates
+`awh://<kind>[/single-segment-id]` at the boundary (256-byte cap, no
+`/` `\` `..` `%` NUL control chars; context takes no segments);
+`tool_metadata` unknown fallback is explicit `"uncategorized"` (never
+silently "workspace"); `mcp.status` reports `"running"` (process state,
+NOT subsystem health); metrics u128→u64 saturating. Test counts:
+mcp_protocol 32 (was 15), workspace 481 total. SDK interop evidence (not
+committed; reproducible with `@modelcontextprotocol/sdk` TS client): stdio
+StdioClientTransport 8/8, SSE `SSEClientTransport` (note the export name is
+SSEClientTransport, class in client/sse.js) 10/10 over `GET /sse` →
+endpoint event → `POST /mcp` with `mcp-session-id`; stdout stays 0 bytes
+over a full session. `/mcp` POST without session header → 400 "missing
+session id" (AWH implements the legacy SSE transport, NOT sessionless
+Streamable HTTP — use SseClientTransport in interop tests).
+Schemas deliberately allow extra well-typed fields (no
+`additionalProperties:false` anywhere) — documented in docs/mcp.md.
+`McpDispatcher` now derives Clone (all-Arc fields; doc always claimed
+cheap-to-clone). Tool catalog 53 static.
+
 - **Phase 11 — GitHub provider + gaps**: `src/mcp/github.rs` (12
   `github.*` tools, direct REST, gated on `GITHUB_TOKEN`; `GITHUB_API_URL`
   overrides base for GHES; target resolution explicit args → origin

@@ -47,6 +47,20 @@ pub enum McpEvent<'a> {
     PromptRequested { name: &'a str },
 }
 
+impl McpEvent<'_> {
+    /// A short safe label identifying the event family, used for hook-failure
+    /// logging. Never includes arguments, URIs' payloads, or secrets.
+    fn method_hint(&self) -> &'static str {
+        match self {
+            McpEvent::NotificationReceived { .. } => "notification",
+            McpEvent::InitializeCompleted { .. } => "initialize",
+            McpEvent::ToolCallCompleted { .. } => "tool_call",
+            McpEvent::ResourceRead { .. } => "resource_read",
+            McpEvent::PromptRequested { .. } => "prompt",
+        }
+    }
+}
+
 /// A registered observer. Hooks are synchronous, must be quick, must not
 /// re-enter the dispatcher (no dispatching from inside a hook), and cannot
 /// modify anything — they receive events for observation only.
@@ -88,16 +102,31 @@ impl McpHooks {
 
     /// Fires an event to every registered hook.
     ///
-    /// The hook list is cloned out of the lock before firing, so a hook that
-    /// (against the contract) registers or unregisters hooks cannot deadlock,
-    /// and a panicking hook cannot poison the registry for the dispatcher.
+    /// Each hook is individually isolated with `catch_unwind`: a hook that
+    /// panics is recorded (tracing) and skipped, but the remaining hooks
+    /// still run and the panic never escapes into the MCP request path.
+    /// The hook list is cloned out of the lock before firing, so a hook
+    /// that (against the contract) registers or unregisters hooks cannot
+    /// deadlock, and a panic cannot poison the registry. The panic payload
+    /// is deliberately dropped — hook internals must not leak to clients
+    /// or logs.
     pub fn fire(&self, event: &McpEvent<'_>) {
         let hooks: Vec<McpHook> = {
             let hooks = self.hooks.read().unwrap_or_else(|e| e.into_inner());
             hooks.clone()
         };
-        for hook in hooks {
-            hook(event);
+        for (index, hook) in hooks.into_iter().enumerate() {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hook(event);
+            }));
+            if outcome.is_err() {
+                tracing::warn!(
+                    event = "hook_panicked",
+                    hook_index = index,
+                    method_hint = event.method_hint(),
+                    "observer hook panicked; remaining hooks continue"
+                );
+            }
         }
     }
 }
@@ -162,9 +191,13 @@ impl ToolMetrics {
         if !ok {
             stats.failures.fetch_add(1, Ordering::Relaxed);
         }
+        // Saturating u128→u64 conversion: a duration past u64::MAX
+        // nanoseconds (~584 years) is recorded as the cap rather than
+        // truncating modulo 2^64 (which would silently corrupt averages).
+        let duration_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
         stats
             .total_duration_ns
-            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add(duration_ns, Ordering::Relaxed);
     }
 
     /// A snapshot of every tracked tool's metrics, sorted by name.
@@ -194,8 +227,8 @@ impl ToolMetrics {
         let mut calls = 0u64;
         let mut failures = 0u64;
         for stats in stats.values() {
-            calls += stats.calls.load(Ordering::Relaxed);
-            failures += stats.failures.load(Ordering::Relaxed);
+            calls = calls.saturating_add(stats.calls.load(Ordering::Relaxed));
+            failures = failures.saturating_add(stats.failures.load(Ordering::Relaxed));
         }
         (stats.len(), calls, failures)
     }
@@ -287,40 +320,75 @@ mod tests {
         assert_eq!(hooks.len(), 1);
     }
 
+    /// Panic containment, per hook: a panicking hook is contained by
+    /// `fire` itself — the CALLER must not need catch_unwind, later hooks
+    /// still run, and the registry stays usable. (This replaces the earlier
+    /// test that wrongly asserted the panic escapes to the caller.)
     #[test]
-    fn panicking_hook_does_not_break_the_registry() {
+    fn panicking_hook_does_not_terminate_process() {
         let hooks = McpHooks::new();
-        let observed = Arc::new(AtomicUsize::new(0));
         hooks
             .register(Arc::new(|_: &McpEvent<'_>| panic!("hook bug")))
             .unwrap();
+        // No catch_unwind around `fire`: if the panic escaped, this test
+        // would abort instead of completing.
+        hooks.fire(&McpEvent::PromptRequested { name: "x" });
+    }
+
+    #[test]
+    fn panicking_hook_does_not_prevent_later_hooks() {
+        let hooks = McpHooks::new();
+        hooks
+            .register(Arc::new(|_: &McpEvent<'_>| panic!("hook A bug")))
+            .unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
         let observed_hook = Arc::clone(&observed);
         hooks
             .register(Arc::new(move |_: &McpEvent<'_>| {
                 observed_hook.fetch_add(1, Ordering::SeqCst);
             }))
             .unwrap();
+        // Hook A panics; hook B must still observe the event.
+        hooks.fire(&McpEvent::PromptRequested { name: "x" });
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
 
-        let hook_catcher = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            hooks.fire(&McpEvent::PromptRequested { name: "x" });
-        }));
-        assert!(
-            hook_catcher.is_err(),
-            "the panicking hook panics the caller"
-        );
-        assert_eq!(
-            observed.load(Ordering::SeqCst),
-            0,
-            "fire aborts at the panic"
-        );
-        // The registry survives: a later fire still iterates (and aborts at
-        // the same panicking hook) without corrupting the hook list.
-        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            hooks.fire(&McpEvent::PromptRequested { name: "x" });
-        }));
-        assert!(second.is_err());
-        assert_eq!(observed.load(Ordering::SeqCst), 0);
-        assert_eq!(hooks.len(), 2, "registry entries survive the panics");
+    #[test]
+    fn panicking_hook_does_not_break_registry() {
+        let hooks = McpHooks::new();
+        hooks
+            .register(Arc::new(|_: &McpEvent<'_>| panic!("hook bug")))
+            .unwrap();
+        hooks.fire(&McpEvent::PromptRequested { name: "x" });
+        // The registry survived the contained panic: entries are intact and
+        // firing again is safe.
+        assert_eq!(hooks.len(), 1);
+        hooks.fire(&McpEvent::PromptRequested { name: "x" });
+    }
+
+    /// The full request-path invariant: the dispatch path itself (metrics
+    /// recording here) must complete even though an observer-side panic
+    /// happened. Tool calls keep returning results with panicking hooks
+    /// registered; that is pinned end-to-end by the dispatcher test
+    /// `panicking_hook_does_not_break_dispatch` in tests/mcp_protocol.rs.
+    #[test]
+    fn hook_failure_is_observable_through_surviving_registry() {
+        let hooks = McpHooks::new();
+        hooks
+            .register(Arc::new(|_: &McpEvent<'_>| panic!("hook bug")))
+            .unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observed_hook = Arc::clone(&observed);
+        hooks
+            .register(Arc::new(move |_: &McpEvent<'_>| {
+                observed_hook.fetch_add(1, Ordering::SeqCst);
+            }))
+            .unwrap();
+        hooks.fire(&McpEvent::NotificationReceived { method: "x" });
+        // The surviving hook observed the event; the registry did not shrink
+        // or reorder as a side effect of the contained panic.
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert_eq!(hooks.len(), 2);
     }
 
     #[test]

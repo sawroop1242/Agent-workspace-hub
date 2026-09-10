@@ -92,8 +92,8 @@ pub use custom_mcp::{
     StreamableHttpMcpClient,
 };
 pub use dispatcher::{
-    DispatchResult, McpDispatcher, SessionLifecycle, SessionState, MCP_PROTOCOL_VERSION,
-    SERVER_NOT_INITIALIZED_CODE, SUPPORTED_PROTOCOL_VERSIONS,
+    tool_metadata, DispatchResult, McpDispatcher, SessionLifecycle, SessionState,
+    MCP_PROTOCOL_VERSION, SERVER_NOT_INITIALIZED_CODE, SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use error::McpAuthorizationError;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};

@@ -107,14 +107,11 @@ pub const SERVER_NOT_INITIALIZED_CODE: i64 = -32002;
 /// which gate on the `initialize` exchange, not the follow-up notification).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    /// Created, waiting for the `initialize` request.
+    /// Created, waiting for the `initialize` request. Pre-init requests
+    /// other than `initialize`/`ping` are rejected with `-32002`.
     New,
-    /// A malformed or failed `initialize` left the session retryable.
-    Initializing,
     /// The `initialize` exchange completed successfully.
     Ready,
-    /// The transport is shutting the session down.
-    Closing,
     /// The session is closed; further requests are protocol errors.
     Closed,
     /// The session failed structurally (e.g. the transport died).
@@ -146,9 +143,10 @@ pub struct SessionLifecycle {
 }
 
 impl SessionLifecycle {
-    // Reduced-state encoding for the atomic: `New` and `Initializing` both
-    // mean "not yet admitted" (the gate only distinguishes them for
-    // observability), `Ready` and `Closing` both mean "admitted".
+    // The four states the atomic can actually represent. Finer-grained
+    // lifecycle phases (`Initializing`, `Closing`) are deliberately NOT
+    // modeled in this milestone — they belong to the future Agent Runtime
+    // session layer; a not-yet-admitted session is simply `New` here.
     const NEW: u8 = 0;
     const READY: u8 = 1;
     const CLOSED: u8 = 2;
@@ -169,11 +167,13 @@ impl SessionLifecycle {
         self.state() == SessionState::Ready
     }
 
-    /// Marks the session initialized. Idempotent; returns whether this call
-    /// was the transition (i.e. the session was previously uninitialized).
+    /// Marks the session initialized. Returns whether this call performed
+    /// the `New → Ready` transition (i.e. whether the session was
+    /// previously uninitialized). Atomic (CAS), so exactly one concurrent
+    /// caller can win; the losers see `false` and must treat their own
+    /// initialize as a duplicate.
     pub fn mark_initialized(&self) -> bool {
-        !self
-            .state
+        self.state
             .compare_exchange(
                 Self::NEW,
                 Self::READY,
@@ -271,13 +271,46 @@ impl SessionLifecycle {
 }
 
 /// A single parsed JSON-RPC request.
-#[derive(Debug, Deserialize)]
+///
+/// The distinction between an ABSENT `id` (a notification) and a PRESENT
+/// `id` (a request — even when the value is JSON `null`) is protocol
+/// semantics per JSON-RPC 2.0 / MCP, so it is preserved here explicitly
+/// rather than collapsing both into `id: None`.
 pub struct RpcRequest {
     pub jsonrpc: String,
     pub id: Option<Value>,
+    /// Whether the `id` member was present at all (a request), even when
+    /// its value is `null`. `false` means the message is a notification.
+    pub id_present: bool,
     pub method: String,
-    #[serde(default)]
     pub params: Value,
+}
+
+impl<'de> Deserialize<'de> for RpcRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let object = raw
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("request must be a JSON object"))?;
+        Ok(RpcRequest {
+            jsonrpc: object
+                .get("jsonrpc")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            id: object.get("id").cloned(),
+            id_present: object.contains_key("id"),
+            method: object
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            params: object.get("params").cloned().unwrap_or_else(|| json!({})),
+        })
+    }
 }
 
 /// A JSON-RPC response envelope.
@@ -314,6 +347,7 @@ impl std::fmt::Debug for DispatchResult {
 /// single [`McpDispatcher::dispatch`] entry point consumed by every transport.
 /// It is [`Send`] + [`Sync`] and cheap to clone (internally reference-counted),
 /// so it can be shared across concurrent MCP sessions.
+#[derive(Clone)]
 pub struct McpDispatcher {
     skills: Arc<SkillMcp>,
     workspace: Arc<WorkspaceMcp>,
@@ -633,18 +667,36 @@ impl McpDispatcher {
         let req: RpcRequest = serde_json::from_str(input)
             .map_err(|e| DispatchError::parse(format!("invalid JSON: {e}")))?;
 
-        // Notifications (parseable messages with no `id`) produce no
+        // Notifications (parseable messages with no `id` member) produce no
         // response at any lifecycle stage — including `notifications/
         // initialized` (state flips on the initialize exchange, matching
         // the MCP reference servers) and notifications that arrive while
         // the session is closed or uninitialized. The method name is
         // recorded for observability; arguments are never logged.
+        // A PRESENT `id` makes the message a request — even `id: null`
+        // (JSON-RPC 2.0 §Request object: notifications lack the id member;
+        // MCP additionally forbids null request ids, handled below).
         let id = req.id;
-        if id.is_none() {
+        if !req.id_present {
             self.hooks.fire(&McpEvent::NotificationReceived {
                 method: &req.method,
             });
             return Ok(DispatchResult::NoResponse);
+        }
+        // MCP (and JSON-RPC interoperability practice) requires request ids
+        // to be strings or numbers; a literal `null` id is a malformed
+        // request, not a notification. Respond with the id echoed as null.
+        if matches!(id.as_ref(), Some(Value::Null)) {
+            audit_deny("request_rejected", "null_request_id", &req.method);
+            return Ok(DispatchResult::Response(RpcResponse {
+                jsonrpc: "2.0",
+                id: Some(Value::Null),
+                result: None,
+                error: Some(json!({
+                    "code": codes::INVALID_REQUEST,
+                    "message": "request 'id' must not be null (notifications omit 'id' entirely)",
+                })),
+            }));
         }
 
         if req.jsonrpc != "2.0" {
@@ -683,7 +735,7 @@ impl McpDispatcher {
                     }));
                 }
             }
-            SessionState::New | SessionState::Initializing => {
+            SessionState::New => {
                 if req.method != "initialize" && req.method != "ping" {
                     audit_deny(
                         "session_preinit_rejected",
@@ -696,12 +748,11 @@ impl McpDispatcher {
                         result: None,
                         error: Some(json!({
                             "code": SERVER_NOT_INITIALIZED_CODE,
-                            "message": "server not initialized: send an initialize request first",
+                            "message": "session not initialized: send an initialize request first",
                         })),
                     }));
                 }
             }
-            SessionState::Closing => { /* requests still admitted while closing */ }
         }
 
         let result = self.dispatch_inner(input).await?;
@@ -709,7 +760,23 @@ impl McpDispatcher {
         // to initialized and record what was negotiated. (A failure
         // response keeps the session uninitialized so the client can retry.)
         if req.method == "initialize" && result_is_ok(&result) {
-            lifecycle.mark_initialized();
+            // Atomic CAS: exactly one concurrent initialize can win. If this
+            // call did not perform the New→Ready transition, another request
+            // initialized the session first (or a sequential duplicate raced
+            // past the gate check above) — respond as a duplicate rather
+            // than reporting a second success.
+            if !lifecycle.mark_initialized() {
+                audit_deny("session_initialize", "duplicate_initialize", "initialize");
+                return Ok(DispatchResult::Response(RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": codes::INVALID_REQUEST,
+                        "message": "session already initialized",
+                    })),
+                }));
+            }
             let negotiated = self
                 .initialize_metadata(&req.params)
                 .unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_string());
@@ -748,9 +815,9 @@ impl McpDispatcher {
             )));
         }
 
-        // Notifications (no `id`) produce no response.
+        // Notifications (no `id` member) produce no response.
         let id = req.id;
-        let is_notification = id.is_none();
+        let is_notification = !req.id_present;
 
         // Notifications produce no response (JSON-RPC 2.0). `notifications/
         // initialized` is the standard post-initialize notification; every
@@ -1045,23 +1112,73 @@ impl McpDispatcher {
             // violation, not a server failure: -32602, not -32603.
             DispatchError::invalid_params("resources/read requires a string 'uri' parameter")
         })?;
+        // MCP-boundary URI validation (defense in depth — downstream
+        // stores also validate, but malformed identifiers must never reach
+        // them): a resource uri is `awh://<kind>[/single-segment-id]`.
+        // The id may not contain path separators, traversal patterns
+        // (literal or percent-encoded), percent signs, control characters,
+        // or NUL; `awh://context` is the only kindless form.
+        const MAX_URI_LEN: usize = 256;
+        if uri.is_empty() {
+            return Err(DispatchError::invalid_params("resource uri must not be empty").into());
+        }
+        if uri.len() > MAX_URI_LEN {
+            return Err(DispatchError::invalid_params(format!(
+                "resource uri exceeds {MAX_URI_LEN} bytes"
+            ))
+            .into());
+        }
         let path = uri.strip_prefix("awh://").ok_or_else(|| {
-            DispatchError::invalid_params(format!("unsupported resource uri: {uri}"))
+            DispatchError::invalid_params(format!("unsupported resource uri scheme: {uri}"))
         })?;
         let (kind, rest) = match path.split_once('/') {
             Some((kind, rest)) => (kind, rest),
             None => (path, ""),
         };
+        if kind.is_empty() {
+            return Err(DispatchError::invalid_params(format!(
+                "resource uri is missing its kind: {uri}"
+            ))
+            .into());
+        }
+        let validate_id = |id: &str| -> Result<(), DispatchError> {
+            if id.is_empty() {
+                return Err(DispatchError::invalid_params(
+                    "resource uri is missing its identifier segment",
+                ));
+            }
+            if id.contains('/') || id.contains('\\') || id.contains("..") || id.contains('%') {
+                return Err(DispatchError::invalid_params(
+                    "resource uri identifier must be a single path segment without traversal or percent-encoding",
+                ));
+            }
+            if id.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+                return Err(DispatchError::invalid_params(
+                    "resource uri identifier must not contain control characters",
+                ));
+            }
+            Ok(())
+        };
 
         let (content, mime) = match kind {
-            "context" => (self.workspace.context()?, "text/markdown"),
+            "context" => {
+                if !rest.is_empty() {
+                    return Err(DispatchError::invalid_params(
+                        "awh://context takes no path segments",
+                    )
+                    .into());
+                }
+                (self.workspace.context()?, "text/markdown")
+            }
             "memory" => {
+                validate_id(rest)?;
                 let entry = self.memory.get(rest)?.ok_or_else(|| {
                     DispatchError::invalid_params(format!("memory entry not found: {rest}"))
                 })?;
                 (entry.content, "text/plain")
             }
             "skills" => {
+                validate_id(rest)?;
                 let skill = self.skills.read(rest)?;
                 (skill.description, "text/markdown")
             }
@@ -1133,6 +1250,10 @@ impl McpDispatcher {
         let value = match name {
             // Read-only MCP health/status: bounded, secret-free snapshot
             // of this server's catalog, providers, and observability state.
+            // `status` reports the SERVER PROCESS state only: "running"
+            // means this dispatcher is serving requests. It is NOT a
+            // subsystem-health verdict — in-process subsystems (filesystem,
+            // skills, memory) fail per-call and surface as tool errors.
             "mcp.status" => {
                 let registry = self.providers.read().await;
                 let provider_ids = registry.providers();
@@ -1149,7 +1270,7 @@ impl McpDispatcher {
                     .unwrap_or(0);
                 let (tracked, calls, failures) = self.metrics.totals();
                 serde_json::to_value(json!({
-                    "status": "healthy",
+                    "status": "running",
                     "protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
                     "tools": {
                         "static": static_count,
@@ -1884,6 +2005,13 @@ fn github_tool_schemas() -> Value {
 /// catalog today; it changes only when a tool's schema or behavior changes
 /// and lets clients detect deprecations deterministically.
 pub fn tool_metadata(name: &str) -> (&'static str, &'static str) {
+    // Categories are purely descriptive metadata for clients — they are
+    // never capabilities, permissions, or policy. Every tool in the static
+    // catalog matches one arm; anything else gets an EXPLICIT
+    // "uncategorized" label rather than silently masquerading as
+    // "workspace" (a future tool must never inherit a misleading category).
+    // The version is the catalog/format version shared by all static
+    // tools, not a per-tool release version.
     let category = match name {
         "mcp.status" => "system",
         _ if name.starts_with("skills.") => "skills",
@@ -1895,7 +2023,7 @@ pub fn tool_metadata(name: &str) -> (&'static str, &'static str) {
         _ if name.starts_with("git.") => "git",
         _ if name.starts_with("terminal.") => "terminal",
         _ if name.starts_with("github.") => "github",
-        _ => "workspace",
+        _ => "uncategorized",
     };
     (category, "1.0.0")
 }
