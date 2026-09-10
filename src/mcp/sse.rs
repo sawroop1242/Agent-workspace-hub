@@ -76,10 +76,13 @@ impl SessionRegistry {
         // Each session gets its own channel, so no cross-client message leakage.
         let (tx, _) = broadcast::channel(256);
         let endpoint = format!("{endpoint_path}?sessionId={id}");
+        let lifecycle = Arc::new(SessionLifecycle::default());
+        lifecycle.set_session_id(id.clone());
+        lifecycle.set_transport("sse");
         let session = Session {
             id: id.clone(),
             endpoint,
-            lifecycle: Arc::new(SessionLifecycle::default()),
+            lifecycle,
             tx,
         };
         self.sessions.lock().await.insert(id, session.clone());
@@ -92,10 +95,12 @@ impl SessionRegistry {
         self.sessions.lock().await.get(id).cloned()
     }
 
-    /// Removes and drops a session (on disconnect or shutdown).
+    /// Removes and drops a session (on disconnect or shutdown), closing its
+    /// lifecycle so later requests observe a deterministic closed state.
     pub async fn remove(&self, id: &str) {
-        let existed = self.sessions.lock().await.remove(id).is_some();
-        if existed {
+        let existing = self.sessions.lock().await.remove(id);
+        if let Some(session) = existing {
+            session.lifecycle.mark_closed();
             crate::mcp::audit_allow("session_destroy", id, "disconnect");
         }
     }
@@ -119,6 +124,12 @@ impl SessionRegistry {
         // A session id is formed from an unguessable random 128-bit secret plus
         // a monotonic counter, hex-encoded. Randomness comes from the OS CSPRNG
         // (see `fill_random`); the counter merely guarantees local uniqueness.
+        // The counter deliberately WRAPS at u64::MAX (sequence-number
+        // semantics): saturating it would hand out the same counter value to
+        // every future session, while wrap keeps ids distinct for 2^64
+        // creates — and the random prefix keeps ids unique regardless.
+        // `fetch_add` is atomic, so concurrent creates never race or duplicate
+        // a counter value.
         let mut secret = [0u8; 16];
         fill_random(&mut secret);
         let counter = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -156,6 +167,52 @@ fn fill_random(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_id_counter_wraps_cleanly_at_the_boundary() {
+        // The id counter uses sequence-number semantics: it wraps to 0
+        // after u64::MAX rather than saturating (a saturated counter would
+        // issue the same suffix forever). Ids stay unique through the
+        // boundary thanks to the random 128-bit prefix.
+        let registry = SessionRegistry::new();
+        for start in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            registry.next_id.store(start, Ordering::Relaxed);
+            let first = registry.create("/mcp").await;
+            let second = registry.create("/mcp").await;
+            let third = registry.create("/mcp").await;
+            assert_ne!(first.id, second.id);
+            assert_ne!(second.id, third.id);
+            assert_ne!(first.id, third.id);
+            let suffix = |id: &str| id[id.len() - 16..].to_string();
+            // Suffix sequence: start, start+1, start+2 (mod 2^64).
+            assert_eq!(suffix(&first.id), format!("{start:016x}"));
+            assert_eq!(
+                suffix(&second.id),
+                format!("{:016x}", start.wrapping_add(1))
+            );
+            assert_eq!(suffix(&third.id), format!("{:016x}", start.wrapping_add(2)));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_creation_never_duplicates_ids() {
+        // Concurrent creates race only the atomic counter: every create
+        // must observe a distinct counter value (no lost updates), and
+        // the full ids must be unique.
+        let registry = std::sync::Arc::new(SessionRegistry::new());
+        registry.next_id.store(u64::MAX - 1, Ordering::Relaxed);
+        let mut ids = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let registry = std::sync::Arc::clone(&registry);
+            ids.spawn(async move { registry.create("/mcp").await.id });
+        }
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = ids.join_next().await {
+            assert!(seen.insert(id.expect("task panicked")), "duplicate id");
+        }
+        // 64 creates from MAX-1: the counter wraps but stays atomic.
+        assert_eq!(seen.len(), 64);
+    }
 
     #[tokio::test]
     async fn sessions_are_isolated_and_removable() {

@@ -93,8 +93,35 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 ## Phase Status
 
 0-11 done (branch rust; Phase 11 via PR #10, CI green on all 3 platforms).
-Next: none — implementation plan complete; future phases would be new spec
-work.
+**PR #15 (mcp-protocol-hardening) — MCP protocol hardening round**: landed
+per-hook `catch_unwind` isolation in `McpHooks::fire` (panic recorded via
+tracing with `method_hint`, hook skipped, registry stays usable — pinned
+end-to-end: a panicking hook cannot change any dispatch outcome);
+`RpcRequest` gained `id_present` via custom `Deserialize` (absent id =
+notification silence; PRESENT id even `null` = request; `id:null` → -32600
+per MCP, echoed id null); `SessionState` reduced to atomic-backed
+New/Ready/Closed/Failed; `mark_initialized()` returns whether THIS call did
+the New→Ready CAS, and the initialize completion path consumes it so
+concurrent duplicate initialize deterministically loses with -32600
+(one-winner pinned by `tokio::join!` test); `resources/read` validates
+`awh://<kind>[/single-segment-id]` at the boundary (256-byte cap, no
+`/` `\` `..` `%` NUL control chars; context takes no segments);
+`tool_metadata` unknown fallback is explicit `"uncategorized"` (never
+silently "workspace"); `mcp.status` reports `"running"` (process state,
+NOT subsystem health); metrics u128→u64 saturating. Test counts:
+mcp_protocol 32 (was 15), workspace 481 total. SDK interop evidence (not
+committed; reproducible with `@modelcontextprotocol/sdk` TS client): stdio
+StdioClientTransport 8/8, SSE `SSEClientTransport` (note the export name is
+SSEClientTransport, class in client/sse.js) 10/10 over `GET /sse` →
+endpoint event → `POST /mcp` with `mcp-session-id`; stdout stays 0 bytes
+over a full session. `/mcp` POST without session header → 400 "missing
+session id" (AWH implements the legacy SSE transport, NOT sessionless
+Streamable HTTP — use SseClientTransport in interop tests).
+Schemas deliberately allow extra well-typed fields (no
+`additionalProperties:false` anywhere) — documented in docs/mcp.md.
+`McpDispatcher` now derives Clone (all-Arc fields; doc always claimed
+cheap-to-clone). Tool catalog 53 static.
+
 - **Phase 11 — GitHub provider + gaps**: `src/mcp/github.rs` (12
   `github.*` tools, direct REST, gated on `GITHUB_TOKEN`; `GITHUB_API_URL`
   overrides base for GHES; target resolution explicit args → origin
@@ -108,7 +135,7 @@ work.
   deepest existing ancestor then join; symlink-out rejected),
   `workspace.delete_file` (Ok(false) missing), `tasks.get`/`connectors.get`
   (`get(&str) -> Result<Option<_>>`, missing → null not error). Catalog:
-  52 core / 64 with github.*; docs/mcp.md + configuration.md + README
+  53 core / 65 with github.*; docs/mcp.md + configuration.md + README
   counts all updated together. Testing gotchas: dispatcher tests inject a
   stubbed provider via private field (no env mutation, no races); the
   stub's tokio runtime must be leaked (`std::mem::forget`) or it dies with
@@ -178,6 +205,47 @@ work.
   project` (GET/POST/DELETE) with `store_scope` validating project names
   before path joins; mutations audited (`api_context_write`,
   `api_memory_append`, `api_skill_add`, `api_skill_remove`).
+- **Phase 12 — MCP hardening (Ruflo-informed, AWH-native)**: implements only
+  concepts that materially improved AWH's MCP surface. (1) `SessionLifecycle`
+  explicit state machine (Uninitialized→Initializing→Ready; `-32002` for
+  pre-init requests, `-32600` duplicate initialize; notifications silent at
+  every state incl. invalid ones). (2) `SUPPORTED_PROTOCOL_VERSIONS` const
+  (dispatcher.rs:89) + version negotiation: echo client version if
+  supported, else fall back to latest; unknown → fallback NOT error (spec
+  allows either; test pins the choice). (3) Schema-first argument
+  validation BEFORE handlers run (`src/mcp/schema.rs`, depth-capped 32):
+  wrong type/unknown field/missing required/non-string enum/
+  additionalProperties=false → standardized `-32602` naming the failing
+  field — this FIXED a real bug where `workspace.read_file {path: 42}`
+  panicked-ish into -32603 instead of -32602. (4) Tool metadata: every
+  `tools/list` entry carries `category` + `version` (json! third arrays per
+  family — watch dispatcher.rs recursion limits, never fold them). (5)
+  `mcp.status` tool (category "system") + `ToolMetrics` bounded fixed-size
+  map (no per-tool-name allocation from untrusted input; avg duration via
+  checked_div). (6) `McpEvent` observer-only hooks in `src/mcp/
+  observability.rs` — hooks CANNOT veto/mutate/reorder; panicking hook is
+  contained (catch_unwind) without breaking the registry. REJECTED from
+  Ruflo: agent-runtime/policy/tool-broker architecture (premature per spec
+  hard constraint), tool result streaming/cancellation, dynamic
+  registration. Test gotchas: (a) tools/call results are wrapped in MCP
+  `content` text envelope (dispatcher.rs:1831) — parse `result.content[0]
+  .text` then serde_json::from_str; (b) mcp.status can't count itself —
+  metrics record AFTER serialization; call another tool first then assert
+  `metrics.tool_calls >= 1`; (c) notifications MUST omit `id` — sending
+  `id` with notifications/initialized yields -32601 (JSON-RPC req); (d)
+  `StdioClientTransport` sanitizes env — pass `{...process.env, HOME}` in
+  interop harness; (e) binary stdio tests: `ChildStdin` lacks
+  Default/take-once — hold it as `Option<ChildStdin>`, set `server.stdin =
+  None` to close for EOF shutdown test; (f) initialize needs clientInfo
+  (client SDK always sends it — hand-rolled JSON must too); (g) container
+  wiped `~/.cargo` MID-SESSION after 460 green tests — rustup reinstall
+  (`--profile minimal`, add rustfmt+clippy) then `source ~/.cargo/env`
+  works; SSE interop needs self-signed certs at /tmp/awh-tls (README
+  documents openssl command) — after reinstall, `cargo build --release`
+  before `node examples/mcp-interop/*.mjs` (harness spawns the release
+  binary). Suite now: 461 tests (385 lib + 15 protocol + 3 executable +
+  3+3+13 integration + 39 doc-adjacent), interop: stdio+SSE harnesses pass
+  with 53 tools advertised (no GITHUB_TOKEN).
 - **Env note**: the Rust toolchain can be wiped from this container
   between sessions; if `cargo` is missing reinstall with rustup
   (`--default-toolchain stable --profile minimal` then `rustup

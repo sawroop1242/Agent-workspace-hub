@@ -107,6 +107,28 @@ impl ProviderRegistry {
                 if tool.description.is_empty() {
                     tool.description = format!("Tool provided by {provider}");
                 }
+                // Exposure gate: a dynamic tool whose advertised input
+                // schema is malformed (or uses unsupported keywords) is
+                // NOT exposed — clients would otherwise see a tool whose
+                // arguments AWH cannot validate, leaving provider-side
+                // checks as the only defense. Fail closed per tool, not
+                // per provider: one bad advertisement must not hide its
+                // healthy siblings.
+                if let Err(error) =
+                    crate::mcp::schema::validate_schema_syntax(&tool.input_schema, "#")
+                {
+                    tracing::warn!(
+                        tool = %tool.name,
+                        error = %error,
+                        "dynamic tool rejected: malformed input schema"
+                    );
+                    crate::mcp::audit::audit_deny(
+                        "dynamic_tool_rejected",
+                        "malformed_tool_schema",
+                        &tool.name,
+                    );
+                    continue;
+                }
                 out.push(tool);
             }
         }

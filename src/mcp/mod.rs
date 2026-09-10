@@ -43,6 +43,8 @@ pub mod global_mcp;
 pub mod http;
 /// MCP memory store.
 pub mod memory;
+/// Lifecycle events, bounded observer hooks, and tool metrics.
+pub mod observability;
 /// MCP permission validation.
 pub mod permissions;
 /// Connector provider registry.
@@ -65,6 +67,8 @@ pub mod store_lock;
 pub mod tasks;
 /// TLS configuration for the remote transport.
 pub mod tls;
+/// Canonical Tool Registry: explicit per-tool metadata.
+pub mod tool_registry;
 /// MCP trust and approval policy.
 pub mod trust;
 /// Persistent trust store.
@@ -90,8 +94,8 @@ pub use custom_mcp::{
     StreamableHttpMcpClient,
 };
 pub use dispatcher::{
-    DispatchResult, McpDispatcher, SessionLifecycle, MCP_PROTOCOL_VERSION,
-    SERVER_NOT_INITIALIZED_CODE,
+    tool_metadata, DispatchResult, McpDispatcher, SessionLifecycle, SessionState,
+    MCP_PROTOCOL_VERSION, SERVER_NOT_INITIALIZED_CODE, SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use error::McpAuthorizationError;
 pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
@@ -101,6 +105,10 @@ pub use global_mcp::{
 };
 pub use http::{build_router, serve, AppState, HttpServerConfig};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
+pub use observability::{
+    client_name_version, McpEvent, McpHook, McpHooks, ToolMetrics, ToolMetricsSnapshot, MAX_HOOKS,
+    MAX_TRACKED_TOOLS,
+};
 pub use permissions::{
     is_blocked_environment, is_valid_env_name, require as require_permission, McpPermissions,
     Permission,
@@ -114,7 +122,7 @@ pub use providers::{
 #[cfg(target_os = "linux")]
 pub use sandbox::wrap_command_with;
 pub use sandbox::{sandbox_available, wrap_command, SandboxConfig, SandboxLimits};
-pub use schema::validate_tool_arguments;
+pub use schema::{validate_schema, validate_schema_syntax, validate_tool_arguments};
 pub use security::{
     atomic_write, secure_destination, secure_path, sha256_file, validate_command, validate_id,
     validate_url, verify_sha256, PackageIntegrity,
