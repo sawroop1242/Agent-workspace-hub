@@ -6,6 +6,7 @@
 - [Security policy and threat model](docs/security.md)
 - [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
 - [MCP integration](docs/mcp.md) — transports, 53 core tools (65 with `github.*` when `GITHUB_TOKEN` is set), interop evidence
+- [Composio integration guide](docs/composio.md) — add Composio's hosted MCP, connect apps, invoke tools, gotchas
 - [Configuration](docs/configuration.md) — every `AWH_*` variable and precedence
 - [Development guide](docs/development.md) — conventions, commands, PR process
 - [Testing guide](docs/testing.md) — suite map and regression policy

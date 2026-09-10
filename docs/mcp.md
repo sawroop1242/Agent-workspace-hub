@@ -275,7 +275,9 @@ configuration → enabled? → trust decision → permission validation
   permission — `McpPermissions::validate` requires the pair); an
   unapproved reference fails closed at registration, and a paste of a
   raw credential into `--header` prints a warning recommending the
-  `${secret:…}` indirection.
+  `${secret:…}` indirection. A complete walkthrough for Composio's hosted
+  MCP — including app connections, tool search, and live-validation
+  gotchas — is in [docs/composio.md](composio.md).
 * No automatic trust escalation: nothing a server does at runtime can
   upgrade its approval.
 
