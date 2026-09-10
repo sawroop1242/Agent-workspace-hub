@@ -229,6 +229,7 @@ mod tests {
             args: vec![],
             url: None,
             env: Default::default(),
+            headers: Default::default(),
             permissions: McpPermissions::default(),
             enabled: true,
         }

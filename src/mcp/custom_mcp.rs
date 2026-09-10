@@ -21,6 +21,49 @@ use super::schema::validate_tool_arguments;
 
 const MAX_MCP_ID_LEN: usize = 128;
 const MAX_MCP_NAME_LEN: usize = 256;
+/// Header names are short by any practical standard; a generous cap keeps
+/// malformed configs from bloating requests.
+const MAX_HEADER_NAME_LEN: usize = 128;
+/// Header values (including `${secret:NAME}` references) stay bounded.
+const MAX_HEADER_VALUE_LEN: usize = 4096;
+
+/// RFC 7230 token character set for header names. CR/LF, spaces, and all
+/// control characters are rejected — a header name containing them is a
+/// header-injection attempt, not a typo.
+pub fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HEADER_NAME_LEN
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Header values must be printable and free of CR/LF/NUL — a value with
+/// line breaks would smuggle additional headers into the request.
+pub fn is_valid_header_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HEADER_VALUE_LEN
+        && value
+            .chars()
+            .all(|c| c == '\t' || (c as u32) >= 0x20 && (c as u32) != 0x7f)
+}
 
 /// Resolves runtime resource limits, applying any `AWH_*` environment overrides.
 ///
@@ -63,6 +106,12 @@ pub struct CustomMcpServerConfig {
     /// Environment variables passed to the server.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Extra HTTP headers sent on every request to the server (HTTP
+    /// transport). Values may be `${secret:NAME}` references resolved from
+    /// the serving process's environment — the recommended way to carry
+    /// API keys so the raw key never lands in this file.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// Permissions granted to the server.
     #[serde(default)]
     pub permissions: McpPermissions,
@@ -155,6 +204,14 @@ fn validate_server(server: &CustomMcpServerConfig) -> Result<()> {
             if parsed.username() != "" || parsed.password().is_some() {
                 bail!("MCP HTTP URL must not contain embedded credentials");
             }
+        }
+    }
+    for (name, value) in &server.headers {
+        if !is_valid_header_name(name) {
+            bail!("invalid HTTP header name: {name:?} (RFC 7230 token characters only)");
+        }
+        if !is_valid_header_value(value) {
+            bail!("invalid HTTP header value for {name}: control characters are not allowed");
         }
     }
     for key in server.env.keys() {
@@ -407,11 +464,19 @@ pub struct StreamableHttpMcpClient {
 }
 
 impl StreamableHttpMcpClient {
-    /// Creates a client from a server config, deriving headers from permitted env vars.
+    /// Creates a client from a server config, deriving headers from the
+    /// configured `headers` map (first) and permitted env vars (legacy
+    /// path). Every value runs through `expand_secret_ref`, so
+    /// `${secret:NAME}` references resolve only when the server was
+    /// granted that secret — a reference without permission fails closed
+    /// instead of sending a literal `${secret:...}` string upstream.
     pub fn new(cfg: &CustomMcpServerConfig) -> Result<Self> {
         validate_server(cfg)?;
         let url = cfg.url.clone().context("missing streamable HTTP MCP url")?;
         let mut headers = HashMap::new();
+        for (key, value) in &cfg.headers {
+            headers.insert(key.clone(), expand_secret_ref(value, &cfg.permissions)?);
+        }
         for (key, value) in filter_env(cfg) {
             headers.insert(key.clone(), expand_secret_ref(value, &cfg.permissions)?);
         }
@@ -575,5 +640,97 @@ mod tests {
         let mut bounded = reader.take(limit as u64 + 1);
         bounded.read_line(&mut line).await.unwrap();
         assert_eq!(line.len(), limit + 1);
+    }
+
+    fn http_config(
+        headers: HashMap<String, String>,
+        permissions: McpPermissions,
+    ) -> CustomMcpServerConfig {
+        CustomMcpServerConfig {
+            id: "http".into(),
+            name: "http server".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: vec![],
+            url: Some("https://example.invalid/mcp".into()),
+            env: Default::default(),
+            headers,
+            permissions,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn header_name_validation_rejects_injection_and_accepts_hyphens() {
+        // Real-world auth header names, including the hyphenated kind.
+        assert!(is_valid_header_name("x-consumer-api-key"));
+        assert!(is_valid_header_name("authorization"));
+        assert!(is_valid_header_name("X-Custom-Token"));
+        // Injection attempts and malformed names fail closed.
+        assert!(!is_valid_header_name(""));
+        assert!(!is_valid_header_name("x-api-key\r\nX-Evil: 1"));
+        assert!(!is_valid_header_name("x api key"));
+        assert!(!is_valid_header_name("x-api-key: v"));
+        assert!(!is_valid_header_name(&"h".repeat(129)));
+    }
+
+    #[test]
+    fn header_value_validation_rejects_control_characters() {
+        assert!(is_valid_header_value("token 123"));
+        assert!(is_valid_header_value("${secret:MY_KEY}"));
+        assert!(!is_valid_header_value(""));
+        assert!(!is_valid_header_value("a\r\nb"));
+        assert!(!is_valid_header_value("a\0b"));
+        assert!(!is_valid_header_value(&"v".repeat(4097)));
+    }
+
+    #[test]
+    fn validate_server_rejects_header_injection() {
+        let mut headers = HashMap::new();
+        headers.insert("x-api-key\r\nX-Evil: 1".into(), "v".into());
+        let err = validate_server(&http_config(headers, McpPermissions::default())).unwrap_err();
+        assert!(err.to_string().contains("header name"), "{err}");
+    }
+
+    #[test]
+    fn streamable_client_carries_configured_headers_and_resolves_secrets() {
+        // A plain header value is carried verbatim.
+        let mut headers = HashMap::new();
+        headers.insert("x-consumer-api-key".into(), "plain-token".into());
+        let client =
+            StreamableHttpMcpClient::new(&http_config(headers, McpPermissions::default())).unwrap();
+        assert_eq!(
+            client.headers.get("x-consumer-api-key").map(String::as_str),
+            Some("plain-token")
+        );
+
+        // A ${secret:...} reference resolves only when permission grants it.
+        // The unique env name keeps this test isolated from parallel tests.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".into(),
+            "${secret:AWH_TEST_HEADER_SECRET}".into(),
+        );
+        let err = match StreamableHttpMcpClient::new(&http_config(
+            headers.clone(),
+            McpPermissions::default(),
+        )) {
+            Err(err) => err,
+            Ok(_) => panic!("secret reference without permission must fail closed"),
+        };
+        assert!(err.to_string().contains("not approved"), "{err}");
+
+        std::env::set_var("AWH_TEST_HEADER_SECRET", "resolved-value");
+        let mut permissions = McpPermissions::default();
+        permissions
+            .environment
+            .push("AWH_TEST_HEADER_SECRET".into());
+        permissions.secrets.push("AWH_TEST_HEADER_SECRET".into());
+        let client = StreamableHttpMcpClient::new(&http_config(headers, permissions)).unwrap();
+        assert_eq!(
+            client.headers.get("authorization").map(String::as_str),
+            Some("resolved-value")
+        );
+        std::env::remove_var("AWH_TEST_HEADER_SECRET");
     }
 }

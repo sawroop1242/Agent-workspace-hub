@@ -113,6 +113,16 @@ enum McpCommand {
         url: Option<String>,
         #[arg(long = "env")]
         env: Vec<String>,
+        /// Extra HTTP header sent on every request (HTTP transport), as NAME=VALUE.
+        /// Prefer `--header 'Authorization=${secret:NAME}'` with `--secret NAME`
+        /// over pasting raw API keys into the registry file.
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Secret (env var name) this server may resolve via `${secret:NAME}`
+        /// header/env references. Grants read permission at serve time; the
+        /// value is only ever read from the serving process environment.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
     },
     Remove {
         id: String,
@@ -401,6 +411,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Conservative heuristic for "this looks like a pasted credential": a
+/// long, dense base62/base64-style token. Used only to warn the operator
+/// toward the `${secret:...}` indirection — never to block a header.
+fn looks_like_secret(value: &str) -> bool {
+    value.len() >= 20
+        && !value.starts_with("${secret:")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && value.chars().any(|c| c.is_ascii_digit())
+}
+
 fn trust_dir() -> Result<std::path::PathBuf> {
     Ok(dirs::home_dir()
         .context("could not determine home directory")?
@@ -429,6 +451,8 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
             args,
             url,
             env,
+            headers,
+            secrets,
         } => {
             let transport = match transport.to_ascii_lowercase().as_str() {
                 "stdio" => McpTransport::Stdio,
@@ -445,6 +469,38 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
                 }
                 environment.insert(k.to_string(), v.to_string());
             }
+            let mut header_map = std::collections::HashMap::new();
+            for item in headers {
+                let mut parts = item.splitn(2, '=');
+                let k = parts.next().unwrap_or("");
+                let v = parts.next().unwrap_or("");
+                if k.is_empty() {
+                    anyhow::bail!("--header must be NAME=VALUE")
+                }
+                header_map.insert(k.to_string(), v.to_string());
+            }
+            let mut permissions = McpPermissions::default();
+            for secret in &secrets {
+                if agent_workspace_hub::mcp::permissions::is_valid_env_name(secret)
+                    && !agent_workspace_hub::mcp::permissions::is_blocked_environment(secret)
+                {
+                    // Secret-read permission implies environment-read for the
+                    // same name (`McpPermissions::validate` enforces this).
+                    permissions.environment.push(secret.clone());
+                    permissions.secrets.push(secret.clone());
+                } else {
+                    anyhow::bail!("--secret must be a safe environment variable name: {secret}");
+                }
+            }
+            for value in header_map.values() {
+                if looks_like_secret(value) {
+                    eprintln!(
+                        "warning: --header value looks like a raw credential. Prefer \
+                         --header 'NAME=${{secret:ENV_VAR}}' with --secret ENV_VAR so the \
+                         key is read from the environment and never stored in .agent/mcps.json"
+                    );
+                }
+            }
             let s = registry.add(CustomMcpServerConfig {
                 id,
                 name,
@@ -453,7 +509,8 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
                 args,
                 url,
                 env: environment,
-                permissions: McpPermissions::default(),
+                headers: header_map,
+                permissions,
                 enabled: true,
             })?;
             println!("added MCP: {}", s.id);

@@ -259,6 +259,7 @@ fn server_config(id: &str) -> CustomMcpServerConfig {
         args: Vec::new(),
         url: None,
         env: Default::default(),
+        headers: Default::default(),
         permissions: McpPermissions::default(),
         enabled: true,
     }
