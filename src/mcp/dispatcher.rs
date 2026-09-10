@@ -80,6 +80,38 @@ impl std::error::Error for DispatchError {}
 /// JSON-RPC protocol version negotiated by this server.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// JSON-RPC server-error code for requests that arrive before the MCP
+/// session is initialized (the same code the MCP reference SDKs borrow
+/// from LSP's `ServerNotInitialized`).
+pub const SERVER_NOT_INITIALIZED_CODE: i64 = -32002;
+
+/// Per-session MCP initialization state, shared between a transport and the
+/// dispatcher's lifecycle gate.
+///
+/// The state flips to initialized exactly once — when a valid `initialize`
+/// request has been answered with a success response. `notifications/
+/// initialized` is accepted silently (matching the MCP reference servers,
+/// which gate on the `initialize` exchange, not the follow-up notification).
+#[derive(Debug, Default)]
+pub struct SessionLifecycle {
+    initialized: std::sync::atomic::AtomicBool,
+}
+
+impl SessionLifecycle {
+    /// Whether the `initialize` exchange has completed for this session.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Marks the session initialized. Idempotent; returns whether this call
+    /// was the transition (i.e. the session was previously uninitialized).
+    pub fn mark_initialized(&self) -> bool {
+        !self
+            .initialized
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
 /// A single parsed JSON-RPC request.
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
@@ -136,14 +168,44 @@ pub struct McpDispatcher {
 }
 
 impl McpDispatcher {
-    /// Builds the dispatcher for a project, wiring the Composio and custom MCP
-    /// providers.
+    /// Builds the dispatcher for a project on the caller's thread.
+    ///
+    /// **Fail-closed contract**: this constructor refuses to run inside an
+    /// already-running Tokio runtime. Historically it created an internal
+    /// runtime and called `block_on` to spawn trusted custom MCP servers —
+    /// calling `block_on` from within a runtime panics ("Cannot start a
+    /// runtime from within a runtime"), a latent hazard that struck the
+    /// moment a trusted custom stdio server was configured. The refusal is
+    /// deterministic and actionable: use [`McpDispatcher::new_async`] from
+    /// async contexts.
     pub fn new(project_root: PathBuf) -> Result<Self> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            bail!(
+                "McpDispatcher::new cannot be called from within a Tokio runtime \
+                 (nested runtimes are unsafe); use McpDispatcher::new_async instead"
+            );
+        }
+        let rt = tokio::runtime::Runtime::new()?;
+        let dispatcher = rt.block_on(Self::construct(project_root))?;
+        // Drop the runtime after construction completes; the dispatcher's
+        // providers own their connections and the transports drive dispatch
+        // on their own runtimes.
+        drop(rt);
+        Ok(dispatcher)
+    }
+
+    /// Builds the dispatcher for a project from an async context, wiring the
+    /// Composio and custom MCP providers without creating any nested runtime.
+    pub async fn new_async(project_root: PathBuf) -> Result<Self> {
+        Self::construct(project_root).await
+    }
+
+    async fn construct(project_root: PathBuf) -> Result<Self> {
         let registry = Arc::new(RwLock::new(ProviderRegistry::default()));
 
         if std::env::var("COMPOSIO_API_KEY").is_ok() {
             if let Ok(provider) = ComposioProvider::from_env() {
-                registry.blocking_write().register(Box::new(provider));
+                registry.write().await.register(Box::new(provider));
             }
         }
 
@@ -157,14 +219,16 @@ impl McpDispatcher {
         if let Ok(api_key) = std::env::var("COMPOSIO_API_KEY") {
             if !api_key.trim().is_empty() {
                 if let Ok(accounts) = ComposioRegistry::new().and_then(|r| r.list()) {
-                    let mut write = registry.blocking_write();
+                    let mut write = registry.write().await;
                     for account in accounts {
-                        write.register(Box::new(ComposioProvider::new(
+                        if let Ok(provider) = ComposioProvider::new(
                             format!("composio:{}", account.label),
                             api_key.clone(),
                             Some(account.connected_account_id),
                             account.toolkit,
-                        )));
+                        ) {
+                            write.register(Box::new(provider));
+                        }
                     }
                 }
             }
@@ -186,28 +250,26 @@ impl McpDispatcher {
             }
             match cfg.transport {
                 McpTransport::Stdio => {
-                    let rt = tokio::runtime::Runtime::new()?;
-                    let client = rt.block_on(StdioMcpClient::spawn(&cfg, project_root.clone()))?;
-                    rt.block_on(client.initialize())?;
+                    let client = StdioMcpClient::spawn(&cfg, project_root.clone()).await?;
+                    client.initialize().await?;
                     let guarded = CircuitBreakerMcpClient::new(
                         cfg.id.clone(),
                         Arc::new(client),
                         circuit_breaker_config(),
                     );
                     let provider = CustomMcpProvider::new(cfg.id, Arc::new(guarded));
-                    registry.blocking_write().register(Box::new(provider));
+                    registry.write().await.register(Box::new(provider));
                 }
                 McpTransport::StreamableHttp => {
-                    let rt = tokio::runtime::Runtime::new()?;
                     let client = StreamableHttpMcpClient::new(&cfg)?;
-                    rt.block_on(client.initialize())?;
+                    client.initialize().await?;
                     let guarded = CircuitBreakerMcpClient::new(
                         cfg.id.clone(),
                         Arc::new(client),
                         circuit_breaker_config(),
                     );
                     let provider = CustomMcpProvider::new(cfg.id, Arc::new(guarded));
-                    registry.blocking_write().register(Box::new(provider));
+                    registry.write().await.register(Box::new(provider));
                 }
             }
         }
@@ -316,6 +378,119 @@ impl McpDispatcher {
         self.dispatch_inner(input).await
     }
 
+    /// Dispatches a message on behalf of a transport session, enforcing the
+    /// MCP initialization lifecycle (spec §8):
+    ///
+    /// - Before the `initialize` exchange completes, every request except
+    ///   `initialize` and `ping` is rejected with `-32002` (server not
+    ///   initialized). Notifications are accepted silently.
+    /// - `initialize` parameters are validated and the protocol version is
+    ///   negotiated: the client's requested version is echoed when supported,
+    ///   otherwise the server's own (supported) version is returned, per the
+    ///   MCP specification.
+    /// - A duplicate `initialize` on an already-initialized session is a
+    ///   deterministic `-32600` protocol error, not a second handshake.
+    ///
+    /// Structurally invalid messages (bad JSON, unsupported JSON-RPC version)
+    /// fail exactly like [`Self::dispatch`]; the lifecycle gate only applies
+    /// to well-formed 2.0 messages.
+    pub async fn dispatch_with_lifecycle(
+        &self,
+        input: &str,
+        lifecycle: &SessionLifecycle,
+    ) -> DispatchResult {
+        match self.dispatch_strict_with_lifecycle(input, lifecycle).await {
+            Ok(result) => result,
+            Err(error) => {
+                let id = serde_json::from_str::<Value>(input)
+                    .ok()
+                    .and_then(|value| value.get("id").cloned());
+                DispatchResult::Response(RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": error.code,
+                        "message": error.message,
+                    })),
+                })
+            }
+        }
+    }
+
+    /// Strict variant of [`Self::dispatch_with_lifecycle`]: structural and
+    /// protocol failures propagate as [`Err`] (preserving the fail-closed
+    /// contract of [`Self::dispatch_strict`]), while lifecycle outcomes
+    /// (pre-initialization requests, duplicate initialization) are *known*
+    /// JSON-RPC failure modes and come back as well-formed error responses.
+    ///
+    /// A successful `initialize` exchange flips the session to initialized;
+    /// a failed one leaves it uninitialized so the client can retry.
+    pub async fn dispatch_strict_with_lifecycle(
+        &self,
+        input: &str,
+        lifecycle: &SessionLifecycle,
+    ) -> Result<DispatchResult, DispatchError> {
+        // Parse and version-check first so structural errors keep their
+        // precise codes regardless of session state.
+        let req: RpcRequest = serde_json::from_str(input)
+            .map_err(|e| DispatchError::parse(format!("invalid JSON: {e}")))?;
+        if req.jsonrpc != "2.0" {
+            return Err(DispatchError::invalid_request(format!(
+                "unsupported JSON-RPC version: {}",
+                req.jsonrpc
+            )));
+        }
+
+        // Notifications (no `id`) produce no response at any lifecycle stage;
+        // `notifications/initialized` included (state flips on the
+        // initialize exchange, matching the MCP reference servers).
+        let id = req.id;
+        if id.is_none() {
+            return Ok(DispatchResult::NoResponse);
+        }
+
+        if lifecycle.is_initialized() {
+            if req.method == "initialize" {
+                audit_deny("session_initialize", "duplicate_initialize", "initialize");
+                return Ok(DispatchResult::Response(RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": codes::INVALID_REQUEST,
+                        "message": "session already initialized",
+                    })),
+                }));
+            }
+        } else if req.method != "initialize" && req.method != "ping" {
+            audit_deny(
+                "session_preinit_rejected",
+                "server_not_initialized",
+                &req.method,
+            );
+            return Ok(DispatchResult::Response(RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(json!({
+                    "code": SERVER_NOT_INITIALIZED_CODE,
+                    "message": "server not initialized: send an initialize request first",
+                })),
+            }));
+        }
+
+        let result = self.dispatch_inner(input).await?;
+        // The initialize exchange completed successfully: flip the session
+        // to initialized. (A failure response keeps the session
+        // uninitialized so the client can retry.)
+        if req.method == "initialize" && result_is_ok(&result) {
+            lifecycle.mark_initialized();
+            audit_allow("session_initialize", "initialize", "lifecycle");
+        }
+        Ok(result)
+    }
+
     async fn dispatch_inner(&self, input: &str) -> Result<DispatchResult, DispatchError> {
         let req: RpcRequest = serde_json::from_str(input)
             .map_err(|e| DispatchError::parse(format!("invalid JSON: {e}")))?;
@@ -337,11 +512,7 @@ impl McpDispatcher {
         }
 
         let result = match req.method.as_str() {
-            "initialize" => json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "agent-workspace-hub", "version": env!("CARGO_PKG_VERSION")}
-            }),
+            "initialize" => self.initialize_response(&req.params)?,
             // MCP liveness probe: the protocol requires an empty response.
             "ping" => json!({}),
             "tools/list" => self
@@ -351,6 +522,13 @@ impl McpDispatcher {
             "tools/call" => self
                 .call_tool(&req.params)
                 .await
+                .inspect_err(|_| {
+                    // Structured record of the failed dispatch; see
+                    // audit_tool_failure for what is (not) captured.
+                    if let Some(name) = req.params.get("name").and_then(Value::as_str) {
+                        audit_tool_failure(name);
+                    }
+                })
                 .map_err(to_dispatch_error)?,
             // MCP resources: project context, memory entries, and
             // referenced skills exposed as addressable, readable URIs.
@@ -361,6 +539,21 @@ impl McpDispatcher {
             // This server ships no prompt templates; the protocol
             // expects an empty list rather than an error.
             "prompts/list" => json!({"prompts": []}),
+            // No prompt templates exist, so every `prompts/get` names an
+            // unknown prompt. Answering with a deterministic protocol error
+            // (rather than a generic "method not found") matches the
+            // MCP error model for unknown prompts and stays consistent
+            // with the empty `prompts/list` advertisement.
+            "prompts/get" => {
+                let name = req
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                return Err(DispatchError::invalid_params(format!(
+                    "unknown prompt: {name} (this server ships no prompt templates)"
+                )));
+            }
             _ => {
                 // Unknown method: a proper JSON-RPC "method not found" error.
                 return Ok(DispatchResult::Response(RpcResponse {
@@ -380,6 +573,43 @@ impl McpDispatcher {
             id,
             result: Some(result),
             error: None,
+        }))
+    }
+
+    /// Builds the `initialize` result: validated parameters, negotiated
+    /// protocol version, and honest capability advertisement.
+    ///
+    /// Validation (fail-closed on anything the protocol types strictly):
+    /// - `params`, when present, must be a JSON object;
+    /// - `protocolVersion`, when present, must be a string.
+    ///
+    /// Negotiation follows the MCP specification: if the client requests a
+    /// version this server supports, that exact version is echoed; otherwise
+    /// the server responds with its own supported version and the client
+    /// decides whether to continue.
+    fn initialize_response(&self, params: &Value) -> Result<Value, DispatchError> {
+        if !params.is_null() && !params.is_object() {
+            return Err(DispatchError::invalid_params(
+                "initialize params must be a JSON object",
+            ));
+        }
+        if let Some(requested) = params.get("protocolVersion") {
+            if !requested.is_string() {
+                return Err(DispatchError::invalid_params(
+                    "initialize protocolVersion must be a string",
+                ));
+            }
+        }
+        // Single supported protocol version: requesting any other version
+        // yields the server's own (the MCP negotiation rule — the client
+        // then decides whether to continue).
+        let negotiated = MCP_PROTOCOL_VERSION;
+        Ok(json!({
+            "protocolVersion": negotiated,
+            // Honest advertisement: tools, resources, and prompts/list are
+            // all implemented by this server.
+            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+            "serverInfo": {"name": "agent-workspace-hub", "version": env!("CARGO_PKG_VERSION")}
         }))
     }
 
@@ -842,7 +1072,7 @@ impl McpDispatcher {
                                 api_key,
                                 Some(connected_account_id),
                                 toolkit,
-                            )));
+                            )?));
                     }
                 }
                 serde_json::to_value(account)?
@@ -1236,6 +1466,13 @@ impl McpDispatcher {
     }
 }
 
+/// Records a failed tool dispatch in the audit ring with a stable slug and
+/// the tool name only — never the error text (it can echo argument or path
+/// content) and never the arguments.
+fn audit_tool_failure(tool: &str) {
+    audit_deny("tool_failure", "dispatch_failed", tool);
+}
+
 /// Records a `github.*` tool call in the audit ring. Only the tool name and
 /// the `owner/repo` target are recorded — never the token, never any freeform
 /// argument (bodies, titles, and reviews can hold user content).
@@ -1267,6 +1504,14 @@ fn github_tool_schemas() -> Value {
         {"name":"github.workflow_dispatch","description":"Manually trigger a workflow_dispatch run on a branch","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"workflow_file":{"type":"string"},"ref":{"type":"string"}},"required":["workflow_file","ref"]}},
         {"name":"github.release_create","description":"Create a release","inputSchema":{"type":"object","properties":{"owner":{"type":"string"},"repo":{"type":"string"},"tag_name":{"type":"string"},"name":{"type":"string"},"body":{"type":"string"},"draft":{"type":"boolean"},"prerelease":{"type":"boolean"}},"required":["tag_name"]}}
     ])
+}
+
+/// Whether a dispatch result is a success response (no `error` field). Used
+/// by the lifecycle gate: only a *successful* `initialize` completes the
+/// session handshake; an error response leaves the session uninitialized so
+/// the client can retry.
+fn result_is_ok(result: &DispatchResult) -> bool {
+    matches!(result, DispatchResult::Response(r) if r.error.is_none())
 }
 
 /// Converts a dispatch error to a [`DispatchError`], preserving an existing
@@ -2002,7 +2247,9 @@ mod tests {
         // Same construction path as `McpDispatcher::new`, then the github
         // provider is swapped for one bound to the stub server.
         let mut dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
-        dispatcher.github = Some(Arc::new(GithubProvider::new("stub-token", &base_url)));
+        dispatcher.github = Some(Arc::new(
+            GithubProvider::new("stub-token", &base_url).expect("provider"),
+        ));
         (dispatcher, paths)
     }
 

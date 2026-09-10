@@ -285,7 +285,13 @@ impl StdioMcpClient {
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::inherit())
+            // If the dispatcher (and with it this client) is dropped without
+            // an explicit shutdown, the child must not outlive the process
+            // that spawned it: no orphaned MCP servers, no zombies holding
+            // pipes. On Linux the bwrap wrapper additionally uses
+            // --die-with-parent for its sandboxed children.
+            .kill_on_drop(true);
         for (key, value) in filter_env(cfg) {
             cmd.env(key, expand_secret_ref(value, &cfg.permissions)?);
         }

@@ -9,19 +9,51 @@ use serde_json::{json, Value};
 use tempfile::tempdir;
 
 /// Sends a single JSON-RPC request to the server and decodes the response body.
+///
+/// The server enforces the MCP initialization lifecycle (spec §8): every
+/// session must complete the `initialize` exchange before other requests.
+/// This helper mirrors what every real MCP client does — initialize once,
+/// then issue the request under test.
 fn rpc(server: &StdioMcpServer, method: &str, params: Value) -> Value {
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-    let response: Value =
-        serde_json::from_str(&server.handle(&request.to_string()).unwrap()).unwrap();
+    let response = rpc_raw(server, 1, method, params);
     response
         .get("result")
         .cloned()
         .unwrap_or_else(|| panic!("no result in response: {response}"))
+}
+
+/// Sends a single JSON-RPC request with a chosen id and returns the raw
+/// response object (so error envelopes can be inspected).
+fn rpc_raw(server: &StdioMcpServer, id: i64, method: &str, params: Value) -> Value {
+    // `initialize` is the request that opens the session; everything else
+    // requires an initialized session per the MCP lifecycle.
+    if method != "initialize" && !server.is_initialized() {
+        let _ = rpc_once(server, 0, "initialize", json!({}));
+    }
+    rpc_once(server, id, method, params)
+}
+
+/// Completes the `initialize` exchange so subsequent raw requests model an
+/// established MCP session.
+fn init(server: &StdioMcpServer) {
+    let response = rpc_once(server, 0, "initialize", json!({}));
+    assert!(
+        response.get("error").is_none(),
+        "initialize failed: {response}"
+    );
+}
+
+/// Sends a single JSON-RPC request and decodes the full response envelope
+/// (result or error). Uses the resilient handler so protocol failures come
+/// back as JSON-RPC error objects, exactly like the serve loop delivers them.
+fn rpc_once(server: &StdioMcpServer, id: i64, method: &str, params: Value) -> Value {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    serde_json::from_str(&server.handle_response(&request.to_string())).unwrap()
 }
 
 #[test]
@@ -156,6 +188,7 @@ fn workspace_read_file_serves_real_file() {
 fn unknown_tool_returns_error_not_panic() {
     let dir = tempdir().unwrap();
     let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    init(&server);
 
     // A name without a dot hits the "unknown tool" fallthrough and now returns
     // a JSON-RPC error (-32602 invalid params) rather than a success envelope
@@ -182,6 +215,7 @@ fn unknown_tool_returns_error_not_panic() {
 fn unknown_qualified_provider_tool_fails_closed() {
     let dir = tempdir().unwrap();
     let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    init(&server);
     // A dotted, unregistered provider name must fail closed (Err), not panic.
     let request = json!({
         "jsonrpc": "2.0",
@@ -222,8 +256,111 @@ fn unsupported_jsonrpc_version_returns_invalid_request_code() {
 fn unknown_method_returns_method_not_found_code() {
     let dir = tempdir().unwrap();
     let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    init(&server);
     let request = json!({"jsonrpc": "2.0", "id": 1, "method": "bogus/method", "params": {}});
     let response: Value =
         serde_json::from_str(&server.handle_response(&request.to_string())).unwrap();
     assert_eq!(response["error"]["code"], -32601);
+}
+
+#[test]
+fn pre_initialize_request_is_rejected_with_32002() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+
+    // tools/call before initialize must be refused (-32002), not dispatched:
+    // this is the end-to-end contract of the MCP initialization lifecycle.
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "skills.list", "arguments": {}}
+    });
+    let response: Value =
+        serde_json::from_str(&server.handle_response(&request.to_string())).unwrap();
+    assert_eq!(response["error"]["code"], -32002);
+    assert!(!server.is_initialized());
+
+    // The connection survives: initialize then retries the same call fine.
+    init(&server);
+    let ok = rpc(
+        &server,
+        "tools/call",
+        json!({"name": "skills.list", "arguments": {}}),
+    );
+    assert!(ok["content"].is_array(), "got: {ok}");
+}
+
+#[test]
+fn duplicate_initialize_is_a_protocol_error() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    init(&server);
+
+    let response = rpc_raw(&server, 2, "initialize", json!({}));
+    assert_eq!(response["error"]["code"], -32600, "got: {response}");
+    // The established session stays usable after the duplicate.
+    let ok = rpc_raw(&server, 3, "ping", json!({}));
+    assert!(ok.get("error").is_none(), "got: {ok}");
+}
+
+#[test]
+fn initialize_with_bad_params_is_rejected_and_retryable() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+
+    // A non-string protocolVersion is a parameter error, not a version miss.
+    let bad = rpc_raw(&server, 1, "initialize", json!({"protocolVersion": 3}));
+    assert_eq!(bad["error"]["code"], -32602, "got: {bad}");
+    assert!(!server.is_initialized());
+
+    // Retry with correct params opens the session.
+    init(&server);
+    assert!(server.is_initialized());
+}
+
+#[test]
+fn version_negotiation_responds_with_supported_version() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+
+    // Requesting an (unsupported) older protocol version still returns the
+    // server's supported version — the client decides whether to continue.
+    let old = rpc_raw(
+        &server,
+        1,
+        "initialize",
+        json!({"protocolVersion": "2024-11-05"}),
+    );
+    assert_eq!(old["result"]["protocolVersion"], "2025-06-18", "got: {old}");
+
+    // Requesting the supported version echoes it exactly.
+    let dir2 = tempdir().unwrap();
+    let server2 = StdioMcpServer::new(dir2.path().to_path_buf()).unwrap();
+    let exact = rpc_raw(
+        &server2,
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18"}),
+    );
+    assert_eq!(exact["result"]["protocolVersion"], "2025-06-18");
+    assert!(exact["result"]["capabilities"]["resources"].is_object());
+    assert!(exact["result"]["capabilities"]["prompts"].is_object());
+}
+
+#[test]
+fn prompts_get_is_a_deterministic_unknown_prompt_error() {
+    let dir = tempdir().unwrap();
+    let server = StdioMcpServer::new(dir.path().to_path_buf()).unwrap();
+    init(&server);
+
+    let response = rpc_raw(&server, 1, "prompts/get", json!({"name": "code_review"}));
+    assert_eq!(response["error"]["code"], -32602, "got: {response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown prompt"),
+        "got: {response}"
+    );
 }

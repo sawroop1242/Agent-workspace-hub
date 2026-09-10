@@ -1,1 +1,13 @@
-Nothing needs to be added to .gitignore since the only change is adding a markdown file (RUFLO_AWH_ARCHITECTURE_ANALYSIS.md), which is a source document that should not be ignored.
+# Rust build artifacts
+/target
+
+# Test output
+**/*.rs.bk
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db

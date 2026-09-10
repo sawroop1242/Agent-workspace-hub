@@ -115,6 +115,7 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
     let acceptor = config.tls.build_acceptor()?;
 
     tracing::info!(event = "http_server_started", addr = %addr, tls = config.tls.enabled());
+    crate::mcp::audit::audit_allow("server_start", "http", &addr);
 
     match acceptor {
         Some(acceptor) => {
@@ -292,11 +293,14 @@ async fn rate_limit_guard(
                 })),
             )
                 .into_response();
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_str(&retry_after.to_string())
-                    .expect("retry-after is numeric"),
-            );
+            // The retry-after value is a rendered integer, so this cannot
+            // fail; if it ever did, serve the response without the header
+            // rather than panicking inside a request handler.
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
             response
         }
     }
@@ -449,7 +453,12 @@ async fn mcp_handler(
         }
     };
 
-    let result = state.dispatcher.dispatch(&body).await;
+    // Enforce the MCP initialization lifecycle per session (the dispatcher's
+    // gate flips the session's state when the initialize exchange succeeds).
+    let result = state
+        .dispatcher
+        .dispatch_with_lifecycle(&body, &session.lifecycle)
+        .await;
 
     match result {
         DispatchResult::Response(response) => {
@@ -471,19 +480,29 @@ struct McpQuery {
 }
 
 /// Signals graceful shutdown on SIGINT/SIGTERM.
+///
+/// Handler installation failures degrade gracefully: the server keeps
+/// serving (it can still be killed outright), rather than panicking at
+/// startup — the shutdown path is best-effort, never fatal (§20).
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(event = "ctrl_c_handler_failed", error = %error);
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(event = "terminate_handler_failed", error = %error);
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -495,6 +514,7 @@ async fn shutdown_signal() {
     }
 
     tracing::info!(event = "http_server_shutdown");
+    crate::mcp::audit::audit_allow("server_stop", "http", "signal");
 }
 
 #[cfg(test)]

@@ -78,6 +78,89 @@ callable, and callers get a clear error if they try.
 Every tool advertises a JSON `inputSchema`; malformed arguments are rejected
 at dispatch with a JSON-RPC error rather than a panic.
 
+## Security model
+
+### Session lifecycle (MCP §8)
+
+A session (one stdio process or one SSE connection) must complete the
+`initialize` exchange before anything else. Every request sent before that —
+except `initialize` and `ping` — is rejected with JSON-RPC error `-32002`
+(server not initialized), and the denial is audited. A malformed
+`initialize` (bad params) returns `-32602` and leaves the session
+uninitialized so the client can retry; a duplicate `initialize` on a live
+session is a deterministic `-32600`. Notifications are accepted silently at
+every stage, matching the MCP reference servers.
+
+### Custom MCP servers: trust is enforced, not stored
+
+Custom (per-project, `.agent/mcps.json`) MCP servers follow this lifecycle:
+
+```
+configuration → enabled? → trust decision → permission validation
+             → spawn → initialize → health (circuit breaker) → registration
+```
+
+* **Enabled is not trusted.** An enabled server is only spawned if it has an
+  explicit, matching approval in the persistent trust store
+  (`~/.agent-workspace-hub`). Missing, blocked, wrong-version, or
+  over-broad (config requests permissions the approval does not grant)
+  fail closed: the server is skipped entirely — it never registers a
+  provider, so its tools are invisible. Untrusted servers are unavailable
+  by construction, not by policy alone.
+* **A corrupted or unreadable trust store means no approvals** — deny all,
+  never fall back to "probably fine".
+* **Permissions are validated at registration**: `network`, `process`,
+  `filesystem` (absolute, existing paths only), `environment` (safe
+  identifier names; dangerous variables like `LD_PRELOAD` and `PATH` are
+  blocked), and `secrets` (every secret must also be an allowed
+  environment key — a conflict is rejected). A malformed permission set
+  cannot even be stored.
+* **Permissions are enforced at spawn**: the child receives only the
+  allow-listed environment keys; secret values are injected only when the
+  secret name appears in the server's own configuration, and only when the
+  matching secret permission was granted.
+* No automatic trust escalation: nothing a server does at runtime can
+  upgrade its approval.
+
+This is the *current* trust boundary — a per-server execution gate. It is
+not the future AWH-wide Tool Broker / capability system.
+
+### Sandbox (platform-specific, honestly stated)
+
+Custom stdio MCP servers are spawned through a sandbox when enabled. What
+that means depends on the platform — no false equivalence claimed:
+
+| Platform | Mechanism | Enforced |
+| --- | --- | --- |
+| Linux | bubblewrap (`bwrap`) | mount namespace (root + permission paths bound; `/usr`, `/proc`, `/dev`, `/tmp` only), user/pid/ipc/uts namespaces, all capabilities dropped, network **only** when the `network` permission is granted, and rlimits: address space 2 GiB, CPU 300 s, 128 processes, 1024 fds (defaults; `SandboxLimits`). `--die-with-parent` and `--new-session` prevent orphans. Missing `bwrap` (override with `AWH_BWRAP`) ⇒ **execution fails closed**, never runs unsandboxed. |
+| macOS | `sandbox-exec` profile | `(deny default)` with read allowed for system paths + the project root, writes restricted to the project root and `/tmp`; network only when granted. Note: `sandbox-exec` is deprecated by Apple but remains enforced here. Resource limits (CPU/memory/fd/process counts) are **not** applied on macOS. |
+| Windows | Job Object | memory + job memory + active-process limits applied to the child; handle released on drop. This bounds resources only — it is **not** a filesystem or network sandbox. |
+| Other | none | Sandboxed execution is **refused** when enabled; the server is not started unsandboxed. |
+
+Sandbox-disabled is a per-server configuration choice; the trust gate,
+permission validation, environment filtering, and circuit breaker still apply.
+
+### Circuit breaker and bounded resources
+
+* Every custom MCP server is wrapped in a **circuit breaker** (closed →
+  open after 5 consecutive failures → half-open after a 30 s cooldown).
+  In half-open exactly **one** probe call is admitted; concurrent callers
+  are rejected, and a lost probe self-heals after 60 s rather than wedging
+  the breaker. A failing server degrades to fast errors instead of
+  cascading delays. Thresholds/cooldown are tunable via
+  `AWH_CIRCUIT_FAILURE_THRESHOLD` / `AWH_CIRCUIT_COOLDOWN_SECS`.
+* **Bounded everything**: stdio lines and HTTP bodies are capped at
+  10 MiB (`AWH_MAX_MCP_LINE_BYTES`), HTTP client requests time out at
+  30 s, per-request MCP dispatch times out, and SSE sessions are capped
+  at 100 concurrent with per-session dispatcher state. Children are
+  `kill_on_drop`, so a dropped client cannot leave an orphaned server
+  process.
+* **No panics on the request path**: construction of shared clients
+  returns errors (fail-closed) instead of unwinding, HTTP handlers
+  degrade gracefully (e.g. a rate-limited response still ships without
+  the header if header rendering ever failed), and all denials are
+  audited (`api_rate_limit`, `session_preinit_rejected`, …).
+
 ## Interoperability evidence
 
 AWH is verified against two independent, standards-compliant MCP clients:

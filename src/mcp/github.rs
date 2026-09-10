@@ -192,18 +192,21 @@ impl GithubProvider {
         Ok(Self {
             token,
             base_url,
-            client: super::config::build_http_client(),
+            client: super::config::build_http_client()?,
         })
     }
 
     /// Creates a provider with an explicit token and base URL — the seam
     /// tests use to point the provider at a local stub server.
-    pub fn new(token: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
+    ///
+    /// Fails only if the shared HTTP client cannot be constructed —
+    /// fail-closed, not panic (§20).
+    pub fn new(token: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
+        Ok(Self {
             token: token.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            client: super::config::build_http_client(),
-        }
+            client: super::config::build_http_client()?,
+        })
     }
 
     /// The API root this provider talks to.
@@ -899,7 +902,7 @@ mod tests {
     #[tokio::test]
     async fn pr_list_hits_expected_endpoint_query_and_headers() {
         let (base, recorded) = spawn_stub(vec![]).await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         let value = provider
             .pr_list(&target(), Some("open"), Some("main"))
             .await
@@ -918,7 +921,7 @@ mod tests {
     #[tokio::test]
     async fn pr_list_without_filters_sends_no_query() {
         let (base, recorded) = spawn_stub(vec![]).await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         provider.pr_list(&target(), None, None).await.unwrap();
         let recorded = recorded.lock().unwrap();
         assert_eq!(recorded[0].query, "");
@@ -927,7 +930,7 @@ mod tests {
     #[tokio::test]
     async fn pr_create_posts_required_fields_only() {
         let (base, recorded) = spawn_stub(vec![]).await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         provider
             .pr_create(&target(), "T", "feature", "main", None, None)
             .await
@@ -945,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn pr_merge_puts_merge_method() {
         let (base, recorded) = spawn_stub(vec![]).await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         provider
             .pr_merge(&target(), 7, Some("squash"))
             .await
@@ -960,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn issue_comment_posts_body_to_issue_endpoint() {
         let (base, recorded) = spawn_stub(vec![]).await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         provider
             .issue_comment(&target(), 5, "looks good")
             .await
@@ -975,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn checks_status_combines_status_and_check_runs() {
         let (base, recorded) = spawn_stub(vec![]).await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         let value = provider.checks_status(&target(), "main").await.unwrap();
         assert_eq!(
             value,
@@ -996,7 +999,7 @@ mod tests {
             Some(json!({"message": "Bad credentials"})),
         )])
         .await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         let error = provider.checks_status(&target(), "main").await.unwrap_err();
         assert!(error.to_string().contains("401"), "unexpected: {error}");
     }
@@ -1009,7 +1012,7 @@ mod tests {
             None,
         )])
         .await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         let value = provider
             .workflow_dispatch(&target(), "ci.yml", "main")
             .await
@@ -1028,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_dispatch_rejects_path_shaping_arguments() {
         let (base, _recorded) = spawn_stub(vec![]).await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         // A workflow_file carrying URL metacharacters could reshape the
         // endpoint; it must be rejected before any request is sent.
         let error = provider
@@ -1049,7 +1052,7 @@ mod tests {
             Some(json!({"message": "Not Found"})),
         )])
         .await;
-        let provider = GithubProvider::new("token", &base);
+        let provider = GithubProvider::new("token", &base).expect("provider");
         let error = provider.pr_get(&target(), 999).await.unwrap_err();
         let text = error.to_string();
         assert!(text.contains("404"), "unexpected: {text}");
@@ -1058,7 +1061,7 @@ mod tests {
 
     #[test]
     fn base_url_has_trailing_slash_stripped() {
-        let provider = GithubProvider::new("token", "http://127.0.0.1:1/");
+        let provider = GithubProvider::new("token", "http://127.0.0.1:1/").expect("provider");
         assert_eq!(provider.base_url(), "http://127.0.0.1:1");
     }
 }
