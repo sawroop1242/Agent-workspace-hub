@@ -250,3 +250,30 @@ cheap-to-clone). Tool catalog 53 static.
   between sessions; if `cargo` is missing reinstall with rustup
   (`--default-toolchain stable --profile minimal` then `rustup
   component add rustfmt clippy`).
+- **Custom MCP HTTP headers (Phase 12, PR #16, f072414)**:
+  `CustomMcpServerConfig.headers` map + `awh mcp add --header NAME=VALUE
+  --secret NAME`. Names = RFC 7230 tokens, values control-char-free
+  (CRLF injection rejected at config time), all values via
+  `expand_secret_ref` (`${secret:NAME}` resolves only with BOTH secrets
+  AND environment permission Ñ `McpPermissions::validate` requires
+  every secret to also be an allowed env name, so `--secret` grants the
+  pair). Fail closed at registration, never send literal refs upstream.
+  Gotchas: (1) test env-var manipulation needs globally-unique names
+  (AWH_TEST_HEADER_SECRET) to survive parallel siblings;
+  (2) `unwrap_err()` needs Debug on the Ok type Ñ use `match` for
+  non-Debug clients; (3) a shell-exported COMPOSIO_API_KEY leaks into
+  `cargo test` and makes dispatcher tests hit the live Composio backend
+  (401) Ñ unset before testing; (4) repo-root `.agent/` is gitignored
+  (anchored `/.agent/` so `examples/mcp-interop/.agent` fixtures stay
+  tracked) since `--header` can carry raw credentials in other setups;
+  (5) Composio hosted MCP key only works on
+  `connect.composio.dev/mcp` (x-consumer-api-key header), NOT on the
+  backend API the native `ComposioProvider` uses Ñ register the hosted
+  endpoint as a custom server instead.
+- **Toolchain-reinstall trap**: rustup minimal profile lacks
+  `cargo-fmt`/`cargo-clippy` shims until `rustup component add rustfmt
+  clippy`; verify with `cargo --version` before trusting rustup logs.
+
+- **Custom MCP HTTP headers (Phase 12, PR #16, f072414)**: `CustomMcpServerConfig.headers` map + `awh mcp add --header NAME=VALUE --secret NAME`. Names = RFC 7230 tokens, values control-char-free (CRLF injection rejected at config time), all values via `expand_secret_ref` (`${secret:NAME}` resolves only with BOTH secrets AND environment permission â€” `McpPermissions::validate` requires every secret to also be an allowed env name, so `--secret` grants the pair). Fail closed at registration, never send literal refs upstream. Gotchas: (1) test env-var manipulation needs globally-unique names (AWH_TEST_HEADER_SECRET) to survive parallel siblings; (2) `unwrap_err()` needs Debug on the Ok type â€” use `match` for non-Debug clients; (3) a shell-exported COMPOSIO_API_KEY leaks into `cargo test` and makes dispatcher tests hit the live Composio backend (401) â€” unset before testing; (4) repo-root `.agent/` is gitignored (anchored `/.agent/` so `examples/mcp-interop/.agent` fixtures stay tracked) since `--header` can carry raw credentials in other setups; (5) Composio hosted MCP key only works on `connect.composio.dev/mcp` (x-consumer-api-key header), NOT on the backend API the native `ComposioProvider` uses â€” register the hosted endpoint as a custom server instead.
+- **Toolchain-reinstall trap**: rustup minimal profile lacks `cargo-fmt`/`cargo-clippy` shims until `rustup component add rustfmt clippy`; verify with `cargo --version` before trusting rustup logs.
+- **AGENTS.md is not pure UTF-8** (a 0xd1 byte near offset 8098 makes strict decoders fail); append via python/shell, not the file editor.
