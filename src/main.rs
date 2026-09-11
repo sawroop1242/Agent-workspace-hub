@@ -1,9 +1,12 @@
+use agent_workspace_hub::core::agents::AgentStore;
+use agent_workspace_hub::core::capability_grants::CapabilityGrantStore;
 use agent_workspace_hub::mcp::{
     auth::load_api_key, CommunityMcpRegistryClient, CustomMcpRegistry, CustomMcpServerConfig,
-    GlobalMcpRegistry, HttpServerConfig, McpDispatcher, McpPermissions, McpTransport,
+    GlobalMcpRegistry, HttpServerConfig, McpDispatcher, McpPermissions, McpTransport, Permission,
     PersistentTrustStore, ProjectMcpReferences, ResourceLimits, StdioMcpServer, TlsConfig,
     TrustLevel,
 };
+use agent_workspace_hub::models::{Agent, AgentStatus, CapabilityGrant};
 use agent_workspace_hub::skills::{
     GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller,
 };
@@ -64,6 +67,11 @@ enum Command {
     Registry {
         #[command(subcommand)]
         command: RegistryCommand,
+    },
+    /// Manage agent identities and their capability grants.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
     Tunnel {
         #[command(subcommand)]
@@ -251,6 +259,43 @@ enum TunnelCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Create a new agent identity (initial status: created).
+    Create {
+        /// Unique agent id.
+        id: String,
+        /// Human-readable agent name.
+        name: String,
+        /// The agent's role (e.g. researcher).
+        #[arg(long)]
+        role: String,
+    },
+    /// List agents (one per line).
+    List,
+    /// Show an agent and its capability grants.
+    Inspect {
+        /// Agent id.
+        id: String,
+    },
+    /// Grant a capability to an agent.
+    Grant {
+        /// Agent id.
+        id: String,
+        /// Capability category: network|filesystem|environment|process|secrets.
+        #[arg(long)]
+        permission: String,
+        /// Optional resource scope (e.g. a filesystem path prefix).
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Revoke a capability grant.
+    Revoke {
+        /// Grant id.
+        grant_id: String,
+    },
+}
+
 fn main() -> Result<()> {
     // JSON-RPC responses are written to stdout; keep all diagnostics on stderr
     // so they never corrupt the protocol stream consumed by MCP clients.
@@ -405,6 +450,7 @@ fn main() -> Result<()> {
             }
             RegistryCommand::Search { query, url } => search_registry(&url, &query)?,
         },
+        Some(Command::Agent { command }) => handle_agent_cli(command)?,
         Some(Command::Tunnel { command }) => handle_tunnel_cli(command)?,
         None => println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
     }
@@ -697,6 +743,129 @@ fn serve_control_api(host: String, port: u16, api_key_env: String) -> Result<()>
         axum::serve(listener, app).await
     })?;
     Ok(())
+}
+
+/// Handles `awh agent create|list|inspect|grant|revoke`. Agents and their
+/// capability grants are plain persisted records in this phase: nothing here
+/// is consulted by tool execution — enforcement is a later phase.
+fn handle_agent_cli(command: AgentCommand) -> Result<()> {
+    // Agents are workspace-local: they live in the `.agent` directory of the
+    // project the command runs against.
+    let root = std::env::current_dir().context("could not determine workspace directory")?;
+    let agents = AgentStore::new(&root);
+    let grants = CapabilityGrantStore::new(&root);
+
+    match command {
+        AgentCommand::Create { id, name, role } => {
+            let agent = Agent {
+                id,
+                name,
+                role,
+                status: AgentStatus::Created,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            agents.create(&agent)?;
+            println!(
+                "created agent {} ({}) role: {} status: created",
+                agent.id, agent.name, agent.role
+            );
+        }
+        AgentCommand::List => {
+            for agent in agents.list()? {
+                println!(
+                    "{} {} {} {}",
+                    agent.id,
+                    agent.name,
+                    agent.role,
+                    status_label(&agent.status)
+                );
+            }
+        }
+        AgentCommand::Inspect { id } => {
+            let Some(agent) = agents.get(&id)? else {
+                bail!("agent not found: {id}");
+            };
+            println!(
+                "id: {}\nname: {}\nrole: {}\nstatus: {}\ncreated: {}",
+                agent.id,
+                agent.name,
+                agent.role,
+                status_label(&agent.status),
+                agent.created_at
+            );
+            let agent_grants = grants.list_for_agent(&id)?;
+            if agent_grants.is_empty() {
+                println!("grants: none");
+            } else {
+                println!("grants ({}):", agent_grants.len());
+                for grant in agent_grants {
+                    println!(
+                        "  {} {} scope: {}",
+                        grant.id,
+                        grant.permission.as_str(),
+                        grant.scope.as_deref().unwrap_or("unscoped")
+                    );
+                }
+            }
+        }
+        AgentCommand::Grant {
+            id,
+            permission,
+            scope,
+        } => {
+            if agents.get(&id)?.is_none() {
+                bail!("agent not found: {id}");
+            }
+            let permission = parse_permission(&permission)?;
+            // Grant ids are derived from the agent id and permission so they
+            // are unique per agent/permission pair and predictable for
+            // `agent revoke`.
+            let grant_id = format!("{}-{}", id, permission.as_str());
+            let grant = CapabilityGrant {
+                id: grant_id.clone(),
+                agent_id: id.clone(),
+                permission,
+                scope,
+                granted_at: chrono::Utc::now().to_rfc3339(),
+                expires_at: None,
+            };
+            grants.create(&grant)?;
+            println!("granted {} to {id} (grant {grant_id})", permission.as_str());
+        }
+        AgentCommand::Revoke { grant_id } => {
+            if grants.revoke(&grant_id)? {
+                println!("revoked grant: {grant_id}");
+            } else {
+                println!("grant not found: {grant_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Maps a permission label from the CLI to the shared [`Permission`] enum.
+fn parse_permission(value: &str) -> Result<Permission> {
+    match value {
+        "network" => Ok(Permission::Network),
+        "filesystem" => Ok(Permission::Filesystem),
+        "environment" => Ok(Permission::Environment),
+        "process" => Ok(Permission::Process),
+        "secrets" => Ok(Permission::Secrets),
+        other => bail!(
+            "invalid permission {other:?} — expected one of: network, filesystem, environment, process, secrets"
+        ),
+    }
+}
+
+/// Human-readable agent status label matching the serde wire names.
+fn status_label(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Created => "created",
+        AgentStatus::Active => "active",
+        AgentStatus::Paused => "paused",
+        AgentStatus::Stopped => "stopped",
+        AgentStatus::Failed => "failed",
+    }
 }
 
 /// Handles `awh tunnel start|status`. `start` runs in the foreground:
