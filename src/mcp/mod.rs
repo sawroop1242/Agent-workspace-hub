@@ -94,11 +94,15 @@ pub use custom_mcp::{
     StreamableHttpMcpClient,
 };
 pub use dispatcher::{
-    tool_metadata, DispatchResult, McpDispatcher, SessionLifecycle, SessionState,
-    MCP_PROTOCOL_VERSION, SERVER_NOT_INITIALIZED_CODE, SUPPORTED_PROTOCOL_VERSIONS,
+    tool_metadata, trust_data_dir, DispatchResult, McpDispatcher, SessionLifecycle, SessionState,
+    BUILTIN_TOOL_DENIED_CODE, MCP_PROTOCOL_VERSION, SERVER_NOT_INITIALIZED_CODE,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
-pub use error::McpAuthorizationError;
-pub use execution_gate::{authorize as authorize_mcp_execution, McpExecutionRequest};
+pub use error::{BuiltinToolAuthorizationError, McpAuthorizationError};
+pub use execution_gate::{
+    authorize as authorize_mcp_execution, authorize_builtin_tool, McpExecutionRequest,
+    BUILTIN_TOOL_TRUST_ID,
+};
 pub use github::{resolve_repo_target, GithubProvider, RepoTarget};
 pub use global_mcp::{
     GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs,

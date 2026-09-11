@@ -52,6 +52,12 @@ impl Permission {
     }
 }
 
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 const BLOCKED_ENVIRONMENT: &[&str] = &[
     "PATH",
     "LD_PRELOAD",

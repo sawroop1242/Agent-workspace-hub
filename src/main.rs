@@ -4,7 +4,7 @@ use agent_workspace_hub::mcp::{
     auth::load_api_key, CommunityMcpRegistryClient, CustomMcpRegistry, CustomMcpServerConfig,
     GlobalMcpRegistry, HttpServerConfig, McpDispatcher, McpPermissions, McpTransport, Permission,
     PersistentTrustStore, ProjectMcpReferences, ResourceLimits, StdioMcpServer, TlsConfig,
-    TrustLevel,
+    TrustLevel, BUILTIN_TOOL_TRUST_ID,
 };
 use agent_workspace_hub::models::{Agent, AgentStatus, CapabilityGrant};
 use agent_workspace_hub::skills::{
@@ -165,6 +165,18 @@ enum McpCommand {
         id: String,
         #[arg(long, default_value = "local")]
         version: String,
+        /// Grant the built-in tool surface the network capability (only
+        /// valid for the reserved `awh.builtin` id).
+        #[arg(long)]
+        network: bool,
+        /// Grant the built-in tool surface the process capability (only
+        /// valid for the reserved `awh.builtin` id).
+        #[arg(long)]
+        process: bool,
+        /// Grant the built-in tool surface the filesystem capability (only
+        /// valid for the reserved `awh.builtin` id).
+        #[arg(long)]
+        filesystem: bool,
     },
     Block {
         id: String,
@@ -470,9 +482,8 @@ fn looks_like_secret(value: &str) -> bool {
 }
 
 fn trust_dir() -> Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
-        .context("could not determine home directory")?
-        .join(".agent-workspace-hub"))
+    agent_workspace_hub::mcp::trust_data_dir()
+        .context("could not determine the trust data directory (set AWH_TRUST_DIR)")
 }
 
 fn handle_mcp_cli(command: McpCommand) -> Result<()> {
@@ -632,16 +643,42 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
                 bail!("global MCP not found: {id}")
             }
         }
-        McpCommand::Trust { id, version } => {
-            let config = registry.get(&id)?.context("MCP not found")?;
+        McpCommand::Trust {
+            id,
+            version,
+            network,
+            process,
+            filesystem,
+        } => {
+            // The reserved built-in identity is not a registered custom
+            // server, so its permissions are declared by the capability
+            // flags instead of a server config. No flags means a Reviewed
+            // record granting nothing — the least-privilege starting point;
+            // `awh mcp trust awh.builtin --network --process --filesystem`
+            // grants the full built-in surface.
+            let permissions = if id == BUILTIN_TOOL_TRUST_ID {
+                McpPermissions {
+                    network,
+                    process,
+                    filesystem: if filesystem {
+                        vec![BUILTIN_TOOL_TRUST_ID.to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..McpPermissions::default()
+                }
+            } else {
+                if network || process || filesystem {
+                    bail!(
+                        "capability flags are only valid for the reserved id {}",
+                        BUILTIN_TOOL_TRUST_ID
+                    );
+                }
+                registry.get(&id)?.context("MCP not found")?.permissions
+            };
             let dir = trust_dir()?;
             let mut store = PersistentTrustStore::new(&dir)?;
-            store.approve(
-                id.clone(),
-                TrustLevel::Reviewed,
-                config.permissions,
-                version,
-            )?;
+            store.approve(id.clone(), TrustLevel::Reviewed, permissions, version)?;
             store.save(&dir)?;
             println!("trusted MCP: {id}");
         }
@@ -689,8 +726,20 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
             }
         }
         McpCommand::Permissions { id } => {
-            let config = registry.get(&id)?.context("MCP not found")?;
-            let p = config.permissions;
+            // The reserved built-in identity has no registered server config;
+            // report the granted capabilities straight from its trust record.
+            let p = if id == BUILTIN_TOOL_TRUST_ID {
+                let dir = trust_dir()?;
+                let store = PersistentTrustStore::new(&dir)?;
+                store
+                    .approvals
+                    .iter()
+                    .find(|a| a.id == BUILTIN_TOOL_TRUST_ID)
+                    .map(|a| a.approved_permissions.clone())
+                    .context("no trust record found for the built-in tool surface (every built-in tool is unrestricted)")?
+            } else {
+                registry.get(&id)?.context("MCP not found")?.permissions
+            };
             println!(
                 "MCP: {id}\nnetwork: {}\nprocess: {}\nfilesystem: {}\nenvironment: {}\nsecrets: {}",
                 p.network,
