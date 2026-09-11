@@ -21,6 +21,12 @@ impl CapabilityGrantStore {
 
     /// Creates (or overwrites) a grant, keyed by its `id`.
     pub fn create(&self, grant: &CapabilityGrant) -> Result<()> {
+        if !is_safe_grant_id(&grant.id) {
+            return Err(anyhow::anyhow!(
+                "invalid grant id: {:?} (must not be empty or contain path separators)",
+                grant.id
+            ));
+        }
         fs::create_dir_all(self.capabilities_dir())?;
         let path = self.capabilities_dir().join(format!("{}.json", grant.id));
         let data = serde_json::to_string_pretty(grant)?;
@@ -154,6 +160,20 @@ mod tests {
             !store.revoke("g1").unwrap(),
             "revoking a missing grant returns false"
         );
+    }
+
+    #[test]
+    fn create_rejects_unsafe_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CapabilityGrantStore::new(temp.path());
+        for bad in ["../escape", "a/b", "a\\b"] {
+            assert!(
+                store
+                    .create(&grant(bad, "writer", Permission::Network))
+                    .is_err(),
+                "id {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
