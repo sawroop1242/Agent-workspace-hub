@@ -4,6 +4,7 @@
 //! business logic.
 
 pub mod audit;
+pub mod edit;
 pub mod files;
 pub mod git;
 pub mod projects;
