@@ -76,3 +76,29 @@ impl BuiltinToolAuthorizationError {
         }
     }
 }
+
+/// Denial of a built-in tool call by a workspace-local policy rule.
+///
+/// Unlike [`BuiltinToolAuthorizationError`] (which answers "is this tool
+/// category allowed at all for this machine"), this error names the
+/// *specific* rule that rejected a *specific* resource (a path or program).
+/// It is produced only when the coarse gate has already allowed the call, so
+/// a policy denial always narrows — never widens — the trust decision.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PolicyDenialError {
+    /// A policy rule matched the call's resource, and its deny applies.
+    #[error(
+        "'{tool}' denied by policy rule '{rule_id}' matching '{pattern}'{}",
+        reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default()
+    )]
+    Denied {
+        /// The gated tool name.
+        tool: String,
+        /// The id of the rule that matched.
+        rule_id: String,
+        /// The pattern that matched.
+        pattern: String,
+        /// Optional human-readable reason, prefixed with `": "` when present.
+        reason: Option<String>,
+    },
+}

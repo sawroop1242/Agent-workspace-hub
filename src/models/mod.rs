@@ -9,6 +9,8 @@ pub mod agent;
 pub mod capability_grant;
 /// Memory entry models.
 pub mod memory;
+/// Workspace policy rule models.
+pub mod policy_rule;
 /// Project models.
 pub mod project;
 /// Task models.
@@ -17,5 +19,6 @@ pub mod task;
 pub use agent::{Agent, AgentStatus};
 pub use capability_grant::CapabilityGrant;
 pub use memory::MemoryEntry;
+pub use policy_rule::PolicyRule;
 pub use project::Project;
 pub use task::{Task, TaskStatus};

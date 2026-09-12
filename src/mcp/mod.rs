@@ -95,10 +95,10 @@ pub use custom_mcp::{
 };
 pub use dispatcher::{
     tool_metadata, trust_data_dir, DispatchResult, McpDispatcher, SessionLifecycle, SessionState,
-    BUILTIN_TOOL_DENIED_CODE, MCP_PROTOCOL_VERSION, SERVER_NOT_INITIALIZED_CODE,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    BUILTIN_TOOL_DENIED_CODE, MCP_PROTOCOL_VERSION, POLICY_DENIED_CODE,
+    SERVER_NOT_INITIALIZED_CODE, SUPPORTED_PROTOCOL_VERSIONS,
 };
-pub use error::{BuiltinToolAuthorizationError, McpAuthorizationError};
+pub use error::{BuiltinToolAuthorizationError, McpAuthorizationError, PolicyDenialError};
 pub use execution_gate::{
     authorize as authorize_mcp_execution, authorize_builtin_tool, McpExecutionRequest,
     BUILTIN_TOOL_TRUST_ID,

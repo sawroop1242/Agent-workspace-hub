@@ -93,6 +93,69 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
 ## Phase Status
 
 0-11 done (branch rust; Phase 11 via PR #10, CI green on all 3 platforms).
+
+- **Phase 3 policy - workspace-local DENY-only rules (on top of PR #19's
+  built-in gate)**: PR #19 routes every Medium/High built-in tool through
+  `authorize_builtin(...)` - a coarse, workspace-independent category gate
+  via `awh.builtin` (per-user-machine trust). This phase adds a SECOND,
+  narrower check for exactly the three tools whose call carries a meaningful
+  resource: `workspace.write_file` (`path`), `workspace.delete_file`
+  (`path`), and `terminal.run` (`program`). New `PolicyStore`
+  (`src/core/policy.rs`) persists ALL rules as a single JSON array at
+  `<workspace>/.agent/policy.json` - the ONE deliberate deviation from the
+  `AgentStore`/`CapabilityGrantStore` one-file-per-record pattern (single
+  hot-path read via `matching()`). `matching(tool, resource)` returns the
+  first rule for that exact tool whose pattern matches: forward-slash
+  relative-path PREFIX for the two `workspace.*` tools, EXACT case-sensitive
+  match for `terminal.run` - no globs either way (v1 limitation, documented).
+  New `src/models/policy_rule.rs` (`PolicyRule { id, tool, pattern, reason,
+  created_at }`), `PolicyDenialError` in `src/mcp/error.rs`, JSON-RPC code
+  `POLICY_DENIED_CODE = -32004` (after `BUILTIN_TOOL_DENIED_CODE = -32003`).
+  Dispatcher gains a `policy: PolicyStore` field loaded from the workspace
+  root (per-workspace, NOT home dir) + `with_policy_store` builder + private
+  `authorize_policy(tool, resource)` that emits `policy_denied`/
+  `policy_allowed` audit actions (distinct from Phase 2's `builtin_tool_denied`)
+  and returns `-32004` on match. EXACTLY three call sites (write_file/
+  delete_file/terminal.run) immediately after their `authorize_builtin` call,
+  BEFORE the service runs; the ~34 other `authorize_builtin` arms and
+  `execution_gate.rs` are untouched. CLI `awh policy deny|list|remove` mirrors
+  `handle_agent_cli` (std::env::current_dir(), auto id = `policy-` + tool+
+  pattern SHA-256 prefix). Deny-only: zero rules = byte-identical to Phase 2
+  (`no_policy_rules_leaves_all_three_tools_working`). Fail closed on an
+  unreadable store (internal error, not a false allow). No Allow rules/
+  approval/globs/hierarchy - out of scope. Tests: `tests/mcp_policy_gate.rs`
+  (11, spawns real `awh` + real dispatcher).
+
+- **Phase 3 policy Ñ workspace-local DENY-only rules (on top of PR #19's
+  built-in gate)**: PR #19 routes every Medium/High built-in tool through
+  `authorize_builtin("aws.../workspace.*")` Ñ a coarse, workspace-independent
+  category gate via `awh.builtin` (per-user-machine trust). This phase adds a
+  SECOND, narrower check for exactly the three tools whose call carries a
+  meaningful resource: `workspace.write_file` (`path`), `workspace.delete_file`
+  (`path`), and `terminal.run` (`program`). New `PolicyStore`
+  (`src/core/policy.rs`) persists ALL rules as a single JSON array at
+  `<workspace>/.agent/policy.json` Ñ the ONE deliberate deviation from the
+  `AgentStore`/`CapabilityGrantStore` one-file-per-record pattern (single hot-
+  path read via `matching()`). `matching(tool, resource)` returns the first
+  rule for that exact tool whose pattern matches: forward-slash relative-path
+  PREFIX for the two `workspace.*` tools, EXACT case-sensitive match for
+  `terminal.run` Ñ no globs either way (v1 limitation, documented). New
+  `src/models/policy_rule.rs` (`PolicyRule { id, tool, pattern, reason,
+  created_at }`), `PolicyDenialError` in `src/mcp/error.rs`, JSON-RPC code
+  `POLICY_DENIED_CODE = -32004` (after `BUILTIN_TOOL_DENIED_CODE = -32003`).
+  Dispatcher gains a `policy: PolicyStore` field loaded from the workspace
+  root (per-workspace, NOT home dir) + `with_policy_store` builder + private
+  `authorize_policy(tool, resource)` that emits `policy_denied`/`policy_allowed`
+  audit actions (distinct from Phase 2's `builtin_tool_denied`) and returns
+  `-32004` on match. EXACTLY three call sites (write_file/delete_file/terminal.
+  run) immediately after their `authorize_builtin` call, BEFORE the service
+  runs; the ~34 other `authorize_builtin` arms and `execution_gate.rs` are
+  untouched. CLI `awh policy deny|list|remove` mirrors `handle_agent_cli`
+  (std::env::current_dir(), auto id = `policy-` + tool+pattern SHA-256 prefix).
+  Deny-only: zero rules = byte-identical to Phase 2 (`no_policy_rules_leaves_
+  all_three_tools_working`). Fail closed on unreadable store (internal error,
+  not a false allow). No Allow rules/approval/globs/hierarchy Ñ out of scope.
+  Tests: `tests/mcp_policy_gate.rs` (11, spawns real `awh` + real dispatcher).
 **PR #15 (mcp-protocol-hardening) â€” MCP protocol hardening round**: landed
 per-hook `catch_unwind` isolation in `McpHooks::fire` (panic recorded via
 tracing with `method_hint`, hook skipped, registry stays usable â€” pinned
