@@ -20,7 +20,8 @@
 
 use agent_workspace_hub::core::policy::PolicyStore;
 use agent_workspace_hub::mcp::{
-    McpDispatcher, PersistentTrustStore, SessionLifecycle, TrustStore, POLICY_DENIED_CODE,
+    McpDispatcher, McpPermissions, PersistentTrustStore, SessionLifecycle, TrustLevel, TrustStore,
+    BUILTIN_TOOL_DENIED_CODE, BUILTIN_TOOL_TRUST_ID, POLICY_DENIED_CODE,
 };
 use agent_workspace_hub::models::PolicyRule;
 use agent_workspace_hub::services::audit::global as audit_log;
@@ -32,6 +33,28 @@ use tempfile::tempdir;
 /// these tests isolate the *policy* layer's effect.
 fn empty_trust_store() -> PersistentTrustStore {
     PersistentTrustStore::from_store(&TrustStore::default())
+}
+
+/// A restrictive `awh.builtin` record granting no capabilities: the least
+/// privilege configuration the trust CLI writes. Used to prove the coarse
+/// category-level gate denies a resource-scoped tool *before* the policy
+/// layer is even consulted.
+fn restrictive_trust_store() -> PersistentTrustStore {
+    let mut store = TrustStore::default();
+    store
+        .approve(
+            BUILTIN_TOOL_TRUST_ID,
+            TrustLevel::Reviewed,
+            McpPermissions {
+                network: false,
+                process: false,
+                filesystem: Vec::new(),
+                ..McpPermissions::default()
+            },
+            "local".to_string(),
+        )
+        .expect("valid approval");
+    PersistentTrustStore::from_store(&store)
 }
 
 /// Builds a dispatcher with an empty (allow-everything) trust store and an
@@ -514,33 +537,140 @@ async fn corrupt_policy_store_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
+// E2. authorize_tool runs the coarse gate before the policy check
+// ---------------------------------------------------------------------------
+
+/// With *both* a restrictive trust store (coarse gate denies) and a matching
+/// policy deny rule, the call must be denied by the coarse
+/// [`BUILTIN_TOOL_DENIED_CODE`] gate — not by the policy layer — proving
+/// `authorize_tool` consults `authorize_builtin` before `authorize_policy`.
+#[tokio::test]
+async fn write_file_coarse_gate_runs_before_policy() {
+    let project = tempdir().expect("tempdir");
+    let policy_dir = tempdir().expect("policy tempdir");
+    let store = PolicyStore::new(policy_dir.path());
+    store
+        .add(&rule("r1", "workspace.write_file", "secrets/"))
+        .unwrap();
+    let dispatcher = McpDispatcher::new_async(project.path().to_path_buf())
+        .await
+        .expect("dispatcher")
+        .with_trust_store(restrictive_trust_store())
+        .with_policy_store(PolicyStore::new(policy_dir.path()));
+
+    let error = call_tool_expect_error(
+        &dispatcher,
+        "workspace.write_file",
+        json!({"path": "secrets/token.txt", "content": "nope"}),
+    )
+    .await;
+    // The coarse gate wins: the denial code/message come from the built-in
+    // gate, not the policy rule.
+    assert_eq!(
+        error["code"],
+        json!(BUILTIN_TOOL_DENIED_CODE),
+        "got: {error}"
+    );
+    assert!(
+        any_audited_action("builtin_tool_denied"),
+        "the coarse gate denial must be audited"
+    );
+}
+
+/// Mirrors [`write_file_coarse_gate_runs_before_policy`] for `delete_file`.
+#[tokio::test]
+async fn delete_file_coarse_gate_runs_before_policy() {
+    let project = tempdir().expect("tempdir");
+    let policy_dir = tempdir().expect("policy tempdir");
+    let store = PolicyStore::new(policy_dir.path());
+    store
+        .add(&rule("r2", "workspace.delete_file", "keep.txt"))
+        .unwrap();
+    let dispatcher = McpDispatcher::new_async(project.path().to_path_buf())
+        .await
+        .expect("dispatcher")
+        .with_trust_store(restrictive_trust_store())
+        .with_policy_store(PolicyStore::new(policy_dir.path()));
+
+    let error = call_tool_expect_error(
+        &dispatcher,
+        "workspace.delete_file",
+        json!({"path": "keep.txt"}),
+    )
+    .await;
+    assert_eq!(
+        error["code"],
+        json!(BUILTIN_TOOL_DENIED_CODE),
+        "got: {error}"
+    );
+    assert!(any_audited_action("builtin_tool_denied"));
+}
+
+/// Mirrors [`write_file_coarse_gate_runs_before_policy`] for `terminal.run`.
+#[tokio::test]
+async fn terminal_run_coarse_gate_runs_before_policy() {
+    let project = tempdir().expect("tempdir");
+    let policy_dir = tempdir().expect("policy tempdir");
+    let store = PolicyStore::new(policy_dir.path());
+    store.add(&rule("r3", "terminal.run", "git")).unwrap();
+    let dispatcher = McpDispatcher::new_async(project.path().to_path_buf())
+        .await
+        .expect("dispatcher")
+        .with_trust_store(restrictive_trust_store())
+        .with_policy_store(PolicyStore::new(policy_dir.path()));
+
+    let error =
+        call_tool_expect_error(&dispatcher, "terminal.run", json!({"program": "git"})).await;
+    assert_eq!(
+        error["code"],
+        json!(BUILTIN_TOOL_DENIED_CODE),
+        "got: {error}"
+    );
+    assert!(any_audited_action("builtin_tool_denied"));
+}
+
+// ---------------------------------------------------------------------------
 // F. Source-level guard: exactly three policy call sites, no others
 // ---------------------------------------------------------------------------
 
-/// The acceptance criterion: exactly three `self.authorize_policy(...)` call
-/// sites in dispatcher.rs, for the three supported tools, and none of the
-/// ~34 other `authorize_builtin` arms touched.
+/// The acceptance criterion: exactly three tools are resource-scoped.
+///
+/// The single source of truth for that pairing is the declarative
+/// `RESOURCE_SCOPED_TOOLS` table in `tool_broker.rs`. This guard scans that
+/// table's source and asserts it holds exactly the three supported tools each
+/// mapped to the correct resource argument — so a future resource-scoped tool
+/// (or an accidental removal) is caught here rather than by an off-by-one call
+/// site that a human or agent would have to remember.
 #[test]
 fn exactly_three_policy_call_sites() {
     let source = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/mcp/dispatcher.rs"
+        "/src/mcp/tool_broker.rs"
     ))
-    .expect("read dispatcher.rs");
-    for tool in [
-        "workspace.write_file",
-        "workspace.delete_file",
-        "terminal.run",
+    .expect("read tool_broker.rs");
+    for (tool, arg) in [
+        ("workspace.write_file", "path"),
+        ("workspace.delete_file", "path"),
+        ("terminal.run", "program"),
     ] {
+        let entry = format!("(\"{tool}\", \"{arg}\")");
         assert!(
-            source.contains(&format!("self.authorize_policy(\"{tool}\",")),
-            "dispatcher must call authorize_policy for {tool}"
+            source.contains(&entry),
+            "RESOURCE_SCOPED_TOOLS must map {tool} -> {arg}"
         );
     }
-    // Count actual call sites (not the method definition).
-    let count = source.matches("self.authorize_policy(").count();
+    // Exactly three entries in the table — no more and no fewer. Isolate the
+    // const declaration from the following `#[cfg(test)]` module that also
+    // lists the pairs, then assert the const body has exactly three tuple
+    // literals (each starts a `("tool", "arg")` line).
+    let table = source
+        .split("pub(crate) const RESOURCE_SCOPED_TOOLS")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .expect("RESOURCE_SCOPED_TOOLS const declaration");
+    let entry_count = table.matches("(\"").count();
     assert_eq!(
-        count, 3,
-        "exactly three self.authorize_policy( call sites expected, found {count}"
+        entry_count, 3,
+        "exactly three RESOURCE_SCOPED_TOOLS entries expected, found {entry_count}"
     );
 }

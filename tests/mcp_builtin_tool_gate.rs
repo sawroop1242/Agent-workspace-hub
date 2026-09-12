@@ -675,9 +675,9 @@ fn every_medium_high_risk_static_tool_is_behind_the_gate() {
 /// Source-level coverage guard, the direct regression test for how these
 /// four tools shipped ungated: every literal dispatcher arm for a
 /// Medium/High registry tool must contain its own
-/// `self.authorize_builtin("<tool>")` call. A future high-risk tool whose
-/// arm forgets the gate fails here (and the behavioral tests above prove
-/// the gate itself denies when invoked).
+/// `self.authorize_tool("<tool>", &arguments)` call. A future high-risk tool
+/// whose arm forgets the gate fails here (and the behavioral tests above
+/// prove the gate itself denies when invoked).
 #[test]
 fn every_medium_high_literal_arm_calls_the_gate() {
     let source = std::fs::read_to_string(concat!(
@@ -696,7 +696,7 @@ fn every_medium_high_literal_arm_calls_the_gate() {
         if !source.contains(&literal_arm) {
             continue;
         }
-        let gate_call = format!("self.authorize_builtin(\"{name}\")");
+        let gate_call = format!("self.authorize_tool(\"{name}\",");
         assert!(
             source.contains(&gate_call),
             "dispatcher arm for Medium/High tool '{name}' must call the built-in gate"

@@ -67,6 +67,8 @@ pub mod store_lock;
 pub mod tasks;
 /// TLS configuration for the remote transport.
 pub mod tls;
+/// Declarative built-in tool authorization metadata.
+pub(crate) mod tool_broker;
 /// Canonical Tool Registry: explicit per-tool metadata.
 pub mod tool_registry;
 /// MCP trust and approval policy.

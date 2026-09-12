@@ -20,7 +20,7 @@ use crate::mcp::{
     StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, ToolMetrics, WorkspaceMcp,
     BUILTIN_TOOL_TRUST_ID, MAX_TRACKED_TOOLS,
 };
-use crate::mcp::{permissions, tool_registry};
+use crate::mcp::{permissions, tool_broker::RESOURCE_SCOPED_TOOLS, tool_registry};
 use crate::services::git::GitService;
 use crate::services::terminal::TerminalService;
 use anyhow::{bail, Result};
@@ -701,6 +701,26 @@ impl McpDispatcher {
                 Err(DispatchError::internal(format!("failed to read policy store: {error}")).into())
             }
         }
+    }
+
+    /// The single authorization entry point every built-in tool arm calls.
+    /// Runs the coarse category-level gate ([`Self::authorize_builtin`]) and,
+    /// for tools listed in [`RESOURCE_SCOPED_TOOLS`], the workspace-local
+    /// policy check ([`Self::authorize_policy`]) against the named argument's
+    /// value — in that order, matching current behavior exactly.
+    ///
+    /// `arguments` is the raw tool-call argument map already available at each
+    /// call site; this function extracts the resource argument itself using
+    /// the same [`strval`] helper the call sites use today, so a call site no
+    /// longer needs to extract `path`/`program` before this check runs (though
+    /// it may still need the value afterward for the tool's own logic).
+    fn authorize_tool(&self, name: &str, arguments: &Value) -> Result<()> {
+        self.authorize_builtin(name)?;
+        if let Some((_, arg_name)) = RESOURCE_SCOPED_TOOLS.iter().find(|(tool, _)| *tool == name) {
+            let resource = strval(arguments, arg_name)?;
+            self.authorize_policy(name, &resource)?;
+        }
+        Ok(())
     }
 
     /// The observer-only lifecycle hook registry for this dispatcher.
@@ -1501,7 +1521,7 @@ impl McpDispatcher {
                 )?,
             )?,
             "skills.add" => {
-                self.authorize_builtin("skills.add")?;
+                self.authorize_tool("skills.add", &arguments)?;
                 self.skills.add(
                     arguments
                         .get("name")
@@ -1511,7 +1531,7 @@ impl McpDispatcher {
                 json!({"ok": true})
             }
             "skills.remove" => {
-                self.authorize_builtin("skills.remove")?;
+                self.authorize_tool("skills.remove", &arguments)?;
                 json!({
                     "removed": self.skills.remove(
                         arguments.get("name").and_then(Value::as_str).unwrap_or_default()
@@ -1544,10 +1564,9 @@ impl McpDispatcher {
                 )?,
             )?,
             "workspace.write_file" => {
+                self.authorize_tool("workspace.write_file", &arguments)?;
                 let path = strval(&arguments, "path")?;
                 let content = strval(&arguments, "content")?;
-                self.authorize_builtin("workspace.write_file")?;
-                self.authorize_policy("workspace.write_file", &path)?;
                 // File mutation is exactly what the audit log exists for;
                 // the content itself is never logged.
                 audit_allow("workspace_write", &path, "");
@@ -1555,14 +1574,13 @@ impl McpDispatcher {
                 json!({"written": true})
             }
             "workspace.delete_file" => {
+                self.authorize_tool("workspace.delete_file", &arguments)?;
                 let path = strval(&arguments, "path")?;
-                self.authorize_builtin("workspace.delete_file")?;
-                self.authorize_policy("workspace.delete_file", &path)?;
                 audit_allow("workspace_delete", &path, "");
                 json!({"deleted": self.workspace.delete_file(&path)?})
             }
             "memory.store" => {
-                self.authorize_builtin("memory.store")?;
+                self.authorize_tool("memory.store", &arguments)?;
                 let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
                 serde_json::to_value(self.memory.store(
                     strval(&arguments, "id")?,
@@ -1593,7 +1611,7 @@ impl McpDispatcher {
                 )?,
             )?,
             "memory.delete" => {
-                self.authorize_builtin("memory.delete")?;
+                self.authorize_tool("memory.delete", &arguments)?;
                 json!({
                     "deleted": self.memory.delete(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -1601,7 +1619,7 @@ impl McpDispatcher {
                 })
             }
             "memory.update" => {
-                self.authorize_builtin("memory.update")?;
+                self.authorize_tool("memory.update", &arguments)?;
                 // Updating must not silently create: the entry has to
                 // exist, otherwise the caller gets a clear error. The
                 // existence check and the write happen under one lock hold
@@ -1619,7 +1637,7 @@ impl McpDispatcher {
                 serde_json::to_value(entry)?
             }
             "tasks.create" => {
-                self.authorize_builtin("tasks.create")?;
+                self.authorize_tool("tasks.create", &arguments)?;
                 serde_json::to_value(self.tasks.create(
                     strval(&arguments, "id")?,
                     strval(&arguments, "title")?,
@@ -1639,7 +1657,7 @@ impl McpDispatcher {
             )?,
             "tasks.get" => serde_json::to_value(self.tasks.get(&strval(&arguments, "id")?)?)?,
             "tasks.update" => {
-                self.authorize_builtin("tasks.update")?;
+                self.authorize_tool("tasks.update", &arguments)?;
                 serde_json::to_value(
                     self.tasks.update(
                         arguments
@@ -1663,7 +1681,7 @@ impl McpDispatcher {
                 )?
             }
             "tasks.delete" => {
-                self.authorize_builtin("tasks.delete")?;
+                self.authorize_tool("tasks.delete", &arguments)?;
                 json!({
                     "deleted": self.tasks.delete(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -1675,7 +1693,7 @@ impl McpDispatcher {
                 serde_json::to_value(self.connectors.get(&strval(&arguments, "id")?)?)?
             }
             "connectors.add" => {
-                self.authorize_builtin("connectors.add")?;
+                self.authorize_tool("connectors.add", &arguments)?;
                 let connector = Connector {
                     id: strval(&arguments, "id")?,
                     name: strval(&arguments, "name")?,
@@ -1690,7 +1708,7 @@ impl McpDispatcher {
                 serde_json::to_value(self.connectors.add(connector)?)?
             }
             "connectors.enable" => {
-                self.authorize_builtin("connectors.enable")?;
+                self.authorize_tool("connectors.enable", &arguments)?;
                 serde_json::to_value(
                     self.connectors.set_enabled(
                         arguments
@@ -1702,7 +1720,7 @@ impl McpDispatcher {
                 )?
             }
             "connectors.disable" => {
-                self.authorize_builtin("connectors.disable")?;
+                self.authorize_tool("connectors.disable", &arguments)?;
                 serde_json::to_value(
                     self.connectors.set_enabled(
                         arguments
@@ -1714,7 +1732,7 @@ impl McpDispatcher {
                 )?
             }
             "connectors.remove" => {
-                self.authorize_builtin("connectors.remove")?;
+                self.authorize_tool("connectors.remove", &arguments)?;
                 json!({
                     "removed": self.connectors.remove(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -1734,7 +1752,7 @@ impl McpDispatcher {
                 serde_json::to_value(registry.tools(provider).await?)?
             }
             "connector.invoke" => {
-                self.authorize_builtin("connector.invoke")?;
+                self.authorize_tool("connector.invoke", &arguments)?;
                 let provider = arguments
                     .get("provider")
                     .and_then(Value::as_str)
@@ -1760,7 +1778,7 @@ impl McpDispatcher {
                 serde_json::to_value(registry.invoke(provider, tool, args).await?)?
             }
             "connector.composio_link" => {
-                self.authorize_builtin("connector.composio_link")?;
+                self.authorize_tool("connector.composio_link", &arguments)?;
                 let auth_config_id = strval(&arguments, "auth_config_id")?;
                 let user_id = strval(&arguments, "user_id")?;
                 let alias = arguments.get("alias").and_then(Value::as_str);
@@ -1780,7 +1798,7 @@ impl McpDispatcher {
                 serde_json::to_value(accounts)?
             }
             "connector.composio_register" => {
-                self.authorize_builtin("connector.composio_register")?;
+                self.authorize_tool("connector.composio_register", &arguments)?;
                 let label = strval(&arguments, "label")?;
                 let connected_account_id = strval(&arguments, "connected_account_id")?;
                 let toolkit = arguments
@@ -1813,7 +1831,7 @@ impl McpDispatcher {
                 serde_json::to_value(account)?
             }
             "connector.composio_remove" => {
-                self.authorize_builtin("connector.composio_remove")?;
+                self.authorize_tool("connector.composio_remove", &arguments)?;
                 let label = strval(&arguments, "label")?;
                 let removed = ComposioRegistry::new()?.remove(&label)?;
                 self.providers
@@ -1824,7 +1842,7 @@ impl McpDispatcher {
             }
             "context.status" => serde_json::to_value(self.context()?.status()?)?,
             "context.insert" => {
-                self.authorize_builtin("context.insert")?;
+                self.authorize_tool("context.insert", &arguments)?;
                 let item = ContextItem::new(
                     strval(&arguments, "id")?,
                     parse_context_source(arguments.get("source").and_then(Value::as_str)),
@@ -1870,7 +1888,7 @@ impl McpDispatcher {
                 ),
             )?,
             "context.remove" => {
-                self.authorize_builtin("context.remove")?;
+                self.authorize_tool("context.remove", &arguments)?;
                 json!({
                     "removed": self.context()?.remove_item(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -1890,7 +1908,7 @@ impl McpDispatcher {
                 )?
             }
             "context.optimize" => {
-                self.authorize_builtin("context.optimize")?;
+                self.authorize_tool("context.optimize", &arguments)?;
                 serde_json::to_value(
                     self.context()?.optimize(
                         arguments
@@ -1922,7 +1940,7 @@ impl McpDispatcher {
                 serde_json::to_value(engine.get_context(&request)?)?
             }
             "context.protect" => {
-                self.authorize_builtin("context.protect")?;
+                self.authorize_tool("context.protect", &arguments)?;
                 json!({
                     "protected": self.context()?.protect(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -1930,7 +1948,7 @@ impl McpDispatcher {
                 })
             }
             "context.unprotect" => {
-                self.authorize_builtin("context.unprotect")?;
+                self.authorize_tool("context.unprotect", &arguments)?;
                 json!({
                     "unprotected": self.context()?.unprotect(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -1938,7 +1956,7 @@ impl McpDispatcher {
                 })
             }
             "context.offload" => {
-                self.authorize_builtin("context.offload")?;
+                self.authorize_tool("context.offload", &arguments)?;
                 self.context()?.offload(
                     arguments
                         .get("id")
@@ -1952,7 +1970,7 @@ impl McpDispatcher {
                 json!({"offloaded": true})
             }
             "context.restore" => {
-                self.authorize_builtin("context.restore")?;
+                self.authorize_tool("context.restore", &arguments)?;
                 let item = self.context()?.restore(
                     arguments
                         .get("id")
@@ -1986,7 +2004,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_create" => {
-                self.authorize_builtin("github.pr_create")?;
+                self.authorize_tool("github.pr_create", &arguments)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_create", &target);
@@ -2004,7 +2022,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_merge" => {
-                self.authorize_builtin("github.pr_merge")?;
+                self.authorize_tool("github.pr_merge", &arguments)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_merge", &target);
@@ -2019,7 +2037,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_review" => {
-                self.authorize_builtin("github.pr_review")?;
+                self.authorize_tool("github.pr_review", &arguments)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_review", &target);
@@ -2059,7 +2077,7 @@ impl McpDispatcher {
                 )?
             }
             "github.issue_create" => {
-                self.authorize_builtin("github.issue_create")?;
+                self.authorize_tool("github.issue_create", &arguments)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.issue_create", &target);
@@ -2084,7 +2102,7 @@ impl McpDispatcher {
                 )?
             }
             "github.issue_comment" => {
-                self.authorize_builtin("github.issue_comment")?;
+                self.authorize_tool("github.issue_comment", &arguments)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.issue_comment", &target);
@@ -2109,7 +2127,7 @@ impl McpDispatcher {
                 )?
             }
             "github.workflow_dispatch" => {
-                self.authorize_builtin("github.workflow_dispatch")?;
+                self.authorize_tool("github.workflow_dispatch", &arguments)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.workflow_dispatch", &target);
@@ -2124,7 +2142,7 @@ impl McpDispatcher {
                 )?
             }
             "github.release_create" => {
-                self.authorize_builtin("github.release_create")?;
+                self.authorize_tool("github.release_create", &arguments)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.release_create", &target);
@@ -2146,7 +2164,7 @@ impl McpDispatcher {
                 serde_json::to_value(git.status().await?)?
             }
             "git.branch" => {
-                self.authorize_builtin("git.branch")?;
+                self.authorize_tool("git.branch", &arguments)?;
                 let git = GitService::open(self.workspace.root())?;
                 serde_json::to_value(git.branch().await?)?
             }
@@ -2174,7 +2192,7 @@ impl McpDispatcher {
                 serde_json::to_value(out)?
             }
             "git.stage" => {
-                self.authorize_builtin("git.stage")?;
+                self.authorize_tool("git.stage", &arguments)?;
                 let git = GitService::open(self.workspace.root())?;
                 let path = strval(&arguments, "path")?;
                 if path.is_empty() {
@@ -2183,7 +2201,7 @@ impl McpDispatcher {
                 serde_json::to_value(git.stage(&path).await?)?
             }
             "git.unstage" => {
-                self.authorize_builtin("git.unstage")?;
+                self.authorize_tool("git.unstage", &arguments)?;
                 let git = GitService::open(self.workspace.root())?;
                 let path = strval(&arguments, "path")?;
                 if path.is_empty() {
@@ -2192,15 +2210,14 @@ impl McpDispatcher {
                 serde_json::to_value(git.unstage(&path).await?)?
             }
             "git.commit" => {
-                self.authorize_builtin("git.commit")?;
+                self.authorize_tool("git.commit", &arguments)?;
                 let git = GitService::open(self.workspace.root())?;
                 let message = strval(&arguments, "message")?;
                 serde_json::to_value(git.commit(&message).await?)?
             }
             "terminal.run" => {
-                self.authorize_builtin("terminal.run")?;
+                self.authorize_tool("terminal.run", &arguments)?;
                 let program = strval(&arguments, "program")?;
-                self.authorize_policy("terminal.run", &program)?;
                 let args: Vec<String> = arguments
                     .get("args")
                     .and_then(Value::as_array)
