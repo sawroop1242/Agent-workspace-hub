@@ -1,12 +1,13 @@
 use agent_workspace_hub::core::agents::AgentStore;
 use agent_workspace_hub::core::capability_grants::CapabilityGrantStore;
+use agent_workspace_hub::core::policy::PolicyStore;
 use agent_workspace_hub::mcp::{
     auth::load_api_key, CommunityMcpRegistryClient, CustomMcpRegistry, CustomMcpServerConfig,
     GlobalMcpRegistry, HttpServerConfig, McpDispatcher, McpPermissions, McpTransport, Permission,
     PersistentTrustStore, ProjectMcpReferences, ResourceLimits, StdioMcpServer, TlsConfig,
     TrustLevel, BUILTIN_TOOL_TRUST_ID,
 };
-use agent_workspace_hub::models::{Agent, AgentStatus, CapabilityGrant};
+use agent_workspace_hub::models::{Agent, AgentStatus, CapabilityGrant, PolicyRule};
 use agent_workspace_hub::skills::{
     GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller,
 };
@@ -72,6 +73,11 @@ enum Command {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Manage workspace-local DENY-only policy rules.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
     },
     Tunnel {
         #[command(subcommand)]
@@ -308,6 +314,32 @@ enum AgentCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Add a DENY-only policy rule for a specific tool + resource.
+    Deny {
+        /// The tool to restrict: workspace.write_file, workspace.delete_file,
+        /// or terminal.run.
+        tool: String,
+        /// The deny pattern: a path prefix for the workspace.* tools, or an
+        /// exact program name for terminal.run.
+        pattern: String,
+        /// Optional human-readable reason for the denial.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional rule id; auto-generated (tool + pattern hash) when absent.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// List all policy rules (one per line).
+    List,
+    /// Remove a policy rule by id.
+    Remove {
+        /// Rule id.
+        id: String,
+    },
+}
+
 fn main() -> Result<()> {
     // JSON-RPC responses are written to stdout; keep all diagnostics on stderr
     // so they never corrupt the protocol stream consumed by MCP clients.
@@ -463,6 +495,7 @@ fn main() -> Result<()> {
             RegistryCommand::Search { query, url } => search_registry(&url, &query)?,
         },
         Some(Command::Agent { command }) => handle_agent_cli(command)?,
+        Some(Command::Policy { command }) => handle_policy_cli(command)?,
         Some(Command::Tunnel { command }) => handle_tunnel_cli(command)?,
         None => println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
     }
@@ -890,6 +923,95 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Handles `awh policy deny|list|remove`. Policy rules are workspace-local
+/// (persisted under the current working directory's `.agent/policy.json`) and
+/// DENY-only: they narrow the coarse built-in tool gate for exactly three
+/// tools. Adding a rule does not enable any tool — it can only further
+/// restrict one that Phase 2's gate has already allowed.
+fn handle_policy_cli(command: PolicyCommand) -> Result<()> {
+    let root = std::env::current_dir().context("could not determine workspace directory")?;
+    let policy = PolicyStore::new(&root);
+
+    // The supported tool set is validated here (before anything is written)
+    // so an unsupported `tool` is rejected with a clear error.
+    const SUPPORTED_TOOLS: [&str; 3] = [
+        "workspace.write_file",
+        "workspace.delete_file",
+        "terminal.run",
+    ];
+
+    match command {
+        PolicyCommand::Deny {
+            tool,
+            pattern,
+            reason,
+            id,
+        } => {
+            if !SUPPORTED_TOOLS.contains(&tool.as_str()) {
+                bail!(
+                    "unsupported policy tool: {tool:?} (supported: {})",
+                    SUPPORTED_TOOLS.join(", ")
+                );
+            }
+            let id = id.unwrap_or_else(|| derive_policy_id(&tool, &pattern));
+            let rule = PolicyRule {
+                id,
+                tool,
+                pattern,
+                reason,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            policy.add(&rule)?;
+            println!(
+                "added policy rule {} for {} ({})",
+                rule.id, rule.tool, rule.pattern
+            );
+        }
+        PolicyCommand::List => {
+            for rule in policy.list()? {
+                println!(
+                    "{} {} {} {}",
+                    rule.id,
+                    rule.tool,
+                    rule.pattern,
+                    rule.reason.as_deref().unwrap_or("none")
+                );
+            }
+        }
+        PolicyCommand::Remove { id } => {
+            if policy.remove(&id)? {
+                println!("removed policy rule: {id}");
+            } else {
+                println!("policy rule not found: {id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derives a stable, collision-resistant default rule id from a tool + pattern
+/// pair (a short hex prefix of their SHA-256) when the caller does not supply
+/// one. Deterministic so re-running `deny` with the same arguments reports a
+/// duplicate-id error rather than silently duplicating the rule.
+fn derive_policy_id(tool: &str, pattern: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tool.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(pattern.as_bytes());
+    let digest = hasher.finalize();
+    format!("policy-{}", hex(&digest[..8]))
+}
+
+/// Lowercase hex encoding of a byte slice (local to avoid an extra crate).
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Maps a permission label from the CLI to the shared [`Permission`] enum.

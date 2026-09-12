@@ -8,15 +8,17 @@
 use crate::context::{
     ContextEngine, ContextEngineConfig, ContextItem, ContextRequest, ContextScope, ContextSource,
 };
+use crate::core::policy::PolicyStore;
 use crate::mcp::{
     audit_allow, audit_deny, authorize_builtin_tool, authorize_mcp_execution, client_name_version,
     validate_schema, validate_schema_syntax, validate_tool_arguments, AuthMethod,
     CircuitBreakerConfig, CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider,
     ComposioRegistry, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
     CustomMcpServerConfig, GithubProvider, McpEvent, McpExecutionRequest, McpHook, McpHooks,
-    McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore, ProviderRegistry, RepoTarget,
-    ResourceLimits, SkillMcp, StdioMcpClient, StreamableHttpMcpClient, TaskPriority, TaskStatus,
-    TasksMcp, ToolMetrics, WorkspaceMcp, BUILTIN_TOOL_TRUST_ID, MAX_TRACKED_TOOLS,
+    McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore, PolicyDenialError,
+    ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp, StdioMcpClient,
+    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, ToolMetrics, WorkspaceMcp,
+    BUILTIN_TOOL_TRUST_ID, MAX_TRACKED_TOOLS,
 };
 use crate::mcp::{permissions, tool_registry};
 use crate::services::git::GitService;
@@ -103,6 +105,13 @@ pub const SERVER_NOT_INITIALIZED_CODE: i64 = -32002;
 /// tell authorization denials apart from invalid parameters (`-32602`) and
 /// internal tool failures (`-32603`), without any message parsing.
 pub const BUILTIN_TOOL_DENIED_CODE: i64 = -32003;
+
+/// JSON-RPC server-error code for a built-in (static) tool call rejected by
+/// a workspace-local policy rule. Distinct from
+/// [`BUILTIN_TOOL_DENIED_CODE`] so clients (and audit logs) can tell a
+/// resource-scoped policy denial apart from a coarse category-level gate
+/// denial without parsing message strings.
+pub const POLICY_DENIED_CODE: i64 = -32004;
 
 /// The lifecycle state of one MCP session (the conceptual `NEW →
 /// INITIALIZING → READY → CLOSING/CLOSED/FAILED` machine, reduced to the
@@ -425,6 +434,11 @@ pub struct McpDispatcher {
     /// trust record created after the dispatcher starts applies on the next
     /// dispatcher construction (e.g. the next `awh mcp serve`).
     trust: Option<PersistentTrustStore>,
+    /// Workspace-local policy store, loaded once at construction from
+    /// `self.workspace.root()` (per-workspace, unlike the per-machine trust
+    /// store). Holds DENY-only resource-scoped rules for
+    /// `workspace.write_file`, `workspace.delete_file`, and `terminal.run`.
+    policy: PolicyStore,
 }
 
 impl McpDispatcher {
@@ -558,6 +572,11 @@ impl McpDispatcher {
             .map_err(|e| tracing::warn!("github provider disabled: {e:#}"))
             .ok();
 
+        // The policy store keys off the workspace root (per-workspace, not
+        // the home-directory trust store). Captured before the final move of
+        // `project_root` into the connectors store below.
+        let policy = PolicyStore::new(project_root.clone());
+
         Ok(Self {
             skills: Arc::new(SkillMcp::new(project_root.clone())?),
             workspace: Arc::new(WorkspaceMcp::new(project_root.clone())?),
@@ -571,6 +590,7 @@ impl McpDispatcher {
             metrics: Arc::new(ToolMetrics::new(MAX_TRACKED_TOOLS)),
             started_at: std::time::Instant::now(),
             trust: trust_store,
+            policy,
         })
     }
 
@@ -617,6 +637,16 @@ impl McpDispatcher {
         self
     }
 
+    /// Replaces the workspace-local policy store consulted by
+    /// [`authorize_policy`], mirroring [`Self::with_trust_store`] for tests
+    /// (and library callers) that need to drive policy decisions
+    /// deterministically: inject a store rooted at a temp dir to pin rules,
+    /// independently of the dispatcher's own project root.
+    pub fn with_policy_store(mut self, policy: PolicyStore) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// The single authorization checkpoint every Medium/High-risk static
     /// (built-in) tool arm calls before its underlying service runs.
     ///
@@ -633,6 +663,44 @@ impl McpDispatcher {
         }
         audit_allow("builtin_tool_allowed", name, BUILTIN_TOOL_TRUST_ID);
         Ok(())
+    }
+
+    /// The second, narrower checkpoint for exactly three resource-scoped
+    /// built-in tools, run *after* [`Self::authorize_builtin`] has already
+    /// allowed the call at the coarse category level.
+    ///
+    /// Consults the workspace-local [`PolicyStore`] for a deny rule matching
+    /// `resource` under `tool`. A matching rule narrows the call further:
+    /// the denial is audited with the `policy_denied` action (distinct from
+    /// Phase 2's `builtin_tool_denied` so the two sources are separable)
+    /// and surfaces as a [`POLICY_DENIED_CODE`] JSON-RPC server error naming
+    /// the tool, the rule id, and the optional reason. No rule means the
+    /// call proceeds, audited with the `policy_allowed` action.
+    fn authorize_policy(&self, tool: &str, resource: &str) -> Result<()> {
+        match self.policy.matching(tool, resource) {
+            Ok(Some(rule)) => {
+                audit_deny("policy_denied", resource, &rule.id);
+                let error = PolicyDenialError::Denied {
+                    tool: tool.to_string(),
+                    rule_id: rule.id,
+                    pattern: rule.pattern,
+                    reason: rule.reason,
+                };
+                Err(DispatchError::new(POLICY_DENIED_CODE, error.to_string()).into())
+            }
+            Ok(None) => {
+                audit_allow("policy_allowed", resource, tool);
+                Ok(())
+            }
+            Err(error) => {
+                // Fail closed: an unreadable/corrupt policy store cannot
+                // prove the call is permitted, so it is denied — but the
+                // cause is a store error, surfaced as an internal error
+                // rather than a policy denial (there was no matching rule).
+                tracing::warn!(event = "policy_store_error", tool = %tool, error = %error);
+                Err(DispatchError::internal(format!("failed to read policy store: {error}")).into())
+            }
+        }
     }
 
     /// The observer-only lifecycle hook registry for this dispatcher.
@@ -1479,6 +1547,7 @@ impl McpDispatcher {
                 let path = strval(&arguments, "path")?;
                 let content = strval(&arguments, "content")?;
                 self.authorize_builtin("workspace.write_file")?;
+                self.authorize_policy("workspace.write_file", &path)?;
                 // File mutation is exactly what the audit log exists for;
                 // the content itself is never logged.
                 audit_allow("workspace_write", &path, "");
@@ -1488,6 +1557,7 @@ impl McpDispatcher {
             "workspace.delete_file" => {
                 let path = strval(&arguments, "path")?;
                 self.authorize_builtin("workspace.delete_file")?;
+                self.authorize_policy("workspace.delete_file", &path)?;
                 audit_allow("workspace_delete", &path, "");
                 json!({"deleted": self.workspace.delete_file(&path)?})
             }
@@ -2130,6 +2200,7 @@ impl McpDispatcher {
             "terminal.run" => {
                 self.authorize_builtin("terminal.run")?;
                 let program = strval(&arguments, "program")?;
+                self.authorize_policy("terminal.run", &program)?;
                 let args: Vec<String> = arguments
                     .get("args")
                     .and_then(Value::as_array)

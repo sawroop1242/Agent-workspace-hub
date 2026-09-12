@@ -11,6 +11,8 @@ pub mod context;
 pub mod files;
 /// Memory persistence.
 pub mod memory;
+/// Workspace policy rule persistence.
+pub mod policy;
 /// Project persistence.
 pub mod project;
 /// Task persistence.
