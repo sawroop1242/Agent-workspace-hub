@@ -9,14 +9,14 @@ use crate::context::{
     ContextEngine, ContextEngineConfig, ContextItem, ContextRequest, ContextScope, ContextSource,
 };
 use crate::mcp::{
-    audit_allow, audit_deny, authorize_mcp_execution, client_name_version, validate_schema,
-    validate_schema_syntax, validate_tool_arguments, AuthMethod, CircuitBreakerConfig,
-    CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider, ComposioRegistry,
-    Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry, CustomMcpServerConfig,
-    GithubProvider, McpEvent, McpExecutionRequest, McpHook, McpHooks, McpTransport, MemoryMcp,
-    MemoryScope, PersistentTrustStore, ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp,
-    StdioMcpClient, StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, ToolMetrics,
-    WorkspaceMcp, MAX_TRACKED_TOOLS,
+    audit_allow, audit_deny, authorize_builtin_tool, authorize_mcp_execution, client_name_version,
+    validate_schema, validate_schema_syntax, validate_tool_arguments, AuthMethod,
+    CircuitBreakerConfig, CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider,
+    ComposioRegistry, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
+    CustomMcpServerConfig, GithubProvider, McpEvent, McpExecutionRequest, McpHook, McpHooks,
+    McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore, ProviderRegistry, RepoTarget,
+    ResourceLimits, SkillMcp, StdioMcpClient, StreamableHttpMcpClient, TaskPriority, TaskStatus,
+    TasksMcp, ToolMetrics, WorkspaceMcp, BUILTIN_TOOL_TRUST_ID, MAX_TRACKED_TOOLS,
 };
 use crate::mcp::{permissions, tool_registry};
 use crate::services::git::GitService;
@@ -97,6 +97,12 @@ pub const MCP_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
 /// session is initialized (the same code the MCP reference SDKs borrow
 /// from LSP's `ServerNotInitialized`).
 pub const SERVER_NOT_INITIALIZED_CODE: i64 = -32002;
+
+/// JSON-RPC server-error code for a built-in (static) tool call rejected by
+/// the [`BUILTIN_TOOL_TRUST_ID`] execution gate. A distinct code lets clients
+/// tell authorization denials apart from invalid parameters (`-32602`) and
+/// internal tool failures (`-32603`), without any message parsing.
+pub const BUILTIN_TOOL_DENIED_CODE: i64 = -32003;
 
 /// The lifecycle state of one MCP session (the conceptual `NEW →
 /// INITIALIZING → READY → CLOSING/CLOSED/FAILED` machine, reduced to the
@@ -411,6 +417,14 @@ pub struct McpDispatcher {
     metrics: Arc<ToolMetrics>,
     /// When this dispatcher was constructed (health/uptime reporting).
     started_at: std::time::Instant,
+    /// Snapshot of the persistent trust store consulted by the built-in tool
+    /// execution gate. `None` means the store could not be loaded, which the
+    /// gate treats as fail-closed (deny Medium/High built-in tool calls).
+    ///
+    /// Like the custom-server gate, this is read once at construction: a
+    /// trust record created after the dispatcher starts applies on the next
+    /// dispatcher construction (e.g. the next `awh mcp serve`).
+    trust: Option<PersistentTrustStore>,
 }
 
 impl McpDispatcher {
@@ -556,6 +570,7 @@ impl McpDispatcher {
             hooks: Arc::new(McpHooks::new()),
             metrics: Arc::new(ToolMetrics::new(MAX_TRACKED_TOOLS)),
             started_at: std::time::Instant::now(),
+            trust: trust_store,
         })
     }
 
@@ -586,6 +601,38 @@ impl McpDispatcher {
     /// Returns the shared provider registry used to dispatch tool calls.
     pub fn provider_registry(&self) -> Arc<RwLock<ProviderRegistry>> {
         Arc::clone(&self.providers)
+    }
+
+    /// Replaces the trust store snapshot consulted by the built-in tool
+    /// execution gate ([`authorize_builtin_tool`]).
+    ///
+    /// The default snapshot is loaded once from the user data directory at
+    /// construction; this builder lets tests (and library callers) drive the
+    /// gate deterministically — inject a store without an
+    /// [`BUILTIN_TOOL_TRUST_ID`] record to pin the pre-gate behavior every
+    /// existing workspace has, or one with a restrictive record to exercise
+    /// the enforcement path.
+    pub fn with_trust_store(mut self, trust: PersistentTrustStore) -> Self {
+        self.trust = Some(trust);
+        self
+    }
+
+    /// The single authorization checkpoint every Medium/High-risk static
+    /// (built-in) tool arm calls before its underlying service runs.
+    ///
+    /// Delegates to [`authorize_builtin_tool`] (the shared execution gate)
+    /// and records the decision in the audit ring: every gated call produces
+    /// an audit event on both the allow and the deny path. Denials surface
+    /// as a [`BUILTIN_TOOL_DENIED_CODE`] JSON-RPC server error whose message
+    /// names the tool and, when a specific capability is missing, the
+    /// missing permission.
+    fn authorize_builtin(&self, name: &str) -> Result<()> {
+        if let Err(error) = authorize_builtin_tool(name, self.trust.as_ref()) {
+            tracing::warn!(event = "builtin_tool_denied", tool = %name, error = %error);
+            return Err(DispatchError::new(BUILTIN_TOOL_DENIED_CODE, error.to_string()).into());
+        }
+        audit_allow("builtin_tool_allowed", name, BUILTIN_TOOL_TRUST_ID);
+        Ok(())
     }
 
     /// The observer-only lifecycle hook registry for this dispatcher.
@@ -1386,6 +1433,7 @@ impl McpDispatcher {
                 )?,
             )?,
             "skills.add" => {
+                self.authorize_builtin("skills.add")?;
                 self.skills.add(
                     arguments
                         .get("name")
@@ -1394,11 +1442,14 @@ impl McpDispatcher {
                 )?;
                 json!({"ok": true})
             }
-            "skills.remove" => json!({
-                "removed": self.skills.remove(
-                    arguments.get("name").and_then(Value::as_str).unwrap_or_default()
-                )?
-            }),
+            "skills.remove" => {
+                self.authorize_builtin("skills.remove")?;
+                json!({
+                    "removed": self.skills.remove(
+                        arguments.get("name").and_then(Value::as_str).unwrap_or_default()
+                    )?
+                })
+            }
             "skills.search" => serde_json::to_value(
                 self.skills.search_global(
                     arguments
@@ -1427,6 +1478,7 @@ impl McpDispatcher {
             "workspace.write_file" => {
                 let path = strval(&arguments, "path")?;
                 let content = strval(&arguments, "content")?;
+                self.authorize_builtin("workspace.write_file")?;
                 // File mutation is exactly what the audit log exists for;
                 // the content itself is never logged.
                 audit_allow("workspace_write", &path, "");
@@ -1435,10 +1487,12 @@ impl McpDispatcher {
             }
             "workspace.delete_file" => {
                 let path = strval(&arguments, "path")?;
+                self.authorize_builtin("workspace.delete_file")?;
                 audit_allow("workspace_delete", &path, "");
                 json!({"deleted": self.workspace.delete_file(&path)?})
             }
             "memory.store" => {
+                self.authorize_builtin("memory.store")?;
                 let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
                 serde_json::to_value(self.memory.store(
                     strval(&arguments, "id")?,
@@ -1468,12 +1522,16 @@ impl McpDispatcher {
                         .unwrap_or_default(),
                 )?,
             )?,
-            "memory.delete" => json!({
-                "deleted": self.memory.delete(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
-                )?
-            }),
+            "memory.delete" => {
+                self.authorize_builtin("memory.delete")?;
+                json!({
+                    "deleted": self.memory.delete(
+                        arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                    )?
+                })
+            }
             "memory.update" => {
+                self.authorize_builtin("memory.update")?;
                 // Updating must not silently create: the entry has to
                 // exist, otherwise the caller gets a clear error. The
                 // existence check and the write happen under one lock hold
@@ -1490,13 +1548,16 @@ impl McpDispatcher {
                 )?;
                 serde_json::to_value(entry)?
             }
-            "tasks.create" => serde_json::to_value(self.tasks.create(
-                strval(&arguments, "id")?,
-                strval(&arguments, "title")?,
-                strval(&arguments, "description")?,
-                parse_priority(arguments.get("priority").and_then(Value::as_str))?,
-                strings(&arguments, "tags"),
-            )?)?,
+            "tasks.create" => {
+                self.authorize_builtin("tasks.create")?;
+                serde_json::to_value(self.tasks.create(
+                    strval(&arguments, "id")?,
+                    strval(&arguments, "title")?,
+                    strval(&arguments, "description")?,
+                    parse_priority(arguments.get("priority").and_then(Value::as_str))?,
+                    strings(&arguments, "tags"),
+                )?)?
+            }
             "tasks.list" => serde_json::to_value(
                 self.tasks.list(
                     arguments
@@ -1507,37 +1568,44 @@ impl McpDispatcher {
                 )?,
             )?,
             "tasks.get" => serde_json::to_value(self.tasks.get(&strval(&arguments, "id")?)?)?,
-            "tasks.update" => serde_json::to_value(
-                self.tasks.update(
-                    arguments
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    arguments
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .map(parse_status)
-                        .transpose()?,
-                    arguments
-                        .get("priority")
-                        .and_then(Value::as_str)
-                        .map(|value| parse_priority(Some(value)))
-                        .transpose()?,
-                    arguments
-                        .get("assignee")
-                        .map(|value| value.as_str().map(str::to_string)),
-                )?,
-            )?,
-            "tasks.delete" => json!({
-                "deleted": self.tasks.delete(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+            "tasks.update" => {
+                self.authorize_builtin("tasks.update")?;
+                serde_json::to_value(
+                    self.tasks.update(
+                        arguments
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        arguments
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(parse_status)
+                            .transpose()?,
+                        arguments
+                            .get("priority")
+                            .and_then(Value::as_str)
+                            .map(|value| parse_priority(Some(value)))
+                            .transpose()?,
+                        arguments
+                            .get("assignee")
+                            .map(|value| value.as_str().map(str::to_string)),
+                    )?,
                 )?
-            }),
+            }
+            "tasks.delete" => {
+                self.authorize_builtin("tasks.delete")?;
+                json!({
+                    "deleted": self.tasks.delete(
+                        arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                    )?
+                })
+            }
             "connectors.list" => serde_json::to_value(self.connectors.list()?)?,
             "connectors.get" => {
                 serde_json::to_value(self.connectors.get(&strval(&arguments, "id")?)?)?
             }
             "connectors.add" => {
+                self.authorize_builtin("connectors.add")?;
                 let connector = Connector {
                     id: strval(&arguments, "id")?,
                     name: strval(&arguments, "name")?,
@@ -1551,29 +1619,38 @@ impl McpDispatcher {
                 };
                 serde_json::to_value(self.connectors.add(connector)?)?
             }
-            "connectors.enable" => serde_json::to_value(
-                self.connectors.set_enabled(
-                    arguments
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    true,
-                )?,
-            )?,
-            "connectors.disable" => serde_json::to_value(
-                self.connectors.set_enabled(
-                    arguments
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    false,
-                )?,
-            )?,
-            "connectors.remove" => json!({
-                "removed": self.connectors.remove(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+            "connectors.enable" => {
+                self.authorize_builtin("connectors.enable")?;
+                serde_json::to_value(
+                    self.connectors.set_enabled(
+                        arguments
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        true,
+                    )?,
                 )?
-            }),
+            }
+            "connectors.disable" => {
+                self.authorize_builtin("connectors.disable")?;
+                serde_json::to_value(
+                    self.connectors.set_enabled(
+                        arguments
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        false,
+                    )?,
+                )?
+            }
+            "connectors.remove" => {
+                self.authorize_builtin("connectors.remove")?;
+                json!({
+                    "removed": self.connectors.remove(
+                        arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                    )?
+                })
+            }
             "connector.providers" => {
                 let registry = self.providers.read().await;
                 json!(registry.providers())
@@ -1587,6 +1664,7 @@ impl McpDispatcher {
                 serde_json::to_value(registry.tools(provider).await?)?
             }
             "connector.invoke" => {
+                self.authorize_builtin("connector.invoke")?;
                 let provider = arguments
                     .get("provider")
                     .and_then(Value::as_str)
@@ -1612,6 +1690,7 @@ impl McpDispatcher {
                 serde_json::to_value(registry.invoke(provider, tool, args).await?)?
             }
             "connector.composio_link" => {
+                self.authorize_builtin("connector.composio_link")?;
                 let auth_config_id = strval(&arguments, "auth_config_id")?;
                 let user_id = strval(&arguments, "user_id")?;
                 let alias = arguments.get("alias").and_then(Value::as_str);
@@ -1631,6 +1710,7 @@ impl McpDispatcher {
                 serde_json::to_value(accounts)?
             }
             "connector.composio_register" => {
+                self.authorize_builtin("connector.composio_register")?;
                 let label = strval(&arguments, "label")?;
                 let connected_account_id = strval(&arguments, "connected_account_id")?;
                 let toolkit = arguments
@@ -1663,6 +1743,7 @@ impl McpDispatcher {
                 serde_json::to_value(account)?
             }
             "connector.composio_remove" => {
+                self.authorize_builtin("connector.composio_remove")?;
                 let label = strval(&arguments, "label")?;
                 let removed = ComposioRegistry::new()?.remove(&label)?;
                 self.providers
@@ -1673,6 +1754,7 @@ impl McpDispatcher {
             }
             "context.status" => serde_json::to_value(self.context()?.status()?)?,
             "context.insert" => {
+                self.authorize_builtin("context.insert")?;
                 let item = ContextItem::new(
                     strval(&arguments, "id")?,
                     parse_context_source(arguments.get("source").and_then(Value::as_str)),
@@ -1717,11 +1799,14 @@ impl McpDispatcher {
                         .unwrap_or_default(),
                 ),
             )?,
-            "context.remove" => json!({
-                "removed": self.context()?.remove_item(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
-                )
-            }),
+            "context.remove" => {
+                self.authorize_builtin("context.remove")?;
+                json!({
+                    "removed": self.context()?.remove_item(
+                        arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                    )
+                })
+            }
             "context.search" => {
                 let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
                 serde_json::to_value(
@@ -1734,14 +1819,17 @@ impl McpDispatcher {
                     )?,
                 )?
             }
-            "context.optimize" => serde_json::to_value(
-                self.context()?.optimize(
-                    arguments
-                        .get("task")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                )?,
-            )?,
+            "context.optimize" => {
+                self.authorize_builtin("context.optimize")?;
+                serde_json::to_value(
+                    self.context()?.optimize(
+                        arguments
+                            .get("task")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )?,
+                )?
+            }
             "context.assemble" => {
                 let engine = self.context()?;
                 let request = ContextRequest {
@@ -1763,17 +1851,24 @@ impl McpDispatcher {
                 );
                 serde_json::to_value(engine.get_context(&request)?)?
             }
-            "context.protect" => json!({
-                "protected": self.context()?.protect(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
-                )
-            }),
-            "context.unprotect" => json!({
-                "unprotected": self.context()?.unprotect(
-                    arguments.get("id").and_then(Value::as_str).unwrap_or_default()
-                )
-            }),
+            "context.protect" => {
+                self.authorize_builtin("context.protect")?;
+                json!({
+                    "protected": self.context()?.protect(
+                        arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                    )
+                })
+            }
+            "context.unprotect" => {
+                self.authorize_builtin("context.unprotect")?;
+                json!({
+                    "unprotected": self.context()?.unprotect(
+                        arguments.get("id").and_then(Value::as_str).unwrap_or_default()
+                    )
+                })
+            }
             "context.offload" => {
+                self.authorize_builtin("context.offload")?;
                 self.context()?.offload(
                     arguments
                         .get("id")
@@ -1787,6 +1882,7 @@ impl McpDispatcher {
                 json!({"offloaded": true})
             }
             "context.restore" => {
+                self.authorize_builtin("context.restore")?;
                 let item = self.context()?.restore(
                     arguments
                         .get("id")
@@ -1820,6 +1916,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_create" => {
+                self.authorize_builtin("github.pr_create")?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_create", &target);
@@ -1837,6 +1934,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_merge" => {
+                self.authorize_builtin("github.pr_merge")?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_merge", &target);
@@ -1851,6 +1949,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_review" => {
+                self.authorize_builtin("github.pr_review")?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_review", &target);
@@ -1890,6 +1989,7 @@ impl McpDispatcher {
                 )?
             }
             "github.issue_create" => {
+                self.authorize_builtin("github.issue_create")?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.issue_create", &target);
@@ -1914,6 +2014,7 @@ impl McpDispatcher {
                 )?
             }
             "github.issue_comment" => {
+                self.authorize_builtin("github.issue_comment")?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.issue_comment", &target);
@@ -1938,6 +2039,7 @@ impl McpDispatcher {
                 )?
             }
             "github.workflow_dispatch" => {
+                self.authorize_builtin("github.workflow_dispatch")?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.workflow_dispatch", &target);
@@ -1952,6 +2054,7 @@ impl McpDispatcher {
                 )?
             }
             "github.release_create" => {
+                self.authorize_builtin("github.release_create")?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.release_create", &target);
@@ -1973,6 +2076,7 @@ impl McpDispatcher {
                 serde_json::to_value(git.status().await?)?
             }
             "git.branch" => {
+                self.authorize_builtin("git.branch")?;
                 let git = GitService::open(self.workspace.root())?;
                 serde_json::to_value(git.branch().await?)?
             }
@@ -2000,6 +2104,7 @@ impl McpDispatcher {
                 serde_json::to_value(out)?
             }
             "git.stage" => {
+                self.authorize_builtin("git.stage")?;
                 let git = GitService::open(self.workspace.root())?;
                 let path = strval(&arguments, "path")?;
                 if path.is_empty() {
@@ -2008,6 +2113,7 @@ impl McpDispatcher {
                 serde_json::to_value(git.stage(&path).await?)?
             }
             "git.unstage" => {
+                self.authorize_builtin("git.unstage")?;
                 let git = GitService::open(self.workspace.root())?;
                 let path = strval(&arguments, "path")?;
                 if path.is_empty() {
@@ -2016,11 +2122,13 @@ impl McpDispatcher {
                 serde_json::to_value(git.unstage(&path).await?)?
             }
             "git.commit" => {
+                self.authorize_builtin("git.commit")?;
                 let git = GitService::open(self.workspace.root())?;
                 let message = strval(&arguments, "message")?;
                 serde_json::to_value(git.commit(&message).await?)?
             }
             "terminal.run" => {
+                self.authorize_builtin("terminal.run")?;
                 let program = strval(&arguments, "program")?;
                 let args: Vec<String> = arguments
                     .get("args")
@@ -2207,11 +2315,25 @@ fn to_dispatch_error(error: anyhow::Error) -> DispatchError {
     DispatchError::internal(error.to_string())
 }
 
+/// The user data directory holding the persistent trust store, overridable
+/// via the `AWH_TRUST_DIR` environment variable (used by tests to isolate
+/// the real home directory, and by operators to relocate the store). Shared
+/// by the CLI trust commands and the dispatcher's trust-store load so both
+/// always agree on the same store.
+pub fn trust_data_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("AWH_TRUST_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(dir.into());
+        }
+    }
+    dirs::home_dir().map(|home| home.join(".agent-workspace-hub"))
+}
+
 /// Loads the persistent trust store from the user data directory, returning
 /// `None` if it cannot be loaded (corrupt or missing). A `None` here means
 /// "nothing is approved", so every custom MCP server fails closed.
 fn load_trust_store() -> Option<PersistentTrustStore> {
-    let dir = dirs::home_dir()?.join(".agent-workspace-hub");
+    let dir = trust_data_dir()?;
     match PersistentTrustStore::new(dir) {
         Ok(store) => Some(store),
         Err(error) => {
