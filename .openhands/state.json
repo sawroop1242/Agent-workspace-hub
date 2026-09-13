@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "status": "IDLE",
   "active_feature": null,
   "active_pr": null,
@@ -7,5 +7,6 @@
   "review_round": 0,
   "builder_attempt": 0,
   "last_error": null,
+  "last_review": "",
   "updated_at": null
 }
