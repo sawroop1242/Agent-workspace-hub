@@ -19,6 +19,7 @@ env:
 
 jobs:
   review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -26,7 +27,6 @@ jobs:
       K1: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
       K2: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_2 }}
       K3: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_3 }}
-      K4: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_4 }}
       KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
       AWH_AGENT_ROLE: reviewer
       AWH_PR: ${{ github.event.pull_request.number }}
@@ -40,11 +40,11 @@ jobs:
       - name: Install OpenHands SDK
         run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2'
 
-      - name: Run Agent 3 with four-key Kimi K3 rotation
+      - name: Run Agent 3 with three-key Kimi K3 rotation and routine fallback
         run: |
           set +e
           SUCCESS=0
-          for KEY_NAME in K1 K2 K3 K4 KF; do
+          for KEY_NAME in K1 K2 K3 KF; do
             KEY="${!KEY_NAME}"
             [ -n "$KEY" ] || continue
             echo "Agent 3: trying NVIDIA Kimi K3 key pool slot $KEY_NAME"
