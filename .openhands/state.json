@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "status": "IDLE",
+  "status": "PLANNING",
   "active_feature": null,
   "active_pr": null,
   "active_branch": null,
@@ -8,5 +8,5 @@
   "builder_attempt": 0,
   "last_error": null,
   "last_review": "",
-  "updated_at": null
+  "updated_at": "2026-09-13T05:45:17.046492Z"
 }
