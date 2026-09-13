@@ -6,6 +6,7 @@
   "required": [
     "version",
     "status",
+    "operation_id",
     "active_feature",
     "active_pr",
     "active_branch",
@@ -16,11 +17,12 @@
     "updated_at"
   ],
   "properties": {
-    "version": {"const": 2},
+    "version": {"const": 3},
     "status": {
       "type": "string",
-      "enum": ["IDLE", "PLANNING", "BUILDING", "PR_OPEN", "REVIEWING", "FIXING", "COMPLETED", "BLOCKED"]
+      "enum": ["IDLE", "PLANNING", "BUILDING", "PR_OPEN", "REVIEWING", "FIXING", "MERGING", "COMPLETED", "BLOCKED", "RECOVERING"]
     },
+    "operation_id": {"type": ["string", "null"]},
     "active_feature": {"type": ["string", "null"]},
     "active_pr": {"type": ["integer", "null"], "minimum": 1},
     "active_branch": {"type": ["string", "null"]},

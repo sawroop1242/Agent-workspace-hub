@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,38 @@ ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / ".openhands" / "state.json"
 SCHEMA_PATH = ROOT / ".openhands" / "state.schema.json"
 
-STATUSES = {"IDLE", "PLANNING", "BUILDING", "PR_OPEN", "REVIEWING", "FIXING", "COMPLETED", "BLOCKED"}
+STATE_VERSION = 3
+LEGACY_STATE_VERSION = 2
+
+STATUSES = {
+    "IDLE",
+    "PLANNING",
+    "BUILDING",
+    "PR_OPEN",
+    "REVIEWING",
+    "FIXING",
+    "MERGING",
+    "COMPLETED",
+    "BLOCKED",
+    "RECOVERING",
+}
+
+# Legal status changes. Re-entrant entries (BUILDING -> BUILDING on a fix
+# re-dispatch, REVIEWING -> REVIEWING on a re-review, ...) let a workflow
+# refresh checkpoint metadata under the same compare-and-swap discipline;
+# they never skip or bypass a stage.
+TRANSITIONS: dict[str, set[str]] = {
+    "IDLE": {"PLANNING"},
+    "PLANNING": {"BUILDING", "BLOCKED", "PLANNING"},
+    "BUILDING": {"PR_OPEN", "BLOCKED", "BUILDING", "REVIEWING"},
+    "PR_OPEN": {"REVIEWING", "BLOCKED", "COMPLETED"},
+    "REVIEWING": {"FIXING", "MERGING", "BLOCKED", "REVIEWING", "PR_OPEN"},
+    "FIXING": {"REVIEWING", "BLOCKED", "FIXING", "BUILDING"},
+    "MERGING": {"COMPLETED", "BLOCKED"},
+    "COMPLETED": {"IDLE", "PLANNING"},
+    "BLOCKED": {"RECOVERING", "IDLE"},
+    "RECOVERING": {"BUILDING", "REVIEWING", "FIXING", "IDLE", "BLOCKED"},
+}
 
 
 def fail(message: str) -> None:
@@ -29,6 +61,36 @@ def load_json(path: Path) -> Any:
         fail(f"cannot read valid JSON from {path}: {exc}")
 
 
+def migrate_state(state: Any) -> dict[str, Any] | None:
+    """Lift a well-formed v2 state to v3; return None when not applicable.
+
+    v2 -> v3 adds only `operation_id` (caller-supplied, no v2 equivalent),
+    so the lift is injective: default it to null, bump the version. Anything
+    that is not a valid v2 document falls through and is rejected.
+    """
+    if not isinstance(state, dict) or state.get("version") != LEGACY_STATE_VERSION:
+        return None
+    required = [
+        "version",
+        "status",
+        "active_feature",
+        "active_pr",
+        "active_branch",
+        "review_round",
+        "builder_attempt",
+        "last_error",
+        "last_review",
+        "updated_at",
+    ]
+    if set(state) != set(required):
+        return None
+    # Rebuild in schema order so a migrated state.json reads like a native v3 one.
+    migrated = {key: state[key] for key in required}
+    migrated["version"] = STATE_VERSION
+    migrated["operation_id"] = None
+    return migrated
+
+
 def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
     # Keep the schema in-repo and validate the exact contract here without
     # requiring a third-party package on GitHub-hosted runners.
@@ -36,7 +98,13 @@ def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
         schema = load_json(SCHEMA_PATH)
     if not isinstance(state, dict):
         fail("root must be an object")
-    if state.get("version") != schema["properties"]["version"]["const"]:
+    version = state.get("version")
+    if version == LEGACY_STATE_VERSION:
+        migrated = migrate_state(state)
+        if migrated is None:
+            fail(f"version must be {STATE_VERSION}")
+        return validate_state(migrated, schema)
+    if version != schema["properties"]["version"]["const"]:
         fail(f"version must be {schema['properties']['version']['const']}")
     required = schema["required"]
     missing = [key for key in required if key not in state]
@@ -48,6 +116,8 @@ def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
     if status not in STATUSES:
         fail(f"unsupported status {status!r}")
 
+    if state["operation_id"] is not None and not isinstance(state["operation_id"], str):
+        fail("operation_id must be a string or null")
     nullable_strings = {"active_feature", "active_branch", "last_error"}
     for key in nullable_strings:
         value = state[key]
@@ -78,6 +148,38 @@ def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
 
 def load_state() -> dict[str, Any]:
     return validate_state(load_json(STATE_PATH))
+
+
+def _check_transition(current: str, requested: str) -> None:
+    """Reject any status change that is not in TRANSITIONS. Fail closed."""
+    allowed = TRANSITIONS.get(current)
+    if allowed is None:
+        fail(f"unknown current status {current!r}")
+    if requested not in allowed:
+        fail(
+            f"transition {current} -> {requested} is not allowed "
+            f"(permitted from {current}: {', '.join(sorted(allowed))})"
+        )
+
+
+def apply_assignments(state: dict[str, Any], assignments: list[str]) -> dict[str, Any]:
+    for assignment in assignments:
+        if "=" not in assignment:
+            fail(f"--set must be KEY=JSON, got {assignment!r}")
+        key, raw = assignment.split("=", 1)
+        if key not in state:
+            fail(f"unknown field {key!r}")
+        try:
+            state[key] = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            fail(f"invalid JSON for {key}: {exc}")
+    return state
+
+
+def stamp_updated_at(state: dict[str, Any], assignments: list[str]) -> dict[str, Any]:
+    if "updated_at" in state and not any(item.startswith("updated_at=") for item in assignments):
+        state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return state
 
 
 def _sync_directory(directory: Path) -> None:
@@ -118,29 +220,61 @@ def atomic_write(state: dict[str, Any]) -> None:
             tmp_path.unlink()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("validate", "update"))
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("validate", "update", "transition"))
     parser.add_argument("--set", action="append", default=[], metavar="KEY=JSON")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--expect-status",
+        action="append",
+        default=[],
+        metavar="STATUS",
+        help="current status required for a transition to proceed; repeatable",
+    )
+    parser.add_argument(
+        "--expect-operation-id",
+        default="",
+        metavar="ID",
+        help="current operation_id required for a transition; empty matches any",
+    )
+    parser.add_argument("--to", metavar="STATUS", help="requested status for a transition")
+    args = parser.parse_args(argv)
 
-    state = load_state()
     if args.action == "validate":
+        load_state()
         print("Checkpoint state is valid.")
         return
 
-    for assignment in args.set:
-        if "=" not in assignment:
-            fail(f"--set must be KEY=JSON, got {assignment!r}")
-        key, raw = assignment.split("=", 1)
-        if key not in state:
-            fail(f"unknown field {key!r}")
-        try:
-            state[key] = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            fail(f"invalid JSON for {key}: {exc}")
-    if "updated_at" in state and not any(item.startswith("updated_at=") for item in args.set):
-        state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if args.action == "transition":
+        state = load_state()
+        expected = args.expect_status or [state["status"]]
+        if state["status"] not in expected:
+            fail(
+                f"expected current status {' or '.join(expected)}, "
+                f"but state has {state['status']!r}; refusing to transition"
+            )
+        expected_operation_id = args.expect_operation_id
+        if expected_operation_id != "" and state["operation_id"] != expected_operation_id:
+            fail(
+                f"expected operation_id {expected_operation_id!r}, "
+                f"but state has {state['operation_id']!r}; refusing to transition"
+            )
+        requested = args.to
+        if requested is None:
+            fail("transition requires --to STATUS")
+        _check_transition(state["status"], requested)
+        apply_assignments(state, args.set)
+        state["status"] = requested
+        stamp_updated_at(state, args.set)
+        atomic_write(state)
+        print(f"Checkpoint transitioned to {requested} atomically and validated.")
+        return
+
+    # `update` is retained for backward compatibility with callers outside
+    # the workflows migrated to `transition`; it is unsafe under concurrency.
+    state = load_state()
+    apply_assignments(state, args.set)
+    stamp_updated_at(state, args.set)
     atomic_write(state)
     print("Checkpoint state updated atomically and validated.")
 
