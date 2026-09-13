@@ -3,6 +3,8 @@
 ## Documentation
 
 - [Architecture](docs/architecture.md) — components, request flow, security layers
+- [Features](docs/FEATURES.md) — core AWH capabilities, including Agent Profiles and Policy-Routed MCP
+- [Agent Profiles roadmap](docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) — TOML configuration, per-agent MCP routes, CLI lifecycle, policy integration and multi-agent sequencing
 - [Security policy and threat model](docs/security.md)
 - [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
 - [MCP integration](docs/mcp.md) — transports, 53 core tools (65 with `github.*` when `GITHUB_TOKEN` is set), interop evidence
@@ -41,7 +43,32 @@ The installer requires `curl`; source installs additionally require `cargo`.
 Prebuilt binaries target Linux (x86_64, aarch64), macOS (x86_64, aarch64), and
 Windows (x86_64), falling back to a `cargo build` when no matching asset exists.
 
+## Agent Profiles & Policy-Routed MCP
 
+AWH can be configured around named external agents. The planned runtime model uses TOML-defined profiles, per-agent MCP endpoints, per-agent tool permissions and CLI-controlled server lifecycle.
+
+Example endpoint model:
+
+```text
+/claude/mcp
+/claude/sse
+/qwen/mcp
+/qwen/sse
+```
+
+The CLI can select which configured agent servers are active:
+
+```bash
+awh agent start claude
+awh agent start claude qwen
+awh agent start --all
+awh agent stop claude
+awh agent status
+```
+
+Starting only Claude means only Claude's configured routes are active; Qwen/OpenCode are not merely denied tools, their agent-specific routes are inactive. URL namespaces identify the profile but are not themselves authorization: requests still pass through the canonical capability/policy engine.
+
+See [docs/FEATURES.md](docs/FEATURES.md) and [docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md](docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) for the full design and sequencing.
 
 ## Agent handoff workflow
 
@@ -115,8 +142,8 @@ supplied via environment variables or CLI flags:
 | ------------------- | --------------------- | ----------------- | ------------- |
 | Bind address        | `AWH_HOST`            | `--host`          | `0.0.0.0`     |
 | Port                | `AWH_PORT`            | `--port`          | `8443`        |
-| TLS certificate     | `AWH_TLS_CERT`        | `--tls-cert`      | (off -> HTTP) |
-| TLS private key     | `AWH_TLS_KEY`         | `--tls-key`       | (off -> HTTP) |
+| TLS certificate     | `AWH_TLS_CERT`         | `--tls-cert`       | (off -> HTTP) |
+| TLS private key     | `AWH_TLS_KEY`          | `--tls-key`       | (off -> HTTP) |
 | API key variable    | -                     | `--api-key-env`   | `AWH_API_KEY` |
 | Allowed origins     | `AWH_ALLOWED_ORIGINS` | -                 | empty (none)  |
 
