@@ -11,7 +11,7 @@
       "id": "AWH-AUTO-001",
       "title": "Harden the autonomous development loop foundation",
       "priority": 1,
-      "status": "ready",
+      "status": "completed",
       "dependencies": [],
       "acceptance_criteria": [
         "Add a production-safe sequential Agent 1 -> Agent 2 -> Agent 3 -> Agent 1 GitHub Actions loop.",
@@ -19,7 +19,9 @@
         "Use repository_dispatch for cross-workflow orchestration and prevent concurrent feature runs.",
         "Require CI success and an APPROVE review before autonomous merge.",
         "Document required secrets and how to start the loop."
-      ]
+      ],
+      "merged_pr": null,
+      "bootstrap_commit": "7a47fa3889cbcb1ab74f4e38c1aaf4aaa0bf4fd1"
     },
     {
       "id": "AWH-AUTO-002",
