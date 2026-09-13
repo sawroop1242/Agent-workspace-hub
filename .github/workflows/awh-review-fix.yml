@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   fix:
-    if: github.event.client_payload.review_state == 'CHANGES_REQUESTED'
+    if: github.event.client_payload.review_state == 'CHANGES_REQUIRED'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -60,7 +60,6 @@ jobs:
           PR: ${{ github.event.client_payload.pr_number }}
           FEATURE_ID: ${{ github.event.client_payload.feature_id }}
         run: |
-          TASK=$(jq -r '.active_feature // empty' .openhands/state.json)
           REVIEW=$(python - <<'PY'
           import json
           d=json.load(open('/tmp/reviews.json'))
