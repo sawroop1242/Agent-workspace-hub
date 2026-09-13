@@ -1,115 +1,45 @@
-# AWE-004 — Coding Checklist
+# AWE-004 Coding Checklist
 
-## `src/services/edit.rs`
+## Before coding
+- [ ] Read AWE-001/002/003 prompts and issue bodies.
+- [ ] Inspect current `src/services/edit.rs` and `src/services/files.rs`.
+- [ ] Search for existing edit executors/callers.
+- [ ] Confirm no MCP/CLI editor needs to be preserved yet.
 
-### Preparation model
+## Implementation
+- [ ] Canonical transaction validation.
+- [ ] Resolve all paths before writes.
+- [ ] Load all affected files first.
+- [ ] Capture before states.
+- [ ] Validate expected state/context.
+- [ ] Apply operations in memory.
+- [ ] Reuse AWE-002 replacement helper.
+- [ ] Reuse AWE-003 line helpers.
+- [ ] Compute after states.
+- [ ] Commit only prepared mutations.
+- [ ] Verify actual results.
+- [ ] Return structured edit result.
 
-- [ ] Add internal `PreparedFileMutation`.
-- [ ] Add internal `PreparedPatch` if useful.
-- [ ] Preserve canonical AWE-001 models.
-
-### Pure transformations
-
-- [ ] Extract/reuse replace transformation.
-- [ ] Extract/reuse insert transformation.
-- [ ] Extract/reuse delete-range transformation.
-- [ ] Add `apply_operation_to_content()` dispatcher.
-- [ ] Ensure helpers never write to disk.
-
-### Preparation
-
-- [ ] Validate non-empty transaction.
-- [ ] Validate every operation before mutation.
-- [ ] Validate every target path through existing filesystem security.
-- [ ] Load each affected file.
-- [ ] Capture original `FileState`.
-- [ ] Validate expected state.
-- [ ] Compose same-file operations in transaction order.
-- [ ] Calculate final content and `FileState`.
-- [ ] Prepare all files before commit.
-
-### Commit
-
-- [ ] Commit only after complete preparation succeeds.
-- [ ] Write one final state per affected file.
-- [ ] Never write intermediate states.
-- [ ] Reuse existing safe filesystem write behavior.
-- [ ] Do not implement crash recovery here.
-
-### Result/verification
-
-- [ ] Populate before/after state.
-- [ ] Preserve edit ID.
-- [ ] Preserve operation ordering.
-- [ ] Perform minimal post-write verification.
-- [ ] Return structured failure information.
-
-## `src/services/files.rs`
-
-- [ ] Reuse `FilesService` path validation.
-- [ ] Reuse workspace-root enforcement.
-- [ ] Reuse symlink/traversal protections.
-- [ ] Reuse file-size and UTF-8 handling.
-- [ ] Avoid unrelated changes.
+## Safety
+- [ ] No writes during preparation.
+- [ ] No silent stale overwrite.
+- [ ] No path-security duplication.
+- [ ] No full-file rewrite fallback.
+- [ ] No claim of crash-safe rollback.
 
 ## Tests
+- [ ] Same-file composition.
+- [ ] Multi-file patch.
+- [ ] Invalid later operation leaves every file unchanged.
+- [ ] Stale expected state leaves every file unchanged.
+- [ ] Traversal/symlink cases.
+- [ ] UTF-8/CRLF/LF/EOF.
+- [ ] Real filesystem integration test.
 
-### Basic
-
-- [ ] Replace
-- [ ] Insert
-- [ ] Delete range
-- [ ] Mixed operations
-- [ ] Empty file
-
-### Same-file composition
-
-- [ ] Replace -> Replace
-- [ ] Replace -> Insert
-- [ ] Insert -> Replace
-- [ ] Insert -> Delete
-- [ ] Delete -> Insert
-- [ ] Replace -> Delete
-
-### Multi-file
-
-- [ ] Two files succeed.
-- [ ] Three files succeed.
-- [ ] One final mutation per affected file.
-- [ ] Valid/invalid/valid preparation failure leaves every file unchanged.
-
-### Conflict/security
-
-- [ ] Hash mismatch.
-- [ ] Size mismatch.
-- [ ] Line-count mismatch.
-- [ ] External stale modification.
-- [ ] Absolute path rejection.
-- [ ] Traversal rejection.
-- [ ] Symlink escape rejection.
-
-### Text
-
-- [ ] UTF-8.
-- [ ] Hindi/Devanagari.
-- [ ] Emoji.
-- [ ] LF.
-- [ ] CRLF.
-- [ ] Trailing newline.
-- [ ] No trailing newline.
-
-## Verification
-
-- [ ] `cargo test edit`
-- [ ] `cargo test edit -- --nocapture`
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo check`
-- [ ] `cargo test`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `git diff --stat`
-- [ ] `git diff`
-- [ ] `git status`
-
-## Final invariant
-
-> If any validation or preparation step fails, zero files are mutated.
+## Gate
+```bash
+cargo fmt --all -- --check
+cargo check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
