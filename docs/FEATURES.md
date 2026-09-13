@@ -1,110 +1,106 @@
-# AWH Features
+# AWH Final Features
 
-## Agent Profiles & Policy-Routed MCP
+> This document describes the final target feature contract. Implementation status is tracked separately; planned functionality must not be represented as currently available.
 
-AWH supports named agent profiles that define how an external coding agent connects to the AWH runtime and which capabilities/tools it may use.
+## Product boundary
 
-The feature is deliberately split into two layers:
+AWH is an **agent-agnostic, local-first workspace runtime for coding agents**.
+
+AWH owns workspace/runtime state, controlled editing, Git/worktree isolation, capabilities/policy, snapshots/provenance, context, memory, skills, agent/session state, audit/observability, and MCP/CLI/TUI/Control API interfaces.
+
+External agents own reasoning, planning, model selection, and agent intelligence.
+
+AWH is not an agent framework, generic model router, or general-purpose workflow engine.
+
+## Final feature set
+
+### Foundation and distribution
+
+- Configuration with deterministic precedence
+- Persistent state/storage abstractions
+- Cross-platform paths
+- Structured logging and errors
+- Version/build information
+- Install, upgrade, uninstall, release artifacts and checksums
+- Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64, Android/Termux ARM64 where practical
+- Shell completion
+
+Core commands: `awh init`, `awh version`, `awh status`, `awh doctor`, `awh config`.
+
+### Workspace runtime
+
+`awh workspace create|list|open|info|remove`
+
+Workspace is the primary scope for filesystem, Git, agent, session, context, memory, skills, snapshots and policy.
+
+### Agent-grade filesystem editing
+
+Basic: `awh fs read|write|stat|search|hash|verify`
+
+Controlled edits: `awh fs patch|replace|insert|delete-range|apply-diff|history|rollback`
+
+Every consequential edit follows:
 
 ```text
-TOML configuration
-      ↓
-AgentProfile
-      ↓
-AgentRegistry
-      ↓
-AgentServerManager
-      ↓
-AgentRouter
-      ↓
-AgentSession
-      ↓
-PolicyEngine
-      ↓
-Core AWH services
+request → capability/policy check → locate/read → context validation
+→ conflict detection → atomic apply → verification → snapshot/provenance → audit
 ```
 
-The TOML file is declarative configuration. The runtime `PolicyEngine` remains the authoritative authorization boundary.
+No silent stale-state overwrite and no separate edit semantics per interface.
 
-### Per-agent MCP endpoints
+### Git and first-class worktrees
 
-Enabled agents can receive namespaced MCP endpoints:
+Git: `status`, `diff`, `staged-diff`, `log`, `branch`, `branches`, `worktree`, `stage`, `unstage`, `commit`, `push`, `pull`, `reset`, `clean`, `validate`.
+
+Worktree: `create`, `list`, `inspect`, `remove`, `merge`, `status`.
+
+Agent, session, workspace, worktree, branch and modified-file identity remain associated.
+
+### Capability and policy engine
+
+Capabilities cover resources/actions such as `filesystem.read`, `filesystem.write`, `filesystem.delete`, `git.read`, `git.write`, `process.execute`, `network.request`, `mcp.invoke`, and `secrets.read`.
 
 ```text
-/{agent}/mcp
-/{agent}/sse
+awh capability list|show|grant|revoke|check
+awh policy list|show|check|validate|explain
 ```
 
-Example:
+The PolicyEngine is authoritative. TOML configuration, MCP route names, tool discovery and internal callers cannot bypass it.
+
+### Snapshots, undo and provenance
 
 ```text
-/claude/mcp
-/claude/sse
-
-/qwen/mcp
-/qwen/sse
-
-/opencode/mcp
-/opencode/sse
+awh snapshot create|list|show|restore|delete|diff
 ```
 
-The agent name identifies the runtime profile, but **the URL namespace is not itself authentication or authorization**. Every request must still bind to an AWH agent/session identity and pass the normal capability/policy checks.
+Track where practical: file, agent, session, capability, tool, timestamp, before hash, after hash and snapshot. Snapshots are workspace safety/recovery, not a replacement for OS/container/VM sandboxing.
 
-### TOML configuration
+### Context engine
 
-A profile can configure:
+`awh context show|save|update|clear|search`
 
-- agent name and enabled state
-- MCP and SSE availability
-- tool allowlists
-- workspace selection
-- filesystem permissions
-- Git permissions
-- terminal/process permissions
-- resource/concurrency limits
-- authentication/approval requirements as those capabilities mature
+Context integrates filesystem, Git, workspace metadata, session history, changes, skills, project configuration and tool results while respecting budgets and stale-context detection.
 
-Example:
+### Developer-oriented memory
 
-```toml
-[server]
-host = "127.0.0.1"
-port = 9000
+`awh memory list|get|search|add|update|delete`
 
-[agents.claude]
-enabled = true
+Memory is scoped to projects/workspaces/sessions/agents as appropriate and focuses on coding workflow state.
 
-[agents.claude.mcp]
-enabled = true
-sse = true
+### Skills and capability packages
 
-[agents.claude.permissions]
-tools = [
-    "filesystem.read",
-    "filesystem.search",
-    "filesystem.patch",
-    "git.status",
-    "git.diff",
-]
+`awh skill list|show|install|remove|enable|disable`
 
-[agents.claude.workspace]
-root = "./workspace/claude"
+A skill declares tools/capabilities, inputs, outputs and policy requirements. Requested capabilities are evaluated by PolicyEngine.
 
-[agents.qwen]
-enabled = true
+### Agent Profiles and policy-routed MCP
 
-[agents.qwen.permissions]
-tools = [
-    "filesystem.read",
-    "filesystem.search",
-    "filesystem.patch",
-    "terminal.execute",
-]
+```text
+TOML → AgentProfile → AgentRegistry → AgentServerManager
+→ AgentRouter → AgentSession → PolicyEngine → AWH services
 ```
 
-### CLI server lifecycle
-
-The CLI controls which configured agent servers are actually active.
+Configured endpoints are `/{agent}/mcp` and `/{agent}/sse`. Lifecycle:
 
 ```text
 awh agent list
@@ -113,130 +109,86 @@ awh agent start <name>...
 awh agent start --all
 awh agent stop <name>
 awh agent restart <name>
-awh agent status
 awh agent run <name>
+awh agent status
 ```
 
-Examples:
+The route namespace is routing identity only, not authorization. Disabled/inactive agents have no active agent-specific route.
 
-```bash
-# Start only Claude's MCP server.
-awh agent start claude
+### MCP infrastructure
 
-# Start two independent agent servers.
-awh agent start claude qwen
+`awh mcp serve|list|add|remove|inspect|test|logs`
 
-# Start every enabled profile.
-awh agent start --all
+MCP must support lifecycle, discovery, transports, concurrent clients, cancellation/timeouts, structured errors, authentication hooks, auditing, limits and real-client interoperability.
 
-# Run one agent server in the foreground until shutdown.
-awh agent run claude
-```
-
-If only Claude is started, only Claude's configured endpoint is registered:
+### Sessions and tasks
 
 ```text
-/claude/mcp   ACTIVE
-/claude/sse   ACTIVE
-
-/qwen/mcp     NOT ACTIVE
-/opencode/mcp NOT ACTIVE
+awh session list|show|create|stop|status
+awh task list|show|create|update|cancel|assign
 ```
 
-Inactive agents should not merely receive denied tools; their server endpoints should not be registered as active listeners/routes.
+A session binds agent identity to workspace, worktree, capabilities, context, memory, snapshots and audit.
 
-### Agent isolation
-
-Each active agent should have an explicit runtime identity that propagates through:
+### Audit and observability
 
 ```text
-Agent
-  ↓
-Session
-  ↓
-Workspace
-  ↓
-Worktree
-  ↓
-CapabilityContext
-  ↓
-Tool invocation
-  ↓
-Audit / provenance
+awh audit list|show|search|export
+awh logs show|follow|clear
 ```
 
-This identity must also be available to consequential operations such as filesystem edits, Git operations, snapshots, context, memory, and process execution.
+Audit consequential actions including edits, Git mutations, terminal execution, capability decisions, MCP requests and connector activity without persisting secrets.
 
-### Tool discovery and invocation
+### Terminal runtime
 
-AWH should maintain one canonical tool registry and one authorization boundary.
+`awh terminal run|list|kill`
 
-For an agent with an allowlist:
+Terminal access is high-risk and requires policy/capability checks, session identity, bounded execution, termination/timeouts, resource limits and audit.
 
-1. tool discovery should expose only permitted tools where practical;
-2. invocation must independently re-check authorization;
-3. a direct/internal invocation must not bypass the policy engine;
-4. denied operations must produce structured errors and zero unauthorized side effects.
+### Multi-agent collaboration
 
-Example denial:
+`awh collaboration agents|status|handoff|assign|conflicts|events`
 
-```text
-PermissionDenied {
-    agent: "claude",
-    tool: "terminal.execute",
-    reason: "tool_not_granted"
-}
-```
+AWH coordinates state, ownership, isolation and events. Agents remain responsible for reasoning. Distributed swarms, generic DAG workflow engines and autonomous schedulers are out of scope.
 
-### Concurrency
+### Control API
 
-Multiple agent servers may run concurrently:
+`awh api serve|status|tokens|logs`
 
-```text
-                 AWH
-                  │
-        ┌─────────┼─────────┐
-        │         │         │
-     Claude      Qwen    OpenCode
-        │         │         │
-     Session A Session B Session C
-        │         │         │
-    Worktree A Worktree B Worktree C
-```
+The API exposes stable control operations over the same application services used by CLI/TUI/MCP, with scoped authentication/authorization and local-first operation.
 
-Agent identity, policy, workspace and session state must remain isolated even when requests are processed concurrently.
+### TUI
 
-### Security invariants
+`awh tui`
 
-- An unknown agent name is rejected.
-- A disabled agent cannot start or accept MCP requests.
-- An inactive agent has no active agent-specific MCP route.
-- Agent route identity must be validated and bound to a session.
-- Route names must not permit path traversal or encoded-path bypasses.
-- Tool permissions are enforced by the authoritative policy engine.
-- MCP discovery and invocation cannot bypass capability checks.
-- Internal service calls cannot silently acquire additional agent capabilities.
-- Agent identity is included in audit/provenance for consequential operations.
+The TUI is a control/observability interface, not a second application core or full IDE. It consumes the same service/backend abstractions as CLI and API.
 
-### Relationship to the AWH product boundary
+### Connectors and ecosystem
 
-This feature does **not** turn AWH into an agent framework. External agents continue to own reasoning, planning and model selection. AWH owns the controlled runtime boundary around those agents: identity, sessions, capabilities, workspace state, MCP exposure, isolation, audit and lifecycle.
+`awh connector list|add|remove|inspect|test|invoke`
 
-## Other core AWH feature areas
+Adapters integrate external services without bypassing policy, authentication or audit.
 
-- MCP-first interoperability
-- Controlled workspace/filesystem operations
-- Agent-grade patch editing
-- Git and agent worktrees
-- Capability and policy enforcement
-- Snapshots, undo and provenance
-- Context and project state
-- Developer-oriented memory
-- Skills and capability packages
-- Agent/session lifecycle
-- Audit and observability
-- TUI and Control API
-- Multi-agent workspace coordination
-- Local-first and optional remote runtime
+### Advanced infrastructure
 
-See `docs/PROJECT_ROADMAP.md` and `docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md` for implementation sequencing.
+Optional modular adapters may provide process/OS/container/WASM sandboxing, quotas, network policies, secrets managers, remote execution, snapshot deduplication and enterprise RBAC. These are demand-driven and must not destabilize the core.
+
+## Security invariants
+
+- Unknown agents are rejected.
+- Disabled agents cannot start or accept MCP requests.
+- Inactive agents have no active agent-specific MCP route.
+- URL namespaces never grant authorization.
+- Every consequential tool invocation is policy checked.
+- Direct/internal service calls cannot silently acquire extra capabilities.
+- Path traversal and encoded-path bypasses are rejected.
+- Agent/session identity propagates to audit and provenance.
+- Dangerous Git, terminal, snapshot, capability and connector mutations require their enforcement layers.
+- Secrets are never written to logs or audit records.
+
+## Implementation source of truth
+
+- `docs/PROJECT_ROADMAP.md` — phases, dependencies and build order
+- `docs/CLI.md` — final CLI contract
+- `docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md` — agent profile/MCP details
+- `docs/RECONCILED_ROADMAP_V2.md` — historical reconciled status snapshot
