@@ -1,16 +1,47 @@
-# Rust build artifacts
-/target
+```
+# Compiled and build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
 
-# Test output
-**/*.rs.bk
+# Dependencies
+**/target/
+**/node_modules/
+**/venv/
+**/env/
+**/.venv/
+**/__pycache__/
+**/.mypy_cache/
+**/.pytest_cache/
+**/.gradle/
 
-# Environment files
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Environment
 .env
+.env.local
 .env.*
 
-# OS files
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# System
 .DS_Store
 Thumbs.db
-
-# Local AWH runtime state (custom MCP configs may hold credentials)
-/.agent/
+```

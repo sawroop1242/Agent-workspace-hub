@@ -95,6 +95,19 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
         anyhow::bail!("refusing to serve remote MCP without an API key");
     }
 
+    // SEC-002: Enforce TLS for non-loopback binds to prevent plaintext token exposure.
+    // Loopback (127.0.0.1, ::1) + plaintext is allowed for local development.
+    // Non-loopback (e.g., 0.0.0.0) without TLS must be rejected before serving.
+    let host = config.host.as_str();
+    let is_loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
+    if !is_loopback && !config.tls.enabled() {
+        anyhow::bail!(
+            "refusing to bind MCP to non-loopback address {}:{} without TLS; set AWH_TLS_CERT and AWH_TLS_KEY or bind to loopback",
+            config.host,
+            config.port
+        );
+    }
+
     let state = AppState {
         dispatcher,
         sessions: Arc::new(SessionRegistry::new()),
