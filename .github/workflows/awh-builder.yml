@@ -95,8 +95,8 @@ jobs:
           fi
           test -s /tmp/task.md
 
-      - name: Install OpenHands SDK
-        run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2'
+      - name: Install OpenHands SDK and built-in tools
+        run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2' 'openhands-tools>=1.0,<2'
 
       - name: Run Agent 2 with optional three-key Kimi K3 rotation and required routine fallback
         env:
