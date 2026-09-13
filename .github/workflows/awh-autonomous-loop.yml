@@ -86,8 +86,8 @@ jobs:
             exit 1
           fi
 
-      - name: Install OpenHands SDK
-        run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2'
+      - name: Install OpenHands SDK and built-in tools
+        run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2' 'openhands-tools>=1.0,<2'
 
       - name: Plan next feature with Agent 1 and rotate Kimi K3 keys on rate limit
         id: plan
