@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -9,13 +10,16 @@ from openhands.tools.terminal import TerminalTool
 ROLE = os.environ.get("AWH_AGENT_ROLE", "builder")
 TASK = os.environ.get("AWH_TASK", "")
 REVIEW = os.environ.get("AWH_REVIEW", "")
+PR = os.environ.get("AWH_PR", "")
+
+MODEL = "moonshotai/kimi-k3"
+BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 base_rules = """
 You are operating inside the Agent Workspace Hub Rust repository.
 Read README.md and relevant docs before changing anything. Follow the existing
 architecture and security model. Never weaken tests, security controls, CI gates,
-or error handling. Make the smallest coherent change. Do not modify
-.github/workflows unless the assigned task explicitly requires it.
+or error handling. Make the smallest coherent change.
 """
 
 if ROLE == "planner":
@@ -42,6 +46,33 @@ Acceptance criteria must be concrete and testable. Do not invent requirements.
 If no feature is ready, write `NO_READY_FEATURE` to the file.
 
 Requested feature override: {TASK or '(none)'}
+"""
+elif ROLE == "reviewer":
+    prompt = f"""
+{base_rules}
+You are Agent 3, the independent PR Reviewer and QA/security gate.
+Review PR #{PR} completely. Use the terminal to inspect the PR diff and repository
+context. Do not modify source code. Evaluate:
+- functional correctness and acceptance criteria
+- Rust architecture and API compatibility
+- error handling and edge cases
+- concurrency/state correctness
+- security, especially MCP, agent isolation, filesystem access, command execution,
+  credentials, workflow permissions and prompt-injection risks
+- performance and resource usage
+- test quality and coverage
+- documentation and maintainability
+
+Produce a concise but technically rigorous review in `.openhands/review.md`.
+The final non-empty line MUST be exactly one of:
+VERDICT: APPROVE
+VERDICT: CHANGES_REQUIRED
+VERDICT: BLOCKED
+
+APPROVE only when there are no critical/high defects, the acceptance criteria are
+met, and the implementation is safe to merge. If anything important is missing,
+use CHANGES_REQUIRED. Use BLOCKED for infrastructure/security conditions that
+make a reliable review impossible.
 """
 else:
     prompt = f"""
@@ -71,12 +102,7 @@ api_key = os.environ.get("AWH_LLM_API_KEY")
 if not api_key:
     raise SystemExit("AWH_LLM_API_KEY is required")
 
-llm = LLM(
-    model=os.environ.get("AWH_LLM_MODEL", "gpt-5.5"),
-    api_key=api_key,
-    base_url=os.environ.get("AWH_LLM_BASE_URL") or None,
-)
-
+llm = LLM(model=MODEL, api_key=api_key, base_url=BASE_URL)
 agent = Agent(
     llm=llm,
     tools=[
@@ -96,6 +122,21 @@ if ROLE == "planner":
     text = task_file.read_text(encoding="utf-8").strip()
     if not text or text == "NO_READY_FEATURE":
         raise SystemExit("No ready feature is available")
+    print(text)
+elif ROLE == "reviewer":
+    review_file = Path(".openhands/review.md")
+    if not review_file.exists():
+        raise SystemExit("Reviewer did not create .openhands/review.md")
+    text = review_file.read_text(encoding="utf-8").strip()
+    if not text or "VERDICT:" not in text:
+        raise SystemExit("Reviewer output has no machine-readable verdict")
+    verdict = [x.split(":", 1)[1].strip() for x in text.splitlines() if x.startswith("VERDICT:")][-1]
+    if verdict not in {"APPROVE", "CHANGES_REQUIRED", "BLOCKED"}:
+        raise SystemExit(f"Invalid reviewer verdict: {verdict}")
+    Path(".openhands/review-result.json").write_text(
+        json.dumps({"verdict": verdict, "review": text}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(text)
 else:
     print("Builder finished; deterministic workflow verification follows.")
