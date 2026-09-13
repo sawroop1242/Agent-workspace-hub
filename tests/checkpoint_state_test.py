@@ -106,21 +106,135 @@ def test_interrupted_write_preserves_last_good_checkpoint(tmp_path: Path):
     assert module.validate_state(json.loads(module.STATE_PATH.read_text(encoding="utf-8"))) == original
 
 
-def test_crash_injection_before_replace_preserves_last_good_checkpoint(tmp_path: Path):
-    """Kill the writer at every pre-replace step and verify the old checkpoint survives."""
+def test_crash_injection_at_every_pre_replace_step_preserves_last_good_checkpoint(tmp_path: Path):
+    """Terminate a real writer subprocess at each write boundary before replace."""
     crash_script = tmp_path / "crash_writer.py"
     crash_script.write_text(
-        """\nimport importlib.util\nimport os\nimport sys\nfrom pathlib import Path\n\nscript = Path(sys.argv[1])\nstate_path = Path(sys.argv[2])\ncrash_step = sys.argv[3]\nspec = importlib.util.spec_from_file_location('checkpoint_state', script)\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.STATE_PATH = state_path\n\noriginal = {\n    'version': 2, 'status': 'BUILDING', 'active_feature': 'AWH-CRASH-001',\n    'active_pr': None, 'active_branch': 'awh-crash-001', 'review_round': 0,\n    'builder_attempt': 1, 'last_error': None, 'last_review': '', 'updated_at': None,\n}\nreplacement = dict(original, status='REVIEWING', active_pr=456)\nmodule.atomic_write(original)\n\noriginal_replace = os.replace\noriginal_fsync = os.fsync\noriginal_fdopen = os.fdopen\n\ndef crash(name):\n    if crash_step == name:\n        os._exit(97)\n\ndef hooked_fsync(fd):\n    crash('before_fsync')\n    result = original_fsync(fd)\n    crash('after_fsync')\n    return result\n\ndef hooked_fdopen(fd, *args, **kwargs):\n    crash('before_fdopen')\n    result = original_fdopen(fd, *args, **kwargs)\n    crash('after_fdopen')\n    return result\n\ndef hooked_replace(src, dst):\n    crash('before_replace')\n    return original_replace(src, dst)\n\nos.fsync = hooked_fsync\nos.fdopen = hooked_fdopen\nos.replace = hooked_replace\ntry:\n    module.atomic_write(replacement)\nfinally:\n    os.fsync = original_fsync\n    os.fdopen = original_fdopen\n    os.replace = original_replace\n""",
+        """
+import importlib.util
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script = Path(sys.argv[1])
+state_path = Path(sys.argv[2])
+crash_step = sys.argv[3]
+spec = importlib.util.spec_from_file_location('checkpoint_state', script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.STATE_PATH = state_path
+
+original = {
+    'version': 2, 'status': 'BUILDING', 'active_feature': 'AWH-CRASH-001',
+    'active_pr': None, 'active_branch': 'awh-crash-001', 'review_round': 0,
+    'builder_attempt': 1, 'last_error': None, 'last_review': '', 'updated_at': None,
+}
+replacement = dict(original, status='REVIEWING', active_pr=456)
+module.atomic_write(original)
+
+real_mkstemp = tempfile.mkstemp
+real_fdopen = os.fdopen
+real_replace = os.replace
+real_fsync = os.fsync
+
+
+def crash(name):
+    if crash_step == name:
+        os._exit(97)
+
+
+def hooked_mkstemp(*args, **kwargs):
+    crash('before_mkstemp')
+    result = real_mkstemp(*args, **kwargs)
+    crash('after_mkstemp')
+    return result
+
+
+class CrashFile:
+    def __init__(self, handle):
+        self.handle = handle
+
+    def write(self, data):
+        crash('before_write')
+        result = self.handle.write(data)
+        crash('after_write')
+        return result
+
+    def flush(self):
+        crash('before_flush')
+        result = self.handle.flush()
+        crash('after_flush')
+        return result
+
+    def __enter__(self):
+        self.handle.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.handle.__exit__(*args)
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+
+def hooked_fdopen(*args, **kwargs):
+    crash('before_fdopen')
+    handle = real_fdopen(*args, **kwargs)
+    crash('after_fdopen')
+    return CrashFile(handle)
+
+
+def hooked_fsync(fd):
+    crash('before_fsync')
+    result = real_fsync(fd)
+    crash('after_fsync')
+    return result
+
+
+def hooked_replace(src, dst):
+    crash('before_replace')
+    return real_replace(src, dst)
+
+
+tempfile.mkstemp = hooked_mkstemp
+os.fdopen = hooked_fdopen
+os.fsync = hooked_fsync
+os.replace = hooked_replace
+try:
+    module.atomic_write(replacement)
+finally:
+    tempfile.mkstemp = real_mkstemp
+    os.fdopen = real_fdopen
+    os.fsync = real_fsync
+    os.replace = real_replace
+""",
         encoding="utf-8",
     )
 
-    # These are the observable pre-replace boundaries in atomic_write(): temp
-    # file creation, opening the temp file, writing/flush completion, file
-    # fsync, and the final os.replace boundary. The injected process exits
-    # before each selected boundary, leaving the committed checkpoint untouched.
-    steps = ["before_fdopen", "after_fdopen", "before_fsync", "after_fsync", "before_replace"]
+    # These are every observable writer boundary in atomic_write() before
+    # os.replace(). The child is terminated with os._exit(), so finally blocks
+    # cannot repair the checkpoint; atomicity must come from the final replace.
+    steps = [
+        "before_mkstemp",
+        "after_mkstemp",
+        "before_fdopen",
+        "after_fdopen",
+        "before_write",
+        "after_write",
+        "before_flush",
+        "after_flush",
+        "before_fsync",
+        "after_fsync",
+        "before_replace",
+    ]
     expected = valid_state()
-    expected.update(status="BUILDING", active_feature="AWH-CRASH-001", active_branch="awh-crash-001", builder_attempt=1)
+    expected.update(
+        status="BUILDING",
+        active_feature="AWH-CRASH-001",
+        active_branch="awh-crash-001",
+        builder_attempt=1,
+    )
 
     for step in steps:
         state_path = tmp_path / f"state-{step}.json"
