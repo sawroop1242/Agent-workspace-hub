@@ -34,6 +34,7 @@ jobs:
       KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
       AWH_AGENT_ROLE: reviewer
       AWH_PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
+      AWH_EVENT_FEATURE: ${{ github.event.client_payload.feature_id || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,8 +42,48 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
-      - name: Validate checkpoint before review
-        run: python scripts/checkpoint_state.py validate
+      - name: Sync checkpoint from the shared branch
+        run: python scripts/safe_git.py sync --branch rust
+
+      - name: Validate PR identity before any review work
+        env:
+          PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
+        run: |
+          test -n "$PR"
+          # The PR must belong to this repository, target rust, and be open.
+          # Anything else is not this pipeline's PR: refuse by doing nothing.
+          PRDATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,isCrossRepository)
+          if [ "$(echo "$PRDATA" | jq -r '.isCrossRepository')" != false ]; then
+            echo "STALE_EVENT: PR $PR is cross-repository; ignoring."
+            exit 0
+          fi
+          if [ "$(echo "$PRDATA" | jq -r '.baseRefName')" != rust ]; then
+            echo "STALE_EVENT: PR $PR does not target rust; ignoring."
+            exit 0
+          fi
+          if [ "$(echo "$PRDATA" | jq -r '.state')" != OPEN ]; then
+            echo "STALE_EVENT: PR $PR is not open; ignoring."
+            exit 0
+          fi
+          # The dispatch payload is a notification: the checkpoint is authoritative.
+          if python scripts/awh_pipeline.py validate-event --agent reviewer --pr "$PR" --feature "$AWH_EVENT_FEATURE"; then
+            echo 'Event validated against the checkpoint.'
+          else
+            code=$?
+            if [ "$code" -eq 3 ]; then
+              echo "STALE_EVENT: review event for PR $PR does not match the active checkpoint; ignoring."
+              exit 0
+            fi
+            exit "$code"
+          fi
+
+      - name: Record review-gate failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent reviewer --stage validation \
+            --detail "reviewer PR identity validation failed; see workflow run logs" \
+            --pr "$AWH_PR" || true
 
       - name: Verify required LLM secrets
         run: |
@@ -52,24 +93,31 @@ jobs:
           [ -n "$K2" ] && echo 'Optional Agent 3 key 2 configured.' || echo 'Optional Agent 3 key 2 not configured.'
           [ -n "$K3" ] && echo 'Optional Agent 3 key 3 configured.' || echo 'Optional Agent 3 key 3 not configured.'
 
-      - name: Checkpoint reviewer start
+      - name: Checkpoint reviewer stage with CAS and operation identity
         env:
           PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
         run: |
           test -n "$PR"
           FEATURE=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName' | sed 's#^feature/##')
           test -n "$FEATURE"
-          python scripts/checkpoint_state.py update \
-            --set status='"REVIEWING"' \
-            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE"]))')" \
-            --set active_pr="$PR" \
-            --set active_branch="$(python -c 'import json,subprocess; print(json.dumps(subprocess.check_output(["gh","pr","view",__import__("os").environ["PR"],"--repo",__import__("os").environ["GITHUB_REPOSITORY"],"--json","headRefName","--jq",".headRefName"],text=True).strip()))')" \
-            --set last_error=null
-          git config user.name 'AWH Automation'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .openhands/state.json
-          git commit -m 'chore(automation): checkpoint reviewer start' || true
-          git push origin rust
+          BRANCH=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName')
+          SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
+          test -n "$SHA"
+          python scripts/awh_pipeline.py begin-stage \
+            --stage reviewer \
+            --feature "$FEATURE" \
+            --pr "$PR" \
+            --branch "$BRANCH" \
+            --sha "$SHA" \
+            --message "chore(automation): reviewer stage for $FEATURE PR $PR"
+
+      - name: Record reviewer-start failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent reviewer --stage begin \
+            --detail "reviewer could not enter the REVIEWING stage under CAS; see workflow run logs" \
+            --pr "$AWH_PR" || true
 
       - name: Install OpenHands SDK and built-in tools
         run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2' 'openhands-tools>=1.0,<2'
@@ -95,7 +143,15 @@ jobs:
           done
           test "$SUCCESS" -eq 1
 
-      - name: Publish review and dispatch merge/fix gate
+      - name: Record Agent 3 failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent reviewer --stage agent \
+            --detail "OpenHands Agent 3 failed (non-retryable); see workflow run logs" \
+            --pr "$AWH_PR" || true
+
+      - name: Publish review and record verdict under CAS
         env:
           PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
         run: |
@@ -108,22 +164,39 @@ jobs:
           if len(verdicts) != 1 or verdicts[0] not in {'APPROVE','CHANGES_REQUIRED','BLOCKED'}:
               raise SystemExit('Reviewer output has no single valid VERDICT; refusing checkpoint transition.')
           verdict=verdicts[0]
-          prdata=json.loads(subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','body']))
+          prdata=json.loads(subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','body','state','baseRefName','isCrossRepository','headRefName']))
+          if prdata.get('isCrossRepository') or prdata.get('baseRefName')!='rust' or prdata.get('state')!='OPEN':
+              raise SystemExit(f'PR {pr} no longer targets rust as an open same-repository PR; refusing verdict transition.')
+          feature=prdata['headRefName'].removeprefix('feature/')
           old=prdata.get('body') or ''; marker='<!-- AWH_AGENT3_REVIEW -->'
           section=f"{marker}\n## Agent 3 Review — Kimi K3\n\n{review}\n\n{marker}"
           if marker in old: old=old.split(marker,1)[0].rstrip()
           subprocess.run(['gh','pr','edit',pr,'--repo',repo,'--body',(old+'\n\n'+section).strip()],check=True)
-          feature=subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','headRefName','--jq','.headRefName'],text=True).strip().removeprefix('feature/')
+
+          # The verdict transition is one CAS write keyed on the review operation.
           status={'APPROVE':'PR_OPEN','CHANGES_REQUIRED':'FIXING','BLOCKED':'BLOCKED'}[verdict]
-          subprocess.run(['python','scripts/checkpoint_state.py','update',
-              '--set',f'status={json.dumps(status)}','--set',f'active_feature={json.dumps(feature)}',
-              '--set',f'active_pr={int(pr)}','--set','last_error=null','--set',f'last_review={json.dumps(review)}'],check=True)
+          op=json.loads(Path('.openhands/state.json').read_text(encoding='utf-8'))['operation_id']
+          transition=['python','scripts/checkpoint_state.py','transition',
+              '--expect-status','REVIEWING','--to',status,
+              '--set',f'active_feature={json.dumps(feature)}','--set',f'active_pr={int(pr)}',
+              '--set',f'last_review={json.dumps(review)}','--set','last_error=null']
+          if op:
+              transition += ['--expect-operation-id', op]
+          subprocess.run(transition,check=True)
           subprocess.run(['git','config','user.name','AWH Automation'],check=True)
           subprocess.run(['git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com'],check=True)
           subprocess.run(['git','add','.openhands/state.json'],check=True)
-          subprocess.run(['git','commit','-m','chore(automation): checkpoint reviewer verdict'],check=False)
-          subprocess.run(['git','push','origin','rust'],check=True)
-          payload={'event_type':'awh.review-complete','client_payload':{'pr_number':int(pr),'feature_id':feature,'review_state':verdict,'review':review}}
+          subprocess.run(['python','scripts/safe_git.py','push','--branch','rust',
+              '--message','chore(automation): reviewer verdict '+verdict],check=True)
+          payload={'event_type':'awh.review-complete','client_payload':{'pr_number':int(pr),'feature_id':feature,'review_state':verdict,'review':review,'operation_id':op}}
           subprocess.run(['gh','api',f'repos/{repo}/dispatches','--method','POST','--input','-'],input=json.dumps(payload),text=True,check=True)
-          print(f'Agent 3 verdict: {verdict}; feature: {feature}')
+          print(f'Agent 3 verdict: {verdict}; feature: {feature}; operation: {op}')
           PY
+
+      - name: Record verdict-publication failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent reviewer --stage verdict \
+            --detail "reviewer verdict could not be published or recorded; see workflow run logs" \
+            --pr "$AWH_PR" || true

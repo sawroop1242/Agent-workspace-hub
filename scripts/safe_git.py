@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Commit staged changes and push them to a shared branch, never with force."""
+"""Commit staged changes and push them to a shared branch, never with force.
+
+Also provides `sync`: fetch the shared branch and fast-forward the local
+branch onto it, refusing to proceed when the histories have diverged."""
 
 from __future__ import annotations
 
@@ -43,6 +46,29 @@ def require_head_on_branch(branch: str) -> None:
     head = result.stdout.strip()
     if result.returncode != 0 or head != f"refs/heads/{branch}":
         fail(f"HEAD is not on refs/heads/{branch} (got {head or 'detached HEAD'}); refusing to push.")
+
+
+def sync(branch: str) -> None:
+    """Fetch the shared branch and fast-forward the local branch to it.
+
+    Never rebases, never resets, never discards local history: if the local
+    branch has diverged from the remote, the caller must resolve it through
+    the normal push path (fetch -> rebase -> retry). A clean sync leaves the
+    clone on exactly origin/branch with no local commits, which is the state
+    every AWH workflow needs before reading the authoritative checkpoint.
+    """
+    fetch(branch)
+    require_head_on_branch(branch)
+    result = git("merge", "--ff-only", f"origin/{branch}", check=False)
+    if result.returncode != 0:
+        behind = git("rev-list", "--count", f"{branch}..origin/{branch}", check=False).stdout.strip()
+        ahead = git("rev-list", "--count", f"origin/{branch}..{branch}", check=False).stdout.strip()
+        fail(
+            f"local branch {branch} has diverged from origin/{branch} "
+            f"(ahead {ahead}, behind {behind}); sync is fast-forward only "
+            "and never rewrites local or remote history. Resolve the divergence explicitly."
+        )
+    print(f"safe_git: synced {branch} to origin/{branch} (fast-forward only).")
 
 
 def commit_staged(message: str) -> None:
@@ -103,15 +129,19 @@ def push(branch: str, message: str) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("push",))
+    parser.add_argument("action", choices=("push", "sync"))
     parser.add_argument("--branch", required=True, metavar="BRANCH")
-    parser.add_argument("--message", required=True, metavar="TEXT")
+    parser.add_argument("--message", metavar="TEXT", help="commit message for a push")
     args = parser.parse_args(argv)
 
-    if not args.message.strip():
-        fail("--message must not be empty")
     if args.action == "push":
+        if not args.message or not args.message.strip():
+            fail("--message must not be empty")
         push(args.branch, args.message)
+    elif args.action == "sync":
+        if args.message:
+            fail("--message is only valid for a push, not a sync")
+        sync(args.branch)
 
 
 if __name__ == "__main__":

@@ -12,12 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("AWH_REPO_ROOT", Path(__file__).resolve().parents[1]))
 STATE_PATH = ROOT / ".openhands" / "state.json"
 SCHEMA_PATH = ROOT / ".openhands" / "state.schema.json"
 
-STATE_VERSION = 3
-LEGACY_STATE_VERSION = 2
+STATE_VERSION = 4
+LEGACY_STATE_VERSIONS = (2, 3)
 
 STATUSES = {
     "IDLE",
@@ -35,19 +35,31 @@ STATUSES = {
 # Legal status changes. Re-entrant entries (BUILDING -> BUILDING on a fix
 # re-dispatch, REVIEWING -> REVIEWING on a re-review, ...) let a workflow
 # refresh checkpoint metadata under the same compare-and-swap discipline;
-# they never skip or bypass a stage.
+# they never skip or bypass a stage. RECOVERING -> RECOVERING exists solely
+# so a crashed recovery lease can be reclaimed or refreshed once it has
+# itself gone stale; it is not a way to loop recovery forever.
 TRANSITIONS: dict[str, set[str]] = {
     "IDLE": {"PLANNING"},
-    "PLANNING": {"BUILDING", "BLOCKED", "PLANNING"},
-    "BUILDING": {"PR_OPEN", "BLOCKED", "BUILDING", "REVIEWING"},
-    "PR_OPEN": {"REVIEWING", "BLOCKED", "COMPLETED"},
-    "REVIEWING": {"FIXING", "MERGING", "BLOCKED", "REVIEWING", "PR_OPEN"},
-    "FIXING": {"REVIEWING", "BLOCKED", "FIXING", "BUILDING"},
-    "MERGING": {"COMPLETED", "BLOCKED"},
+    "PLANNING": {"BUILDING", "BLOCKED", "PLANNING", "RECOVERING"},
+    "BUILDING": {"PR_OPEN", "BLOCKED", "BUILDING", "REVIEWING", "RECOVERING"},
+    "PR_OPEN": {"REVIEWING", "BLOCKED", "COMPLETED", "MERGING", "RECOVERING"},
+    "REVIEWING": {"FIXING", "MERGING", "BLOCKED", "REVIEWING", "PR_OPEN", "RECOVERING"},
+    "FIXING": {"REVIEWING", "BLOCKED", "FIXING", "BUILDING", "RECOVERING"},
+    # Idempotent re-entry of the same stage: a retried dispatch of the same
+    # operation re-enters its own stage rather than being rejected as illegal.
+    # MERGING re-entry exists so a crashed merge (state left in MERGING) can be
+    # retried/recovered into MERGING again; it must still exit only via
+    # COMPLETED or BLOCKED.
+    "MERGING": {"COMPLETED", "BLOCKED", "MERGING", "RECOVERING"},
     "COMPLETED": {"IDLE", "PLANNING"},
     "BLOCKED": {"RECOVERING", "IDLE"},
-    "RECOVERING": {"BUILDING", "REVIEWING", "FIXING", "IDLE", "BLOCKED"},
+    "RECOVERING": {"BUILDING", "REVIEWING", "FIXING", "IDLE", "BLOCKED", "RECOVERING"},
 }
+
+# Claim owners are free-form strings recorded in the checkpoint for humans
+# and tooling; the safety property comes from the CAS transition itself.
+RECOVERY_CLAIM_FIELDS = ("operation_id", "feature_id", "attempt", "claimed_at", "owner", "stale_status")
+STALEABLE_STATUSES = ("PLANNING", "BUILDING", "PR_OPEN", "REVIEWING", "FIXING", "MERGING", "RECOVERING")
 
 
 def fail(message: str) -> None:
@@ -61,16 +73,39 @@ def load_json(path: Path) -> Any:
         fail(f"cannot read valid JSON from {path}: {exc}")
 
 
-def migrate_state(state: Any) -> dict[str, Any] | None:
-    """Lift a well-formed v2 state to v3; return None when not applicable.
+def _v4_template_from_legacy(state: dict[str, Any]) -> dict[str, Any]:
+    """Field-ordered v4 document built from a validated v2/v3 payload."""
+    return {
+        "version": STATE_VERSION,
+        "status": state["status"],
+        "operation_id": state.get("operation_id"),
+        "recovery_attempt": 0,
+        "recovery_claim": None,
+        "active_feature": state["active_feature"],
+        "active_pr": state["active_pr"],
+        "active_branch": state["active_branch"],
+        "active_pr_sha": None,
+        "review_round": state["review_round"],
+        "builder_attempt": state["builder_attempt"],
+        "last_error": state["last_error"],
+        "last_review": state["last_review"],
+        "updated_at": state["updated_at"],
+    }
 
-    v2 -> v3 adds only `operation_id` (caller-supplied, no v2 equivalent),
-    so the lift is injective: default it to null, bump the version. Anything
-    that is not a valid v2 document falls through and is rejected.
+
+def migrate_state(state: Any) -> dict[str, Any] | None:
+    """Lift a well-formed legacy state (v2 or v3) to v4; return None when not applicable.
+
+    v2 -> v3 added only `operation_id` (caller-supplied, no v2 equivalent).
+    v3 -> v4 adds `recovery_attempt`, `recovery_claim`, and `active_pr_sha`
+    (the staging field for immutable PR-head-SHA review tracking). Every lift
+    is injective: defaults are null/zero and no information is lost. Anything
+    that is not a valid legacy document falls through and is rejected.
     """
-    if not isinstance(state, dict) or state.get("version") != LEGACY_STATE_VERSION:
+    if not isinstance(state, dict) or state.get("version") not in LEGACY_STATE_VERSIONS:
         return None
-    required = [
+    version = state["version"]
+    base_required = [
         "version",
         "status",
         "active_feature",
@@ -82,13 +117,13 @@ def migrate_state(state: Any) -> dict[str, Any] | None:
         "last_review",
         "updated_at",
     ]
-    if set(state) != set(required):
+    expected = list(base_required)
+    if version >= 3:
+        expected.insert(2, "operation_id")
+    if set(state) != set(expected):
         return None
-    # Rebuild in schema order so a migrated state.json reads like a native v3 one.
-    migrated = {key: state[key] for key in required}
-    migrated["version"] = STATE_VERSION
-    migrated["operation_id"] = None
-    return migrated
+    # Rebuild in schema order so a migrated state.json reads like a native v4 one.
+    return _v4_template_from_legacy(state)
 
 
 def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
@@ -99,7 +134,7 @@ def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
     if not isinstance(state, dict):
         fail("root must be an object")
     version = state.get("version")
-    if version == LEGACY_STATE_VERSION:
+    if version in LEGACY_STATE_VERSIONS:
         migrated = migrate_state(state)
         if migrated is None:
             fail(f"version must be {STATE_VERSION}")
@@ -118,7 +153,7 @@ def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
 
     if state["operation_id"] is not None and not isinstance(state["operation_id"], str):
         fail("operation_id must be a string or null")
-    nullable_strings = {"active_feature", "active_branch", "last_error"}
+    nullable_strings = {"active_feature", "active_branch", "last_error", "active_pr_sha"}
     for key in nullable_strings:
         value = state[key]
         if value is not None and not isinstance(value, str):
@@ -129,10 +164,31 @@ def validate_state(state: Any, schema: Any | None = None) -> dict[str, Any]:
         isinstance(state["active_pr"], bool) or not isinstance(state["active_pr"], int) or state["active_pr"] <= 0
     ):
         fail("active_pr must be a positive integer or null")
-    for key in ("review_round", "builder_attempt"):
+    for key in ("review_round", "builder_attempt", "recovery_attempt"):
         value = state[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             fail(f"{key} must be a non-negative integer")
+    claim = state["recovery_claim"]
+    if claim is not None:
+        if not isinstance(claim, dict):
+            fail("recovery_claim must be an object or null")
+        if set(claim) != set(RECOVERY_CLAIM_FIELDS):
+            fail(
+                "recovery_claim must contain exactly "
+                f"{', '.join(RECOVERY_CLAIM_FIELDS)}"
+            )
+        if not isinstance(claim["owner"], str) or not claim["owner"].strip():
+            fail("recovery_claim.owner must be a non-empty string")
+        if not isinstance(claim["claimed_at"], str) or not claim["claimed_at"].strip():
+            fail("recovery_claim.claimed_at must be a non-empty ISO-8601 string")
+        if claim["stale_status"] not in STALEABLE_STATUSES:
+            fail(f"recovery_claim.stale_status must be one of {', '.join(STALEABLE_STATUSES)}")
+        for key in ("operation_id", "feature_id"):
+            value = claim[key]
+            if value is not None and not isinstance(value, str):
+                fail(f"recovery_claim.{key} must be a string or null")
+        if isinstance(claim["attempt"], bool) or not isinstance(claim["attempt"], int) or claim["attempt"] < 1:
+            fail("recovery_claim.attempt must be a positive integer")
     updated = state["updated_at"]
     if updated is not None:
         if not isinstance(updated, str):
@@ -270,10 +326,15 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Checkpoint transitioned to {requested} atomically and validated.")
         return
 
-    # `update` is retained for backward compatibility with callers outside
-    # the workflows migrated to `transition`; it is unsafe under concurrency.
+    # `update` is retained only for compatibility with callers outside the AWH
+    # automation workflows (for example a human repairing a broken checkpoint).
+    # It performs no status change and no CAS guards; every automation workflow
+    # must use `transition` instead. Contract tests enforce this.
     state = load_state()
+    original_status = state["status"]
     apply_assignments(state, args.set)
+    if state["status"] != original_status:
+        fail("update must not change status; use 'transition' with --expect-status/--to")
     stamp_updated_at(state, args.set)
     atomic_write(state)
     print("Checkpoint state updated atomically and validated.")

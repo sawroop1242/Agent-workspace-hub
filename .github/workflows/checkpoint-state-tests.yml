@@ -8,9 +8,11 @@ on:
       - '.openhands/state.schema.json'
       - 'scripts/checkpoint_state.py'
       - 'scripts/safe_git.py'
+      - 'scripts/awh_pipeline.py'
       - 'tests/checkpoint_state_test.py'
       - 'tests/safe_git_test.py'
-      - '.github/workflows/awh-recovery.yml'
+      - 'tests/awh_pipeline_test.py'
+      - '.github/workflows/awh-*.yml'
       - '.github/workflows/checkpoint-state-tests.yml'
   pull_request:
     paths:
@@ -18,9 +20,11 @@ on:
       - '.openhands/state.schema.json'
       - 'scripts/checkpoint_state.py'
       - 'scripts/safe_git.py'
+      - 'scripts/awh_pipeline.py'
       - 'tests/checkpoint_state_test.py'
       - 'tests/safe_git_test.py'
-      - '.github/workflows/awh-recovery.yml'
+      - 'tests/awh_pipeline_test.py'
+      - '.github/workflows/awh-*.yml'
       - '.github/workflows/checkpoint-state-tests.yml'
   workflow_dispatch:
 
@@ -56,3 +60,7 @@ jobs:
 
       - name: Run checkpoint regression tests
         run: python -m pytest -q tests/checkpoint_state_test.py tests/safe_git_test.py
+
+      - name: Run pipeline safety regression tests
+        if: runner.os != 'Windows'
+        run: python -m pytest -q tests/awh_pipeline_test.py

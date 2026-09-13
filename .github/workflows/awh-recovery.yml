@@ -6,10 +6,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: read
+  pull-requests: read
 
 concurrency:
+  # One recovery job at a time across the whole repository: the claim
+  # provides the correctness guarantee, this group prevents wasted races.
   group: awh-checkpoint-recovery
   cancel-in-progress: false
 
@@ -20,6 +23,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
       STALE_MINUTES: 90
+      LEASE_MINUTES: 120
+      RECOVERY_OWNER: awh-recovery-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,57 +32,57 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
-      - name: Validate checkpoint and recover stale work
+      - name: Sync checkpoint from the shared branch
+        run: python scripts/safe_git.py sync --branch rust
+
+      - name: Atomically claim recovery of stale work
         run: |
-          python scripts/checkpoint_state.py validate
-          python - <<'PY'
-          import json, os, subprocess
-          from datetime import datetime, timezone
-          from pathlib import Path
+          python scripts/awh_pipeline.py claim-recovery \
+            --owner "$RECOVERY_OWNER" \
+            --stale-minutes "$STALE_MINUTES" \
+            --lease-minutes "$LEASE_MINUTES"
 
-          state = json.loads(Path('.openhands/state.json').read_text(encoding='utf-8'))
-          status = state['status']
-          feature = state['active_feature']
-          pr = state['active_pr']
-          updated = state['updated_at']
-          stale_minutes = int(os.environ['STALE_MINUTES'])
+      - name: Inspect reality and decide the safe continuation
+        run: |
+          python scripts/awh_pipeline.py decide-recovery | tee /tmp/decision.txt
+          TARGET=$(sed -n 's/^TARGET=//p' /tmp/decision.txt | head -n1)
+          REASON=$(sed -n 's/^REASON=//p' /tmp/decision.txt | head -n1)
+          EVENT=$(sed -n 's/^DISPATCH_EVENT=//p' /tmp/decision.txt | head -n1)
+          PAYLOAD=$(sed -n 's/^DISPATCH_PAYLOAD=//p' /tmp/decision.txt | head -n1)
+          test -n "$TARGET" -a -n "$REASON"
+          echo "Recovery decision: $TARGET ($REASON)"
+          if [ "$TARGET" = "BLOCKED" ]; then
+            python scripts/awh_pipeline.py record-failure \
+              --agent recovery --stage decide \
+              --detail "recovery found no safe continuation: $REASON" || true
+            exit 0
+          fi
 
-          if status in {'IDLE', 'COMPLETED', 'BLOCKED'}:
-              print(f'No recoverable checkpoint: status={status}')
-              raise SystemExit(0)
+          # Release the claim and move to the decided state in one CAS write.
+          python scripts/awh_pipeline.py finalize-recovery \
+            --owner "$RECOVERY_OWNER" \
+            --to "$TARGET" \
+            --message "chore(automation): recovery resumed as $TARGET"
 
-          if not updated:
-              stale = True
-          else:
-              stamp = datetime.fromisoformat(updated.replace('Z', '+00:00'))
-              age = (datetime.now(timezone.utc) - stamp).total_seconds() / 60
-              stale = age >= stale_minutes
-              print(f'Checkpoint status={status}, feature={feature}, PR={pr}, age={age:.1f}m, stale={stale}')
-          if not stale:
-              raise SystemExit(0)
-
-          repo = os.environ['GITHUB_REPOSITORY']
-          def dispatch(event_type, payload):
-              body = json.dumps({'event_type': event_type, 'client_payload': payload})
-              subprocess.run(['gh', 'api', f'repos/{repo}/dispatches', '--method', 'POST', '--input', '-'], input=body, text=True, check=True)
-
-          if status == 'PLANNING':
-              payload = {'reason': 'checkpoint_resume'}
-              if feature:
-                  payload['feature_id'] = feature
-              dispatch('awh.start', payload)
-          elif status == 'BUILDING':
-              if not feature:
-                  raise SystemExit('BUILDING checkpoint has no active_feature; refusing unsafe recovery.')
-              dispatch('awh.build', {'feature_id': feature, 'reason': 'checkpoint_resume'})
-          elif status == 'FIXING':
-              if not feature or not state['last_review']:
-                  raise SystemExit('FIXING checkpoint is missing active_feature or saved reviewer feedback; refusing unsafe recovery.')
-              dispatch('awh.fix', {'feature_id': feature, 'review': state['last_review'], 'reason': 'checkpoint_resume'})
-          elif status in {'REVIEWING', 'PR_OPEN'}:
-              if not pr:
-                  raise SystemExit(f'{status} checkpoint has no active_pr; refusing unsafe recovery.')
-              dispatch('awh.review', {'pr_number': pr, 'feature_id': feature or '', 'reason': 'checkpoint_resume'})
-          else:
-              raise SystemExit(f'Unknown checkpoint status: {status}')
+          # Only after the claim is released and the state is authoritative do
+          # we notify the next workflow. Events are notifications, never state.
+          if [ -n "$EVENT" ]; then
+            python3 - "$EVENT" "$PAYLOAD" <<'PY'
+          import json, os, subprocess, sys
+          event, payload = sys.argv[1], sys.argv[2]
+          body = {"event_type": event, "client_payload": json.loads(payload)}
+          subprocess.run(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/dispatches",
+                          "--method", "POST", "--input", "-"],
+                          input=json.dumps(body), text=True, check=True)
+          print(f"dispatched {event}")
           PY
+          else
+            echo 'No dispatch required by the recovery decision.'
+          fi
+
+      - name: Record recovery failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent recovery --stage recover \
+            --detail "recovery could not claim, decide, or resume the pipeline; see workflow run logs" || true

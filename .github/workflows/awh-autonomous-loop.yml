@@ -51,7 +51,9 @@ jobs:
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
       - name: Validate checkpoint before planning
-        run: python scripts/checkpoint_state.py validate
+        run: |
+          python scripts/safe_git.py sync --branch rust
+          python scripts/checkpoint_state.py validate
 
       - name: Verify required LLM secrets
         run: |
@@ -71,11 +73,19 @@ jobs:
             --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ.get("FEATURE_ID") or None))')" \
             --set active_pr=null \
             --set active_branch=null \
+            --set active_pr_sha=null \
             --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
           python scripts/safe_git.py push --branch rust --message 'chore(automation): checkpoint planner start'
+
+      - name: Record planner-start failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent starter --stage begin \
+            --detail "planner start checkpoint failed; see workflow run logs" || true
 
       - name: Guard against an active feature
         run: |
@@ -130,10 +140,11 @@ jobs:
             --expect-status PLANNING \
             --to BUILDING \
             --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
+            --set operation_id="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"] + ":BUILD:1"))')" \
             --set active_pr=null \
             --set active_branch=null \
             --set review_round=0 \
-            --set builder_attempt=0 \
+            --set builder_attempt=1 \
             --set last_error=null \
             --set last_review='""'
           rm -f .openhands/generated-task.md
@@ -142,13 +153,39 @@ jobs:
           git add .openhands/state.json
           python scripts/safe_git.py push --branch rust --message "chore(automation): start ${{ steps.plan.outputs.feature_id }}"
 
+      - name: Record build-checkpoint failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent starter --stage plan \
+            --detail "planner produced a task but the BUILDING checkpoint failed; see workflow run logs" \
+            --feature "${{ steps.plan.outputs.feature_id }}" || true
+
       - name: Dispatch Agent 2
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
           TASK: ${{ steps.plan.outputs.task }}
         run: |
-          jq -n --arg feature "$FEATURE_ID" --arg task "$TASK" '{event_type:"awh.build",client_payload:{feature_id:$feature,task:$task}}' > /tmp/payload.json
+          # Idempotent dispatch: the checkpoint already records this build
+          # operation (FEATURE:BUILD:1); a retry only re-notifies the same
+          # logical operation, never a second one.
+          CURRENT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
+          EXPECTED_OP="$FEATURE_ID:BUILD:1"
+          if [ "$CURRENT_OP" != "$EXPECTED_OP" ]; then
+            echo "Refusing to dispatch: checkpoint operation '$CURRENT_OP' is not '$EXPECTED_OP'."
+            exit 1
+          fi
+          jq -n --arg feature "$FEATURE_ID" --arg task "$TASK" --arg op "$CURRENT_OP" \
+            '{event_type:"awh.build",client_payload:{feature_id:$feature,task:$task,operation_id:$op}}' > /tmp/payload.json
           gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/payload.json
+
+      - name: Record dispatch failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent starter --stage dispatch \
+            --detail "failed to dispatch the Agent 2 build event; recovery will resume from BUILDING" \
+            --feature "${{ steps.plan.outputs.feature_id }}" || true
 
   merge-reviewed-feature:
     if: github.event_name == 'repository_dispatch' && github.event.action == 'awh.review-complete' && github.event.client_payload.review_state == 'APPROVE'
@@ -156,6 +193,9 @@ jobs:
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+      PR: ${{ github.event.client_payload.pr_number }}
+      FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+      EVENT_OPERATION_ID: ${{ github.event.client_payload.operation_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -163,25 +203,78 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
+      - name: Sync checkpoint from the shared branch
+        run: python scripts/safe_git.py sync --branch rust
+
+      - name: Validate merge event against the authoritative checkpoint
+        run: |
+          test -n "$PR"
+          # The dispatch payload is a notification: the checkpoint is authoritative.
+          if python scripts/awh_pipeline.py validate-event --agent merger --pr "$PR" --feature "$FEATURE_ID"; then
+            echo 'Merge event validated against the checkpoint.'
+          else
+            code=$?
+            if [ "$code" -eq 3 ]; then
+              echo 'STALE_EVENT: approve event does not match the active checkpoint; ignoring.'
+              exit 0
+            fi
+            exit "$code"
+          fi
+
+      - name: Record merge-gate failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent merger --stage validation \
+            --detail "merge event failed checkpoint validation; see workflow run logs" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
+
+      - name: Checkpoint merge stage with CAS and operation identity
+        run: |
+          python scripts/awh_pipeline.py begin-stage \
+            --stage merger \
+            --feature "$FEATURE_ID" \
+            --pr "$PR" \
+            --message "chore(automation): merge approved $FEATURE_ID PR $PR"
+
+      - name: Record merge-stage failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent merger --stage begin \
+            --detail "merge could not enter the MERGING stage under CAS; see workflow run logs" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
+
       - name: Wait for CI and verify mergeability
-        env:
-          PR: ${{ github.event.client_payload.pr_number }}
         run: |
           gh pr checks "$PR" --repo "$GITHUB_REPOSITORY" --watch --fail-fast
           test "$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json mergeable --jq '.mergeable')" = MERGEABLE
           test "$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state --jq '.state')" = OPEN
+          test "$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json isCrossRepository --jq '.isCrossRepository')" = false
+          test "$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json baseRefName --jq '.baseRefName')" = rust
+
+      - name: Record mergeability failure
+        if: failure() || cancelled()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent merger --stage checks \
+            --detail "PR checks or mergeability verification failed; see workflow run logs" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
 
       - name: Merge reviewed head with squash
-        env:
-          PR: ${{ github.event.client_payload.pr_number }}
         run: |
           HEAD=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
           gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch --match-head-commit "$HEAD"
 
+      - name: Record merge failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent merger --stage merge \
+            --detail "squash merge failed; the checkpoint remains in MERGING for recovery" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
+
       - name: Update backlog and state
-        env:
-          PR: ${{ github.event.client_payload.pr_number }}
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
         run: |
           python - <<'PY'
           import json, os
@@ -195,11 +288,12 @@ jobs:
           b.write_text(json.dumps(backlog, indent=2)+"\n", encoding='utf-8')
           PY
           python scripts/checkpoint_state.py transition \
-            --expect-status PR_OPEN \
+            --expect-status MERGING \
             --to COMPLETED \
             --set active_feature=null \
             --set active_pr=null \
             --set active_branch=null \
+            --set active_pr_sha=null \
             --set review_round=0 \
             --set builder_attempt=0 \
             --set last_error=null \
@@ -208,6 +302,14 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/backlog.json .openhands/state.json
           python scripts/safe_git.py push --branch rust --message "chore(automation): complete ${{ github.event.client_payload.feature_id }}"
+
+      - name: Record completion failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent merger --stage complete \
+            --detail "merge succeeded but the completion checkpoint failed; recovery will detect the merged PR" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
 
       - name: Start next sequential feature
         run: |

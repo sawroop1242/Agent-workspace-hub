@@ -215,3 +215,78 @@ def test_script_source_never_uses_force_push_flags():
     body = inspect.getsource(module.push)
     assert 'git("push", "origin", branch' in body
     assert "force" not in body
+
+
+def test_detached_head_refuses_to_push(tmp_path: Path):
+    """A runner that somehow ended on a detached HEAD must never push rust."""
+    origin, clone = build_repository(tmp_path)
+    remote_before = git(clone, "rev-parse", "origin/rust").stdout.strip()
+    head_before = git(clone, "rev-parse", "HEAD").stdout.strip()
+    stage_state_checkpoint(clone, "PLANNING", operation_id="op-detached")
+
+    head = git(clone, "rev-parse", "HEAD").stdout.strip()
+    git(clone, "checkout", "--detach", head)
+
+    result = run_push(clone, "rust", "chore(automation): detached head attempt")
+
+    assert result.returncode != 0
+    assert "detached HEAD" in (result.stdout + result.stderr)
+    assert "refusing to push" in (result.stdout + result.stderr)
+    # Nothing was committed or pushed: HEAD and the remote are untouched.
+    assert git(clone, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert git(clone, "rev-parse", "origin/rust").stdout.strip() == remote_before
+    # The staged checkpoint survives for the caller to handle; no rebase is left dangling.
+    assert not (clone / ".git" / "rebase-merge").exists()
+    assert not (clone / ".git" / "rebase-apply").exists()
+    staged = git(clone, "diff", "--cached", "--name-only").stdout.split()
+    assert staged == [".openhands/state.json"]
+
+
+def test_sync_fast_forwards_to_advanced_remote(tmp_path: Path):
+    """sync must fetch and fast-forward the local branch onto the remote."""
+    origin, clone = build_repository(tmp_path)
+    other = clone_runner(tmp_path, origin)
+    commit_file(other, "advance.txt", "remote advance\n", "remote advance")
+    git(other, "push", "origin", "rust")
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "sync", "--branch", "rust"],
+        cwd=clone, text=True, capture_output=True, check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "synced rust to origin/rust" in result.stdout
+    assert git(clone, "rev-parse", "HEAD").stdout.strip() == git(clone, "rev-parse", "origin/rust").stdout.strip()
+    assert "advance.txt" in git(clone, "ls-tree", "--name-only", "HEAD").stdout
+
+
+def test_sync_refuses_diverged_local_history_without_rewrite(tmp_path: Path):
+    """A diverged local rust branch must be refused, never rebased or reset."""
+    origin, clone = build_repository(tmp_path)
+    other = clone_runner(tmp_path, origin)
+    commit_file(other, "advance.txt", "remote advance\n", "remote advance")
+    git(other, "push", "origin", "rust")
+    commit_file(clone, "local.txt", "local change\n", "local divergence")
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "sync", "--branch", "rust"],
+        cwd=clone, text=True, capture_output=True, check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode != 0
+    assert "diverged" in (result.stdout + result.stderr)
+    assert "fast-forward only" in (result.stdout + result.stderr)
+    # Nothing was rewritten: the local commit still exists, remote untouched.
+    assert git(clone, "log", "-1", "--oneline").stdout.strip().endswith("local divergence")
+    assert_status_clean(clone)
+
+
+def test_sync_rejects_message_argument():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "sync", "--branch", "rust", "--message", "x"],
+        cwd=ROOT, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "--message is only valid for a push" in (result.stdout + result.stderr)
