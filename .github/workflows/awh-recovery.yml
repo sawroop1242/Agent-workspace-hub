@@ -2,13 +2,11 @@ name: AWH Checkpoint Recovery
 
 on:
   schedule:
-    # Run away from the top of the hour to reduce schedule delays.
     - cron: '17,47 * * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
   actions: read
 
 concurrency:
@@ -29,19 +27,19 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
-      - name: Inspect checkpoint and recover stale work
+      - name: Validate checkpoint and recover stale work
         run: |
+          python scripts/checkpoint_state.py validate
           python - <<'PY'
           import json, os, subprocess
           from datetime import datetime, timezone
           from pathlib import Path
 
-          state_path = Path('.openhands/state.json')
-          state = json.loads(state_path.read_text())
-          status = state.get('status', 'IDLE')
-          feature = state.get('active_feature')
-          pr = state.get('active_pr')
-          updated = state.get('updated_at')
+          state = json.loads(Path('.openhands/state.json').read_text(encoding='utf-8'))
+          status = state['status']
+          feature = state['active_feature']
+          pr = state['active_pr']
+          updated = state['updated_at']
           stale_minutes = int(os.environ['STALE_MINUTES'])
 
           if status in {'IDLE', 'COMPLETED', 'BLOCKED'}:
@@ -49,19 +47,16 @@ jobs:
               raise SystemExit(0)
 
           if not updated:
-              print(f'Checkpoint has no timestamp; treating status={status} as recoverable.')
               stale = True
           else:
               stamp = datetime.fromisoformat(updated.replace('Z', '+00:00'))
               age = (datetime.now(timezone.utc) - stamp).total_seconds() / 60
               stale = age >= stale_minutes
               print(f'Checkpoint status={status}, feature={feature}, PR={pr}, age={age:.1f}m, stale={stale}')
-
           if not stale:
               raise SystemExit(0)
 
           repo = os.environ['GITHUB_REPOSITORY']
-
           def dispatch(event_type, payload):
               body = json.dumps({'event_type': event_type, 'client_payload': payload})
               subprocess.run(['gh', 'api', f'repos/{repo}/dispatches', '--method', 'POST', '--input', '-'], input=body, text=True, check=True)
@@ -71,36 +66,18 @@ jobs:
               if feature:
                   payload['feature_id'] = feature
               dispatch('awh.start', payload)
-              print('Resumed Agent 1 planning.')
-
-          elif status in {'BUILDING', 'FIXING'}:
+          elif status == 'BUILDING':
               if not feature:
-                  raise SystemExit('BUILDING/FIXING checkpoint has no active_feature; refusing unsafe recovery.')
-              review = state.get('last_review', '')
-              if status == 'FIXING' and not review:
-                  raise SystemExit('FIXING checkpoint has no saved reviewer feedback; refusing unsafe recovery.')
-              payload = {'feature_id': feature, 'reason': 'checkpoint_resume'}
-              if status == 'FIXING':
-                  payload.update({'review': review})
-                  dispatch('awh.fix', payload)
-              else:
-                  dispatch('awh.build', payload)
-              print(f'Resumed Agent 2: status={status}.')
-
-          elif status == 'REVIEWING':
+                  raise SystemExit('BUILDING checkpoint has no active_feature; refusing unsafe recovery.')
+              dispatch('awh.build', {'feature_id': feature, 'reason': 'checkpoint_resume'})
+          elif status == 'FIXING':
+              if not feature or not state['last_review']:
+                  raise SystemExit('FIXING checkpoint is missing active_feature or saved reviewer feedback; refusing unsafe recovery.')
+              dispatch('awh.fix', {'feature_id': feature, 'review': state['last_review'], 'reason': 'checkpoint_resume'})
+          elif status in {'REVIEWING', 'PR_OPEN'}:
               if not pr:
-                  raise SystemExit('REVIEWING checkpoint has no active_pr; refusing unsafe recovery.')
-              dispatch('awh.review', {'pr_number': int(pr), 'feature_id': feature or '', 'reason': 'checkpoint_resume'})
-              print(f'Resumed Agent 3 review for PR #{pr}.')
-
-          elif status == 'PR_OPEN':
-              if not pr:
-                  raise SystemExit('PR_OPEN checkpoint has no active_pr; refusing unsafe recovery.')
-              # A PR-open checkpoint is normally waiting for pull_request_target.
-              # If that event was lost, explicitly request an internal review run.
-              dispatch('awh.review', {'pr_number': int(pr), 'feature_id': feature or '', 'reason': 'checkpoint_resume'})
-              print(f'Resumed review gate for PR #{pr}.')
-
+                  raise SystemExit(f'{status} checkpoint has no active_pr; refusing unsafe recovery.')
+              dispatch('awh.review', {'pr_number': pr, 'feature_id': feature or '', 'reason': 'checkpoint_resume'})
           else:
               raise SystemExit(f'Unknown checkpoint status: {status}')
           PY
