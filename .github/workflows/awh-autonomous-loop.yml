@@ -58,11 +58,30 @@ jobs:
           [ -n "$K2" ] && echo 'Optional Agent 1 key 2 configured.' || echo 'Optional Agent 1 key 2 not configured.'
           [ -n "$K3" ] && echo 'Optional Agent 1 key 3 configured.' || echo 'Optional Agent 1 key 3 not configured.'
 
+      - name: Checkpoint planner start
+        env:
+          FEATURE_ID: ${{ inputs.feature_id || github.event.client_payload.feature_id || '' }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          p=Path('.openhands/state.json'); s=json.loads(p.read_text())
+          requested=os.environ.get('FEATURE_ID') or None
+          s.update({'status':'PLANNING','active_feature':requested,'active_pr':None,'active_branch':None,'last_error':None,'updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
+          p.write_text(json.dumps(s, indent=2)+"\n")
+          PY
+          git config user.name 'AWH Automation'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .openhands/state.json
+          git commit -m 'chore(automation): checkpoint planner start' || true
+          git push origin rust
+
       - name: Guard against an active feature
         run: |
           ACTIVE_PR=$(jq -r '.active_pr // empty' .openhands/state.json)
           STATUS=$(jq -r '.status' .openhands/state.json)
-          if [ -n "$ACTIVE_PR" ] && [ "$STATUS" != "COMPLETED" ] && [ "$STATUS" != "IDLE" ]; then
+          if [ -n "$ACTIVE_PR" ] && [ "$STATUS" != "COMPLETED" ] && [ "$STATUS" != "IDLE" ] && [ "$STATUS" != "PLANNING" ]; then
             echo "Active autonomous work already exists: PR=$ACTIVE_PR status=$STATUS"
             exit 1
           fi
@@ -106,15 +125,16 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Persist active state
+      - name: Persist active build checkpoint
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
         run: |
           python - <<'PY'
           import json, os
+          from datetime import datetime, timezone
           from pathlib import Path
           p=Path('.openhands/state.json'); s=json.loads(p.read_text())
-          s.update({'status':'BUILDING','active_feature':os.environ['FEATURE_ID'],'active_pr':None,'active_branch':None,'review_round':0,'builder_attempt':1,'last_error':None})
+          s.update({'status':'BUILDING','active_feature':os.environ['FEATURE_ID'],'active_pr':None,'active_branch':None,'review_round':0,'builder_attempt':0,'last_error':None,'last_review':'','updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
           p.write_text(json.dumps(s, indent=2)+"\n")
           PY
           rm -f .openhands/generated-task.md
@@ -168,6 +188,7 @@ jobs:
         run: |
           python - <<'PY'
           import json, os
+          from datetime import datetime, timezone
           from pathlib import Path
           feature=os.environ['FEATURE_ID']; pr=int(os.environ['PR'])
           b=Path('.openhands/backlog.json'); s=Path('.openhands/state.json')
@@ -176,7 +197,7 @@ jobs:
               if item['id']==feature:
                   item['status']='completed'; item['merged_pr']=pr
           state=json.loads(s.read_text())
-          state.update({'status':'COMPLETED','active_feature':None,'active_pr':None,'active_branch':None,'review_round':0,'builder_attempt':0,'last_error':None})
+          state.update({'status':'COMPLETED','active_feature':None,'active_pr':None,'active_branch':None,'review_round':0,'builder_attempt':0,'last_error':None,'last_review':'','updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
           b.write_text(json.dumps(backlog, indent=2)+"\n")
           s.write_text(json.dumps(state, indent=2)+"\n")
           PY
