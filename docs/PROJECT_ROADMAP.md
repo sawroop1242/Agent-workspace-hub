@@ -1,24 +1,32 @@
-# Agent Workspace Hub — Project Roadmap
+# Agent Workspace Hub — Final Product Roadmap
 
-> **Strategic direction:** AWH is an agent-agnostic, local-first workspace runtime for coding agents. It is infrastructure for existing AI agents, not an attempt to become another agent framework, model router, or general-purpose workflow engine.
+> **Status:** Canonical forward-looking architecture, feature set, CLI contract, dependency graph, and implementation order.
+>
+> **Branch:** `rust`
+>
+> Historical status/evidence documents remain historical snapshots. This document is the authoritative build plan for future implementation.
 
-## Product Boundary
+## 1. Product Boundary
 
-AWH should own:
+AWH is an **agent-agnostic, local-first workspace runtime for coding agents**. It is infrastructure for existing AI agents, not another agent framework, model router, or general-purpose workflow engine.
+
+### AWH owns
 
 - Workspace and filesystem state
-- Controlled file editing
-- Git and agent worktrees
-- Capabilities and policy
-- Snapshots, undo, and provenance
+- Controlled, agent-grade file editing
+- Git and first-class agent worktrees
+- Capabilities and policy enforcement
+- Snapshots, undo, rollback, and provenance
 - Context and project state
 - Persistent developer-oriented memory
 - Skills and capability packages
-- Agent/session state
+- Agent profiles and sessions
+- Tasks and runtime state
 - Audit and observability
 - MCP, CLI, TUI, and Control API interfaces
+- Optional remote runtime and integrations
 
-External agents should own:
+### External agents own
 
 - Reasoning
 - Planning
@@ -26,859 +34,579 @@ External agents should own:
 - Agent intelligence
 - Agent-specific orchestration
 
-The operating system and infrastructure remain below AWH.
+The operating system/container/VM layer remains below AWH. AWH snapshots and policy are not replacements for OS/container/VM sandboxing.
 
----
-
-# Phase 0 — Foundation & Release Infrastructure
-
-**Goal:** Make AWH installable, reproducible, cross-platform, and testable.
-
-### Core
-
-- [ ] Rust workspace architecture cleanup
-- [ ] Configuration system
-- [ ] Workspace/project discovery
-- [ ] Cross-platform path abstraction
-- [ ] Standardized error handling
-- [ ] Structured logging
-- [ ] Version/build information
-- [ ] Storage abstraction
-- [ ] Storage migrations
-- [ ] Locking/concurrency primitives
-
-### Distribution
-
-- [ ] Linux x86_64
-- [ ] Linux ARM64
-- [ ] macOS ARM64
-- [ ] macOS x86_64
-- [ ] Windows x86_64
-- [ ] Android/Termux ARM64
-- [ ] Static/minimal binaries where practical
-- [ ] One-line installer
-- [ ] Upgrade command
-- [ ] Uninstall command
-- [ ] GitHub Releases
-- [ ] Checksums
-- [ ] Shell completion
-
-### CLI baseline
+## 2. Final Architecture
 
 ```text
-awh init
-awh status
-awh doctor
-awh version
-awh config
-awh workspace
-awh logs
+                         External Agents
+        Claude / OpenCode / OpenHands / Qwen / Codex / etc.
+                              │
+                              ▼
+                    ┌─────────────────────┐
+                    │  MCP / Control API  │
+                    │  CLI / TUI          │
+                    └──────────┬──────────┘
+                               │
+                     ┌─────────▼─────────┐
+                     │ Agent Router      │
+                     │ + Agent Registry  │
+                     └─────────┬─────────┘
+                               │
+                     ┌─────────▼─────────┐
+                     │ Session Runtime   │
+                     └─────────┬─────────┘
+                               │
+              ┌────────────────▼────────────────┐
+              │ Capability + Policy Engine     │
+              └────────────────┬────────────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        ▼                      ▼                      ▼
+ Workspace/FS             Git/Worktrees          Runtime/Tools
+        │                      │                      │
+        └──────────────────────┼──────────────────────┘
+                               ▼
+                 Snapshot / Provenance / Audit
+                               │
+                 ┌─────────────┴─────────────┐
+                 ▼                           ▼
+          Context / Memory / Skills    Collaboration
 ```
 
-### Quality gate
+### Shared-service rule
 
-Every important CLI command should be validated through:
+CLI, MCP, TUI, and Control API are **interfaces over the same AWH application services**. They must not implement separate filesystem, Git, policy, editing, snapshot, or runtime semantics.
+
+### Configuration rule
+
+```text
+TOML / env / CLI overrides
+          ↓
+Configuration
+          ↓
+AgentProfile / RuntimeConfig
+          ↓
+AgentRegistry + PolicyEngine
+```
+
+TOML is declarative configuration; it is never the authoritative authorization engine.
+
+## 3. Agent Profiles & Policy-Routed MCP
+
+Named agent profiles are first-class runtime identities.
+
+```text
+/{agent}/mcp
+/{agent}/sse
+```
+
+Example:
+
+```text
+/claude/mcp
+/claude/sse
+/qwen/mcp
+/qwen/sse
+/opencode/mcp
+/opencode/sse
+```
+
+The URL namespace identifies routing only. It is **not authorization**.
+
+Request flow:
+
+```text
+/{agent}/mcp
+   ↓
+AgentRegistry
+   ↓
+AgentSession
+   ↓
+CapabilityContext
+   ↓
+PolicyEngine
+   ↓
+Tool Registry
+   ↓
+AWH application service
+   ↓
+Audit / provenance
+```
+
+If a tool is denied, execution must not occur and a structured `PermissionDenied` result is returned.
+
+### Agent lifecycle
+
+```bash
+awh agent list
+awh agent show <name>
+awh agent start <name>...
+awh agent start --all
+awh agent stop <name>
+awh agent restart <name>
+awh agent run <name>
+awh agent status
+```
+
+Starting only `claude` registers only Claude's configured active routes. An inactive agent must not have an active agent-specific MCP route.
+
+## 4. Final CLI Contract
+
+The following is the **final target CLI surface**. A command is not considered implemented merely because it appears in help; its underlying service, policy checks, tests, terminal validation, and failure/recovery behavior must exist.
+
+```text
+awh
+├── init
+├── version
+├── status
+├── doctor
+├── config
+├── agent
+│   ├── list
+│   ├── show
+│   ├── start
+│   ├── stop
+│   ├── restart
+│   ├── run
+│   └── status
+├── mcp
+│   ├── serve
+│   ├── list
+│   ├── add
+│   ├── remove
+│   ├── inspect
+│   ├── test
+│   └── logs
+├── workspace
+│   ├── create
+│   ├── list
+│   ├── open
+│   ├── info
+│   └── remove
+├── fs
+│   ├── read
+│   ├── write
+│   ├── stat
+│   ├── search
+│   ├── patch
+│   ├── replace
+│   ├── insert
+│   ├── delete-range
+│   ├── apply-diff
+│   ├── hash
+│   ├── verify
+│   ├── history
+│   └── rollback
+├── git
+│   ├── status
+│   ├── diff
+│   ├── staged-diff
+│   ├── log
+│   ├── branch
+│   ├── branches
+│   ├── worktree
+│   ├── stage
+│   ├── unstage
+│   ├── commit
+│   ├── push
+│   ├── pull
+│   ├── reset
+│   ├── clean
+│   └── validate
+├── worktree
+│   ├── create
+│   ├── list
+│   ├── inspect
+│   ├── remove
+│   ├── merge
+│   └── status
+├── capability
+│   ├── list
+│   ├── show
+│   ├── grant
+│   ├── revoke
+│   └── check
+├── policy
+│   ├── list
+│   ├── show
+│   ├── check
+│   ├── validate
+│   └── explain
+├── snapshot
+│   ├── create
+│   ├── list
+│   ├── show
+│   ├── restore
+│   ├── delete
+│   └── diff
+├── context
+│   ├── show
+│   ├── save
+│   ├── update
+│   ├── clear
+│   └── search
+├── memory
+│   ├── list
+│   ├── get
+│   ├── search
+│   ├── add
+│   ├── update
+│   └── delete
+├── skill
+│   ├── list
+│   ├── show
+│   ├── install
+│   ├── remove
+│   ├── enable
+│   └── disable
+├── session
+│   ├── list
+│   ├── show
+│   ├── create
+│   ├── stop
+│   └── status
+├── task
+│   ├── list
+│   ├── show
+│   ├── create
+│   ├── update
+│   ├── cancel
+│   └── assign
+├── audit
+│   ├── list
+│   ├── show
+│   ├── search
+│   └── export
+├── logs
+│   ├── show
+│   ├── follow
+│   └── clear
+├── terminal
+│   ├── run
+│   ├── list
+│   └── kill
+├── connector
+│   ├── list
+│   ├── add
+│   ├── remove
+│   ├── inspect
+│   ├── test
+│   └── invoke
+├── collaboration
+│   ├── agents
+│   ├── status
+│   ├── handoff
+│   ├── assign
+│   ├── conflicts
+│   └── events
+├── api
+│   ├── serve
+│   ├── status
+│   ├── tokens
+│   └── logs
+├── tui
+└── completion
+    ├── bash
+    ├── zsh
+    ├── fish
+    └── powershell
+```
+
+The complete command semantics and dependency table live in `docs/CLI.md`.
+
+## 5. Phase Map
+
+| Phase | Area | Final CLI families |
+|---|---|---|
+| 0 | Foundation & release | root, `init`, `version`, `status`, `doctor`, `config` |
+| 1 | MCP infrastructure | `mcp *`, agent routing foundation |
+| 2 | Workspace runtime | `workspace *`, basic `fs *` |
+| 3 | Git & isolation | `git *`, `worktree *` |
+| 4 | Capability & policy | `capability *`, `policy *`, agent authorization |
+| 5 | Snapshots/undo/provenance | `snapshot *`, `fs history`, `fs rollback` |
+| 6 | Context engine | `context *` |
+| 7 | Developer memory | `memory *` |
+| 8 | Skills | `skill *` |
+| 9 | Sessions & agent runtime | `agent *`, `session *`, `task *` |
+| 10 | Audit/observability | `audit *`, `logs *`, terminal foundation |
+| 11 | TUI | `tui` |
+| 12 | Multi-agent collaboration | `collaboration *` |
+| 13 | Control API | `api *` |
+| 14 | Remote AWH | remote operation behind API/runtime abstractions |
+| 15 | Ecosystem/integrations | `connector *`, agent/IDE adapters, completion |
+| 16 | Advanced infrastructure | sandbox/resource/secrets adapters behind existing interfaces |
+
+## 6. Dependency-Driven Build Order
+
+### Stage A — Foundation
+
+```text
+CLI framework
+→ configuration
+→ init/version/status/doctor
+→ storage/state
+→ structured logging
+```
+
+### Stage B — MCP
+
+```text
+MCP protocol/server
+→ mcp serve
+→ tool/resource registry
+→ mcp inspect/test
+→ lifecycle/logging
+```
+
+### Stage C — Workspace and filesystem
+
+```text
+workspace service
+→ workspace CLI
+→ fs read/stat/search/hash
+→ secure path resolution
+```
+
+### Stage D — Agent-grade editing
+
+```text
+EditTransaction
+→ replace/insert/delete-range
+→ patch
+→ apply-diff
+→ context validation
+→ conflict detection
+→ atomic commit
+→ verification
+→ history/rollback
+```
+
+All editing interfaces must use the same `EditService`.
+
+### Stage E — Security and agent routing
+
+```text
+Capability model
+→ PolicyEngine
+→ AgentProfile
+→ AgentRegistry
+→ AgentSession
+→ agent-specific MCP routes
+→ policy-enforced tool discovery/invocation
+```
+
+### Stage F — Git isolation
+
+```text
+git read operations
+→ git mutations
+→ worktree service
+→ agent/session/worktree association
+→ guarded merge/reset/clean/push/pull
+```
+
+### Stage G — Reversibility and observability
+
+```text
+snapshots
+→ provenance
+→ audit events
+→ logs
+→ rollback/recovery
+```
+
+### Stage H — Runtime state
+
+```text
+sessions
+→ tasks
+→ context
+→ memory
+→ skills
+```
+
+### Stage I — High-risk operations
+
+```text
+policy + capability + session + audit
+→ terminal
+→ connectors
+```
+
+### Stage J — Collaboration and control plane
+
+```text
+agent identity
+→ sessions
+→ worktrees
+→ tasks
+→ conflict/events
+→ collaboration
+→ Control API
+→ TUI
+```
+
+### Stage K — Ecosystem and release
+
+```text
+connectors/integrations
+→ shell completion
+→ documentation
+→ end-to-end acceptance
+→ release
+```
+
+## 7. Critical Dependency Graph
+
+```text
+Foundation
+   │
+   ├───────────────┐
+   ▼               ▼
+Workspace         MCP
+   │               │
+   ▼               ▼
+Filesystem      Agent Profiles
+   │               │
+   ▼               ▼
+EditService ───► PolicyEngine
+   │               │
+   ├───────┬───────┘
+   ▼       ▼
+ Git    Sessions
+   │       │
+   ▼       ▼
+Worktrees Tasks
+   │       │
+   └───┬───┘
+       ▼
+Snapshots / Provenance
+       │
+       ▼
+Audit / Observability
+       │
+       ├──────────────┐
+       ▼              ▼
+ Context            Terminal
+       │              │
+       ▼              ▼
+ Memory           Connectors
+       │
+       └──────┬───────┘
+              ▼
+        Collaboration
+              │
+              ▼
+         Control API
+              │
+              ▼
+             TUI
+              │
+              ▼
+       Ecosystem/Release
+```
+
+## 8. Security Ordering
+
+Security-sensitive mutations must not be implemented before their enforcement layer exists.
+
+```text
+PolicyEngine
+   ↓
+Capability checks
+   ↓
+Session identity
+   ↓
+Audit
+   ↓
+Dangerous operation
+```
+
+This applies especially to:
+
+- `git push`
+- `git reset`
+- `git clean`
+- `snapshot restore`
+- `terminal run`
+- `capability grant`
+- `capability revoke`
+- `connector invoke`
+
+Route namespace, CLI arguments, TOML, or MCP discovery must never bypass authorization.
+
+## 9. Phase Exit Rules
+
+Every phase must satisfy:
 
 ```text
 implementation
-  -> unit test
-  -> integration test
-  -> real terminal test
-  -> failure/recovery test
+→ unit tests
+→ integration tests
+→ real terminal validation
+→ failure/recovery validation
+→ documentation update
 ```
 
-**Exit condition:** a new user can install AWH and successfully run `awh init`, `awh status`, and `awh doctor`.
+For MCP-facing features also require real-client validation where practical.
 
----
+A feature is **implemented** only when the behavior exists and is validated; planned commands must not be documented as currently available.
 
-# Phase 1 — MCP Infrastructure
+## 10. Final Acceptance Workflow
 
-**Goal:** Make AWH a reliable MCP-first infrastructure layer.
-
-### MCP server
-
-- [ ] MCP initialization
-- [ ] Tool discovery
-- [ ] Resource discovery
-- [ ] Prompt support
-- [ ] Transport abstraction
-- [ ] stdio transport
-- [ ] HTTP transport
-- [ ] SSE compatibility where required
-- [ ] Authentication hooks
-- [ ] Connection lifecycle management
-- [ ] Graceful shutdown
-- [ ] Concurrent clients
-- [ ] Request cancellation
-- [ ] Timeout handling
-- [ ] Structured MCP errors
-- [ ] Protocol/version negotiation
-
-### MCP management
+The core product acceptance path is:
 
 ```text
-awh mcp serve
-awh mcp list
-awh mcp add
-awh mcp remove
-awh mcp inspect
-awh mcp test
-awh mcp logs
-```
-
-### MCP security
-
-- [ ] Tool allowlist
-- [ ] Tool denylist
-- [ ] Resource restrictions
-- [ ] Session isolation
-- [ ] Capability checks
-- [ ] Request audit
-- [ ] Rate limits
-- [ ] Payload limits
-- [ ] Timeout policies
-
-### Interoperability
-
-Validate AWH against multiple external MCP clients, including OpenCode, OpenHands, Claude Code, Qwen Code, and generic MCP clients where practical.
-
-**Exit condition:** external agents can connect to AWH reliably without AWH-specific client hacks.
-
----
-
-# Phase 2 — Workspace Runtime
-
-**Goal:** Give agents a controlled, persistent workspace.
-
-### Workspace lifecycle
-
-```text
+awh init
+  ↓
 awh workspace create
-awh workspace list
-awh workspace open
-awh workspace remove
-awh workspace info
-```
-
-### Filesystem
-
-- [ ] Read files
-- [ ] Write files
-- [ ] Append
-- [ ] Create
-- [ ] Delete
-- [ ] Rename
-- [ ] Move
-- [ ] Copy
-- [ ] Directory operations
-- [ ] Recursive listing
-- [ ] File metadata
-- [ ] Binary file support
-- [ ] Streaming
-- [ ] File locking
-
-### Controlled editing
-
-Avoid unnecessary full-file rewrites. Provide a patch-oriented editing model:
-
-```text
-read
-  -> locate region
-  -> validate expected content
-  -> patch
-  -> verify
-```
-
-Support:
-
-- [ ] Line-range edits
-- [ ] Exact replacement
-- [ ] Unified diff
-- [ ] Patch application
-- [ ] Insertions
-- [ ] Deletions
-- [ ] Context matching
-- [ ] Conflict detection
-- [ ] Atomic writes
-
----
-
-# Phase 3 — Git & Workspace Isolation
-
-**Goal:** Make AWH understand developer projects and safely isolate agent work.
-
-### Git
-
-- [ ] Repository detection
-- [ ] Status
-- [ ] Diff
-- [ ] Log
-- [ ] Branch management
-- [ ] Commit
-- [ ] Checkout
-- [ ] Reset
-- [ ] Stash
-- [ ] Remote information
-- [ ] Conflict detection
-
-### First-class agent worktrees
-
-```text
-Project
- ├── main
- ├── agent-claude
- ├── agent-opencode
- ├── agent-qwen
- └── agent-experiment
-```
-
-Commands:
-
-```text
-awh worktree create <name>
-awh worktree list
-awh worktree inspect <name>
-awh worktree remove <name>
-awh worktree merge <name>
-```
-
-AWH should associate agent, session, workspace, worktree, branch, and modified files.
-
-**Exit condition:** multiple agents can work on one project without accidentally sharing the same mutable workspace.
-
----
-
-# Phase 4 — Capability & Policy Engine
-
-**Goal:** Control exactly what an agent is allowed to do.
-
-Core authorization model:
-
-```text
-Identity
-  -> Agent
-  -> Session
-  -> Workspace
-  -> Capability
-  -> Resource
-  -> Policy
-  -> Tool invocation
-```
-
-### Capabilities
-
-Examples:
-
-```text
+  ↓
+awh agent start claude
+  ↓
+awh mcp serve
+  ↓
+Claude → /claude/mcp
+  ↓
 filesystem.read
-filesystem.write
-filesystem.delete
-git.read
-git.write
-process.execute
-network.request
-mcp.invoke
-secrets.read
+  ↓
+filesystem.patch
+  ↓
+PolicyEngine
+  ↓
+EditTransaction
+  ↓
+Snapshot
+  ↓
+Verification
+  ↓
+Audit
+  ↓
+Git diff
+  ↓
+Git commit
 ```
 
-### Policies
-
-Support:
-
-- [ ] Allow/deny rules
-- [ ] Path restrictions
-- [ ] Command restrictions
-- [ ] Network restrictions
-- [ ] Resource limits
-- [ ] Session-specific policies
-- [ ] Agent-specific policies
-- [ ] Workspace-specific policies
-- [ ] Temporary permissions
-- [ ] Approval requests
-- [ ] Policy inheritance
-
-A skill or agent must not silently obtain additional capabilities.
-
----
-
-# Phase 5 — Snapshots, Undo & Provenance
-
-**Goal:** Make agent changes reversible and explainable.
-
-Modification flow:
+Additional acceptance checks:
 
 ```text
-Agent
-  -> AWH
-  -> Snapshot
-  -> Modification
-  -> Verification
-```
-
-### Snapshot commands
-
-```text
-awh snapshot create
+awh doctor
+awh status
+awh policy check
+awh capability check
 awh snapshot list
-awh snapshot inspect
-awh snapshot restore
-awh snapshot delete
+awh audit search
+awh logs follow
 ```
 
-### Workspace recovery
-
-```text
-awh workspace diff
-awh workspace history
-awh workspace undo
-awh workspace restore
-```
-
-### Provenance
-
-Track, where practical:
-
-```text
-file
-agent
-session
-capability
-tool
-timestamp
-before hash
-after hash
-snapshot
-```
-
-This enables workflows such as:
-
-```text
-awh explain src/main.rs
-```
-
-### Recovery features
-
-- [ ] Undo last agent action
-- [ ] Undo a session
-- [ ] Restore a snapshot
-- [ ] Restore an individual file
-- [ ] Compare snapshots
-- [ ] Recover deleted files
-- [ ] Crash recovery
-
-**Boundary:** AWH's snapshot/provenance layer is a workspace safety mechanism. It should not be marketed as a replacement for VM/container/OS sandboxing.
-
----
-
-# Phase 6 — Context Engine
-
-**Goal:** Give agents relevant project context without forcing them to rediscover the project repeatedly.
-
-### Context sources
-
-- Filesystem
-- Git
-- Workspace metadata
-- Session history
-- Previous changes
-- Skills
-- Project configuration
-- Tool results
-- User-provided context
-
-### Operations
-
-```text
-awh context inspect
-awh context search
-awh context build
-awh context summarize
-awh context export
-```
-
-### Context capabilities
-
-- [ ] Relevant-file discovery
-- [ ] Dependency awareness
-- [ ] Project structure
-- [ ] Changed-file awareness
-- [ ] Recent agent-action context
-- [ ] Session context
-- [ ] Context compression
-- [ ] Token-budget-aware context
-- [ ] Stale-context detection
-
----
-
-# Phase 7 — Developer-Oriented Memory
-
-**Goal:** Provide persistent project state integrated with workspace, Git, sessions, and provenance.
-
-AWH should not try to win by implementing every possible memory feature. Focus on coding workflow memory.
-
-### Memory types
-
-```text
-Project memory
-Session memory
-Agent memory
-Developer preferences
-Decision records
-Architecture decisions
-Known issues
-Task state
-```
-
-### Commands
-
-```text
-awh memory add
-awh memory search
-awh memory list
-awh memory forget
-awh memory export
-```
-
-Memory should understand relationships between:
-
-```text
-Project
-Workspace
-Git
-Agent
-Session
-Files
-Snapshots
-```
-
----
-
-# Phase 8 — Skills & Capability Packages
-
-**Goal:** Make AWH extensible without turning it into an agent framework.
-
-A skill package should describe:
-
-```text
-What it does
-Required tools
-Required capabilities
-Inputs
-Outputs
-Policy requirements
-Instructions
-```
-
-Example:
-
-```text
-rust-development
- ├── cargo
- ├── rustfmt
- ├── clippy
- ├── filesystem
- └── git
-```
-
-### Management
-
-```text
-awh skill list
-awh skill install
-awh skill remove
-awh skill inspect
-awh skill enable
-awh skill disable
-```
-
-### Security
-
-```text
-Skill
-  -> requested capabilities
-  -> policy evaluation
-  -> approved capabilities
-```
-
----
-
-# Phase 9 — Sessions & Agent Management
-
-**Goal:** Make AWH agent-aware without becoming the agent itself.
-
-### Agent registry
-
-```text
-awh agent list
-awh agent add
-awh agent remove
-awh agent inspect
-awh agent connect
-```
-
-Target interoperability includes Claude Code, OpenCode, OpenHands, Qwen Code, Codex, Aider, Gemini CLI, and custom MCP agents where technically supported.
-
-### Session model
-
-```text
-Agent
- └── Session
-      ├── Workspace
-      ├── Worktree
-      ├── Capabilities
-      ├── Context
-      ├── Memory
-      ├── Snapshots
-      └── Audit
-```
-
-Commands:
-
-```text
-awh session list
-awh session start
-awh session inspect
-awh session pause
-awh session resume
-awh session close
-```
-
----
-
-# Phase 10 — Audit & Observability
-
-**Goal:** Make agent activity inspectable and diagnosable.
-
-Central event model:
-
-```text
-timestamp
-agent
-session
-workspace
-tool
-capability
-resource
-action
-result
-duration
-policy decision
-```
-
-### CLI
-
-```text
-awh audit
-awh audit agent
-awh audit session
-awh audit workspace
-awh audit tool
-```
-
-### Observability
-
-- [ ] Structured logs
-- [ ] Event stream
-- [ ] Metrics
-- [ ] Tool latency
-- [ ] Failures
-- [ ] Policy denials
-- [ ] File modifications
-- [ ] Process execution
-- [ ] MCP requests
-- [ ] Resource usage
-
----
-
-# Phase 11 — Terminal UI
-
-**Goal:** Provide a live developer control center.
-
-### TUI panels
-
-- [ ] Workspace
-- [ ] Files
-- [ ] Agents
-- [ ] Sessions
-- [ ] MCP
-- [ ] Tools
-- [ ] Capabilities
-- [ ] Policies
-- [ ] Snapshots
-- [ ] Git
-- [ ] Memory
-- [ ] Audit
-- [ ] Logs
-
-The TUI should prioritize local observability and control rather than becoming another full IDE.
-
----
-
-# Phase 12 — Multi-Agent Collaboration
-
-**Goal:** Support multiple agents on one machine/project without building a distributed agent framework.
-
-### Initial capabilities
-
-- [ ] Agent registry
-- [ ] Agent status
-- [ ] Isolated worktrees
-- [ ] Shared project state
-- [ ] Session handoff
-- [ ] Task ownership
-- [ ] Conflict detection
-- [ ] Merge notifications
-- [ ] Agent-to-agent event notifications
-
-Example:
-
-```text
-Agent A -> feature/auth
-Agent B -> feature/api
-Agent C -> tests
-```
-
-AWH coordinates the workspace and state; agents remain responsible for reasoning.
-
-### Explicitly defer
-
-- [ ] Large distributed message bus
-- [ ] Distributed agent swarm
-- [ ] Autonomous agent scheduler
-- [ ] General-purpose DAG workflow engine
-
----
-
-# Phase 13 — Control API
-
-**Goal:** Allow external applications to control AWH through a stable API.
-
-Architecture:
-
-```text
-CLI
-TUI
-MCP
-External UI
-External Agent
-       |
-       v
- AWH Control API
-       |
-       v
-    AWH Core
-```
-
-### API domains
-
-- [ ] Workspace API
-- [ ] Agent API
-- [ ] Session API
-- [ ] Snapshot API
-- [ ] Git API
-- [ ] Memory API
-- [ ] Capability API
-- [ ] Policy API
-- [ ] Audit API
-- [ ] Event streaming
-
-### Security
-
-- [ ] API authentication
-- [ ] Scoped tokens
-- [ ] Capability-based API access
-- [ ] Local-only mode
-- [ ] Remote mode
-- [ ] TLS support
-
----
-
-# Phase 14 — Remote AWH
-
-**Goal:** Extend the local runtime to remote environments only after the local product is mature.
-
-Potential architecture:
-
-```text
-Local Agent
-     |
-     v
- AWH Client
-     |
-     v
- Remote AWH
-     |
-     v
- Workspace
-```
-
-Potential features:
-
-- [ ] Remote workspace
-- [ ] Remote session
-- [ ] Remote MCP
-- [ ] Remote audit
-- [ ] Remote TUI
-- [ ] Secure authentication
-- [ ] Workspace synchronization
-- [ ] Connection recovery
-
-Local-first remains the primary product model.
-
----
-
-# Phase 15 — Ecosystem & Integrations
-
-**Goal:** Make AWH easy to adopt with existing developer tooling.
-
-### Agent integrations
-
-- [ ] Claude Code
-- [ ] OpenCode
-- [ ] OpenHands
-- [ ] Qwen Code
-- [ ] Codex
-- [ ] Aider
-- [ ] Gemini CLI
-- [ ] Custom agents
-
-### Developer integrations
-
-- [ ] GitHub
-- [ ] GitLab
-- [ ] Gitea
-- [ ] VS Code
-- [ ] Neovim
-- [ ] Acode
-- [ ] JetBrains IDEs
-
-AWH should consume and expose MCP infrastructure rather than attempting to replace every MCP server or gateway.
-
----
-
-# Phase 16 — Advanced Infrastructure
-
-**Goal:** Add deeper isolation and enterprise capabilities only when validated by real users.
-
-Potential adapters/features:
-
-- [ ] Process sandbox adapters
-- [ ] Docker integration
-- [ ] WASM sandbox
-- [ ] OS-level sandbox adapters
-- [ ] Resource quotas
-- [ ] Network policies
-- [ ] Secrets-manager integrations
-- [ ] Remote execution
-- [ ] Snapshot deduplication
-- [ ] Distributed workspace
-- [ ] Enterprise RBAC
-
-These should remain modular adapters around the AWH core rather than forcing the core to become a monolithic platform.
-
----
-
-# Priority Model
-
-| Priority | Phase | Importance |
-|---|---|---:|
-| P0 | Foundation & release infrastructure | Critical |
-| P0 | MCP infrastructure | Critical |
-| P0 | Workspace/file runtime | Critical |
-| P0 | Git/worktrees | Critical |
-| P0 | Capability + policy | Critical |
-| P0 | Snapshots/undo/provenance | Core differentiator |
-| P1 | Context engine | High |
-| P1 | Developer-oriented memory | High |
-| P1 | Skills | High |
-| P1 | Sessions/agent management | High |
-| P1 | Audit/observability | High |
-| P2 | TUI | High UX value |
-| P2 | Multi-agent basics | Medium |
-| P2 | Control API | Medium |
-| P3 | Remote AWH | Later |
-| P3 | Ecosystem integrations | Later |
-| P4 | Advanced sandbox/enterprise | Demand-driven |
-
----
-
-# Strategic Guardrails
-
-## 1. Do not become an agent framework
-
-AWH should provide infrastructure to agents, not compete with their reasoning/planning layer.
-
-## 2. Do not build a LangGraph-style workflow platform by default
-
-Only add orchestration features when a concrete AWH workflow requires them.
-
-## 3. Do not build a generic model router
-
-Model selection and provider routing belong above AWH unless a future validated use case requires a small adapter.
-
-## 4. Do not claim to replace real sandboxing
-
-Snapshots, policies, capabilities, and process controls complement container/VM/OS sandboxing; they are not automatically equivalent to it.
-
-## 5. Distribution is a product feature
-
-AWH should remain easy to install and operate as a single local Rust binary wherever practical.
-
-## 6. MCP-first, not MCP-only
-
-MCP is the primary interoperability boundary, while CLI, TUI, and Control API provide direct local control.
-
-## 7. Prefer composable adapters
-
-Integrate with existing MCP gateways, sandbox runtimes, Git providers, memory systems, and agents where doing so is better than rebuilding them.
-
-## 8. Validate the workflow, not just individual components
-
-A feature is not complete merely because its Rust tests pass. The full agent workflow must be exercised through real CLI/MCP interactions and failure/recovery scenarios.
-
----
-
-# Long-Term Product Shape
-
-```text
-                    AI / AGENT LAYER
- ┌─────────────────────────────────────────────────┐
- │ Claude │ Codex │ OpenCode │ Qwen │ OpenHands   │
- └───────────────────────┬─────────────────────────┘
-                         │ MCP / API
-                         ▼
-              ┌───────────────────────┐
-              │       AWH CORE        │
-              │                       │
-              │ Capability Engine     │
-              │ Policy Engine         │
-              │ Tool Broker            │
-              │ Session Manager       │
-              │ Context Engine        │
-              │ Memory                │
-              │ Skills                │
-              │ Audit                 │
-              └───────────┬───────────┘
-                          │
-              ┌───────────▼───────────┐
-              │   WORKSPACE RUNTIME   │
-              │                       │
-              │ Filesystem            │
-              │ File Patching         │
-              │ Snapshots             │
-              │ Git                   │
-              │ Worktrees             │
-              │ Processes             │
-              │ Secrets               │
-              └───────────┬───────────┘
-                          │
-             ┌────────────▼────────────┐
-             │       OS / Runtime      │
-             │ Linux / macOS / Windows │
-             │ Android / Termux        │
-             └─────────────────────────┘
-```
-
-## Success criterion
-
-AWH succeeds when a developer can install one local binary, connect their preferred coding agent, and immediately gain a coherent workspace with persistent project state, controlled capabilities, reversible changes, Git isolation, context, auditability, and MCP interoperability — without requiring AWH to become the agent itself.
+## 11. Strategic Guardrails
+
+1. **Do not become an agent framework.** AWH provides runtime infrastructure; agents own reasoning and planning.
+2. **Do not become a generic workflow/DAG platform.** Add orchestration only when required by an AWH workflow.
+3. **Do not become a generic model router.** Provider/model selection remains above AWH.
+4. **Do not claim snapshots replace sandboxing.** Use OS/container/VM isolation where required.
+5. **MCP-first, not MCP-only.** CLI, TUI, and Control API are first-class interfaces over the same core.
+6. **Prefer composable adapters.** Remote, connector, sandbox, and ecosystem features should not contaminate the core runtime.
+7. **Validate complete workflows, not only unit tests.**
+8. **Coherence over feature count.** Later phases must not destabilize the core runtime.
+9. **Distribution is a product feature.** Cross-platform binaries, install/upgrade/uninstall, checksums, and completion are part of release quality.
