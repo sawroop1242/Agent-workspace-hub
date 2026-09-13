@@ -2,12 +2,14 @@
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — components, request flow, security layers
-- [Features](docs/FEATURES.md) — core AWH capabilities, including Agent Profiles and Policy-Routed MCP
+- [Final architecture and roadmap](docs/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
+- [Final CLI reference](docs/CLI.md) — complete target command tree, phase mapping, dependencies, security ordering, and validation rules
+- [Architecture](docs/architecture.md) — existing implementation architecture and request flow
+- [Features](docs/FEATURES.md) — final target feature contract
 - [Agent Profiles roadmap](docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) — TOML configuration, per-agent MCP routes, CLI lifecycle, policy integration and multi-agent sequencing
 - [Security policy and threat model](docs/security.md)
 - [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
-- [MCP integration](docs/mcp.md) — transports, 53 core tools (65 with `github.*` when `GITHUB_TOKEN` is set), interop evidence
+- [MCP integration](docs/mcp.md) — transports, tools, and interoperability evidence
 - [Composio integration guide](docs/composio.md) — add Composio's hosted MCP, connect apps, invoke tools, gotchas
 - [Configuration](docs/configuration.md) — every `AWH_*` variable and precedence
 - [Development guide](docs/development.md) — conventions, commands, PR process
@@ -45,7 +47,7 @@ Windows (x86_64), falling back to a `cargo build` when no matching asset exists.
 
 ## Agent Profiles & Policy-Routed MCP
 
-AWH can be configured around named external agents. The planned runtime model uses TOML-defined profiles, per-agent MCP endpoints, per-agent tool permissions and CLI-controlled server lifecycle.
+AWH uses named external-agent profiles as a target runtime architecture. Profiles are declarative TOML configuration; authorization remains in the canonical PolicyEngine.
 
 Example endpoint model:
 
@@ -56,19 +58,23 @@ Example endpoint model:
 /qwen/sse
 ```
 
-The CLI can select which configured agent servers are active:
+The final CLI controls which configured agent servers are active:
 
 ```bash
+awh agent list
+awh agent show claude
 awh agent start claude
 awh agent start claude qwen
 awh agent start --all
 awh agent stop claude
+awh agent restart claude
+awh agent run claude
 awh agent status
 ```
 
-Starting only Claude means only Claude's configured routes are active; Qwen/OpenCode are not merely denied tools, their agent-specific routes are inactive. URL namespaces identify the profile but are not themselves authorization: requests still pass through the canonical capability/policy engine.
+Starting only Claude means only Claude's configured routes are active; Qwen/OpenCode are not merely denied tools, their agent-specific routes are inactive. URL namespaces identify the profile but are not authorization: requests still pass through the canonical capability/policy engine.
 
-See [docs/FEATURES.md](docs/FEATURES.md) and [docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md](docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) for the full design and sequencing.
+See [docs/FEATURES.md](docs/FEATURES.md), [docs/CLI.md](docs/CLI.md), and [docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md](docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) for the full design and sequencing.
 
 ## Agent handoff workflow
 
@@ -94,79 +100,23 @@ the user to repeat the project idea.
 
 Agent Workspace Hub exposes its MCP tools over two transports:
 
-| Transport         | Command                          | Audience                       |
-| --------------------- | ------------------------------------ | ------------------------------ |
-| stdio (default)    | `awh mcp serve`                   | Local agents on the same host |
-| HTTPS + SSE (remote)   | `awh mcp serve --transport sse`   | Remote agents                 |
+| Transport | Command | Audience |
+|---|---|---|
+| stdio (default) | `awh mcp serve` | Local agents on the same host |
+| HTTPS + SSE (remote) | `awh mcp serve --transport sse` | Remote agents |
 
-### stdio
+See the existing MCP and security documentation for transport/authentication details. The final agent-profile architecture adds namespaced routes on top of the shared MCP runtime.
 
-The default transport speaks JSON-RPC over standard input/output:
+## Repository layout
 
-```bash
-awh mcp serve
-```
-
-Equivalent explicit form:
-
-```bash
-awh mcp serve --transport stdio
-```
-
-### SSE (remote)
-
-The SSE transport hosts an HTTP(S) server with:
-
-| Endpoint   | Purpose                                                              |
-| ---------- | -------------------------------------------------------------------- |
-| `GET /health` | Liveness probe (unauthenticated, no secrets).                      |
-| `GET /sse`    | Server-Sent Events stream; each client gets an isolated session.   |
-| `POST /mcp`   | Submit a JSON-RPC message for an SSE session (`?sessionId=...`).     |
-
-Remote access is **mandatory bearer-token authenticated**. Start it over HTTPS
-with a single API key:
-
-```bash
-AWH_API_KEY="..." \
-AWH_TLS_CERT="/etc/awh/cert.pem" \
-AWH_TLS_KEY="/etc/awh/key.pem" \
-AWH_PORT=8443 \
-awh mcp serve --transport sse
-```
-
-The server refuses to start without `AWH_API_KEY` and rejects a half-configured
-TLS setup (certificate without key, or key without certificate). Configuration is
-supplied via environment variables or CLI flags:
-
-| Setting             | Env var               | CLI flag          | Default       |
-| ------------------- | --------------------- | ----------------- | ------------- |
-| Bind address        | `AWH_HOST`            | `--host`          | `0.0.0.0`     |
-| Port                | `AWH_PORT`            | `--port`          | `8443`        |
-| TLS certificate     | `AWH_TLS_CERT`         | `--tls-cert`       | (off -> HTTP) |
-| TLS private key     | `AWH_TLS_KEY`          | `--tls-key`       | (off -> HTTP) |
-| API key variable    | -                     | `--api-key-env`   | `AWH_API_KEY` |
-| Allowed origins     | `AWH_ALLOWED_ORIGINS` | -                 | empty (none)  |
-
-Full details (TLS setup, authentication, firewall requirements, secure production
-deployment, troubleshooting) are in [docs/INSTALL.md](docs/INSTALL.md),
-[docs/security.md](docs/security.md), and [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
-
-| File / directory                        | Purpose                                              |
-| ------------------------------------------- | ---------------------------------------------------- |
-| `Cargo.toml` / `Cargo.lock`             | Rust package config, dependencies, binary target `awh` |
-| `src/main.rs`                           | CLI entry point                                      |
-| `src/lib.rs`                            | Library root                                         |
-| `src/core/*.rs`                         | Workspace, project, context, memory, files, tasks     |
-| `src/models/*.rs`                       | Data models (memory, project, task)                  |
-| `src/mcp/*.rs`                          | MCP server, providers, trust, permissions, sandbox    |
-| `src/mcp/audit.rs`                      | Structured security audit logging                    |
-| `src/mcp/circuit_breaker.rs`            | Fail-fast breaker for misbehaving MCP servers         |
-| `src/mcp/config.rs`                     | Resource limits + config precedence rules            |
-| `src/mcp/sandbox.rs`                    | Per-platform process sandboxing (Linux/macOS/Windows) |
-| `src/mcp/schema.rs`                     | JSON Schema argument-validation gate                 |
-| `src/skills/*.rs`                       | Skill registry, installer, package, remote fetching  |
-| `tests/*.rs`                            | Integration + security test suites                   |
-| `examples/bench.rs`                     | Micro-benchmark for the schema-validation gate       |
-| `docs/*.md`                             | Security policy, install guide, project status       |
-| `scripts/install.sh`                    | One-line Rust-binary installer                       |
-| `.github/workflows/*.yml`               | CI (fmt/test/clippy) and release pipeline            |
+| File / directory | Purpose |
+|---|---|
+| `Cargo.toml` / `Cargo.lock` | Rust package config and binary target `awh` |
+| `src/main.rs` | CLI entry point |
+| `src/core/*.rs` | Core workspace/project/context/memory/files/tasks |
+| `src/mcp/*.rs` | MCP server, providers, trust, permissions, sandbox |
+| `src/skills/*.rs` | Skill registry and package support |
+| `tests/*.rs` | Integration and security tests |
+| `docs/*.md` | Architecture, roadmap, security, implementation and status documentation |
+| `scripts/install.sh` | One-line Rust-binary installer |
+| `.github/workflows/*.yml` | CI and release pipelines |
