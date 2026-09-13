@@ -1,89 +1,30 @@
-# AWE-004 — Verification Checklist
+# AWE-004 Verification Checklist
 
-## Static checks
+## Static
+- [ ] `EditTransaction` is the canonical input.
+- [ ] No duplicate operation algorithms.
+- [ ] No writes occur during preparation.
+- [ ] All affected paths are resolved before commit.
+- [ ] Expected state is checked before mutation.
+- [ ] Result contains edit ID and before/after states.
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
+## Behavioral
+- [ ] Valid same-file sequence produces expected content.
+- [ ] Valid multi-file patch produces expected contents.
+- [ ] Invalid operation causes zero mutation everywhere.
+- [ ] Stale hash/context causes zero mutation everywhere.
+- [ ] Traversal/symlink escape is rejected.
+- [ ] UTF-8/newline/EOF behavior is correct.
 
-## Unit/integration tests
-
-- [ ] `cargo test edit`
-- [ ] `cargo test edit -- --nocapture`
-- [ ] `cargo test`
-
-## Functional verification
-
-- [ ] Single replace works.
-- [ ] Single insert works.
-- [ ] Single delete works.
-- [ ] Mixed same-file patch works.
-- [ ] Multi-file patch works.
-- [ ] Same-file operations execute in transaction order.
-- [ ] Intermediate same-file states are never written.
-- [ ] Each affected file receives one final mutation during normal commit.
-
-## Preparation safety
-
-- [ ] Empty transaction rejected.
-- [ ] Invalid operation rejected before mutation.
-- [ ] Invalid path rejected before mutation.
-- [ ] Invalid expected state rejected before mutation.
-- [ ] Valid/invalid/valid multi-file scenario leaves all files unchanged.
-
-## Conflict safety
-
-- [ ] Hash mismatch returns conflict.
-- [ ] Size mismatch returns conflict.
-- [ ] Line-count mismatch returns conflict.
-- [ ] External stale modification is detected.
-- [ ] Same-file expected-state transitions work correctly.
-
-## Filesystem security
-
-- [ ] Absolute paths rejected.
-- [ ] `../` traversal rejected.
-- [ ] Nested traversal rejected.
-- [ ] Symlink escape rejected.
-- [ ] Existing file-size limits remain enforced.
-
-## Text handling
-
-- [ ] UTF-8 text.
-- [ ] Hindi/Devanagari text.
-- [ ] Emoji.
-- [ ] LF files.
-- [ ] CRLF files.
-- [ ] Trailing newline.
-- [ ] No trailing newline.
-
-## Regression review
-
-- [ ] Existing AWE-001 tests remain green.
-- [ ] Existing AWE-002 tests remain green.
-- [ ] Existing AWE-003 tests remain green.
-- [ ] No unrelated tests removed.
-- [ ] No lint suppression added without justification.
-- [ ] No security check bypass added.
-- [ ] No full-file rewrite API introduced.
-
-## Diff review
-
-- [ ] `git status` reviewed.
-- [ ] `git diff --stat` reviewed.
-- [ ] `git diff` reviewed.
-- [ ] Only intended files changed.
-- [ ] No generated artifacts committed.
-- [ ] Commit is focused.
-
-## Acceptance invariant
-
-The following must always hold for preparation failures:
-
-```text
-prepare(patch) fails
-        ↓
-filesystem state before == filesystem state after
+## Commands
+```bash
+cargo fmt --all -- --check
+cargo check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+git status
+git diff
 ```
 
-AWE-004 does not claim crash-safe rollback after commit begins. That responsibility belongs to AWE-006 (#27).
+## Explicit non-claims
+AWE-004 passing does **not** mean file snapshots, persistent audit, explicit rollback, MCP editing tools, CLI editing commands, or per-agent capability enforcement are implemented. Those are later AWE issues.
