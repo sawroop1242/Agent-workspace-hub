@@ -6,337 +6,475 @@
 
 ## Mission
 
-Resolve Issue #40 as a production-quality, evidence-backed documentation deliverable on the `rust` branch.
+Act as the repository's senior technical auditor, documentation engineer, security reviewer, and product-strategy analyst. Resolve Issue #40 on the `rust` branch by producing a **verification-backed, implementation-accurate roadmap, implementation-status, known-issues, and strategic-analysis report**.
 
-The objective is to create and maintain `docs/ROADMAP_STATUS_AND_STRATEGIC_ANALYSIS.md` as a trustworthy strategic/implementation-status report for Agent Workspace Hub (AWH), grounded in the repository's actual implementation, tests, CI evidence, roadmap artifacts, known issues, and explicitly dated strategic analysis.
+This is a documentation/audit task. The report must describe the repository as it actually exists at the time of implementation. Do not treat PR descriptions, roadmap aspirations, stale documents, generated summaries, or assumptions as proof of implementation.
 
-This is a documentation task. Do **not** change runtime behavior or source-code architecture unless the existing repository evidence proves that a documentation claim cannot otherwise be made accurately. If implementation changes are genuinely required to establish a factual claim, STOP and report the blocker rather than silently expanding scope.
+The resulting document must be useful to maintainers, contributors, security reviewers, users, and technical/product leadership deciding what AWH should build next.
+
+**Hard constraint:** do not claim a feature is implemented unless the current `rust` branch and/or directly verifiable CI evidence proves it.
 
 ---
 
-## 1. Mandatory repository preflight
+# 1. Repository and scope preflight
 
-Before editing anything:
+Before writing or changing the report:
 
-1. Confirm the active branch is `rust`.
-2. Inspect the repository status and recent commits.
-3. Read the existing project-status and architecture documentation relevant to roadmap/completeness claims, including where present:
-   - `PROJECT_STATUS.md`
+1. Confirm the repository is `sawroop1242/Agent-workspace-hub`.
+2. Confirm the target branch is `rust`.
+3. Inspect the current repository status and recent history.
+4. Read the current status/architecture documents relevant to roadmap and completeness claims, including where present:
+   - `docs/PROJECT_STATUS.md`
    - `docs/completeness-audit.md`
-   - `docs/AWH_FORENSIC_REPORT.md`
-   - `docs/RUFLO_AWH_ARCHITECTURE_ANALYSIS.md`
-   - existing roadmap or milestone documentation
-   - existing issue-resolving prompts
-4. Inspect the source and tests needed to validate every implementation-status claim.
-5. Inspect GitHub issues/PRs and merge status when the report claims that a feature is merged, in progress, planned, blocked, or not started.
-6. Inspect current CI evidence when test counts or verification status are reported.
-7. Verify whether `docs/ROADMAP_STATUS_AND_STRATEGIC_ANALYSIS.md` already exists on the target branch. If it exists, update it rather than creating a duplicate.
+   - `AWH_FORENSIC_REPORT.md`
+   - `RUFLO_AWH_ARCHITECTURE_ANALYSIS.md`
+   - current roadmap/security documentation
+5. Inspect the actual source and tests for every subsystem whose completion or implementation status will be reported.
+6. Inspect GitHub issues, PRs, merge state, and relevant commits for milestone claims.
+7. Inspect current GitHub Actions workflows and actual results when reporting test counts or CI health.
+8. Establish and record the exact branch/commit baseline used for the report.
+9. Verify whether `docs/ROADMAP_STATUS_AND_STRATEGIC_ANALYSIS.md` exists. If it exists, update it rather than creating a duplicate.
 
 Do not treat previous reports, issue descriptions, PR descriptions, comments, or README claims as authoritative implementation evidence by themselves.
 
 ---
 
-## 2. Evidence hierarchy
+# 2. Evidence hierarchy
 
-Use the following authority order for factual implementation claims:
+Use this authority order for factual implementation claims:
 
 1. Current source code on `rust`.
 2. Current automated tests and their actual results.
-3. Current CI/workflow results and merge status.
+3. Current GitHub Actions workflow results and merge state.
 4. Git history and merged PRs.
 5. Current architecture/project documentation.
 6. Open issues/PR descriptions.
-7. Historical plans, proposals, or previous reports.
+7. Historical plans and previous reports.
+8. External market research for market claims only.
 
-When sources disagree, prefer the higher-authority source and explicitly document the discrepancy where it materially affects the report.
+When evidence conflicts, prefer the higher-authority source and document the discrepancy when it materially affects the report.
 
-Never convert a planned feature into an implemented feature merely because a prompt, issue, roadmap item, or PR description says it exists.
+Never convert:
+
+- a data model into an enforced capability;
+- a CLI declaration into a verified command;
+- a roadmap item into implementation;
+- a test name into proof that production behavior works;
+- a PR description into proof that a PR merged;
+- a source-scan regression test into mutation testing;
+- a design document into an implemented subsystem.
 
 ---
 
-## 3. Required report structure
+# 3. Required report
 
 Create or update:
 
 `docs/ROADMAP_STATUS_AND_STRATEGIC_ANALYSIS.md`
 
-The report should be organized into clear, maintainable sections. At minimum include:
+The report must contain at least the following sections.
 
-### A. Executive summary
+## 3.1 Executive summary
 
-Explain:
+State:
 
-- what AWH currently is;
-- the current implementation maturity;
-- the major security/foundation milestones completed;
-- the most important remaining gaps;
-- the strategic direction supported by the evidence.
+- what AWH actually is today;
+- current implementation maturity;
+- major shipped capabilities;
+- major shipped security foundations;
+- largest remaining gaps;
+- current roadmap phase;
+- highest-value near-term priorities;
+- strategic positioning recommendation.
 
 Keep implementation facts separate from strategic interpretation.
 
-### B. Implementation-status methodology
+## 3.2 Verification methodology and status model
 
-Document how status was determined and define explicit states such as:
+Document how status was determined and use explicit states such as:
 
-- **Implemented** — present in the current branch and supported by meaningful verification.
-- **Implemented / partially validated** — implementation exists but validation is incomplete or limited.
+- **Implemented** — present on the current branch and supported by meaningful verification.
+- **Implemented / partially validated** — implementation exists but acceptance or interoperability evidence is incomplete.
 - **In progress** — active implementation exists but acceptance is incomplete.
 - **Planned / not started** — roadmap intent exists without sufficient implementation evidence.
 - **Blocked / unresolved** — a concrete dependency or defect prevents completion.
-- **Not in current roadmap** — intentionally outside the committed roadmap.
-- **Deprecated / superseded** — replaced by another design.
+- **Intentionally deferred** — deliberately postponed for architectural or sequencing reasons.
+- **Beyond current roadmap** — vision-level work not currently phase-scoped.
 
-Do not use ambiguous percentages without explaining the measurement basis.
+Do not use ambiguous percentages without explaining their measurement basis.
 
-### C. 21-subsystem completion/status table
+## 3.3 Current implementation status
 
-Provide the repository's current subsystem completion table, but derive every row from live evidence.
+Provide a subsystem table covering the major AWH architectural subsystems.
 
-For each subsystem, include where useful:
+For each subsystem include, where useful:
 
 - subsystem name;
-- current status;
-- implementation location(s);
+- previous estimate when meaningful;
+- current status/estimate;
+- implementation location;
 - verification evidence;
 - relevant issue/PR;
+- what changed;
 - known limitation;
 - next action.
 
-Avoid inflated completion claims. A subsystem is not "complete" merely because types, stubs, documentation, or interfaces exist.
+If percentages are used, label approximate values with `~` and explain the basis. Do not present a simple average as equivalent to product readiness.
 
-### D. Security-foundation roadmap phase
+At minimum investigate the status of the major MCP, workspace/filesystem, Git, skills, context, security, capability, policy, tool-broker, CLI, Control API, memory, observability, agent-runtime, messaging, workflow, scheduler, checkpoint/recovery, artifact/provenance, model-router, and TUI areas.
 
-Document the security-foundation roadmap accurately, including:
+A subsystem is not complete merely because interfaces, types, documentation, or stubs exist.
 
-- completed milestones;
-- currently active/in-flight work;
-- not-started milestones;
+## 3.4 Security-foundation roadmap
+
+Document the security-foundation phases and classify each as:
+
+- merged and verified;
+- implemented but awaiting verification;
+- specified/in flight;
+- not started;
+- intentionally deferred.
+
+For completed phases include:
+
+- scope;
+- actual PR/commit reference;
+- exact CI/test evidence when available;
+- security problem solved;
+- remaining limitations.
+
+For future phases include:
+
+- purpose;
 - dependencies;
-- evidence for merged milestones;
-- remaining security risks.
+- sequencing rationale;
+- explicit non-goals.
 
-If the report states that specific PRs are merged, verify their actual merge state instead of relying on issue text.
+Do not claim a future phase has started merely because a prompt exists.
 
-### E. Feature ledger
+## 3.5 Full feature ledger
 
-Maintain a complete feature ledger divided into categories such as:
+Separate features into:
 
-- built;
-- added recently;
-- in progress;
-- upcoming;
-- beyond the current roadmap.
+### Already built
 
-Every feature must have a defensible status and should identify its evidence or implementation location when practical.
+Only verified capabilities.
 
-### F. Known issues and resolution paths
+### Added in the current cycle
 
-Identify the major known issues currently affecting AWH.
+Only changes demonstrably merged on the branch.
+
+### In progress
+
+Only work with concrete evidence of active implementation.
+
+### Upcoming
+
+Planned work not yet implemented.
+
+### Beyond current roadmap
+
+Vision-level capabilities not yet phase-scoped.
+
+For every important feature, identify its evidence or implementation location when practical.
+
+---
+
+# 4. Known-issues audit
+
+Identify the meaningful current issues/gaps affecting AWH.
 
 For each issue provide:
 
-- problem statement;
-- affected subsystem;
-- observable evidence;
-- severity/impact;
-- current state;
-- likely root cause when supported by evidence;
-- recommended resolution;
-- validation required;
-- dependencies/blockers.
+1. identifier/title when one exists;
+2. observable current behavior;
+3. evidence/source location;
+4. affected subsystem;
+5. severity/impact;
+6. whether it is blocking, high priority, non-blocking, cosmetic, or intentionally deferred;
+7. root-cause hypothesis only when supported by evidence;
+8. architectural reason for its current sequencing;
+9. recommended resolution phase;
+10. concrete future implementation prompt when useful;
+11. dependencies/blockers;
+12. validation/acceptance condition.
 
-Do not fabricate issues merely to fill a quota. If fewer than seven materially supported issues exist, report fewer and explain why.
+At minimum investigate:
 
-Where an issue already has an issue-resolving master prompt under `docs/issue-resolving-prompts/`, cross-reference it rather than duplicating implementation instructions.
+- capability data model versus actual per-agent enforcement;
+- custom/dynamic MCP authorization versus built-in authorization;
+- skills executing without the desired sandbox boundary;
+- deny-only/workspace-scoped policy limitations;
+- distribution and packaging verification;
+- duplicate agent/grant identifier behavior;
+- test terminology where source scans are described too strongly.
 
-### G. Strategic/market analysis
+Do not invent issues merely to reach a target count. Distinguish intentional sequencing from accidental omission.
 
-Provide a clearly separated strategic analysis of AWH's positioning.
-
-Distinguish:
-
-- verified repository facts;
-- technical interpretation;
-- market/competitive observations;
-- hypotheses;
-- recommendations.
-
-Any market or competitive claim that depends on external information must be dated and assigned an appropriate confidence level.
-
-Do not present speculative competitive claims as settled facts.
-
-### H. Recommended strategic direction
-
-Give a concise, evidence-backed recommendation covering:
-
-- what AWH should prioritize;
-- what should be deferred;
-- what should explicitly remain outside scope;
-- which capabilities create the strongest product differentiation;
-- which technical foundations must be completed before higher-level features.
-
-Recommendations must respect AWH's existing architectural guardrails and must not redefine the project into a generic agent framework, workflow/DAG platform, or model router.
-
-### I. Roadmap priorities
-
-Turn the evidence into a practical priority order:
-
-1. immediate blockers/security foundations;
-2. core correctness/reliability;
-3. integration/acceptance gaps;
-4. developer/operator experience;
-5. strategic product capabilities;
-6. longer-term experiments.
-
-Each priority should have a concrete reason and verification criterion.
-
-### J. Conclusion
-
-Summarize the current maturity, the most important gaps, and the recommended path forward without overstating certainty.
+When an existing `docs/issue-resolving-prompts/AWE-*.md` already covers a future issue, cross-reference it rather than duplicating its implementation plan.
 
 ---
 
-## 4. Forensic verification requirements
+# 5. Verification methodology
 
-Before writing factual status claims, inspect the relevant implementation directly.
+The report must explain how status claims were verified.
 
-At minimum verify, where applicable:
+Use, where available:
 
-- core service modules;
-- CLI commands;
-- MCP server/tool registry;
-- Control API;
-- TUI;
-- context/session/agent/workspace services;
-- policy and capability enforcement;
-- filesystem/security helpers;
-- editing services and tests;
-- snapshot/provenance/audit facilities;
-- automation workflows;
+- direct source inspection;
+- exact GitHub merge status;
+- real GitHub Actions workflow/job results;
+- exact test counts from raw job output rather than PR summaries;
 - integration tests;
-- documentation structure.
+- command/help validation for CLI claims;
+- real MCP interoperability evidence for MCP claims;
+- security regression evidence for security claims.
 
-For every major claim ask:
+For every important numerical claim, identify where the number came from.
 
-> "What concrete repository evidence proves this is implemented today?"
+Clearly separate:
 
-If there is no sufficient evidence, downgrade the status rather than guessing.
+- verified facts;
+- estimates;
+- technical interpretation;
+- strategic recommendations.
+
+If evidence is unavailable, say so rather than inventing a number or status.
+
+Historical CI results must be labelled historical and must not be presented as current-branch verification unless rechecked.
 
 ---
 
-## 5. CI and verification evidence
+# 6. CI and implementation-status discipline
 
-When reporting test counts or CI status:
+When reporting test or CI evidence:
 
 1. inspect the actual workflow/job result;
 2. identify the relevant commit/PR;
-3. distinguish passing tests from merely existing tests;
-4. distinguish current-branch verification from historical verification;
-5. state limitations when a check was not run or is unavailable.
+3. distinguish tests that exist from tests that actually passed;
+4. distinguish historical verification from current verification;
+5. state limitations when a check was not run or cannot be independently verified.
 
 Never manufacture test counts.
 
-If the report uses historical CI numbers, label them as historical and do not imply that they represent the current branch unless verified.
+Do not describe a PR as merged until the actual merge state is verified.
 
 ---
 
-## 6. Roadmap consistency
+# 7. Market and competitive analysis
+
+Perform a current, dated competitive analysis only where it materially informs product strategy.
+
+Investigate relevant categories such as:
+
+- MCP gateways/tool brokers;
+- MCP security infrastructure;
+- coding-agent memory/context systems;
+- agent orchestration frameworks;
+- agent runtimes;
+- terminal-native developer-agent tooling;
+- Rust-native/local-first developer infrastructure.
+
+For every material external claim:
+
+- identify the source;
+- record the research date;
+- distinguish fact from interpretation;
+- provide a confidence level where uncertainty exists.
+
+Do not present vendor marketing claims as independently verified facts.
+
+Do not merely list competitors. Explain:
+
+- which categories are crowded;
+- where AWH overlaps;
+- where AWH has meaningful differentiation;
+- where competing head-on is strategically weak;
+- where ecosystem integration is better than replacement.
+
+The market section is decision support, not marketing copy.
+
+---
+
+# 8. Strategic positioning recommendation
+
+Use the implementation audit and market research to answer:
+
+1. What should AWH **not** try to become?
+2. What should remain core infrastructure?
+3. What should be prioritized next?
+4. Which capabilities are table stakes versus differentiation?
+5. Which capabilities should integrate with existing ecosystems rather than be rebuilt?
+6. What is the strongest defensible product bundle supported by the current architecture?
+
+Evaluate the strategic thesis around a developer-focused, Rust-native, local-first workspace combining capabilities such as:
+
+- MCP infrastructure;
+- workspace/file operations;
+- context;
+- memory;
+- skills;
+- Git;
+- security;
+- TUI/observability.
+
+Do not declare this thesis correct merely because it is coherent. Tie it to verified implementation strengths and competitive evidence.
+
+Explicitly assess whether AWH should compete directly with:
+
+- generic MCP gateways;
+- generic memory servers;
+- workflow/DAG frameworks;
+- model routers;
+- large agent orchestration frameworks.
+
+Where interoperability is strategically superior to replacement, say so.
+
+---
+
+# 9. Roadmap prioritization
+
+Convert the audit into an actionable priority order using at least:
+
+- security impact;
+- user value;
+- architectural dependency;
+- implementation feasibility;
+- differentiation;
+- adoption/distribution impact;
+- maintenance burden.
+
+Classify recommendations as:
+
+- **P0 — table stakes/blocking**;
+- **P1 — strategic near-term**;
+- **P2 — later/optional**;
+- **Avoid/delegate — work better supplied by the ecosystem**.
+
+For every priority provide a reason and a verification/acceptance criterion.
+
+Do not let a large vision roadmap hide foundational gaps.
+
+If distribution/packaging is a meaningful adoption blocker, evaluate it independently rather than assuming it belongs after every architectural phase.
+
+---
+
+# 10. Future implementation prompts
+
+Where a known issue is sufficiently mature, include a concrete implementation prompt for future work.
+
+Each prompt should specify:
+
+- exact files/subsystems to inspect first;
+- current behavior that must be preserved;
+- desired behavior;
+- security invariants;
+- compatibility constraints;
+- tests required;
+- acceptance criteria;
+- explicit non-goals.
+
+Prompts must be implementation-specific rather than vague requests such as “improve security.”
+
+Do not implement those future issues as part of Issue #40 unless Issue #40 itself explicitly requires implementation.
+
+---
+
+# 11. Roadmap and documentation consistency
 
 Cross-check the report against:
 
 - existing roadmap documents;
 - project status;
 - completeness audits;
-- architecture reports;
+- architecture/forensic reports;
 - open issues;
 - merged PRs;
 - current source tree.
 
 Resolve contradictions explicitly.
 
-Do not silently rewrite roadmap history. If priorities changed, describe the transition and why the current recommendation differs.
+Do not silently rewrite historical documents to make them agree with the new report.
+
+Preserve the distinction among:
+
+- architecture documents;
+- implementation-status documents;
+- forensic/audit reports;
+- roadmap documents;
+- strategic analysis.
+
+The Issue #40 report should be a synthesis/status document, not an unauthorized replacement for foundational architecture documents.
 
 ---
 
-## 7. Strategic-analysis discipline
+# 12. Architecture guardrails
 
-The strategic section must not contaminate implementation-status claims.
-
-Use explicit labels such as:
-
-- **Repository fact**
-- **Verified implementation status**
-- **Technical assessment**
-- **Market observation**
-- **Strategic hypothesis**
-- **Recommendation**
-
-For external market/competitive observations:
-
-- include the date of the observation;
-- identify the confidence level;
-- avoid unsupported numerical market claims;
-- avoid claiming proprietary knowledge;
-- do not confuse popularity with technical superiority.
-
-The purpose is strategic decision support, not marketing copy.
-
----
-
-## 8. Known-issues resolution quality
-
-Every documented known issue must be actionable.
-
-A strong resolution path should contain:
-
-`Observed symptom → evidence → root cause hypothesis → affected boundary → implementation target → tests → acceptance condition`
-
-Prefer existing AWH issue-resolving prompts when available.
-
-Do not create contradictory recommendations that bypass existing security, policy, capability, editing, snapshot, provenance, audit, MCP, or CLI architecture.
-
----
-
-## 9. Architecture guardrails
-
-The report must preserve these project boundaries:
+Preserve these AWH boundaries:
 
 - AWH is not a generic autonomous-agent framework.
 - AWH is not a generic workflow/DAG platform.
 - AWH is not a generic model router.
 - MCP-first does not mean MCP-only.
 - CLI, MCP, TUI, and Control API should remain interfaces over shared services rather than independent implementations of the same semantics.
-- Security-sensitive operations must remain policy/capability/session aware.
+- Security-sensitive mutations must remain policy/capability/session aware.
 - Snapshots are not a replacement for sandboxing.
 - Composable adapters are preferred over hard-coded integrations.
 - Complete workflow validation is more important than feature-count inflation.
 - Distribution and operational usability are product features, but must not be confused with core correctness.
 
-Do not recommend architectural changes that violate these constraints without explicitly identifying the architectural trade-off and obtaining a separate implementation decision.
+Do not recommend architectural changes that violate these constraints without explicitly identifying the trade-off and requiring a separate implementation decision.
 
 ---
 
-## 10. Documentation quality requirements
+# 13. Security and sensitive-data requirements
+
+Never expose:
+
+- API keys;
+- bearer tokens;
+- credentials;
+- private user data;
+- CI secrets;
+- sensitive filesystem contents.
+
+Do not paste raw secret-bearing CI logs.
+
+When describing security controls, distinguish among:
+
+- authentication;
+- trust;
+- capability authorization;
+- policy authorization;
+- sandboxing;
+- audit/observability.
+
+Do not imply that one layer substitutes for another.
+
+For example, a capability data model without an enforcement call site is not per-agent authorization.
+
+---
+
+# 14. Documentation quality
 
 The report must be:
 
 - concise enough to remain maintainable;
-- detailed enough to support engineering decisions;
+- detailed enough for engineering decisions;
 - internally consistent;
-- linkable through repository-relative paths;
-- explicit about evidence;
-- explicit about uncertainty;
+- traceable to repository paths/issues/PRs where useful;
+- explicit about evidence and uncertainty;
 - free of stale copied claims that are no longer true.
 
-Use tables where they improve scanability, but do not create giant unreadable tables merely to maximize detail.
+Use tables when they improve scanability, but avoid giant unreadable tables.
 
 Prefer exact paths, issue numbers, PR numbers, commit identifiers, and test names when they materially improve traceability.
 
 ---
 
-## 11. Change-scope rules
+# 15. Change-scope rules
 
-This issue is documentation-only.
+Issue #40 is documentation/audit/strategy work.
 
 Unless the issue's evidence proves that a documentation-only correction is impossible, modify only:
 
@@ -354,29 +492,40 @@ Do **not** modify:
 - generated artifacts;
 - unrelated documentation.
 
-If the target report cannot be completed accurately without another file change, STOP and report the exact blocker.
+If the report cannot be completed accurately without another file change, STOP and report the exact blocker.
 
 ---
 
-## 12. Validation of the finished report
+# 16. Validation of the finished report
 
 After creating/updating the report:
 
 1. Re-read the complete document.
-2. Check every implementation claim against repository evidence.
+2. Check every implementation claim against current repository evidence.
 3. Check every issue/PR reference for correctness.
 4. Check every roadmap status for consistency.
 5. Check historical versus current CI claims.
 6. Check that strategic speculation is explicitly labelled.
 7. Check that no unsupported completion percentage or feature claim remains.
-8. Check Markdown formatting and links.
+8. Check Markdown formatting and repository-relative links.
 9. Confirm only the intended documentation file changed.
-10. Run appropriate documentation/static checks if available without changing unrelated files.
+10. Run appropriate documentation/static checks when available without changing unrelated files.
 11. Do not claim full Rust CI was run unless it actually was run and passed.
+
+When practical, the standard repository validation remains:
+
+```text
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Do not weaken CI or modify CI configuration to make the documentation task pass.
 
 ---
 
-## 13. Acceptance criteria
+# 17. Acceptance criteria
 
 AWE-019 is complete only when:
 
@@ -390,14 +539,14 @@ AWE-019 is complete only when:
 - [ ] External strategic claims are dated and confidence-labelled where necessary.
 - [ ] Roadmap recommendations are actionable and prioritized.
 - [ ] Existing AWH architecture guardrails are preserved.
-- [ ] No source-code behavior was changed.
+- [ ] No source-code behavior is changed by this issue.
 - [ ] No unsupported implementation claim remains.
 - [ ] The document is internally consistent and maintainable.
 - [ ] The final diff contains only the intended documentation file.
 
 ---
 
-## 14. Definition of Done
+# 18. Definition of Done
 
 The issue is DONE only if the final report is a reliable engineering/strategy reference that a new contributor can use to understand:
 
@@ -409,11 +558,11 @@ The issue is DONE only if the final report is a reliable engineering/strategy re
 6. what the highest-priority technical work is;
 7. what strategic direction is supported by the available evidence.
 
-The document must be more trustworthy than a simple copy of issue/PR descriptions because its status claims are independently checked against the repository and CI evidence.
+The report must be more trustworthy than a copy of issue/PR descriptions because its status claims are independently checked against the repository and CI evidence.
 
 ---
 
-## 15. Explicit non-goals
+# 19. Explicit non-goals
 
 Do not use AWE-019 to:
 
@@ -431,29 +580,35 @@ Do not use AWE-019 to:
 
 ---
 
-## 16. Final implementation report
+# 20. Final implementation report
 
-When the issue is complete, report:
+When Issue #40 is complete, report:
 
-- target file changed;
-- Issue #40 subject addressed;
-- evidence sources inspected;
-- major report sections added/updated;
-- validation performed;
-- any unresolved evidence gaps;
-- exact final diff scope.
+1. exact target file created/updated;
+2. branch and baseline commit used;
+3. evidence sources inspected;
+4. major report sections added/updated;
+5. implementation-status conclusions;
+6. roadmap conclusions;
+7. known issues identified;
+8. strategic recommendation;
+9. tests/validation executed and results;
+10. evidence limitations or unresolved uncertainty;
+11. exact final diff scope;
+12. explicit confirmation that no unrelated repository file was modified.
 
-State explicitly whether any non-target file changed.
+Do not claim Issue #40 is fully verified if any major status claim remains unsupported. State the limitation explicitly.
 
 ---
 
-## HARD STOP
+# HARD STOP
 
 After completing AWE-019:
 
-1. Do not begin AWE-020 or any later issue.
-2. Do not modify unrelated repository files.
-3. Do not convert strategic recommendations into implementation work.
-4. Do not claim features are implemented without current evidence.
-5. Do not silently change the AWH architecture.
-6. Stop after the AWE-019 deliverable and report the final verification state.
+1. **Do not begin AWE-020 or any later issue.**
+2. **Do not modify unrelated repository files.**
+3. **Do not convert strategic recommendations into implementation work.**
+4. **Do not convert planned roadmap items into claimed implementation.**
+5. **Do not invent verification evidence.**
+6. **Do not weaken existing security controls to simplify the report.**
+7. **Stop after the Issue #40 deliverable and final verification report.**
