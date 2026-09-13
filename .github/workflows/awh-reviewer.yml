@@ -13,49 +13,77 @@ concurrency:
   group: awh-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  AWH_LLM_MODEL: moonshotai/kimi-k3
+  AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+
 jobs:
   review:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+      K1: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
+      K2: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_2 }}
+      K3: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_3 }}
+      K4: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_4 }}
+      KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+      AWH_AGENT_ROLE: reviewer
+      AWH_PR: ${{ github.event.pull_request.number }}
     steps:
-      - name: OpenHands review
-        uses: OpenHands/extensions/plugins/pr-review@main
+      - uses: actions/checkout@v4
         with:
-          agent-kind: openhands
-          llm-model: ${{ secrets.AWH_REVIEWER_MODEL || 'gpt-5.5' }}
-          llm-base-url: ${{ secrets.AWH_LLM_BASE_URL }}
-          llm-api-key: ${{ secrets.AWH_LLM_API_KEY }}
-          github-token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-          use-sub-agents: 'false'
-          require-evidence: 'true'
-          load-public-skills: 'true'
-          collect-feedback: 'false'
+          ref: rust
+          fetch-depth: 0
+          token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
-      - name: Mirror review and dispatch gate
+      - name: Install OpenHands SDK
+        run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2'
+
+      - name: Run Agent 3 with four-key Kimi K3 rotation
+        run: |
+          set +e
+          SUCCESS=0
+          for KEY_NAME in K1 K2 K3 K4 KF; do
+            KEY="${!KEY_NAME}"
+            [ -n "$KEY" ] || continue
+            echo "Agent 3: trying NVIDIA Kimi K3 key pool slot $KEY_NAME"
+            AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/review.txt 2>&1
+            RC=$?
+            cat /tmp/review.txt
+            if [ "$RC" -eq 0 ]; then
+              SUCCESS=1
+              break
+            fi
+            if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/review.txt; then
+              echo "Rate limit detected for $KEY_NAME; rotating to the next key."
+              continue
+            fi
+            echo "Agent 3 failed for a non-rate-limit reason."
+            exit "$RC"
+          done
+          test "$SUCCESS" -eq 1
+
+      - name: Publish review and dispatch merge/fix gate
         env:
-          GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
         run: |
           python - <<'PY'
           import json, os, subprocess
+          from pathlib import Path
           repo=os.environ['GITHUB_REPOSITORY']; pr=os.environ['PR']
-          reviews=json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/pulls/{pr}/reviews','--paginate']))
-          if not reviews:
-              raise SystemExit('OpenHands review produced no GitHub review')
-          latest=reviews[-1]
-          state=latest.get('state','COMMENTED').upper()
-          body=latest.get('body','').strip()
-          feature=subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','headRefName','--jq','.headRefName'],text=True).strip()
-          feature=feature.removeprefix('feature/')
+          review=Path('.openhands/review.md').read_text(encoding='utf-8').strip()
+          verdict=[x.split(':',1)[1].strip() for x in review.splitlines() if x.startswith('VERDICT:')][-1]
           prdata=json.loads(subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','body']))
           old=prdata.get('body') or ''
           marker='<!-- AWH_AGENT3_REVIEW -->'
-          section=f"{marker}\n## Agent 3 Review\n\n**State:** `{state}`\n\n{body}\n\n{marker}"
+          section=f"{marker}\n## Agent 3 Review — Kimi K3\n\n{review}\n\n{marker}"
           if marker in old:
               old=old.split(marker,1)[0].rstrip()
           new=(old+'\n\n'+section).strip()
           subprocess.run(['gh','pr','edit',pr,'--repo',repo,'--body',new],check=True)
-          payload=json.dumps({'event_type':'awh.review-complete','client_payload':{'pr_number':int(pr),'feature_id':feature,'review_state':state}})
-          subprocess.run(['gh','api',f'repos/{repo}/dispatches','--method','POST','--input','-'],input=payload,text=True,check=True)
-          print(f'Agent 3 review state: {state}; feature: {feature}')
+          feature=subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','headRefName','--jq','.headRefName'],text=True).strip().removeprefix('feature/')
+          payload={'event_type':'awh.review-complete','client_payload':{'pr_number':int(pr),'feature_id':feature,'review_state':verdict,'review':review}}
+          subprocess.run(['gh','api',f'repos/{repo}/dispatches','--method','POST','--input','-'],input=json.dumps(payload),text=True,check=True)
+          print(f'Agent 3 verdict: {verdict}; feature: {feature}')
           PY
