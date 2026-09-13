@@ -42,7 +42,6 @@ jobs:
       K1: ${{ secrets.AWH_AGENT1_NVIDIA_KEY_1 }}
       K2: ${{ secrets.AWH_AGENT1_NVIDIA_KEY_2 }}
       K3: ${{ secrets.AWH_AGENT1_NVIDIA_KEY_3 }}
-      K4: ${{ secrets.AWH_AGENT1_NVIDIA_KEY_4 }}
       KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +69,8 @@ jobs:
           AWH_TASK: ${{ inputs.feature_id || github.event.client_payload.feature_id || '' }}
         run: |
           set +e
-          for KEY_NAME in K1 K2 K3 K4 KF; do
+          SUCCESS=0
+          for KEY_NAME in K1 K2 K3 KF; do
             KEY="${!KEY_NAME}"
             [ -n "$KEY" ] || continue
             echo "Agent 1: trying NVIDIA Kimi K3 key pool slot $KEY_NAME"
@@ -78,6 +78,7 @@ jobs:
             RC=$?
             cat /tmp/task.txt
             if [ "$RC" -eq 0 ]; then
+              SUCCESS=1
               break
             fi
             if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/task.txt; then
@@ -87,7 +88,7 @@ jobs:
             echo "Agent 1 failed for a non-rate-limit reason."
             exit "$RC"
           done
-          test -s /tmp/task.txt
+          test "$SUCCESS" -eq 1
           FEATURE_ID=$(sed -n 's/^Feature ID: *//p' /tmp/task.txt | head -n1)
           test -n "$FEATURE_ID"
           {
