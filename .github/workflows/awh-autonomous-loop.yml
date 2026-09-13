@@ -50,6 +50,14 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
+      - name: Verify required LLM secrets
+        run: |
+          test -n "$K1" || { echo 'Missing required secret: AWH_AGENT1_NVIDIA_KEY_1'; exit 1; }
+          test -n "$KF" || { echo 'Missing required secret: AWH_ROUTINE_NVIDIA_KEY'; exit 1; }
+          echo 'Required Agent 1 key and routine fallback are configured.'
+          [ -n "$K2" ] && echo 'Optional Agent 1 key 2 configured.' || echo 'Optional Agent 1 key 2 not configured.'
+          [ -n "$K3" ] && echo 'Optional Agent 1 key 3 configured.' || echo 'Optional Agent 1 key 3 not configured.'
+
       - name: Guard against an active feature
         run: |
           ACTIVE_PR=$(jq -r '.active_pr // empty' .openhands/state.json)
