@@ -41,6 +41,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
+      - name: Validate checkpoint before review
+        run: python scripts/checkpoint_state.py validate
+
       - name: Verify required LLM secrets
         run: |
           test -n "$K1" || { echo 'Missing required secret: AWH_AGENT3_NVIDIA_KEY_1'; exit 1; }
@@ -54,19 +57,14 @@ jobs:
           PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
         run: |
           test -n "$PR"
-          python - <<'PY'
-          import json, os, subprocess
-          from datetime import datetime, timezone
-          from pathlib import Path
-          pr=int(os.environ['PR'])
-          try:
-              feature=subprocess.check_output(['gh','pr','view',str(pr),'--repo',os.environ['GITHUB_REPOSITORY'],'--json','headRefName','--jq','.headRefName'],text=True).strip().removeprefix('feature/')
-          except Exception:
-              feature=''
-          p=Path('.openhands/state.json'); s=json.loads(p.read_text())
-          s.update({'status':'REVIEWING','active_feature':feature or s.get('active_feature'),'active_pr':pr,'updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),'last_error':None})
-          p.write_text(json.dumps(s, indent=2)+"\n")
-          PY
+          FEATURE=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName' | sed 's#^feature/##')
+          test -n "$FEATURE"
+          python scripts/checkpoint_state.py update \
+            --set status='"REVIEWING"' \
+            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE"]))')" \
+            --set active_pr="$PR" \
+            --set active_branch="$(python -c 'import json,subprocess; print(json.dumps(subprocess.check_output(["gh","pr","view",__import__("os").environ["PR"],"--repo",__import__("os").environ["GITHUB_REPOSITORY"],"--json","headRefName","--jq",".headRefName"],text=True).strip()))')" \
+            --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
@@ -87,10 +85,7 @@ jobs:
             AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/review.txt 2>&1
             RC=$?
             cat /tmp/review.txt
-            if [ "$RC" -eq 0 ]; then
-              SUCCESS=1
-              break
-            fi
+            if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
             if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/review.txt; then
               echo "Rate limit detected for $KEY_NAME; rotating to the next key."
               continue
@@ -106,30 +101,23 @@ jobs:
         run: |
           python - <<'PY'
           import json, os, subprocess
-          from datetime import datetime, timezone
           from pathlib import Path
           repo=os.environ['GITHUB_REPOSITORY']; pr=os.environ['PR']
           review=Path('.openhands/review.md').read_text(encoding='utf-8').strip()
-          verdict=[x.split(':',1)[1].strip() for x in review.splitlines() if x.startswith('VERDICT:')][-1]
+          verdicts=[x.split(':',1)[1].strip() for x in review.splitlines() if x.startswith('VERDICT:')]
+          if len(verdicts) != 1 or verdicts[0] not in {'APPROVE','CHANGES_REQUIRED','BLOCKED'}:
+              raise SystemExit('Reviewer output has no single valid VERDICT; refusing checkpoint transition.')
+          verdict=verdicts[0]
           prdata=json.loads(subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','body']))
-          old=prdata.get('body') or ''
-          marker='<!-- AWH_AGENT3_REVIEW -->'
+          old=prdata.get('body') or ''; marker='<!-- AWH_AGENT3_REVIEW -->'
           section=f"{marker}\n## Agent 3 Review — Kimi K3\n\n{review}\n\n{marker}"
-          if marker in old:
-              old=old.split(marker,1)[0].rstrip()
-          new=(old+'\n\n'+section).strip()
-          subprocess.run(['gh','pr','edit',pr,'--repo',repo,'--body',new],check=True)
+          if marker in old: old=old.split(marker,1)[0].rstrip()
+          subprocess.run(['gh','pr','edit',pr,'--repo',repo,'--body',(old+'\n\n'+section).strip()],check=True)
           feature=subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','headRefName','--jq','.headRefName'],text=True).strip().removeprefix('feature/')
-          state_path=Path('.openhands/state.json')
-          state=json.loads(state_path.read_text())
-          state.update({'active_feature':feature,'active_pr':int(pr),'updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),'last_review':review,'last_error':None})
-          if verdict == 'APPROVE':
-              state['status']='PR_OPEN'
-          elif verdict == 'CHANGES_REQUIRED':
-              state['status']='FIXING'
-          else:
-              state['status']='BLOCKED'
-          state_path.write_text(json.dumps(state, indent=2)+'\n')
+          status={'APPROVE':'PR_OPEN','CHANGES_REQUIRED':'FIXING','BLOCKED':'BLOCKED'}[verdict]
+          subprocess.run(['python','scripts/checkpoint_state.py','update',
+              '--set',f'status={json.dumps(status)}','--set',f'active_feature={json.dumps(feature)}',
+              '--set',f'active_pr={int(pr)}','--set','last_error=null','--set',f'last_review={json.dumps(review)}'],check=True)
           subprocess.run(['git','config','user.name','AWH Automation'],check=True)
           subprocess.run(['git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com'],check=True)
           subprocess.run(['git','add','.openhands/state.json'],check=True)
