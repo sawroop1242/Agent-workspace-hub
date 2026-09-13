@@ -65,8 +65,9 @@ jobs:
         env:
           FEATURE_ID: ${{ inputs.feature_id || github.event.client_payload.feature_id || '' }}
         run: |
-          python scripts/checkpoint_state.py update \
-            --set status='"PLANNING"' \
+          python scripts/checkpoint_state.py transition \
+            --expect-status IDLE --expect-status COMPLETED --expect-status PLANNING \
+            --to PLANNING \
             --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ.get("FEATURE_ID") or None))')" \
             --set active_pr=null \
             --set active_branch=null \
@@ -74,8 +75,7 @@ jobs:
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
-          git commit -m 'chore(automation): checkpoint planner start' || true
-          git push origin rust
+          python scripts/safe_git.py push --branch rust --message 'chore(automation): checkpoint planner start'
 
       - name: Guard against an active feature
         run: |
@@ -126,8 +126,9 @@ jobs:
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
         run: |
-          python scripts/checkpoint_state.py update \
-            --set status='"BUILDING"' \
+          python scripts/checkpoint_state.py transition \
+            --expect-status PLANNING \
+            --to BUILDING \
             --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
             --set active_pr=null \
             --set active_branch=null \
@@ -139,8 +140,7 @@ jobs:
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
-          git commit -m "chore(automation): start ${{ steps.plan.outputs.feature_id }}" || true
-          git push origin rust
+          python scripts/safe_git.py push --branch rust --message "chore(automation): start ${{ steps.plan.outputs.feature_id }}"
 
       - name: Dispatch Agent 2
         env:
@@ -194,8 +194,9 @@ jobs:
                   item['status']='completed'; item['merged_pr']=pr
           b.write_text(json.dumps(backlog, indent=2)+"\n", encoding='utf-8')
           PY
-          python scripts/checkpoint_state.py update \
-            --set status='"COMPLETED"' \
+          python scripts/checkpoint_state.py transition \
+            --expect-status PR_OPEN \
+            --to COMPLETED \
             --set active_feature=null \
             --set active_pr=null \
             --set active_branch=null \
@@ -206,8 +207,7 @@ jobs:
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/backlog.json .openhands/state.json
-          git commit -m "chore(automation): complete ${{ github.event.client_payload.feature_id }}" || true
-          git push origin rust
+          python scripts/safe_git.py push --branch rust --message "chore(automation): complete ${{ github.event.client_payload.feature_id }}"
 
       - name: Start next sequential feature
         run: |

@@ -52,16 +52,16 @@ jobs:
           test -n "$FEATURE_ID"
           CURRENT=$(jq -r '.builder_attempt' .openhands/state.json)
           NEXT=$((CURRENT + 1))
-          python scripts/checkpoint_state.py update \
-            --set status='"BUILDING"' \
+          python scripts/checkpoint_state.py transition \
+            --expect-status PLANNING --expect-status FIXING --expect-status BUILDING \
+            --to BUILDING \
             --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
             --set builder_attempt="$NEXT" \
             --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
-          git commit -m 'chore(automation): checkpoint builder attempt' || true
-          git push origin rust
+          python scripts/safe_git.py push --branch rust --message 'chore(automation): checkpoint builder attempt'
 
       - name: Determine branch
         id: branch
@@ -184,8 +184,9 @@ jobs:
         run: |
           git checkout rust
           git pull --ff-only origin rust
-          python scripts/checkpoint_state.py update \
-            --set status='"PR_OPEN"' \
+          python scripts/checkpoint_state.py transition \
+            --expect-status BUILDING --expect-status REVIEWING \
+            --to PR_OPEN \
             --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
             --set active_pr="$PR" \
             --set active_branch="$(python -c 'import json,os; print(json.dumps(os.environ["BRANCH"]))')" \
@@ -193,5 +194,4 @@ jobs:
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
-          git commit -m "chore(automation): record PR ${{ steps.pr.outputs.number }}" || true
-          git push origin rust
+          python scripts/safe_git.py push --branch rust --message "chore(automation): record PR ${{ steps.pr.outputs.number }}"
