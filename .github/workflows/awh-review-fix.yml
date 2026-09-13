@@ -1,0 +1,72 @@
+name: AWH Review Fix Loop
+
+on:
+  repository_dispatch:
+    types: [awh.review-complete]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: awh-review-fix-${{ github.event.client_payload.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: github.event.client_payload.review_state == 'CHANGES_REQUESTED'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: rust
+          fetch-depth: 0
+          token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+
+      - name: Enforce review-round limit
+        env:
+          PR: ${{ github.event.client_payload.pr_number }}
+        run: |
+          ROUND=$(jq -r '.review_round' .openhands/state.json)
+          if [ "$ROUND" -ge 3 ]; then
+            echo "Maximum review rounds reached; leaving feature blocked."
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('.openhands/state.json'); s=json.loads(p.read_text())
+          s['status']='FIXING'; s['review_round']=int(s.get('review_round',0))+1
+          p.write_text(json.dumps(s, indent=2)+"\n")
+          PY
+          git config user.name 'AWH Automation'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .openhands/state.json
+          git commit -m "chore(automation): start review fix round" || true
+          git push origin rust
+
+      - name: Collect reviewer feedback
+        env:
+          GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          PR: ${{ github.event.client_payload.pr_number }}
+        run: |
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --comments > /tmp/pr.txt
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate > /tmp/reviews.json
+
+      - name: Dispatch Agent 2 fix
+        env:
+          GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          PR: ${{ github.event.client_payload.pr_number }}
+          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+        run: |
+          TASK=$(jq -r '.active_feature // empty' .openhands/state.json)
+          REVIEW=$(python - <<'PY'
+          import json
+          d=json.load(open('/tmp/reviews.json'))
+          print(d[-1].get('body','') if d else '')
+          PY
+          )
+          jq -n --arg feature "$FEATURE_ID" --arg review "$REVIEW" \
+            '{event_type:"awh.fix",client_payload:{feature_id:$feature,review:$review}}' > /tmp/payload.json
+          gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/payload.json

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "status": "IDLE",
+  "active_feature": null,
+  "active_pr": null,
+  "active_branch": null,
+  "review_round": 0,
+  "builder_attempt": 0,
+  "last_error": null,
+  "updated_at": null
+}

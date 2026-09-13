@@ -1,0 +1,61 @@
+name: AWH Agent 3 Reviewer
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: awh-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: OpenHands review
+        uses: OpenHands/extensions/plugins/pr-review@main
+        with:
+          agent-kind: openhands
+          llm-model: ${{ secrets.AWH_REVIEWER_MODEL || 'gpt-5.5' }}
+          llm-base-url: ${{ secrets.AWH_LLM_BASE_URL }}
+          llm-api-key: ${{ secrets.AWH_LLM_API_KEY }}
+          github-token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          use-sub-agents: 'false'
+          require-evidence: 'true'
+          load-public-skills: 'true'
+          collect-feedback: 'false'
+
+      - name: Mirror review and dispatch gate
+        env:
+          GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          repo=os.environ['GITHUB_REPOSITORY']; pr=os.environ['PR']
+          reviews=json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/pulls/{pr}/reviews','--paginate']))
+          if not reviews:
+              raise SystemExit('OpenHands review produced no GitHub review')
+          latest=reviews[-1]
+          state=latest.get('state','COMMENTED').upper()
+          body=latest.get('body','').strip()
+          feature=subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','headRefName','--jq','.headRefName'],text=True).strip()
+          feature=feature.removeprefix('feature/')
+          prdata=json.loads(subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','body']))
+          old=prdata.get('body') or ''
+          marker='<!-- AWH_AGENT3_REVIEW -->'
+          section=f"{marker}\n## Agent 3 Review\n\n**State:** `{state}`\n\n{body}\n\n{marker}"
+          if marker in old:
+              old=old.split(marker,1)[0].rstrip()
+          new=(old+'\n\n'+section).strip()
+          subprocess.run(['gh','pr','edit',pr,'--repo',repo,'--body',new],check=True)
+          payload=json.dumps({'event_type':'awh.review-complete','client_payload':{'pr_number':int(pr),'feature_id':feature,'review_state':state}})
+          subprocess.run(['gh','api',f'repos/{repo}/dispatches','--method','POST','--input','-'],input=payload,text=True,check=True)
+          print(f'Agent 3 review state: {state}; feature: {feature}')
+          PY

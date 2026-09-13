@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "policy": {
+    "max_active_features": 1,
+    "max_review_rounds": 3,
+    "base_branch": "rust",
+    "merge_method": "squash"
+  },
+  "features": [
+    {
+      "id": "AWH-AUTO-001",
+      "title": "Harden the autonomous development loop foundation",
+      "priority": 1,
+      "status": "ready",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Add a production-safe sequential Agent 1 -> Agent 2 -> Agent 3 -> Agent 1 GitHub Actions loop.",
+        "Keep the existing Rust CI and release workflows intact.",
+        "Use repository_dispatch for cross-workflow orchestration and prevent concurrent feature runs.",
+        "Require CI success and an APPROVE review before autonomous merge.",
+        "Document required secrets and how to start the loop."
+      ]
+    },
+    {
+      "id": "AWH-AUTO-002",
+      "title": "Add persistent agent-loop state and recovery",
+      "priority": 2,
+      "status": "backlog",
+      "dependencies": ["AWH-AUTO-001"],
+      "acceptance_criteria": [
+        "Persist active feature, PR, attempts, and last error in a small state file.",
+        "Make every orchestration event idempotent.",
+        "Recover safely from a failed or cancelled run without starting a second feature."
+      ]
+    },
+    {
+      "id": "AWH-AUTO-003",
+      "title": "Add AWH CLI smoke-test gate to autonomous delivery",
+      "priority": 3,
+      "status": "backlog",
+      "dependencies": ["AWH-AUTO-001"],
+      "acceptance_criteria": [
+        "Exercise core CLI commands in CI before autonomous merge.",
+        "Include MCP stdio initialization and representative tool calls.",
+        "Keep the test suite deterministic and free of network dependencies unless explicitly required."
+      ]
+    }
+  ]
+}
