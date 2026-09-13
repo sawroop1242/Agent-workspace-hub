@@ -50,6 +50,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
+      - name: Validate checkpoint before planning
+        run: python scripts/checkpoint_state.py validate
+
       - name: Verify required LLM secrets
         run: |
           test -n "$K1" || { echo 'Missing required secret: AWH_AGENT1_NVIDIA_KEY_1'; exit 1; }
@@ -62,15 +65,12 @@ jobs:
         env:
           FEATURE_ID: ${{ inputs.feature_id || github.event.client_payload.feature_id || '' }}
         run: |
-          python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          from pathlib import Path
-          p=Path('.openhands/state.json'); s=json.loads(p.read_text())
-          requested=os.environ.get('FEATURE_ID') or None
-          s.update({'status':'PLANNING','active_feature':requested,'active_pr':None,'active_branch':None,'last_error':None,'updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
-          p.write_text(json.dumps(s, indent=2)+"\n")
-          PY
+          python scripts/checkpoint_state.py update \
+            --set status='"PLANNING"' \
+            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ.get("FEATURE_ID") or None))')" \
+            --set active_pr=null \
+            --set active_branch=null \
+            --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
@@ -104,10 +104,7 @@ jobs:
             AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/task.txt 2>&1
             RC=$?
             cat /tmp/task.txt
-            if [ "$RC" -eq 0 ]; then
-              SUCCESS=1
-              break
-            fi
+            if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
             if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/task.txt; then
               echo "Rate limit detected for $KEY_NAME; rotating to the next key."
               continue
@@ -129,14 +126,15 @@ jobs:
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
         run: |
-          python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          from pathlib import Path
-          p=Path('.openhands/state.json'); s=json.loads(p.read_text())
-          s.update({'status':'BUILDING','active_feature':os.environ['FEATURE_ID'],'active_pr':None,'active_branch':None,'review_round':0,'builder_attempt':0,'last_error':None,'last_review':'','updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
-          p.write_text(json.dumps(s, indent=2)+"\n")
-          PY
+          python scripts/checkpoint_state.py update \
+            --set status='"BUILDING"' \
+            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
+            --set active_pr=null \
+            --set active_branch=null \
+            --set review_round=0 \
+            --set builder_attempt=0 \
+            --set last_error=null \
+            --set last_review='""'
           rm -f .openhands/generated-task.md
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -149,8 +147,7 @@ jobs:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
           TASK: ${{ steps.plan.outputs.task }}
         run: |
-          jq -n --arg feature "$FEATURE_ID" --arg task "$TASK" \
-            '{event_type:"awh.build",client_payload:{feature_id:$feature,task:$task}}' > /tmp/payload.json
+          jq -n --arg feature "$FEATURE_ID" --arg task "$TASK" '{event_type:"awh.build",client_payload:{feature_id:$feature,task:$task}}' > /tmp/payload.json
           gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/payload.json
 
   merge-reviewed-feature:
@@ -188,19 +185,24 @@ jobs:
         run: |
           python - <<'PY'
           import json, os
-          from datetime import datetime, timezone
           from pathlib import Path
+          b=Path('.openhands/backlog.json')
+          backlog=json.loads(b.read_text(encoding='utf-8'))
           feature=os.environ['FEATURE_ID']; pr=int(os.environ['PR'])
-          b=Path('.openhands/backlog.json'); s=Path('.openhands/state.json')
-          backlog=json.loads(b.read_text())
           for item in backlog['features']:
               if item['id']==feature:
                   item['status']='completed'; item['merged_pr']=pr
-          state=json.loads(s.read_text())
-          state.update({'status':'COMPLETED','active_feature':None,'active_pr':None,'active_branch':None,'review_round':0,'builder_attempt':0,'last_error':None,'last_review':'','updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
-          b.write_text(json.dumps(backlog, indent=2)+"\n")
-          s.write_text(json.dumps(state, indent=2)+"\n")
+          b.write_text(json.dumps(backlog, indent=2)+"\n", encoding='utf-8')
           PY
+          python scripts/checkpoint_state.py update \
+            --set status='"COMPLETED"' \
+            --set active_feature=null \
+            --set active_pr=null \
+            --set active_branch=null \
+            --set review_round=0 \
+            --set builder_attempt=0 \
+            --set last_error=null \
+            --set last_review='""'
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/backlog.json .openhands/state.json
@@ -209,6 +211,4 @@ jobs:
 
       - name: Start next sequential feature
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST \
-            -f event_type=awh.start \
-            -f 'client_payload[reason]=feature_merged'
+          gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST -f event_type=awh.start -f 'client_payload[reason]=feature_merged'
