@@ -80,6 +80,26 @@ def load_state() -> dict[str, Any]:
     return validate_state(load_json(STATE_PATH))
 
 
+def _sync_directory(directory: Path) -> None:
+    """Durably sync the parent directory where the platform supports it.
+
+    POSIX filesystems can fsync a directory after os.replace(), which closes
+    the durability window for the rename. Windows does not expose
+    os.O_DIRECTORY, and attempting to use it raises AttributeError. The file
+    itself is flushed before replacement on every platform; on Windows we
+    therefore rely on the platform's atomic replace semantics rather than
+    opening the directory with a POSIX-only flag.
+    """
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if directory_flag is None:
+        return
+    dir_fd = os.open(directory, directory_flag)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def atomic_write(state: dict[str, Any]) -> None:
     validate_state(state)
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -92,11 +112,7 @@ def atomic_write(state: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, STATE_PATH)
-        dir_fd = os.open(STATE_PATH.parent, os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        _sync_directory(STATE_PATH.parent)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
