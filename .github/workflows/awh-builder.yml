@@ -34,6 +34,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
+      - name: Validate checkpoint before builder work
+        run: python scripts/checkpoint_state.py validate
+
       - name: Verify required LLM secrets
         run: |
           test -n "$K1" || { echo 'Missing required secret: AWH_AGENT2_NVIDIA_KEY_1'; exit 1; }
@@ -47,22 +50,17 @@ jobs:
           FEATURE_ID: ${{ github.event.client_payload.feature_id }}
         run: |
           test -n "$FEATURE_ID"
-          python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          from pathlib import Path
-          p=Path('.openhands/state.json'); s=json.loads(p.read_text())
-          s['status']='BUILDING'
-          s['active_feature']=os.environ['FEATURE_ID']
-          s['builder_attempt']=int(s.get('builder_attempt',0))+1
-          s['updated_at']=datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
-          s['last_error']=None
-          p.write_text(json.dumps(s, indent=2)+"\n")
-          PY
+          CURRENT=$(jq -r '.builder_attempt' .openhands/state.json)
+          NEXT=$((CURRENT + 1))
+          python scripts/checkpoint_state.py update \
+            --set status='"BUILDING"' \
+            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
+            --set builder_attempt="$NEXT" \
+            --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
-          git commit -m "chore(automation): checkpoint builder attempt" || true
+          git commit -m 'chore(automation): checkpoint builder attempt' || true
           git push origin rust
 
       - name: Determine branch
@@ -115,10 +113,7 @@ jobs:
             AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/agent2.txt 2>&1
             RC=$?
             cat /tmp/agent2.txt
-            if [ "$RC" -eq 0 ]; then
-              SUCCESS=1
-              break
-            fi
+            if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
             if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/agent2.txt; then
               echo "Rate limit detected for $KEY_NAME; rotating to the next key."
               continue
@@ -158,10 +153,7 @@ jobs:
           TASK: ${{ github.event.client_payload.task }}
         run: |
           EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base rust --state open --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING" ]; then
-            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          if [ -n "$EXISTING" ]; then echo "number=$EXISTING" >> "$GITHUB_OUTPUT"; exit 0; fi
           BODY=$(cat <<EOF
           ## Autonomous Feature Delivery
 
@@ -192,14 +184,12 @@ jobs:
         run: |
           git checkout rust
           git pull --ff-only origin rust
-          python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          from pathlib import Path
-          p=Path('.openhands/state.json'); s=json.loads(p.read_text())
-          s.update({'status':'PR_OPEN','active_feature':os.environ['FEATURE_ID'],'active_pr':int(os.environ['PR']),'active_branch':os.environ['BRANCH'],'updated_at':datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),'last_error':None})
-          p.write_text(json.dumps(s, indent=2)+"\n")
-          PY
+          python scripts/checkpoint_state.py update \
+            --set status='"PR_OPEN"' \
+            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
+            --set active_pr="$PR" \
+            --set active_branch="$(python -c 'import json,os; print(json.dumps(os.environ["BRANCH"]))')" \
+            --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
