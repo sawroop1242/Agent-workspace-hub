@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AWH checkpoint state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "status",
+    "active_feature",
+    "active_pr",
+    "active_branch",
+    "review_round",
+    "builder_attempt",
+    "last_error",
+    "last_review",
+    "updated_at"
+  ],
+  "properties": {
+    "version": {"const": 2},
+    "status": {
+      "type": "string",
+      "enum": ["IDLE", "PLANNING", "BUILDING", "PR_OPEN", "REVIEWING", "FIXING", "COMPLETED", "BLOCKED"]
+    },
+    "active_feature": {"type": ["string", "null"]},
+    "active_pr": {"type": ["integer", "null"], "minimum": 1},
+    "active_branch": {"type": ["string", "null"]},
+    "review_round": {"type": "integer", "minimum": 0},
+    "builder_attempt": {"type": "integer", "minimum": 0},
+    "last_error": {"type": ["string", "null"]},
+    "last_review": {"type": "string"},
+    "updated_at": {"type": ["string", "null"], "format": "date-time"}
+  }
+}
