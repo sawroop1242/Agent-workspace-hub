@@ -8,42 +8,49 @@ All three agents use the **same model: `moonshotai/kimi-k3`**, hosted by NVIDIA'
 
 ## Key pools
 
-Each agent has its own four-key NVIDIA pool so one agent cannot consume another agent's quota:
+Each agent has its own **three-key NVIDIA pool**, followed by one shared routine fallback. A fourth role-specific key is not required by the workflows.
 
 ### Agent 1 — Orchestrator
+
+Required:
 
 - `AWH_AGENT1_NVIDIA_KEY_1`
 - `AWH_AGENT1_NVIDIA_KEY_2`
 - `AWH_AGENT1_NVIDIA_KEY_3`
-- `AWH_AGENT1_NVIDIA_KEY_4`
 
 ### Agent 2 — Builder
+
+Required:
 
 - `AWH_AGENT2_NVIDIA_KEY_1`
 - `AWH_AGENT2_NVIDIA_KEY_2`
 - `AWH_AGENT2_NVIDIA_KEY_3`
-- `AWH_AGENT2_NVIDIA_KEY_4`
 
 ### Agent 3 — Reviewer
+
+Required:
 
 - `AWH_AGENT3_NVIDIA_KEY_1`
 - `AWH_AGENT3_NVIDIA_KEY_2`
 - `AWH_AGENT3_NVIDIA_KEY_3`
-- `AWH_AGENT3_NVIDIA_KEY_4`
 
 ### Shared routine fallback
 
+Required:
+
 - `AWH_ROUTINE_NVIDIA_KEY`
 
-The routine key is attempted only after the four role-specific keys report a rate-limit condition.
+The routine key is attempted only after all three role-specific keys for the current agent report a rate-limit condition.
 
 ## Rotation behavior
 
-The workflows use this order:
+The workflows use this order for every agent:
 
-`KEY_1 -> KEY_2 -> KEY_3 -> KEY_4 -> ROUTINE_KEY`
+`KEY_1 -> KEY_2 -> KEY_3 -> ROUTINE_KEY`
 
 Rotation happens **only when the previous request appears to have hit HTTP 429/rate limiting**. Normal agent failures are not silently retried with another key; they fail the workflow so the underlying problem remains visible.
+
+If a role-specific key is not configured, that slot is skipped. The intended production configuration is three keys per agent plus the shared routine fallback.
 
 The model and endpoint are fixed in the workflows:
 
@@ -52,18 +59,42 @@ The model and endpoint are fixed in the workflows:
 
 No per-agent model selection is used.
 
-## Other required secret
+## Required GitHub secrets
 
-Create:
+Create these secrets under **Settings -> Secrets and variables -> Actions**:
+
+### Agent 1
+
+- `AWH_AGENT1_NVIDIA_KEY_1`
+- `AWH_AGENT1_NVIDIA_KEY_2`
+- `AWH_AGENT1_NVIDIA_KEY_3`
+
+### Agent 2
+
+- `AWH_AGENT2_NVIDIA_KEY_1`
+- `AWH_AGENT2_NVIDIA_KEY_2`
+- `AWH_AGENT2_NVIDIA_KEY_3`
+
+### Agent 3
+
+- `AWH_AGENT3_NVIDIA_KEY_1`
+- `AWH_AGENT3_NVIDIA_KEY_2`
+- `AWH_AGENT3_NVIDIA_KEY_3`
+
+### Shared fallback
+
+- `AWH_ROUTINE_NVIDIA_KEY`
+
+### GitHub automation
 
 - `AWH_AUTOMATION_TOKEN` — fine-grained token for this repository with Contents read/write, Pull requests read/write, and Checks read.
 
-Do not put NVIDIA API keys in repository files or workflow YAML.
+In total, the LLM side requires **10 NVIDIA secrets: 3 per agent × 3 agents + 1 shared routine fallback**. Do not put NVIDIA API keys in repository files or workflow YAML.
 
 ## Starting the loop
 
 1. Make sure the `rust` branch is the repository default branch.
-2. Add the automation token and all NVIDIA key secrets under **Settings -> Secrets and variables -> Actions**.
+2. Add the required GitHub secrets listed above.
 3. Open **Actions -> AWH Autonomous Development Loop**.
 4. Choose **Run workflow**, keep `start=true`, and optionally enter a specific ready feature.
 5. Agent 1 selects/plans the feature and dispatches Agent 2.
