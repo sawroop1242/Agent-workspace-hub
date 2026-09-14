@@ -24,7 +24,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -89,10 +89,37 @@ pub struct AppState {
 }
 
 /// Serves the remote MCP server over HTTP (optionally TLS) until shutdown.
+/// Enforces SEC-002: plaintext MCP HTTP/SSE is allowed only for loopback binds.
+/// Any non-loopback bind must have TLS enabled; otherwise startup is rejected.
 pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> Result<()> {
     config.tls.validate()?;
     if config.api_key.is_empty() {
         anyhow::bail!("refusing to serve remote MCP without an API key");
+    }
+
+    // SEC-002: Require TLS for non-loopback binds. Fail closed if host cannot
+    // be reliably classified as loopback (e.g. "localhost" without resolution).
+    let host_addr: std::net::IpAddr = config.host.parse::<std::net::IpAddr>()
+        .unwrap_or_else(|_| {
+            // "localhost" or other non-IP host strings cannot be safely classified
+            // as loopback without DNS resolution — fail closed.
+            anyhow::bail!(
+                "TLS is required for non-loopback MCP HTTP/SSE binds; invalid or unresolvable host: {}",
+                config.host
+            );
+        });
+
+    // Check if the resolved address is a loopback address.
+    // IPv4 loopback: 127.0.0.1/8
+    // IPv6 loopback: ::1
+    let is_loopback = host_addr.is_loopback();
+
+    // Reject plaintext on non-loopback addresses.
+    if !config.tls.enabled() && !is_loopback {
+        anyhow::bail!(
+            "TLS is required for non-loopback MCP HTTP/SSE binds; plaintext bind rejected for {}",
+            config.host
+        );
     }
 
     let state = AppState {
