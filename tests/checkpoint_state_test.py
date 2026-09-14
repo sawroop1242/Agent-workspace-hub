@@ -706,6 +706,61 @@ def test_recovery_workflow_uses_claim_and_finalization():
     assert "awh-checkpoint-recovery" in text  # single global concurrency group
 
 
+def test_recovery_workflow_handles_explicit_claim_results():
+    """The recovery claim step must act on the reported result: only CLAIMED
+    continues; LOST_CLAIM and NO_OP exit green without dispatching anything;
+    anything else is a hard failure."""
+    import re
+
+    text = (ROOT / ".github/workflows/awh-recovery.yml").read_text(encoding="utf-8")
+
+    # The claim is invoked with the identity observed from the remote, and the
+    # result is parsed explicitly (never trusted from the exit code alone).
+    assert "--claim-owner" in text
+    assert "--operation-id" in text
+    assert re.search(r"claim-recovery[^#]*?--claim-owner", text, re.DOTALL)
+
+    for case in ("CLAIMED", "LOST_CLAIM", "NO_OP"):
+        assert re.search(rf"^\s*{case}\)$", text, re.MULTILINE), f"{case} case missing"
+    assert "::error::Recovery claim failed" in text
+
+    # A lost claim is not a failure: it must not block the checkpoint.
+    assert "Another recovery worker won the claim; exiting safely" in text
+    assert re.search(
+        r"if: failure\(\) && steps\.claim\.outputs\.result != 'LOST_CLAIM'", text)
+
+    # Everything downstream of the claim runs only after a successful claim:
+    # a lost claim never dispatches Agent 1/2/3.
+    decide = text.split("Inspect reality and decide the safe continuation", 1)[1]
+    assert "steps.claim.outputs.result == 'CLAIMED'" in decide
+
+
+def test_claim_publishes_through_push_claim_not_safe_push():
+    """The claim path in the pipeline must use the fail-closed push_claim
+    primitive (never the fetch/rebase/retry push) after the remote race."""
+    import importlib.util
+    import inspect
+
+    spec = importlib.util.spec_from_file_location(
+        "awh_pipeline_claim", ROOT / "scripts" / "awh_pipeline.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    claim_body = inspect.getsource(module.claim_recovery) + inspect.getsource(module._publish_claim)
+    assert "push_claim" in claim_body
+    assert "stage_and_push" not in claim_body
+    assert "recovery claim lost" in inspect.getsource(module._publish_claim) or "LostClaimError" in claim_body
+
+    safe_spec = importlib.util.spec_from_file_location(
+        "safe_git_claim", ROOT / "scripts" / "safe_git.py")
+    safe = importlib.util.module_from_spec(safe_spec)
+    safe_spec.loader.exec_module(safe)
+    # The normal path is unchanged: push() still fetch/rebases/retries.
+    push_body = inspect.getsource(safe.push)
+    assert "rebase_onto" in push_body
+    assert "fetch" in push_body
+
+
 def test_builder_feature_branch_push_is_safe():
     """The only raw push left: pushing the feature branch (never rust)."""
     text = (ROOT / ".github/workflows/awh-builder.yml").read_text(encoding="utf-8")

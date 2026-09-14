@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+from pathlib import Path
 
 MAX_PUSH_ATTEMPTS = 3
 
@@ -16,6 +17,14 @@ MAX_PUSH_ATTEMPTS = 3
 # first") or because histories diverged ("non-fast-forward"); both are
 # recoverable with fetch + rebase. Any other rejection is a real failure.
 NON_FAST_FORWARD_MARKERS = ("non-fast-forward", "fetch first")
+
+
+class GitError(RuntimeError):
+    """A git operation failed in a way the caller cannot safely resolve."""
+
+
+class LostClaimError(RuntimeError):
+    """The remote branch changed before a recovery claim could be published."""
 
 
 def fail(message: str) -> None:
@@ -90,6 +99,55 @@ def commit_staged(message: str) -> None:
 def is_non_fast_forward(result: subprocess.CompletedProcess[str]) -> bool:
     combined = (result.stderr + result.stdout).lower()
     return any(marker in combined for marker in NON_FAST_FORWARD_MARKERS)
+
+
+def run_git(
+    repo: Path,
+    arguments: list[str],
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run git in an explicit repository, non-interactively, output captured."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise GitError(f"'git {' '.join(arguments)}' in {repo} failed (exit {result.returncode}):\n{detail}")
+    return result
+
+
+def push_claim(repo: Path, remote: str, branch: str) -> None:
+    """Publish a recovery claim.
+
+    IMPORTANT:
+    - Never fetch/rebase/retry after a rejected push.
+    - A non-fast-forward means another writer changed the checkpoint.
+    - The caller must treat this as a lost claim.
+
+    Unlike safe_push, this path never reconciles with the remote: the claim
+    was computed against the exact state that was observed, so any remote
+    movement invalidates it rather than something to build on top of.
+    """
+    head = run_git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False)
+    if head.returncode != 0 or head.stdout.strip() != f"refs/heads/{branch}":
+        raise GitError(
+            f"HEAD is not on refs/heads/{branch} (got {head.stdout.strip() or 'detached HEAD'}); refusing to push the claim."
+        )
+
+    result = run_git(repo, ["push", remote, f"HEAD:{branch}"], check=False)
+
+    if result.returncode == 0:
+        return
+
+    output = f"{result.stdout}\n{result.stderr}"
+
+    if is_non_fast_forward(result):
+        raise LostClaimError("recovery claim lost: remote branch advanced")
+
+    raise GitError(f"recovery claim push failed: {output}")
 
 
 def rebase_onto(branch: str) -> None:

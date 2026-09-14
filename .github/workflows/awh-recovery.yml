@@ -33,16 +33,55 @@ jobs:
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
       - name: Sync checkpoint from the shared branch
-        run: python scripts/safe_git.py sync --branch rust
+        run: |
+          git config user.name 'AWH Recovery'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python scripts/safe_git.py sync --branch rust
+
+      - name: Observe the identity to recover
+        id: observe
+        run: |
+          # Read the identity from the remote tip we just synced to: the claim
+          # validates that origin/rust still shows exactly this when it lands.
+          FEATURE=$(jq -r '.active_feature // ""' .openhands/state.json)
+          OPERATION_ID=$(jq -r '.operation_id // ""' .openhands/state.json)
+          if [ -z "$FEATURE" ]; then
+            echo 'No active feature on the shared checkpoint; nothing to recover (the loop re-plans).'
+            exit 0
+          fi
+          echo "feature=$FEATURE" >> "$GITHUB_OUTPUT"
+          echo "operation_id=$OPERATION_ID" >> "$GITHUB_OUTPUT"
 
       - name: Atomically claim recovery of stale work
+        id: claim
+        if: steps.observe.outputs.feature != ''
         run: |
-          python scripts/awh_pipeline.py claim-recovery \
-            --owner "$RECOVERY_OWNER" \
+          result="$(python scripts/awh_pipeline.py claim-recovery \
+            --feature "${{ steps.observe.outputs.feature }}" \
+            --operation-id "${{ steps.observe.outputs.operation_id }}" \
+            --claim-owner "$RECOVERY_OWNER" \
             --stale-minutes "$STALE_MINUTES" \
-            --lease-minutes "$LEASE_MINUTES"
+            --lease-minutes "$LEASE_MINUTES" | tail -n1)"
+
+          case "$result" in
+            CLAIMED)
+              echo "Recovery claim acquired"
+              ;;
+            LOST_CLAIM)
+              echo "Another recovery worker won the claim; exiting safely"
+              ;;
+            NO_OP)
+              echo "Nothing recoverable right now; exiting safely"
+              ;;
+            *)
+              echo "::error::Recovery claim failed (result: $result)"
+              exit 1
+              ;;
+          esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
 
       - name: Inspect reality and decide the safe continuation
+        if: steps.claim.outputs.result == 'CLAIMED'
         run: |
           python scripts/awh_pipeline.py decide-recovery | tee /tmp/decision.txt
           TARGET=$(sed -n 's/^TARGET=//p' /tmp/decision.txt | head -n1)
@@ -81,7 +120,9 @@ jobs:
           fi
 
       - name: Record recovery failure
-        if: failure()
+        # A lost claim or a no-op is a safe standdown, not a failure: blocking
+        # the checkpoint here would undo the winner's recovery.
+        if: failure() && steps.claim.outputs.result != 'LOST_CLAIM' && steps.claim.outputs.result != 'NO_OP'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent recovery --stage recover \

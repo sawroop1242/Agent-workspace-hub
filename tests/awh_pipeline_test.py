@@ -281,9 +281,14 @@ def test_claim_recovery_single_job_acquires_claim(repo):
     seed_stale_build(repo)
     job = Runner(repo.origin, "recovery-a")
 
-    result = job.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90")
+    result = job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:2",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    )
 
     assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout.strip().endswith("CLAIMED")
     assert "recovery claim acquired" in result.stdout
     state = json.loads(subprocess.run(
         ["git", "-C", str(job.path), "show", "origin/rust:.openhands/state.json"],
@@ -295,53 +300,213 @@ def test_claim_recovery_single_job_acquires_claim(repo):
     assert state["recovery_claim"]["stale_status"] == "BUILDING"
     assert state["recovery_claim"]["operation_id"] == "AWH-AUTO-002:BUILD:2"
     assert state["operation_id"] == "AWH-AUTO-002:RECOVERY:1"
+    # The winner published its claim through the fail-closed path.
+    log = git(job.path, "log", "--oneline", "origin/rust").stdout
+    assert "claim recovery AWH-AUTO-002" in log
 
 
-def test_two_racing_recovery_jobs_only_one_wins(repo, monkeypatch):
-    """The scenario from the PR: two recovery jobs, one stale BUILDING
-    checkpoint. Only one may dispatch the builder; the other must exit
-    without doing work."""
+def test_claim_rejects_when_remote_identity_differs(repo):
+    """The claim is only valid against the exact state the caller observed."""
     seed_stale_build(repo)
-    job_a = Runner(repo.origin, "recovery-a")
-    job_b = Runner(repo.origin, "recovery-b")
+    job = Runner(repo.origin, "recovery-a")
 
-    # Job A claims first (its transition + push land).
-    result_a = job_a.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90")
-    assert result_a.returncode == 0, (result_a.stdout, result_a.stderr)
-    assert "recovery claim acquired" in result_a.stdout
+    wrong_feature = job.run(
+        "claim-recovery", "--feature", "AWH-OTHER-9",
+        "--operation-id", "AWH-AUTO-002:BUILD:2",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    )
+    assert wrong_feature.returncode == 0
+    assert wrong_feature.stdout.strip().endswith("LOST_CLAIM")
 
-    # Job B starts from the same stale base and loses the race three ways:
-    # the CAS read fails, or the push conflicts, or the remote shows the claim.
-    result_b = job_b.run("claim-recovery", "--owner", "job-b", "--stale-minutes", "90")
+    wrong_operation = job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:1",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    )
+    assert wrong_operation.returncode == 0
+    assert wrong_operation.stdout.strip().endswith("LOST_CLAIM")
 
-    combined = (result_b.stdout + result_b.stderr).lower()
-    if result_b.returncode == 0:
-        assert "claim" in combined
-        assert any(phrase in combined for phrase in ("already held", "lost", "standing down", "did not win"))
-    else:
-        # A hard failure is acceptable ONLY if the loser never pushed its own
-        # claim over the winner's.
-        pass
+    # Neither attempt touched the remote.
+    state = json.loads(subprocess.run(
+        ["git", "-C", str(job.path), "show", "origin/rust:.openhands/state.json"],
+        capture_output=True, text=True, env=GIT_ENV,
+    ).stdout)
+    assert state["status"] == "BUILDING"  # untouched, still stale
 
+
+def test_two_workers_race_same_remote_state_exactly_one_claim(repo, monkeypatch):
+    """The dangerous sequence: two recovery workers observe the SAME remote
+    state, both build a claim locally, and both push. Exactly one publishes;
+    the loser's claim push is rejected as non-fast-forward and it reports
+    LOST_CLAIM without ever rebasing or retrying."""
+    seed_stale_build(repo)
+    base = git(repo.primary.path, "rev-parse", "HEAD").stdout.strip()
+
+    owner_a, owner_b = "recovery-job-a", "recovery-job-b"
+    runner_a = Runner(repo.origin, "recovery-a")
+    runner_b = Runner(repo.origin, "recovery-b")
+    assert git(runner_a.path, "rev-parse", "HEAD").stdout.strip() == base
+    assert git(runner_b.path, "rev-parse", "HEAD").stdout.strip() == base
+
+    # Worker B claims in-process; its observation of the remote is patched so
+    # that worker A publishes ITS claim immediately after B reads the shared
+    # stale state - the exact window where both believe they can win.
+    monkeypatch.setenv("AWH_REPO_ROOT", str(runner_b.path))
+    monkeypatch.chdir(runner_b.path)
+    module = load_pipeline()
+
+    original_read = module.read_remote_state
+
+    def read_then_let_a_win():
+        observed = original_read()
+        assert observed["status"] == "BUILDING", "B must observe the shared stale state"
+        # A races ahead and publishes its claim before B can.
+        result_a = runner_a.run(
+            "claim-recovery", "--feature", "AWH-AUTO-002",
+            "--operation-id", "AWH-AUTO-002:BUILD:2",
+            "--claim-owner", owner_a, "--stale-minutes", "90",
+        )
+        assert result_a.returncode == 0, (result_a.stdout, result_a.stderr)
+        assert result_a.stdout.strip().endswith("CLAIMED")
+        return observed
+
+    monkeypatch.setattr(module, "read_remote_state", read_then_let_a_win)
+    result_b = module.claim_recovery(
+        feature_id="AWH-AUTO-002",
+        expected_operation_id="AWH-AUTO-002:BUILD:2",
+        claim_owner=owner_b,
+        stale_minutes=90,
+    )
+    result_a_value = module.ClaimResult.CLAIMED  # A's subprocess reported CLAIMED
+
+    assert result_a_value != result_b
+    assert {result_a_value, result_b} == {module.ClaimResult.CLAIMED, module.ClaimResult.LOST_CLAIM}
+
+    # The remote shows exactly one claim, from exactly one owner.
     remote = json.loads(subprocess.run(
-        ["git", "-C", str(job_a.path), "show", "origin/rust:.openhands/state.json"],
+        ["git", "-C", str(runner_a.path), "show", "origin/rust:.openhands/state.json"],
         capture_output=True, text=True, env=GIT_ENV,
     ).stdout)
     assert remote["status"] == "RECOVERING"
-    # The winner's claim is intact and B never overwrote it.
-    assert remote["recovery_claim"]["owner"] == "job-a"
-    assert remote["recovery_attempt"] == 1
+    assert remote["recovery_claim"]["owner"] in {owner_a, owner_b}
+    assert remote["recovery_claim"]["owner"] == owner_a
+
+    # MOST IMPORTANT: the losing claim's commit does NOT appear on origin/rust.
+    loser_head = git(runner_b.path, "rev-parse", "HEAD").stdout.strip()
+    origin_commits = git(runner_a.path, "rev-list", "origin/rust").stdout.split()
+    assert loser_head not in origin_commits, "the loser's claim commit reached the remote"
+
+    # The loser stands down cleanly: its local commit survives unrebased (its
+    # parent is still the shared base), and no rebase was left dangling.
+    assert git(runner_b.path, "rev-parse", f"{loser_head}^").stdout.strip() == base
+    assert not (runner_b.path / ".git" / "rebase-merge").exists()
+    assert not (runner_b.path / ".git" / "rebase-apply").exists()
+
+
+def test_recovery_claim_never_rebases_after_non_ff(repo, monkeypatch):
+    """Regression: after a rejected claim push there must be exactly ONE push
+    attempt and ZERO rebase calls - a second push or any rebase here would
+    recreate the race the claim is meant to close."""
+    seed_stale_build(repo)
+    base = git(repo.primary.path, "rev-parse", "HEAD").stdout.strip()
+
+    owner_a, owner_b = "recovery-job-a", "recovery-job-b"
+    runner_a = Runner(repo.origin, "recovery-a")
+    runner_b = Runner(repo.origin, "recovery-b")
+
+    monkeypatch.setenv("AWH_REPO_ROOT", str(runner_b.path))
+    monkeypatch.chdir(runner_b.path)
+    module = load_pipeline()
+
+    # A publishes its claim right after B commits its own claim locally, so
+    # B's push is guaranteed to be rejected as non-fast-forward.
+    original_commit = module.stage_and_commit
+
+    def commit_then_let_a_win(message):
+        original_commit(message)
+        result_a = runner_a.run(
+            "claim-recovery", "--feature", "AWH-AUTO-002",
+            "--operation-id", "AWH-AUTO-002:BUILD:2",
+            "--claim-owner", owner_a, "--stale-minutes", "90",
+        )
+        assert result_a.returncode == 0, (result_a.stdout, result_a.stderr)
+
+    monkeypatch.setattr(module, "stage_and_commit", commit_then_let_a_win)
+
+    # Instrument every safe_git call worker B makes so the test fails if the
+    # claim path ever re-fetches, rebases, or pushes a second time.
+    calls: list[tuple[str, ...]] = []
+    real_loader = module.load_script_module
+
+    def recording_loader(name):
+        loaded = real_loader(name)
+        if name == "safe_git":
+            class RecordingSafeGit:
+                def __getattr__(self, item):
+                    return getattr(loaded, item)
+
+                def sync(self, branch):
+                    calls.append(("sync", branch))
+                    return loaded.sync(branch)
+
+                def push_claim(self, **kwargs):
+                    calls.append(("push_claim", kwargs["branch"]))
+                    return loaded.push_claim(**kwargs)
+
+            return RecordingSafeGit()
+        return loaded
+
+    monkeypatch.setattr(module, "load_script_module", recording_loader)
+
+    result = module.claim_recovery(
+        feature_id="AWH-AUTO-002",
+        expected_operation_id="AWH-AUTO-002:BUILD:2",
+        claim_owner=owner_b,
+        stale_minutes=90,
+    )
+    assert result is module.ClaimResult.LOST_CLAIM
+
+    # Exactly one claim push was attempted, and nothing else was tried after
+    # the rejection: no re-fetch, no rebase, no second push.
+    assert calls.count(("push_claim", "rust")) == 1
+    rebases = [c for c in calls if "rebase" in c[0]]
+    assert rebases == []
+    extra_syncs = [c for c in calls if c[0] == "sync"]
+    assert len(extra_syncs) == 1  # only the initial observation sync
+
+    # B's local claim commit was never rebased onto A's history.
+    loser_head = git(runner_b.path, "rev-parse", "HEAD").stdout.strip()
+    assert git(runner_b.path, "rev-parse", f"{loser_head}^").stdout.strip() == base
+    origin_commits = git(runner_a.path, "rev-list", "origin/rust").stdout.split()
+    assert loser_head not in origin_commits
 
 
 def test_second_claim_same_owner_is_reentry_not_duplicate(repo):
     seed_stale_build(repo)
     job = Runner(repo.origin, "recovery-a")
-    assert job.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90").returncode == 0
+    assert job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:2",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    ).returncode == 0
 
     # The same job re-running (retry) re-enters its own claim, no second claim.
-    result = job.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90")
+    result = job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:RECOVERY:1",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    )
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "already held by this owner" in result.stdout
+    assert result.stdout.strip().endswith("CLAIMED")
+
+    # The re-entry published nothing new: the remote is unchanged.
+    remote = json.loads(subprocess.run(
+        ["git", "-C", str(job.path), "show", "origin/rust:.openhands/state.json"],
+        capture_output=True, text=True, env=GIT_ENV,
+    ).stdout)
+    assert remote["recovery_attempt"] == 1
+    assert remote["recovery_claim"]["owner"] == "job-a"
 
 
 def test_claim_recovery_ignores_fresh_checkpoint(repo):
@@ -352,10 +517,15 @@ def test_claim_recovery_ignores_fresh_checkpoint(repo):
     git(repo.primary.path, "push", "origin", "rust")
     job = Runner(repo.origin, "recovery-a")
 
-    result = job.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90")
+    result = job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:1",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    )
 
     assert result.returncode == 0
     assert "not stale" in result.stdout
+    assert result.stdout.strip().endswith("NO_OP")
     remote = json.loads(subprocess.run(
         ["git", "-C", str(job.path), "show", "origin/rust:.openhands/state.json"],
         capture_output=True, text=True, env=GIT_ENV,
@@ -371,23 +541,36 @@ def test_claim_recovery_ignores_terminal_checkpoint(repo):
     git(repo.primary.path, "push", "origin", "rust")
     job = Runner(repo.origin, "recovery-a")
 
-    result = job.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90")
+    result = job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:1",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    )
 
     assert result.returncode == 0
     assert "No recoverable checkpoint: status=BLOCKED" in result.stdout
+    assert result.stdout.strip().endswith("NO_OP")
 
 
 def test_claim_recovery_requires_owner(repo):
     job = Runner(repo.origin, "recovery-a")
-    result = job.run("claim-recovery", "--owner", "")
+    result = job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:1",
+        "--claim-owner", "",
+    )
     assert result.returncode == 1
-    assert "non-empty --owner" in result.stdout + result.stderr
+    assert "non-empty --claim-owner" in result.stdout + result.stderr
 
 
 def test_finalize_recovery_releases_claim_and_moves_to_verified_target(repo):
     seed_stale_build(repo)
     job = Runner(repo.origin, "recovery-a")
-    assert job.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90").returncode == 0
+    assert job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:2",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    ).returncode == 0
 
     result = job.run(
         "finalize-recovery", "--owner", "job-a", "--to", "BUILDING",
@@ -409,7 +592,11 @@ def test_finalize_recovery_refuses_when_another_owner_holds_the_lease(repo):
     seed_stale_build(repo)
     job_a = Runner(repo.origin, "recovery-a")
     job_b = Runner(repo.origin, "recovery-b")
-    assert job_a.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90").returncode == 0
+    assert job_a.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:2",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    ).returncode == 0
 
     # job_b's stale clone still says BUILDING: its finalize must stand down,
     # never stomp job-a's claim.
@@ -430,7 +617,11 @@ def test_finalize_recovery_refuses_when_another_owner_holds_the_lease(repo):
 def test_finalize_recovery_illegal_target_is_rejected_without_mutation(repo):
     seed_stale_build(repo)
     job = Runner(repo.origin, "recovery-a")
-    assert job.run("claim-recovery", "--owner", "job-a", "--stale-minutes", "90").returncode == 0
+    assert job.run(
+        "claim-recovery", "--feature", "AWH-AUTO-002",
+        "--operation-id", "AWH-AUTO-002:BUILD:2",
+        "--claim-owner", "job-a", "--stale-minutes", "90",
+    ).returncode == 0
 
     result = job.run(
         "finalize-recovery", "--owner", "job-a", "--to", "PLANNING",

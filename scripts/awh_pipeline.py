@@ -11,15 +11,22 @@ Nothing here duplicates those mechanisms; it composes them so all workflows
 share exactly one tested path.
 
 Exit codes:
-  0  action succeeded, or was a safe no-op (stale event, claim held by
-     another job, nothing recoverable);
-  3  stale event / lost claim race: the caller must stop without doing work;
+  0  action succeeded, or was a safe no-op (stale event, lost recovery-claim
+     race, nothing recoverable);
+  3  stale event the caller must treat as 'stop without doing work'
+     (validate-event, finalize-recovery);
   1  hard failure: fail closed, never guess.
+
+claim-recovery additionally reports its outcome as the last stdout line
+(CLAIMED / LOST_CLAIM / NO_OP) so the workflow can act on the result: a
+LOST_CLAIM means another recovery worker won the claim and this worker must
+stop without dispatching anything.
 """
 
 from __future__ import annotations
 
 import argparse
+import enum
 import importlib.util
 import json
 import os
@@ -133,6 +140,28 @@ def stage_and_push(checkpoint_module, message: str) -> None:
     if result.returncode != 0:
         raise SystemExit(f"awh_pipeline: git add {STATE_FILE} failed: {sanitize_detail(result.stderr)}")
     load_script_module("safe_git").push(SHARED_BRANCH, message)
+
+
+def stage_and_commit(message: str) -> None:
+    """Stage and locally commit the checkpoint; publishing is the caller's job.
+
+    The recovery claim uses this plus safe_git.push_claim (fail-closed) so a
+    losing claimant never rebases its claim on top of the winner's. The normal
+    path (stage_and_push) keeps fetch/rebase/retry semantics.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "add", STATE_FILE],
+        capture_output=True, text=True, env=GIT_ENV,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"awh_pipeline: git add {STATE_FILE} failed: {sanitize_detail(result.stderr)}")
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "commit", "-m", message],
+        capture_output=True, text=True, env=GIT_ENV,
+    )
+    if result.returncode != 0:
+        detail = sanitize_detail((result.stderr or result.stdout).strip())
+        raise SystemExit(f"awh_pipeline: commit of the claim failed (exit {result.returncode}):\n{detail}")
 
 
 # --------------------------------------------------------------------------
@@ -269,99 +298,207 @@ def begin_stage(
 # Recovery: atomic claim/lease against the checkpoint, no external services.
 # --------------------------------------------------------------------------
 
-def claim_recovery(owner: str, stale_minutes: int, lease_minutes: int) -> dict[str, Any]:
-    """Atomically claim recovery of a stale checkpoint, or safely stand down.
 
-    The claim is a CAS transition <stale> -> RECOVERING carrying a claim
-    object (operation_id, feature_id, attempt, claimed_at, owner,
-    stale_status). Two recovery jobs racing on the same stale checkpoint
-    cannot both win: the first push lands, and the loser either fails its
-    CAS read, hits a non-fast-forward push that conflicts on state.json
-    (never force-resolved), or observes the winner's claim on re-fetch and
-    exits without doing work.
+class ClaimResult(enum.Enum):
+    """Outcome of a recovery-claim attempt, parsed by the recovery workflow."""
+
+    CLAIMED = "CLAIMED"
+    LOST_CLAIM = "LOST_CLAIM"
+    NO_OP = "NO_OP"
+
+
+def sync_to_remote() -> None:
+    """Fast-forward the local shared branch onto origin (never rebase/reset).
+
+    Delegates to safe_git.sync, the single synchronization implementation, so
+    the local checkpoint provably equals the remote state that is about to be
+    observed and claimed against.
     """
-    if not owner or not owner.strip():
-        raise SystemExit("awh_pipeline: claim-recovery requires a non-empty --owner")
+    load_script_module("safe_git").sync(SHARED_BRANCH)
+
+
+def claim_recovery(
+    *,
+    feature_id: str,
+    expected_operation_id: str,
+    claim_owner: str,
+    stale_minutes: int = 90,
+    lease_minutes: int = 120,
+) -> ClaimResult:
+    """Claim recovery of a stale checkpoint against the exact remote state.
+
+    The claim is computed from what origin/rust actually shows, not from a
+    possibly stale local clone. Publishing the claim uses safe_git.push_claim,
+    which never fetches/rebases/retries after a rejected push: a non-fast-
+    forward means another writer won the race and this claim is lost - never
+    something to reconcile on top of.
+
+    Exactly one concurrent claimant can publish: the loser either observes the
+    winner's claim on the remote and stands down, or has its claim push
+    rejected as non-fast-forward and reports LOST_CLAIM. Either way it exits
+    without dispatching anything.
+    """
+    if not claim_owner or not claim_owner.strip():
+        raise SystemExit("awh_pipeline: claim-recovery requires a non-empty --claim-owner")
 
     checkpoint = load_script_module("checkpoint_state")
-    state = checkpoint.load_state()
+    recoverable_statuses = set(checkpoint.STALEABLE_STATUSES)
+
+    # Observe the exact remote state: sync makes the local clone equal to it,
+    # then the claim is validated against what origin shows right now.
+    sync_to_remote()
+    state = read_remote_state()
+    if state is None:
+        raise SystemExit("awh_pipeline: could not read the checkpoint from origin/rust")
     status = state["status"]
 
-    if status not in checkpoint.STALEABLE_STATUSES:
+    if status not in recoverable_statuses:
         print(f"No recoverable checkpoint: status={status}")
-        return {"claimed": False, "reason": f"status={status}"}
+        return ClaimResult.NO_OP
 
-    age = minutes_since(state["updated_at"])
     claim = state.get("recovery_claim")
 
-    if status == "RECOVERING" and claim:
-        if claim.get("owner") == owner:
-            print("Recovery claim already held by this owner; continuing.")
-            return {"claimed": True, "reentry": True, "claim": claim}
+    if status == "RECOVERING":
+        return _handle_existing_claim(
+            state, claim, claim_owner, feature_id, expected_operation_id, lease_minutes,
+        )
+
+    # Nothing has claimed yet: validate the staleness window and that the
+    # identity the caller observed is still exactly what the remote holds.
+    age = minutes_since(state["updated_at"])
+    if age is not None and age < stale_minutes:
+        print(f"Checkpoint is not stale (age {age:.1f}m < {stale_minutes}m); nothing to recover.")
+        return ClaimResult.NO_OP
+
+    if state["active_feature"] != feature_id:
+        print(
+            f"STALE_EVENT: remote active_feature is {state['active_feature']!r}, "
+            f"not {feature_id!r}; the claim is lost."
+        )
+        return ClaimResult.LOST_CLAIM
+    if state["operation_id"] != expected_operation_id:
+        print(
+            f"STALE_EVENT: remote operation_id is {state['operation_id']!r}, "
+            f"not {expected_operation_id!r}; the claim is lost."
+        )
+        return ClaimResult.LOST_CLAIM
+
+    return _publish_claim(
+        state, feature_id=feature_id, claim_owner=claim_owner,
+        expect_status=status, expect_operation_id=state["operation_id"],
+        stale_status=status,
+    )
+
+
+def _handle_existing_claim(
+    state: dict[str, Any],
+    claim: dict[str, Any] | None,
+    claim_owner: str,
+    feature_id: str,
+    expected_operation_id: str,
+    lease_minutes: int,
+) -> ClaimResult:
+    """The remote already shows RECOVERING: re-enter, stand down, or take over."""
+    if claim and claim.get("owner") == claim_owner:
+        if claim.get("feature_id") != feature_id:
+            print(
+                f"STALE_EVENT: the recorded claim is for feature {claim.get('feature_id')!r}, "
+                f"not {feature_id!r}; the claim is lost."
+            )
+            return ClaimResult.LOST_CLAIM
+        print("Recovery claim already held by this owner; continuing.")
+        return ClaimResult.CLAIMED
+
+    if claim:
         claim_age = minutes_since(claim.get("claimed_at"))
         if claim_age is not None and claim_age < lease_minutes:
             print(
                 f"Recovery claim already held by {claim.get('owner')!r} "
                 f"(age {claim_age:.1f}m < lease {lease_minutes}m); standing down safely."
             )
-            return {"claimed": False, "reason": "claim held by another job"}
-        print(f"Recovery lease expired (age {claim_age:.1f}m); taking over the claim.")
-    elif age is not None and age < stale_minutes:
-        print(f"Checkpoint is not stale (age {age:.1f}m < {stale_minutes}m); nothing to recover.")
-        return {"claimed": False, "reason": "not stale"}
+            return ClaimResult.LOST_CLAIM
+        print(f"Recovery lease expired (age {minutes_since(claim.get('claimed_at')):.1f}m); taking over the claim.")
+    else:
+        print("RECOVERING without a recorded claim; re-claiming to repair the lease.")
 
+    # A takeover must still agree with the observed operation identity.
+    if state["operation_id"] != expected_operation_id:
+        print(
+            f"STALE_EVENT: remote operation_id is {state['operation_id']!r}, "
+            f"not {expected_operation_id!r}; refusing the takeover."
+        )
+        return ClaimResult.LOST_CLAIM
+
+    return _publish_claim(
+        state, feature_id=feature_id, claim_owner=claim_owner,
+        expect_status="RECOVERING", expect_operation_id=state["operation_id"],
+        stale_status=(claim or {}).get("stale_status") or state["status"],
+    )
+
+
+def _publish_claim(
+    state: dict[str, Any],
+    *,
+    feature_id: str,
+    claim_owner: str,
+    expect_status: str,
+    expect_operation_id: str | None,
+    stale_status: str,
+) -> ClaimResult:
+    """Transition the (synced) local checkpoint to RECOVERING and publish it.
+
+    The local clone was fast-forwarded onto the observed remote state, so this
+    CAS write fails closed if anything moved between the observation and now.
+    Publication uses push_claim: a rejected push is a LOST_CLAIM, never a
+    fetch/rebase/retry - rebasing here would recreate the original race.
+    """
     attempt = int(state["recovery_attempt"]) + 1
-    recovery_operation = f"{state['active_feature'] or 'PIPELINE'}:RECOVERY:{attempt}"
     claim_object = {
         "operation_id": state["operation_id"],
         "feature_id": state["active_feature"],
         "attempt": attempt,
         "claimed_at": utc_now(),
-        "owner": owner,
-        "stale_status": status,
+        "owner": claim_owner,
+        "stale_status": stale_status,
     }
+    recovery_operation = f"{state['active_feature'] or 'PIPELINE'}:RECOVERY:{attempt}"
+
     transition_args = [
         "transition",
-        "--expect-status", status,
+        "--expect-status", expect_status,
         "--to", "RECOVERING",
         "--set", f"operation_id={json.dumps(recovery_operation)}",
         "--set", f"recovery_attempt={attempt}",
         "--set", f"recovery_claim={json.dumps(claim_object)}",
         "--set", "last_error=null",
     ]
-    if state["operation_id"]:
-        transition_args += ["--expect-operation-id", state["operation_id"]]
+    if expect_operation_id:
+        transition_args += ["--expect-operation-id", expect_operation_id]
 
     try:
-        state = run_checkpoint(transition_args)
+        run_checkpoint(transition_args)
     except SystemExit as exc:
         message = str(exc)
         if "expected current status" in message or "expected operation_id" in message:
-            # The checkpoint moved between the read and the CAS: another job
-            # (recovery or pipeline) won the race. Do nothing.
+            # The checkpoint moved between the observation and this write:
+            # another job (recovery or pipeline) won the race. Do nothing.
             print(f"Claim lost to a concurrent checkpoint writer: {sanitize_detail(message)}")
-            return {"claimed": False, "reason": "lost CAS race"}
+            return ClaimResult.LOST_CLAIM
         raise
 
+    stage_and_commit(f"chore(automation): claim recovery {state['active_feature']}")
+
+    safe_git = load_script_module("safe_git")
     try:
-        stage_and_push(checkpoint, f"chore(automation): recovery claim attempt {attempt} by {owner}")
-    except SystemExit:
-        # The push was rejected or conflicted. Inspect the remote authority:
-        # if another job already holds the claim, stand down; otherwise this
-        # is a real failure and must fail closed.
-        remote = read_remote_state()
-        if remote and remote.get("status") == "RECOVERING":
-            remote_claim = remote.get("recovery_claim") or {}
-            if remote_claim.get("owner") != owner:
-                print(
-                    f"Claim already held on the remote by {remote_claim.get('owner')!r}; "
-                    "standing down safely without dispatching anything."
-                )
-                return {"claimed": False, "reason": "remote claim held by another job"}
-        raise
+        safe_git.push_claim(repo=REPO_ROOT, remote="origin", branch=SHARED_BRANCH)
+    except safe_git.LostClaimError:
+        print("LOST_CLAIM: another writer advanced origin/rust before this claim was published; standing down.")
+        return ClaimResult.LOST_CLAIM
+    except safe_git.GitError as exc:
+        raise SystemExit(f"awh_pipeline: {sanitize_detail(str(exc))}")
 
-    print(f"awh_pipeline: recovery claim acquired (attempt {attempt}, owner {owner}).")
-    return {"claimed": True, "claim": claim_object, "state": state}
+    print(f"awh_pipeline: recovery claim acquired (attempt {attempt}, owner {claim_owner}).")
+    return ClaimResult.CLAIMED
 
 
 def read_remote_state() -> dict[str, Any] | None:
@@ -588,7 +725,9 @@ def main(argv: list[str] | None = None) -> None:
     begin.add_argument("--set", action="append", default=[], metavar="KEY=JSON")
 
     claim = subparsers.add_parser("claim-recovery", help="atomically claim recovery of a stale checkpoint")
-    claim.add_argument("--owner", required=True)
+    claim.add_argument("--feature", required=True, help="active_feature observed on origin/rust")
+    claim.add_argument("--operation-id", required=True, help="operation_id observed on origin/rust")
+    claim.add_argument("--claim-owner", required=True)
     claim.add_argument("--stale-minutes", type=int, default=90)
     claim.add_argument("--lease-minutes", type=int, default=120)
 
@@ -633,7 +772,17 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.action == "claim-recovery":
-        claim_recovery(args.owner, args.stale_minutes, args.lease_minutes)
+        # The result token is printed as the last line: the recovery workflow
+        # parses it to distinguish a win (CLAIMED) from a safe standdown
+        # (LOST_CLAIM / NO_OP) and a hard failure (exit 1).
+        result = claim_recovery(
+            feature_id=args.feature,
+            expected_operation_id=args.operation_id,
+            claim_owner=args.claim_owner,
+            stale_minutes=args.stale_minutes,
+            lease_minutes=args.lease_minutes,
+        )
+        print(result.value)
         return
 
     if args.action == "decide-recovery":

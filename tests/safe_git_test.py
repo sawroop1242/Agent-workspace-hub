@@ -134,6 +134,29 @@ def test_advanced_remote_triggers_fetch_rebase_retry(tmp_path: Path):
     assert_status_clean(clone)
 
 
+def test_normal_safe_push_rebases_after_non_ff(tmp_path: Path):
+    """Regression counterpart to the recovery-claim path: the NORMAL
+    checkpoint write must keep reconciling - fetch, rebase, retry - when the
+    remote advanced. Only the recovery claim is fail-closed."""
+    origin, clone = build_repository(tmp_path)
+    other = clone_runner(tmp_path, origin)
+    commit_file(other, "advance.txt", "remote moved\n", "remote advance")
+    git(other, "push", "origin", "rust")
+
+    stage_state_checkpoint(clone, "PR_OPEN", operation_id="op-normal-1")
+    result = run_push(clone, "rust", "chore(automation): normal checkpoint write")
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "non-fast-forward" in result.stdout
+    assert "fetching and rebasing" in result.stdout
+    assert "pushed to origin/rust" in result.stdout
+    # The remote advance survived and the write landed on top of it.
+    log = git(clone, "log", "--oneline", "origin/rust").stdout
+    assert "remote advance" in log
+    assert "normal checkpoint write" in log
+    assert_status_clean(clone)
+
+
 def test_genuine_conflict_aborts_cleanly_with_no_dangling_rebase(tmp_path: Path):
     origin, clone = build_repository(tmp_path)
     other = clone_runner(tmp_path, origin)
@@ -290,3 +313,81 @@ def test_sync_rejects_message_argument():
     )
     assert result.returncode != 0
     assert "--message is only valid for a push" in (result.stdout + result.stderr)
+
+
+# --------------------------------------------------------------------------
+# push_claim: the fail-closed recovery-claim publish path.
+# --------------------------------------------------------------------------
+
+
+def test_push_claim_publishes_when_remote_is_unchanged(tmp_path: Path):
+    origin, clone = build_repository(tmp_path)
+    stage_state_checkpoint(clone, "RECOVERING", operation_id="F:RECOVERY:1")
+    git(clone, *IDENTITY, "commit", "-m", "chore(automation): claim recovery F")
+
+    load_module().push_claim(repo=clone, remote="origin", branch="rust")
+
+    assert git(clone, "rev-parse", "origin/rust").stdout.strip() == git(clone, "rev-parse", "HEAD").stdout.strip()
+    assert "RECOVERING" in git(clone, "show", "origin/rust:.openhands/state.json").stdout
+
+
+def test_push_claim_lost_when_remote_advanced(tmp_path: Path):
+    """A non-fast-forward rejection is a lost claim - never a fetch/rebase/retry."""
+    origin, clone = build_repository(tmp_path)
+    other = clone_runner(tmp_path, origin)
+    commit_file(other, "winner.txt", "winner's claim\n", "winner's claim")
+    git(other, "push", "origin", "rust")
+
+    stage_state_checkpoint(clone, "RECOVERING", operation_id="F:RECOVERY:1")
+    git(clone, *IDENTITY, "commit", "-m", "chore(automation): claim recovery F")
+    loser_head = git(clone, "rev-parse", "HEAD").stdout.strip()
+
+    module = load_module()
+    with pytest.raises(module.LostClaimError, match="remote branch advanced"):
+        module.push_claim(repo=clone, remote="origin", branch="rust")
+
+    # The loser's commit never reached the remote and was never rebased.
+    origin_commits = git(clone, "rev-list", "origin/rust").stdout.split()
+    assert loser_head not in origin_commits
+    assert git(clone, "rev-parse", f"{loser_head}^").stdout.strip() in origin_commits
+    assert not (clone / ".git" / "rebase-merge").exists()
+    assert not (clone / ".git" / "rebase-apply").exists()
+
+
+def test_push_claim_hard_fails_on_real_push_error(tmp_path: Path):
+    """A non-rejection failure (e.g. unknown remote) is a hard GitError, not a
+    silent lost claim."""
+    _, clone = build_repository(tmp_path)
+    stage_state_checkpoint(clone, "RECOVERING", operation_id="F:RECOVERY:1")
+    git(clone, *IDENTITY, "commit", "-m", "chore(automation): claim recovery F")
+
+    module = load_module()
+    with pytest.raises(module.GitError, match="claim push failed"):
+        module.push_claim(repo=clone, remote="no-such-remote", branch="rust")
+
+
+def test_push_claim_refuses_detached_head(tmp_path: Path):
+    _, clone = build_repository(tmp_path)
+    stage_state_checkpoint(clone, "RECOVERING", operation_id="F:RECOVERY:1")
+    head = git(clone, "rev-parse", "HEAD").stdout.strip()
+    git(clone, "checkout", "--detach", head)
+
+    module = load_module()
+    with pytest.raises(module.GitError, match="detached HEAD"):
+        module.push_claim(repo=clone, remote="origin", branch="rust")
+
+
+def test_push_claim_never_calls_safe_push(tmp_path: Path):
+    """The claim path must not route through the fetch/rebase/retry loop."""
+    import inspect
+
+    module = load_module()
+    body = inspect.getsource(module.push_claim)
+    # No invocation of the retrying push, and no reconciliation of any kind.
+    for call_pattern in ("safe_push(", "push(branch", "rebase_onto(", "rebase(", "fetch("):
+        assert call_pattern not in body, f"{call_pattern!r} called inside push_claim"
+    for forbidden in ("MAX_PUSH_ATTEMPTS",):
+        assert forbidden not in body, f"{forbidden!r} appears in push_claim"
+    # Exactly one push invocation: a rejected push is terminal, never retried.
+    assert body.count('"push"') == 1
+    assert body.count('"HEAD:{branch}"') == 1
