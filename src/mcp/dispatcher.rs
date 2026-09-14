@@ -629,9 +629,9 @@ impl McpDispatcher {
     /// The default snapshot is loaded once from the user data directory at
     /// construction; this builder lets tests (and library callers) drive the
     /// gate deterministically — inject a store without an
-    /// [`BUILTIN_TOOL_TRUST_ID`] record to pin the pre-gate behavior every
-    /// existing workspace has, or one with a restrictive record to exercise
-    /// the enforcement path.
+    /// [`BUILTIN_TOOL_TRUST_ID`] record to pin the SEC-001 default
+    /// (High-risk tools denied, Medium tools unrestricted), or one with a
+    /// grant record to exercise the explicit-authorization path.
     pub fn with_trust_store(mut self, trust: PersistentTrustStore) -> Self {
         self.trust = Some(trust);
         self
@@ -2680,6 +2680,29 @@ mod tests {
 
     // ---- context engine MCP tool wiring ---------------------------------
 
+    /// The full-grant `awh.builtin` trust record (`awh mcp trust
+    /// awh.builtin --network --process --filesystem`), for dispatcher
+    /// unit tests that exercise High-risk built-in tools at the service
+    /// level. The SEC-001 default-deny itself is pinned in
+    /// tests/mcp_builtin_tool_gate.rs.
+    fn builtin_full_grant() -> PersistentTrustStore {
+        let mut trust = TrustStore::default();
+        trust
+            .approve(
+                BUILTIN_TOOL_TRUST_ID,
+                TrustLevel::Reviewed,
+                McpPermissions {
+                    network: true,
+                    process: true,
+                    filesystem: vec![BUILTIN_TOOL_TRUST_ID.to_string()],
+                    ..McpPermissions::default()
+                },
+                "local",
+            )
+            .expect("valid approval");
+        PersistentTrustStore::from_store(&trust)
+    }
+
     fn call(dispatcher: &McpDispatcher, name: &str, arguments: Value) -> Result<Value> {
         let rt = tokio::runtime::Runtime::new()?;
         let text = rt.block_on(async {
@@ -3104,7 +3127,13 @@ mod tests {
     #[test]
     fn terminal_run_executes_argv_without_shell() {
         let temp = tempfile::tempdir().unwrap();
-        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        // SEC-001: terminal.run is High-risk, so the service-level argv
+        // behavior needs the full-grant awh.builtin record to reach the
+        // terminal service. The default-deny itself is pinned in
+        // tests/mcp_builtin_tool_gate.rs.
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf())
+            .unwrap()
+            .with_trust_store(builtin_full_grant());
         let out = call(
             &dispatcher,
             "terminal.run",

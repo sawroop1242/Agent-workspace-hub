@@ -76,9 +76,7 @@ pub enum EditOperation {
     },
     /// Apply a unified diff. Parsing/application is implemented by the
     /// unified-diff milestone; this variant keeps the public model stable.
-    ApplyDiff {
-        diff: String,
-    },
+    ApplyDiff { diff: String },
 }
 
 impl EditOperation {
@@ -261,7 +259,10 @@ pub fn validate_path(path: &str) -> Result<(), EditError> {
         return Err(EditError::InvalidPath(path.to_owned()));
     }
     for component in p.components() {
-        if matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
             return Err(EditError::InvalidPath(path.to_owned()));
         }
     }
@@ -323,7 +324,10 @@ mod tests {
             line: 1,
             content: "x".into(),
         });
-        assert!(matches!(bad_path.validate_shape(), Err(EditError::InvalidPath(_))));
+        assert!(matches!(
+            bad_path.validate_shape(),
+            Err(EditError::InvalidPath(_))
+        ));
 
         let bad_range = EditTransaction::single(EditOperation::DeleteRange {
             path: "src/lib.rs".into(),

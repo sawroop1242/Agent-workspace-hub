@@ -82,6 +82,14 @@ for future hardening:
 ## Secure defaults
 
 - Fail closed: any denied decision is a hard error, never a silent passthrough.
+- **High-risk built-in MCP tools are denied by default (SEC-001).**
+  `terminal.run`, `connector.invoke`, and the `github.*` mutations
+  require an explicit `awh.builtin` trust record before the dispatcher
+  will run them (`awh mcp trust awh.builtin --network --process
+  --filesystem`; see the [built-in tool gate](mcp.md) section). Any
+  future registry-declared High-risk tool inherits the default-deny.
+  Lower-risk reads and workspace-local mutations keep their existing
+  behavior; external-MCP server trust semantics are unchanged.
 - Default message/body limit: **10 MiB**.
 - Default request/HTTP timeout: **30 seconds**.
 - Default circuit-breaker threshold: **5** consecutive failures; cooldown **30 s**.
