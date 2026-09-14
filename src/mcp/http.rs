@@ -8,6 +8,12 @@
 //! Remote access is mandatory bearer-token authenticated, bounded by request
 //! size/time/connection limits, and exposes no secrets or internal paths in
 //! error responses.
+//!
+//! ## Security: SEC-002 TLS Guard
+//!
+//! Non-loopback MCP HTTP/SSE binds require TLS. Plaintext is only allowed for
+//! loopback addresses (`127.0.0.1`, `::1`). This prevents accidental exposure
+//! of bearer tokens and MCP traffic on public interfaces.
 
 use crate::mcp::auth;
 use crate::mcp::dispatcher::{DispatchResult, McpDispatcher};
@@ -24,7 +30,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -89,11 +95,20 @@ pub struct AppState {
 }
 
 /// Serves the remote MCP server over HTTP (optionally TLS) until shutdown.
+///
+/// ## SEC-002 Security Enforcement
+///
+/// This function enforces the SEC-002 policy: non-loopback binds require TLS.
+/// The check happens before binding, ensuring no plaintext listener starts on
+/// public interfaces.
 pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> Result<()> {
     config.tls.validate()?;
     if config.api_key.is_empty() {
         anyhow::bail!("refusing to serve remote MCP without an API key");
     }
+
+    // SEC-002: Enforce TLS for non-loopback binds
+    validate_sec_002_policy(&config.host, config.tls.enabled())?;
 
     let state = AppState {
         dispatcher,
@@ -133,6 +148,92 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
             .await
             .context("HTTP server terminated with error"),
     }
+}
+
+/// SEC-002: Validates that non-loopback binds have TLS enabled.
+///
+/// This is the core security enforcement for SEC-002. It checks the actual
+/// bind address semantics rather than relying on string matching alone.
+///
+/// # Policy Matrix
+///
+/// | Bind Address | TLS Disabled | TLS Enabled |
+/// |--------------|--------------|-------------|
+/// | 127.0.0.1    | ALLOW        | ALLOW       |
+/// | ::1          | ALLOW        | ALLOW       |
+/// | localhost    | ALLOW*       | ALLOW       |
+/// | 0.0.0.0      | REJECT       | ALLOW       |
+/// | ::           | REJECT       | ALLOW       |
+/// | non-loopback | REJECT       | ALLOW       |
+///
+/// *localhost is resolved and checked against actual loopback addresses.
+/// If resolution fails, we fail closed (reject).
+pub fn validate_sec_002_policy(host: &str, tls_enabled: bool) -> Result<()> {
+    // If TLS is enabled, all binds are allowed
+    if tls_enabled {
+        return Ok(());
+    }
+
+    // Parse the host and determine if it's loopback
+    let is_loopback = is_loopback_host(host)?;
+
+    if !is_loopback {
+        audit_deny("sec_002_tls_guard", "non_loopback_plaintext_rejected", host);
+        anyhow::bail!(
+            "SEC-002 violation: TLS is required for non-loopback MCP HTTP/SSE binds. \
+             Attempted plaintext bind on '{}' which is not a loopback address. \
+             Enable TLS or use a loopback address (127.0.0.1, ::1).",
+            host
+        );
+    }
+
+    Ok(())
+}
+
+/// Determines if a host string represents a loopback address.
+///
+/// Uses actual IP address semantics via std::net types rather than string
+/// matching. Handles:
+/// - Direct IP addresses (127.0.0.1, ::1, 0.0.0.0, etc.)
+/// - Hostname 'localhost' via resolution
+///
+/// Fails closed: if resolution is ambiguous or fails, returns an error.
+fn is_loopback_host(host: &str) -> Result<bool> {
+    // Try parsing as a direct IP address first (fast path, no DNS)
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ip.is_loopback());
+    }
+
+    // For hostnames like 'localhost', resolve to addresses
+    // We fail closed if resolution fails or yields no loopback addresses
+    if host.eq_ignore_ascii_case("localhost") {
+        // Resolve localhost to actual addresses
+        // Use a well-known port (80) for resolution, but we're not connecting
+        let addrs: Vec<SocketAddr> = (host, 80)
+            .to_socket_addrs()
+            .with_context(|| format!("failed to resolve '{}'", host))?
+            .collect();
+
+        if addrs.is_empty() {
+            // Fail closed: cannot determine if loopback
+            anyhow::bail!(
+                "SEC-002: failed to resolve '{}' to any addresses, rejecting as non-loopback",
+                host
+            );
+        }
+
+        // Check if ALL resolved addresses are loopback
+        // This is conservative: if any address is non-loopback, reject
+        let all_loopback = addrs.iter().all(|addr| addr.ip().is_loopback());
+        return Ok(all_loopback);
+    }
+
+    // Unknown hostname that isn't 'localhost' - fail closed
+    anyhow::bail!(
+        "SEC-002: host '{}' is neither a recognized IP address nor 'localhost'. \
+         For security, only explicit loopback IPs (127.0.0.1, ::1) or 'localhost' are allowed for plaintext.",
+        host
+    );
 }
 
 /// A [`axum::serve::Listener`] that wraps accepted TCP streams in TLS.
