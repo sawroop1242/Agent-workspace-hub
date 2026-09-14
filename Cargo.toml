@@ -44,3 +44,4 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 proptest = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+rcgen = "0.13"

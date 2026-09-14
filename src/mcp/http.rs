@@ -110,6 +110,13 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
     // SEC-002: Enforce TLS for non-loopback binds
     validate_sec_002_policy(&config.host, config.tls.enabled())?;
 
+    // SEC-002: build the TLS acceptor BEFORE binding any socket. With the
+    // acceptor built first, invalid TLS material on a non-loopback bind
+    // fails closed before a single public TCP listener exists — a
+    // misconfigured public server can never briefly open a plaintext-
+    // capable socket while the error surfaces.
+    let acceptor = config.tls.build_acceptor()?;
+
     let state = AppState {
         dispatcher,
         sessions: Arc::new(SessionRegistry::new()),
@@ -127,8 +134,6 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
         .with_context(|| format!("failed to bind {addr}"))?;
 
     // Never log the API key; only log the bind address and TLS status.
-    let acceptor = config.tls.build_acceptor()?;
-
     tracing::info!(event = "http_server_started", addr = %addr, tls = config.tls.enabled());
     crate::mcp::audit::audit_allow("server_start", "http", &addr);
 
