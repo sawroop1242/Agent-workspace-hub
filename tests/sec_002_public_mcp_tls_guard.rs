@@ -71,7 +71,7 @@ async fn serve_rejects_public_plaintext_before_binding() {
     let dispatcher = Arc::new(
         McpDispatcher::new_async(dir.path().to_path_buf())
             .await
-            .expect("dispatcher");
+            .expect("dispatcher"),
     );
 
     let error = serve(plaintext_config("0.0.0.0"), dispatcher)
@@ -89,7 +89,7 @@ async fn serve_rejects_non_loopback_ipv4_before_binding() {
     let dispatcher = Arc::new(
         McpDispatcher::new_async(dir.path().to_path_buf())
             .await
-            .expect("dispatcher");
+            .expect("dispatcher"),
     );
 
     let error = serve(plaintext_config("192.0.2.1"), dispatcher)
@@ -105,5 +105,8 @@ fn invalid_tls_material_is_not_accepted_by_tls_validation() {
         cert: Some("/definitely/missing/sec-002-cert.pem".to_string()),
         key: Some("/definitely/missing/sec-002-key.pem".to_string()),
     };
-    assert!(config.validate().is_err());
+    // `validate()` checks cert/key pairing only; the TLS material itself is
+    // rejected at the `build_acceptor()` boundary that `serve()` runs, which
+    // is where invalid TLS material fails closed during startup.
+    assert!(config.build_acceptor().is_err());
 }
