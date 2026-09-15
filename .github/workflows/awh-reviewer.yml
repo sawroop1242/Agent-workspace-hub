@@ -80,7 +80,7 @@ jobs:
           echo "current_sha=$CURRENT" >> "$GITHUB_OUTPUT"
 
       - name: Record validation failure
-        if: failure() && steps.validate_event.outputs.stale != 'true'
+        if: failure() && steps.validate_event.outputs.stale != 'true' && steps.validate_event.outputs.analysis_only != 'true'
         run: python scripts/awh_pipeline.py record-failure --agent reviewer --stage validation --detail "reviewer validation failed; see workflow logs" --pr "$AWH_PR" || true
 
       - name: Verify required LLM secrets
@@ -152,7 +152,7 @@ jobs:
         run: python scripts/reviewer_validate.py
 
       - name: Record semantic review failure
-        if: failure() && steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'
+        if: failure() && steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true' && steps.validate_event.outputs.analysis_only != 'true'
         run: python scripts/awh_pipeline.py record-failure --agent reviewer --stage agent --detail "Agent 3 failed; see workflow logs" --pr "$AWH_PR" || true
 
       - name: Publish analysis-only evidence to docs and PR
