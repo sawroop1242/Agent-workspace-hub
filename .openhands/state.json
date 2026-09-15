@@ -1,6 +1,6 @@
 {
   "version": 4,
-  "status": "IDLE",
+  "status": "PLANNING",
   "operation_id": null,
   "recovery_attempt": 0,
   "recovery_claim": null,
@@ -12,5 +12,5 @@
   "builder_attempt": 0,
   "last_error": null,
   "last_review": "",
-  "updated_at": "2026-09-15T14:00:00Z"
+  "updated_at": "2026-09-15T14:17:09.985915Z"
 }
