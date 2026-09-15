@@ -55,19 +55,54 @@ jobs:
           python scripts/safe_git.py sync --branch rust
           python scripts/checkpoint_state.py validate
 
-      - name: Refuse new planning while another operation exists
+      - name: Handle existing checkpoint safely
+        id: checkpoint_gate
         run: |
           STATUS=$(jq -r '.status' .openhands/state.json)
+          FEATURE=$(jq -r '.active_feature // empty' .openhands/state.json)
+          OPERATION_ID=$(jq -r '.operation_id // empty' .openhands/state.json)
           case "$STATUS" in
-            IDLE|COMPLETED) echo "Checkpoint permits new planning: $STATUS" ;;
+            IDLE|COMPLETED)
+              echo "checkpoint_action=plan" >> "$GITHUB_OUTPUT"
+              echo "Checkpoint permits new planning: $STATUS"
+              ;;
+            BLOCKED)
+              echo "checkpoint_action=recover" >> "$GITHUB_OUTPUT"
+              echo "CHECKPOINT_BLOCKED: feature=$FEATURE operation=$OPERATION_ID"
+              echo "A blocked operation must be recovered; it must never be reset to IDLE by the planner."
+              ;;
+            RECOVERING|PLANNING|BUILDING|PR_OPEN|REVIEWING|FIXING|MERGING)
+              echo "checkpoint_action=busy" >> "$GITHUB_OUTPUT"
+              echo "CHECKPOINT_BUSY: status=$STATUS feature=$FEATURE operation=$OPERATION_ID"
+              echo "Planner will not create or overwrite a second operation."
+              ;;
             *)
-              echo "CHECKPOINT_BUSY: status=$STATUS"
-              echo "Planner is fail-closed; recovery/continuation must own this operation."
+              echo "Unknown checkpoint status: $STATUS"
               exit 1
               ;;
           esac
 
+      - name: Request recovery for blocked operation
+        if: steps.checkpoint_gate.outputs.checkpoint_action == 'recover'
+        run: |
+          FEATURE=$(jq -r '.active_feature // empty' .openhands/state.json)
+          OPERATION_ID=$(jq -r '.operation_id // empty' .openhands/state.json)
+          test -n "$FEATURE"
+          test -n "$OPERATION_ID"
+          jq -n --arg feature "$FEATURE" --arg operation "$OPERATION_ID" \
+            '{event_type:"awh.recover",client_payload:{feature_id:$feature,operation_id:$operation}}' > /tmp/recovery-payload.json
+          gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/recovery-payload.json
+          echo "Recovery requested for $FEATURE / $OPERATION_ID."
+
+      - name: Stop without mutation when checkpoint is not ready for planning
+        if: steps.checkpoint_gate.outputs.checkpoint_action != 'plan'
+        run: |
+          echo 'No planner mutation performed.'
+          echo 'Existing operation remains authoritative; recovery/active workflow owns continuation.'
+          exit 0
+
       - name: Verify required LLM secrets
+        if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         run: |
           test -n "$K1" || { echo 'Missing required secret: AWH_AGENT1_NVIDIA_KEY_1'; exit 1; }
           test -n "$KF" || { echo 'Missing required secret: AWH_ROUTINE_NVIDIA_KEY'; exit 1; }
@@ -76,6 +111,7 @@ jobs:
           [ -n "$K3" ] && echo 'Optional Agent 1 key 3 configured.' || echo 'Optional Agent 1 key 3 not configured.'
 
       - name: Checkpoint planner start
+        if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         env:
           FEATURE_ID: ${{ inputs.feature_id || github.event.client_payload.feature_id || '' }}
         run: |
@@ -93,16 +129,18 @@ jobs:
           python scripts/safe_git.py push --branch rust --message 'chore(automation): checkpoint planner start'
 
       - name: Record planner-start failure
-        if: failure()
+        if: failure() && steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent starter --stage begin \
             --detail "planner start checkpoint failed; see workflow run logs" || true
 
       - name: Install OpenHands SDK and built-in tools
+        if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2' 'openhands-tools>=1.0,<2'
 
       - name: Plan next feature with Agent 1 and rotate Kimi K3 keys on rate limit
+        if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         id: plan
         env:
           AWH_AGENT_ROLE: planner
@@ -132,6 +170,7 @@ jobs:
           echo "feature_id=$FEATURE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Persist active build checkpoint and planner task
+        if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
         run: |
@@ -152,7 +191,7 @@ jobs:
           python scripts/safe_git.py push --branch rust --message "chore(automation): start ${{ steps.plan.outputs.feature_id }}"
 
       - name: Record build-checkpoint failure
-        if: failure()
+        if: failure() && steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent starter --stage plan \
@@ -160,6 +199,7 @@ jobs:
             --feature "${{ steps.plan.outputs.feature_id }}" || true
 
       - name: Dispatch Agent 2
+        if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
         run: |
@@ -175,7 +215,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/payload.json
 
       - name: Record dispatch failure
-        if: failure()
+        if: failure() && steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent starter --stage dispatch \
