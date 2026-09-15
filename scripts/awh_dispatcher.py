@@ -2,9 +2,9 @@
 """AWH autonomous dispatcher.
 
 The durable checkpoint is authoritative. The dispatcher emits only the next
-small repository_dispatch event; agents perform mutations under CAS. A stale
-PLANNING checkpoint without feature identity is treated as an orphan repair,
-not as a healthy active stage.
+small repository_dispatch event; agents perform mutations under CAS. Startup
+states with no feature/operation identity are treated as recoverable orphans,
+not as healthy active stages.
 """
 
 from __future__ import annotations
@@ -34,6 +34,11 @@ def load_state(path: Path) -> dict:
     return state
 
 
+def is_orphan_startup(state: dict) -> bool:
+    status = state.get("status")
+    return status in {"PLANNING", "BLOCKED", "RECOVERING"} and not state.get("active_feature") and not state.get("operation_id")
+
+
 def plan_dispatch(state: dict) -> dict:
     status = state.get("status")
     feature = state.get("active_feature")
@@ -42,13 +47,14 @@ def plan_dispatch(state: dict) -> dict:
     sha = state.get("active_pr_sha")
     review = state.get("last_review") or ""
 
+    if is_orphan_startup(state):
+        return {
+            "action": "repair",
+            "status": status,
+            "reason": f"orphan startup checkpoint in {status} has no feature or operation identity",
+        }
+
     if status == "PLANNING":
-        if not feature and not operation:
-            return {
-                "action": "repair",
-                "status": status,
-                "reason": "stale orphaned PLANNING checkpoint has no feature or operation identity",
-            }
         return {"action": "wait", "status": status, "reason": "active planner stage owns continuation"}
 
     if status == "RECOVERING":
