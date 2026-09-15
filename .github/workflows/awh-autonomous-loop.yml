@@ -205,32 +205,57 @@ jobs:
         run: python scripts/safe_git.py sync --branch rust
 
       - name: Validate merge event against the authoritative checkpoint
+        id: validate_event
         run: |
           test -n "$PR"
           test -n "$REVIEWED_SHA"
           if python scripts/awh_pipeline.py validate-event --agent merger --pr "$PR" --feature "$FEATURE_ID"; then
-            echo 'Merge event validated against the checkpoint.'
+            :
           else
             code=$?
             if [ "$code" -eq 3 ]; then
-              echo 'STALE_EVENT: approve event does not match the active checkpoint; ignoring.'
-              exit 0
+              echo 'STALE_EVENT: approve event does not match the active checkpoint; terminating job.'
+              echo 'stale=true' >> "$GITHUB_OUTPUT"
+              exit 1
             fi
             exit "$code"
           fi
+          CHECKPOINT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
+          if [ -n "$EVENT_OPERATION_ID" ] && [ "$EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
+            echo "STALE_EVENT: event operation_id=$EVENT_OPERATION_ID does not match checkpoint operation_id=$CHECKPOINT_OP; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          CHECKPOINT_SHA=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
+          if [ -z "$CHECKPOINT_SHA" ] || [ "$REVIEWED_SHA" != "$CHECKPOINT_SHA" ]; then
+            echo "STALE_EVENT: reviewed_sha=$REVIEWED_SHA does not match checkpoint active_pr_sha=$CHECKPOINT_SHA; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Record merge-event validation failure
+        if: failure() && steps.validate_event.outputs.stale != 'true'
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent merger --stage validation \
+            --detail "merge event validation failed; see workflow run logs" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
 
       - name: Verify immutable reviewed head before entering MERGING
+        id: verify_review
         run: |
-          CHECKPOINT_SHA=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
           CURRENT_SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
+          CHECKPOINT_SHA=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
           test -n "$CHECKPOINT_SHA"
-          test "$REVIEWED_SHA" = "$CHECKPOINT_SHA" || {
-            echo "STALE_EVENT: reviewed_sha=$REVIEWED_SHA does not match checkpoint active_pr_sha=$CHECKPOINT_SHA; refusing merge."
-            exit 0
-          }
+          if [ "$REVIEWED_SHA" != "$CHECKPOINT_SHA" ]; then
+            echo "STALE_EVENT: reviewed_sha=$REVIEWED_SHA does not match checkpoint active_pr_sha=$CHECKPOINT_SHA; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           if [ "$CURRENT_SHA" != "$REVIEWED_SHA" ]; then
-            echo "REVIEW_INVALIDATED: PR head changed from reviewed $REVIEWED_SHA to $CURRENT_SHA; refusing merge. The synchronize reviewer will bind a new SHA."
-            exit 0
+            echo "REVIEW_INVALIDATED: PR head changed from reviewed $REVIEWED_SHA to $CURRENT_SHA; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
           fi
           echo "Immutable review head verified: $REVIEWED_SHA"
 
@@ -243,7 +268,7 @@ jobs:
             --message "chore(automation): merge approved $FEATURE_ID PR $PR"
 
       - name: Record merge-stage failure
-        if: failure()
+        if: failure() && steps.validate_event.outputs.stale != 'true' && steps.verify_review.outputs.stale != 'true'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent merger --stage begin \
