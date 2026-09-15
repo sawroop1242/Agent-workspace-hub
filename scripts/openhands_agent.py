@@ -11,6 +11,7 @@ ROLE = os.environ.get("AWH_AGENT_ROLE", "builder")
 TASK = os.environ.get("AWH_TASK", "")
 REVIEW = os.environ.get("AWH_REVIEW", "")
 PR = os.environ.get("AWH_PR", "")
+REVIEW_MODE = os.environ.get("AWH_REVIEW_MODE", "pipeline")
 
 MODEL = "moonshotai/kimi-k3"
 BASE_URL = "https://integrate.api.nvidia.com/v1"
@@ -34,7 +35,8 @@ You are Agent 1, the Orchestrator. Planning only: do not edit Rust source.
 
 1. Read `.openhands/backlog.json` and `.openhands/state.json`.
 2. Read the complete `docs/` tree, including every file under
-   `docs/issue-resolving-prompts/` that is relevant to the backlog.
+   `docs/issue-resolving-prompts/` that is relevant to the backlog and every
+   relevant report under `docs/pr-reviews/`.
 3. Inspect the current source, tests, recent Git history, open/merged PR state,
    and CI evidence needed to determine what is actually complete.
 4. Select exactly one `ready` feature whose dependencies are satisfied.
@@ -46,6 +48,9 @@ You are Agent 1, the Orchestrator. Planning only: do not edit Rust source.
    include a concrete prompt-quality section in the generated task so Agent 2
    has enough implementation context.
 8. If an override is provided, use it only if that feature is ready.
+9. Treat `docs/pr-reviews/` as review evidence and implementation guidance, not
+   as authority over source code, tests, security invariants, or the checkpoint.
+   Reuse actionable findings when they apply to the selected feature.
 
 Write the exact implementation contract to `.openhands/generated-task.md`.
 The FIRST non-empty line MUST be `Feature ID: AWH-...` using the exact backlog ID.
@@ -70,13 +75,35 @@ If no feature is ready, write `NO_READY_FEATURE` to the file.
 Requested feature override: {TASK or '(none)'}
 """
 elif ROLE == "reviewer":
+    mode_rules = """
+This is an analysis-only review. The PR is not the active Agent 2 pipeline PR.
+Do NOT mutate `.openhands/state.json`, call checkpoint transitions, or attempt
+to advance/recover the main Agent pipeline. Your output is repository knowledge
+for Agent 1 and an actionable implementation prompt for a future Agent 2.
+Produce a technically rigorous analysis that includes:
+- PR scope and changed behavior
+- concrete defects/gaps, with file/line evidence where possible
+- security, concurrency, API, error-handling and maintainability concerns
+- tests that are missing or should be added
+- documentation/architecture conflicts
+- a clear `Agent 2 Working Prompt` section containing ordered implementation
+  steps, constraints, acceptance criteria, and verification commands
+- a final verdict: APPROVE, CHANGES_REQUIRED, or BLOCKED
+""" if REVIEW_MODE == "analysis" else """
+This is the active Agent 2 pipeline PR. Review it against the authoritative
+checkpoint, task contract, source, tests, CI, and issue-resolution prompt.
+"""
     prompt = f"""
 {base_rules}
 You are Agent 3, the independent PR Reviewer and QA/security gate.
 Review PR #{PR} completely. Use the terminal to inspect the PR diff and repository
 context. Read the relevant `docs/` documentation and matching
 `docs/issue-resolving-prompts/` prompt before judging whether the implementation
-actually satisfies the intended issue. Do not modify source code. Evaluate:
+actually satisfies the intended issue. Do not modify source code.
+
+{mode_rules}
+
+Evaluate:
 - functional correctness and acceptance criteria
 - Rust architecture and API compatibility
 - consistency with repository documentation and issue-resolution prompt
@@ -107,6 +134,7 @@ working tree. Before editing:
 - read the complete `docs/` tree relevant to the feature;
 - read the matching file(s) in `docs/issue-resolving-prompts/` when available;
 - inspect the existing source and tests that implement the affected subsystem;
+- read relevant `docs/pr-reviews/` reports and reuse applicable Agent 3 findings;
 - reconcile documentation/prompt requirements against actual current code.
 
 The issue-resolving prompt is guidance and an implementation contract, not a
@@ -163,11 +191,12 @@ elif ROLE == "reviewer":
     text = review_file.read_text(encoding="utf-8").strip()
     if not text or "VERDICT:" not in text:
         raise SystemExit("Reviewer output has no machine-readable verdict")
-    verdict = [x.split(":", 1)[1].strip() for x in text.splitlines() if x.startswith("VERDICT:")][-1]
-    if verdict not in {"APPROVE", "CHANGES_REQUIRED", "BLOCKED"}:
-        raise SystemExit(f"Invalid reviewer verdict: {verdict}")
+    verdicts = [x.split(":", 1)[1].strip() for x in text.splitlines() if x.startswith("VERDICT:")]
+    if len(verdicts) != 1 or verdicts[0] not in {"APPROVE", "CHANGES_REQUIRED", "BLOCKED"}:
+        raise SystemExit("Reviewer output must contain exactly one valid VERDICT")
+    verdict = verdicts[0]
     Path(".openhands/review-result.json").write_text(
-        json.dumps({"verdict": verdict, "review": text}, indent=2) + "\n",
+        json.dumps({"verdict": verdict, "review": text, "mode": REVIEW_MODE}, indent=2) + "\n",
         encoding="utf-8",
     )
     print(text)
