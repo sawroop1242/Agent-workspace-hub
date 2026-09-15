@@ -54,6 +54,7 @@ jobs:
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Validate explicit recovery request identity
+        id: request_gate
         if: github.event_name == 'repository_dispatch'
         run: |
           REQUESTED_FEATURE='${{ github.event.client_payload.feature_id }}'
@@ -61,13 +62,16 @@ jobs:
           CURRENT_FEATURE='${{ steps.observe.outputs.feature }}'
           CURRENT_OPERATION='${{ steps.observe.outputs.operation_id }}'
           if [ "$REQUESTED_FEATURE" != "$CURRENT_FEATURE" ] || [ "$REQUESTED_OPERATION" != "$CURRENT_OPERATION" ]; then
+            echo 'valid=false' >> "$GITHUB_OUTPUT"
             echo "STALE_RECOVERY_REQUEST: requested=$REQUESTED_FEATURE/$REQUESTED_OPERATION current=$CURRENT_FEATURE/$CURRENT_OPERATION"
             exit 0
           fi
+          echo 'valid=true' >> "$GITHUB_OUTPUT"
+          echo 'Recovery request identity matches the authoritative checkpoint.'
 
       - name: Atomically claim recovery of stale work
         id: claim
-        if: steps.observe.outputs.feature != ''
+        if: steps.observe.outputs.feature != '' && (github.event_name != 'repository_dispatch' || steps.request_gate.outputs.valid == 'true')
         run: |
           result="$(python scripts/awh_pipeline.py claim-recovery \
             --feature "${{ steps.observe.outputs.feature }}" \
