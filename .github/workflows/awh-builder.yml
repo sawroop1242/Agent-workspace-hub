@@ -28,6 +28,7 @@ jobs:
       K3: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_3 }}
       KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
       AWH_FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+      AWH_EVENT_OPERATION_ID: ${{ github.event.client_payload.operation_id }}
       AWH_EVENT_REVIEW: ${{ github.event.client_payload.review }}
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +44,7 @@ jobs:
         id: validate_event
         run: |
           if python scripts/awh_pipeline.py validate-event --agent builder --feature "$AWH_FEATURE_ID"; then
-            echo 'Event is current; proceeding as a builder run.'
+            :
           else
             code=$?
             if [ "$code" -eq 3 ]; then
@@ -53,6 +54,13 @@ jobs:
             fi
             exit "$code"
           fi
+          CHECKPOINT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
+          if [ -n "$AWH_EVENT_OPERATION_ID" ] && [ "$AWH_EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
+            echo "STALE_EVENT: builder event operation_id=$AWH_EVENT_OPERATION_ID does not match checkpoint operation_id=$CHECKPOINT_OP; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo 'Event identity and operation are current.'
 
       - name: Record failure on workflow error
         if: failure() && steps.validate_event.outputs.stale != 'true'
