@@ -91,7 +91,8 @@ jobs:
             echo 'stale=true' >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          echo "PR identity validated at head $CURRENT_SHA."
+          echo "current_sha=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "PR identity validated at current head $CURRENT_SHA."
 
       - name: Record review-gate failure
         if: failure() && steps.validate_event.outputs.stale != 'true'
@@ -109,6 +110,24 @@ jobs:
           [ -n "$K2" ] && echo 'Optional Agent 3 key 2 configured.' || echo 'Optional Agent 3 key 2 not configured.'
           [ -n "$K3" ] && echo 'Optional Agent 3 key 3 configured.' || echo 'Optional Agent 3 key 3 not configured.'
 
+      - name: Checkpoint reviewer stage with CAS and operation identity
+        env:
+          PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
+        run: |
+          test -n "$PR"
+          FEATURE=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName' | sed 's#^feature/##')
+          test -n "$FEATURE"
+          BRANCH=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName')
+          SHA='${{ steps.validate_event.outputs.current_sha }}'
+          test -n "$SHA"
+          python scripts/awh_pipeline.py begin-stage \
+            --stage reviewer \
+            --feature "$FEATURE" \
+            --pr "$PR" \
+            --branch "$BRANCH" \
+            --sha "$SHA" \
+            --message "chore(automation): reviewer stage for $FEATURE PR $PR"
+
       - name: Pin and verify exact review head
         id: pin
         env:
@@ -125,30 +144,11 @@ jobs:
           if [ "$CURRENT" != "$EXPECTED" ]; then
             echo 'valid=false' >> "$GITHUB_OUTPUT"
             echo 'stale=true' >> "$GITHUB_OUTPUT"
-            echo "REVIEW_INVALIDATED: PR head changed before Agent 3 review (checkpoint=$EXPECTED current=$CURRENT); terminating job."
+            echo "REVIEW_INVALIDATED: PR head changed during reviewer setup (checkpoint=$EXPECTED current=$CURRENT); terminating job."
             exit 1
           fi
           echo 'valid=true' >> "$GITHUB_OUTPUT"
-          echo "Agent 3 is pinned to reviewed SHA $EXPECTED before checkpoint mutation."
-
-      - name: Checkpoint reviewer stage with CAS and operation identity
-        env:
-          PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
-        run: |
-          test -n "$PR"
-          FEATURE=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName' | sed 's#^feature/##')
-          test -n "$FEATURE"
-          BRANCH=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName')
-          SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
-          test -n "$SHA"
-          test "$SHA" = "$(jq -r '.active_pr_sha // empty' .openhands/state.json)"
-          python scripts/awh_pipeline.py begin-stage \
-            --stage reviewer \
-            --feature "$FEATURE" \
-            --pr "$PR" \
-            --branch "$BRANCH" \
-            --sha "$SHA" \
-            --message "chore(automation): reviewer stage for $FEATURE PR $PR"
+          echo "Agent 3 is pinned to reviewed SHA $EXPECTED."
 
       - name: Install OpenHands SDK and built-in tools
         if: steps.pin.outputs.valid == 'true'
