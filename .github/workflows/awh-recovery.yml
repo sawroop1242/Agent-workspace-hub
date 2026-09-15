@@ -11,8 +11,6 @@ permissions:
   pull-requests: read
 
 concurrency:
-  # One recovery job at a time across the whole repository: the claim
-  # provides the correctness guarantee, this group prevents wasted races.
   group: awh-checkpoint-recovery
   cancel-in-progress: false
 
@@ -41,8 +39,6 @@ jobs:
       - name: Observe the identity to recover
         id: observe
         run: |
-          # Read the identity from the remote tip we just synced to: the claim
-          # validates that origin/rust still shows exactly this when it lands.
           FEATURE=$(jq -r '.active_feature // ""' .openhands/state.json)
           OPERATION_ID=$(jq -r '.operation_id // ""' .openhands/state.json)
           if [ -z "$FEATURE" ]; then
@@ -80,8 +76,52 @@ jobs:
           esac
           echo "result=$result" >> "$GITHUB_OUTPUT"
 
-      - name: Inspect reality and decide the safe continuation
+      - name: Repair an invalidated merge approval before normal recovery
+        id: sha_repair
         if: steps.claim.outputs.result == 'CLAIMED'
+        run: |
+          STALE_STATUS=$(jq -r '.recovery_claim.stale_status // empty' .openhands/state.json)
+          if [ "$STALE_STATUS" != "MERGING" ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PR=$(jq -r '.active_pr // empty' .openhands/state.json)
+          FEATURE=$(jq -r '.active_feature // empty' .openhands/state.json)
+          EXPECTED=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
+          if [ -z "$PR" ] || [ -z "$EXPECTED" ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PRDATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,isCrossRepository,headRefOid)
+          if [ "$(echo "$PRDATA" | jq -r '.state')" != OPEN ] || \
+             [ "$(echo "$PRDATA" | jq -r '.baseRefName')" != rust ] || \
+             [ "$(echo "$PRDATA" | jq -r '.isCrossRepository')" != false ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CURRENT=$(echo "$PRDATA" | jq -r '.headRefOid')
+          if [ "$CURRENT" = "$EXPECTED" ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "REVIEW_INVALIDATED: MERGING checkpoint reviewed $EXPECTED but PR head is now $CURRENT."
+          python scripts/awh_pipeline.py finalize-recovery \
+            --owner "$RECOVERY_OWNER" \
+            --to REVIEWING \
+            --message "chore(automation): invalidate stale merge approval" \
+            --set active_pr_sha="$(python -c 'import json,os; print(json.dumps(os.environ["CURRENT"]))')"
+
+          jq -n \
+            --arg feature "$FEATURE" \
+            --arg pr "$PR" \
+            --arg sha "$CURRENT" \
+            '{event_type:"awh.review",client_payload:{feature_id:$feature,pr_number:($pr|tonumber),reviewed_sha:$sha,reason:"merge approval invalidated by head change"}}' > /tmp/review-payload.json
+          gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/review-payload.json
+          echo 'handled=true' >> "$GITHUB_OUTPUT"
+
+      - name: Inspect reality and decide the safe continuation
+        if: steps.claim.outputs.result == 'CLAIMED' && steps.sha_repair.outputs.handled != 'true'
         run: |
           python scripts/awh_pipeline.py decide-recovery | tee /tmp/decision.txt
           TARGET=$(sed -n 's/^TARGET=//p' /tmp/decision.txt | head -n1)
@@ -97,14 +137,11 @@ jobs:
             exit 0
           fi
 
-          # Release the claim and move to the decided state in one CAS write.
           python scripts/awh_pipeline.py finalize-recovery \
             --owner "$RECOVERY_OWNER" \
             --to "$TARGET" \
             --message "chore(automation): recovery resumed as $TARGET"
 
-          # Only after the claim is released and the state is authoritative do
-          # we notify the next workflow. Events are notifications, never state.
           if [ -n "$EVENT" ]; then
             python3 - "$EVENT" "$PAYLOAD" <<'PY'
           import json, os, subprocess, sys
@@ -120,10 +157,8 @@ jobs:
           fi
 
       - name: Record recovery failure
-        # A lost claim or a no-op is a safe standdown, not a failure: blocking
-        # the checkpoint here would undo the winner's recovery.
         if: failure() && steps.claim.outputs.result != 'LOST_CLAIM' && steps.claim.outputs.result != 'NO_OP'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent recovery --stage recover \
-            --detail "recovery could not claim, decide, or resume the pipeline; see workflow run logs" || true
+            --detail "recovery could not claim, repair, decide, or resume the pipeline; see workflow run logs" || true
