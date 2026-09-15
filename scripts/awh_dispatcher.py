@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """AWH autonomous dispatcher.
 
-This is the AWH equivalent of autonomous-dev-team's dispatcher tick, but the
-checkpoint is authoritative instead of GitHub labels. The dispatcher only
-emits the next small repository_dispatch event; agents perform all mutations
-under their existing CAS/checkpoint contracts.
+The durable checkpoint is authoritative. The dispatcher emits only the next
+small repository_dispatch event; agents perform mutations under CAS. A stale
+PLANNING checkpoint without feature identity is treated as an orphan repair,
+not as a healthy active stage.
 """
 
 from __future__ import annotations
@@ -42,8 +42,17 @@ def plan_dispatch(state: dict) -> dict:
     sha = state.get("active_pr_sha")
     review = state.get("last_review") or ""
 
-    if status in {"PLANNING", "RECOVERING"}:
-        return {"action": "wait", "status": status, "reason": "active checkpoint stage owns continuation"}
+    if status == "PLANNING":
+        if not feature and not operation:
+            return {
+                "action": "repair",
+                "status": status,
+                "reason": "stale orphaned PLANNING checkpoint has no feature or operation identity",
+            }
+        return {"action": "wait", "status": status, "reason": "active planner stage owns continuation"}
+
+    if status == "RECOVERING":
+        return {"action": "wait", "status": status, "reason": "active recovery stage owns continuation"}
 
     if status not in EVENTS:
         raise ValueError(f"unsupported checkpoint status: {status!r}")
