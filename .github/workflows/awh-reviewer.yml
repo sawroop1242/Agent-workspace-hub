@@ -57,19 +57,13 @@ jobs:
           test -n "$PR"
           PRDATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,isCrossRepository,headRefOid,headRefName)
           if [ "$(echo "$PRDATA" | jq -r '.isCrossRepository')" != false ]; then
-            echo 'stale=true' >> "$GITHUB_OUTPUT"
-            echo "STALE_EVENT: PR $PR is cross-repository; safe no-op."
-            exit 0
+            echo 'stale=true' >> "$GITHUB_OUTPUT"; echo "STALE_EVENT: PR $PR is cross-repository; safe no-op."; exit 0
           fi
           if [ "$(echo "$PRDATA" | jq -r '.baseRefName')" != rust ]; then
-            echo 'stale=true' >> "$GITHUB_OUTPUT"
-            echo "STALE_EVENT: PR $PR does not target rust; safe no-op."
-            exit 0
+            echo 'stale=true' >> "$GITHUB_OUTPUT"; echo "STALE_EVENT: PR $PR does not target rust; safe no-op."; exit 0
           fi
           if [ "$(echo "$PRDATA" | jq -r '.state')" != OPEN ]; then
-            echo 'stale=true' >> "$GITHUB_OUTPUT"
-            echo "STALE_EVENT: PR $PR is not open; safe no-op."
-            exit 0
+            echo 'stale=true' >> "$GITHUB_OUTPUT"; echo "STALE_EVENT: PR $PR is not open; safe no-op."; exit 0
           fi
 
           CURRENT_SHA=$(echo "$PRDATA" | jq -r '.headRefOid')
@@ -79,43 +73,30 @@ jobs:
           CHECKPOINT_SHA=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
           EVENT_FEATURE="$AWH_EVENT_FEATURE"
 
-          # repository_dispatch is reserved for the autonomous Agent 2 review
-          # loop. It must carry the exact reviewed SHA; otherwise it is stale.
           if [ "$GITHUB_EVENT_NAME" = "repository_dispatch" ]; then
             if [ -z "$AWH_EVENT_REVIEWED_SHA" ]; then
-              echo 'stale=true' >> "$GITHUB_OUTPUT"
-              echo "STALE_EVENT: repository_dispatch review for PR $PR has no reviewed_sha; safe no-op."
-              exit 0
+              echo 'stale=true' >> "$GITHUB_OUTPUT"; echo "STALE_EVENT: repository_dispatch review for PR $PR has no reviewed_sha; safe no-op."; exit 0
             fi
             if [ "$AWH_EVENT_REVIEWED_SHA" != "$CURRENT_SHA" ] || [ "$AWH_EVENT_REVIEWED_SHA" != "$CHECKPOINT_SHA" ]; then
-              echo 'stale=true' >> "$GITHUB_OUTPUT"
-              echo "STALE_EVENT: dispatch reviewed_sha does not match current PR/checkpoint; safe no-op."
-              exit 0
+              echo 'stale=true' >> "$GITHUB_OUTPUT"; echo "STALE_EVENT: dispatch reviewed_sha does not match current PR/checkpoint; safe no-op."; exit 0
             fi
             if [ "$CHECKPOINT_PR" != "$PR" ]; then
-              echo 'stale=true' >> "$GITHUB_OUTPUT"
-              echo "STALE_EVENT: dispatch PR $PR is not the checkpoint active_pr=$CHECKPOINT_PR; safe no-op."
-              exit 0
+              echo 'stale=true' >> "$GITHUB_OUTPUT"; echo "STALE_EVENT: dispatch PR $PR is not checkpoint active_pr=$CHECKPOINT_PR; safe no-op."; exit 0
             fi
           fi
 
-          # A normal PR opened/reopened outside the Agent 2 pipeline is still
-          # worth reviewing. It becomes analysis-only: no checkpoint mutation,
-          # no recovery, no pipeline transition.
-          if [ "$CHECKPOINT_PR" != "$PR" ] || [ "$CHECKPOINT_STATUS" != "PR_OPEN" -a "$CHECKPOINT_STATUS" != "REVIEWING" ]; then
+          if [ "$CHECKPOINT_PR" != "$PR" ] || { [ "$CHECKPOINT_STATUS" != "PR_OPEN" ] && [ "$CHECKPOINT_STATUS" != "REVIEWING" ]; }; then
             echo 'analysis_only=true' >> "$GITHUB_OUTPUT"
             echo 'stale=false' >> "$GITHUB_OUTPUT"
             echo "ANALYSIS_ONLY: PR $PR is not the active Agent 2 pipeline PR; review only, do not mutate checkpoint."
           else
             if [ -n "$EVENT_FEATURE" ] && [ "$EVENT_FEATURE" != "$CHECKPOINT_FEATURE" ]; then
-              echo 'stale=true' >> "$GITHUB_OUTPUT"
-              echo "STALE_EVENT: event feature $EVENT_FEATURE does not match checkpoint feature $CHECKPOINT_FEATURE; safe no-op."
-              exit 0
+              echo 'stale=true' >> "$GITHUB_OUTPUT"; echo "STALE_EVENT: event feature $EVENT_FEATURE does not match checkpoint feature $CHECKPOINT_FEATURE; safe no-op."; exit 0
             fi
             if [ -n "$CHECKPOINT_SHA" ] && [ "$CHECKPOINT_SHA" != "$CURRENT_SHA" ]; then
               echo 'analysis_only=true' >> "$GITHUB_OUTPUT"
               echo 'stale=false' >> "$GITHUB_OUTPUT"
-              echo "ANALYSIS_ONLY: active PR head changed before review; record analysis without mutating pipeline state."
+              echo 'ANALYSIS_ONLY: active PR head changed before review; record analysis without mutating pipeline state.'
             else
               echo 'analysis_only=false' >> "$GITHUB_OUTPUT"
               echo 'stale=false' >> "$GITHUB_OUTPUT"
@@ -126,8 +107,7 @@ jobs:
 
       - name: Record review-gate failure
         if: failure() && steps.validate_event.outputs.stale != 'true'
-        run: |
-          python scripts/awh_pipeline.py record-failure --agent reviewer --stage validation --detail "reviewer validation failed; see workflow run logs" --pr "$AWH_PR" || true
+        run: python scripts/awh_pipeline.py record-failure --agent reviewer --stage validation --detail "reviewer validation failed; see workflow run logs" --pr "$AWH_PR" || true
 
       - name: Verify required LLM secrets
         if: steps.validate_event.outputs.stale != 'true'
@@ -150,10 +130,11 @@ jobs:
         if: steps.validate_event.outputs.stale != 'true'
         env:
           PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
+          ANALYSIS_ONLY: ${{ steps.validate_event.outputs.analysis_only }}
         run: |
           EXPECTED=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
           CURRENT=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
-          if [ "$${{ steps.validate_event.outputs.analysis_only }}" = "true" ]; then
+          if [ "$ANALYSIS_ONLY" = "true" ]; then
             echo 'valid=true' >> "$GITHUB_OUTPUT"
             echo 'stale=false' >> "$GITHUB_OUTPUT"
             echo "Analysis-only reviewer mode pinned to current PR head $CURRENT."
@@ -162,7 +143,7 @@ jobs:
           if [ -z "$EXPECTED" ] || [ "$CURRENT" != "$EXPECTED" ]; then
             echo 'valid=false' >> "$GITHUB_OUTPUT"
             echo 'stale=true' >> "$GITHUB_OUTPUT"
-            echo "REVIEW_INVALIDATED: pipeline PR head changed; safe no-op."
+            echo 'REVIEW_INVALIDATED: pipeline PR head changed; safe no-op.'
             exit 0
           fi
           echo 'valid=true' >> "$GITHUB_OUTPUT"
@@ -180,11 +161,9 @@ jobs:
           set +e
           SUCCESS=0
           for KEY_NAME in K1 K2 K3 KF; do
-            KEY="${!KEY_NAME}"
-            [ -n "$KEY" ] || continue
+            KEY="${!KEY_NAME}"; [ -n "$KEY" ] || continue
             AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/review.txt 2>&1
-            RC=$?
-            cat /tmp/review.txt
+            RC=$?; cat /tmp/review.txt
             if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
             if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/review.txt; then continue; fi
             exit "$RC"
@@ -193,8 +172,7 @@ jobs:
 
       - name: Record Agent 3 failure
         if: failure() && steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'
-        run: |
-          python scripts/awh_pipeline.py record-failure --agent reviewer --stage agent --detail "OpenHands Agent 3 failed; see workflow run logs" --pr "$AWH_PR" || true
+        run: python scripts/awh_pipeline.py record-failure --agent reviewer --stage agent --detail "OpenHands Agent 3 failed; see workflow run logs" --pr "$AWH_PR" || true
 
       - name: Publish analysis to docs and PR without changing pipeline state
         if: steps.validate_event.outputs.analysis_only == 'true' && steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'
@@ -208,23 +186,16 @@ jobs:
           SAFE_SHA=$(printf '%s' "$SHA" | cut -c1-12)
           REPORT="docs/pr-reviews/pr-${PR}-${SAFE_SHA}.md"
           {
-            echo "# Agent 3 PR Analysis — PR #${PR}"
-            echo
-            echo "- Reviewed at: \`$DATE\`"
-            echo "- Reviewed SHA: \`$SHA\`"
-            echo "- Mode: \`analysis-only\`"
-            echo "- Pipeline state: unchanged"
-            echo
-            echo "$REVIEW"
-            echo
-            echo "## Agent 1 / Agent 2 Usage"
-            echo
+            echo "# Agent 3 PR Analysis — PR #${PR}"; echo
+            echo "- Reviewed at: \`$DATE\`"; echo "- Reviewed SHA: \`$SHA\`"; echo "- Mode: \`analysis-only\`"; echo "- Pipeline state: unchanged"; echo
+            echo "$REVIEW"; echo
+            echo "## Agent 1 / Agent 2 Usage"; echo
             echo "Agent 1 should read this report as review evidence when selecting or planning related work. Agent 2 should use the \`Agent 2 Working Prompt\` section as implementation guidance when this finding becomes an assigned feature."
           } > "$REPORT"
           git add "$REPORT"
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m "docs(reviews): record Agent 3 analysis for PR #$PR" || true
+          git commit -m "docs(reviews): record Agent 3 analysis for PR #$PR"
           python scripts/safe_git.py push --branch rust --message "docs(reviews): record Agent 3 analysis for PR #$PR"
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "## Agent 3 Analysis (analysis-only)\n\nReviewed SHA: \`$SHA\`\n\n$REVIEW\n\n> This review is informational. It did not change \`.openhands/state.json\` or advance the main Agent pipeline.\n\nRepository report: \`$REPORT\`"
 
@@ -240,24 +211,21 @@ jobs:
           repo=os.environ['GITHUB_REPOSITORY']; pr=os.environ['PR']
           review=Path('.openhands/review.md').read_text(encoding='utf-8').strip()
           verdicts=[x.split(':',1)[1].strip() for x in review.splitlines() if x.startswith('VERDICT:')]
-          if len(verdicts) != 1 or verdicts[0] not in {'APPROVE','CHANGES_REQUIRED','BLOCKED'}:
-              raise SystemExit('Reviewer output has no single valid VERDICT')
+          if len(verdicts) != 1 or verdicts[0] not in {'APPROVE','CHANGES_REQUIRED','BLOCKED'}: raise SystemExit('Reviewer output has no single valid VERDICT')
           verdict=verdicts[0]
-          prdata=json.loads(subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','body','state','baseRefName','isCrossRepository','headRefName','headRefOid']))
+          prdata=json.loads(subprocess.check_output(['gh','pr','view',pr,'--repo',repo,'--json','body,state,baseRefName,isCrossRepository,headRefName,headRefOid']))
           if prdata.get('isCrossRepository') or prdata.get('baseRefName')!='rust' or prdata.get('state')!='OPEN': raise SystemExit('PR is no longer an eligible pipeline PR')
           state=json.loads(Path('.openhands/state.json').read_text(encoding='utf-8'))
           expected=state.get('active_pr_sha'); current=prdata.get('headRefOid')
           if not expected or current != expected: raise SystemExit('REVIEW_INVALIDATED: reviewed SHA no longer matches current PR head')
           feature=prdata['headRefName'].removeprefix('feature/')
-          old=prdata.get('body') or ''
-          marker='<!-- AWH_AGENT3_REVIEW -->'
+          old=prdata.get('body') or ''; marker='<!-- AWH_AGENT3_REVIEW -->'
           section=f"{marker}\n## Agent 3 Review — Kimi K3\n\nReviewed SHA: `{expected}`\n\n{review}\n\n{marker}"
           if marker in old: old=old.split(marker,1)[0].rstrip()
           subprocess.run(['gh','pr','edit',pr,'--repo',repo,'--body',(old+'\n\n'+section).strip()],check=True)
           status={'APPROVE':'PR_OPEN','CHANGES_REQUIRED':'FIXING','BLOCKED':'BLOCKED'}[verdict]
           op=state['operation_id']
-          transition=['python','scripts/checkpoint_state.py','transition','--expect-status','REVIEWING','--to',status,'--set',f'active_feature={json.dumps(feature)}','--set',f'active_pr={int(pr)}','--set',f'active_pr_sha={json.dumps(expected)}','--set',f'last_review={json.dumps(review)}','--set','last_error=null','--expect-operation-id',op]
-          subprocess.run(transition,check=True)
+          subprocess.run(['python','scripts/checkpoint_state.py','transition','--expect-status','REVIEWING','--to',status,'--set',f'active_feature={json.dumps(feature)}','--set',f'active_pr={int(pr)}','--set',f'active_pr_sha={json.dumps(expected)}','--set',f'last_review={json.dumps(review)}','--set','last_error=null','--expect-operation-id',op],check=True)
           subprocess.run(['git','config','user.name','AWH Automation'],check=True)
           subprocess.run(['git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com'],check=True)
           subprocess.run(['git','add','.openhands/state.json'],check=True)
@@ -268,5 +236,4 @@ jobs:
 
       - name: Record verdict-publication failure
         if: failure() && steps.validate_event.outputs.analysis_only != 'true' && steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'
-        run: |
-          python scripts/awh_pipeline.py record-failure --agent reviewer --stage verdict --detail "reviewer verdict could not be published or recorded; see workflow run logs" --pr "$AWH_PR" || true
+        run: python scripts/awh_pipeline.py record-failure --agent reviewer --stage verdict --detail "reviewer verdict could not be published or recorded; see workflow run logs" --pr "$AWH_PR" || true
