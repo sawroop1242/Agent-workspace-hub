@@ -3,6 +3,7 @@
 ## Documentation
 
 - [Final architecture and roadmap](docs/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
+- [Autonomous pipeline](docs/pipeline/autonomous-pipeline.md) — checkpoint-driven dispatcher, planner, builder, reviewer, fix loop, and recovery architecture inspired by open-source autonomous development pipelines
 - [Final CLI reference](docs/CLI.md) — complete target command tree, phase mapping, dependencies, security ordering, and validation rules
 - [Architecture](docs/architecture.md) — existing implementation architecture and request flow
 - [Features](docs/FEATURES.md) — final target feature contract
