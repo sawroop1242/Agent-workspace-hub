@@ -125,14 +125,10 @@ jobs:
           test "$SUCCESS" -eq 1
           FEATURE_ID=$(sed -n 's/^Feature ID: *//p' /tmp/task.txt | head -n1)
           test -n "$FEATURE_ID"
-          {
-            echo "feature_id=$FEATURE_ID"
-            echo 'task<<EOF'
-            cat /tmp/task.txt
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          test -s .openhands/generated-task.md
+          echo "feature_id=$FEATURE_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Persist active build checkpoint
+      - name: Persist active build checkpoint and planner task
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
         run: |
@@ -147,10 +143,9 @@ jobs:
             --set builder_attempt=1 \
             --set last_error=null \
             --set last_review='""'
-          rm -f .openhands/generated-task.md
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .openhands/state.json
+          git add .openhands/state.json .openhands/generated-task.md
           python scripts/safe_git.py push --branch rust --message "chore(automation): start ${{ steps.plan.outputs.feature_id }}"
 
       - name: Record build-checkpoint failure
@@ -164,7 +159,6 @@ jobs:
       - name: Dispatch Agent 2
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
-          TASK: ${{ steps.plan.outputs.task }}
         run: |
           CURRENT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
           EXPECTED_OP="$FEATURE_ID:BUILD:1"
@@ -172,8 +166,9 @@ jobs:
             echo "Refusing to dispatch: checkpoint operation '$CURRENT_OP' is not '$EXPECTED_OP'."
             exit 1
           fi
-          jq -n --arg feature "$FEATURE_ID" --arg task "$TASK" --arg op "$CURRENT_OP" \
-            '{event_type:"awh.build",client_payload:{feature_id:$feature,task:$task,operation_id:$op}}' > /tmp/payload.json
+          test -s .openhands/generated-task.md
+          jq -n --arg feature "$FEATURE_ID" --arg op "$CURRENT_OP" \
+            '{event_type:"awh.build",client_payload:{feature_id:$feature,operation_id:$op}}' > /tmp/payload.json
           gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/payload.json
 
       - name: Record dispatch failure
