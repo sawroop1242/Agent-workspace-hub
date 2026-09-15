@@ -512,6 +512,12 @@ pub enum EditError {
     InvalidLineRange { start: usize, end: usize },
     #[error("unified diff must not be empty")]
     EmptyDiff,
+    #[error("invalid unified diff format: {0}")]
+    InvalidDiff(String),
+    #[error("unsupported binary patch: {0}")]
+    BinaryPatch(String),
+    #[error("hunk context mismatch in {path} at hunk {hunk}")]
+    HunkContextMismatch { path: String, hunk: usize },
     /// Insertion content must not be empty; it is the text to insert.
     #[error("insert content must not be empty")]
     EmptyInsertContent,
@@ -948,6 +954,274 @@ pub enum PatchFailurePhase {
     Commit,
 }
 
+// ---------------------------------------------------------------------------
+// Unified-diff parser and applier (AWE-005).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedFileDiff {
+    pub path: String,
+    pub hunks: Vec<ParsedHunk>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct ParsedHunk {
+    pub old_start: usize,
+    pub old_lines: usize,
+    pub new_start: usize,
+    pub new_lines: usize,
+    pub lines: Vec<HunkLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HunkLine {
+    Context(String),
+    Add(String),
+    Del(String),
+}
+
+pub(crate) fn parse_unified_diff(diff: &str) -> Result<Vec<ParsedFileDiff>, EditError> {
+    if diff.trim().is_empty() {
+        return Err(EditError::EmptyDiff);
+    }
+    if diff.contains("Binary files") || diff.contains("GIT binary patch") {
+        return Err(EditError::BinaryPatch(
+            "binary patches are not supported".into(),
+        ));
+    }
+
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut file_diffs = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.starts_with("--- ") {
+            if i + 1 >= lines.len() || !lines[i + 1].starts_with("+++ ") {
+                return Err(EditError::InvalidDiff(
+                    "expected +++ header after ---".into(),
+                ));
+            }
+            let old_header = line;
+            let new_header = lines[i + 1];
+            i += 2;
+
+            let path_raw = if let Some(stripped) = new_header.strip_prefix("+++ b/") {
+                stripped
+            } else if let Some(p) = new_header.strip_prefix("+++ ") {
+                if let Some(stripped) = p.strip_prefix("b/") {
+                    stripped
+                } else {
+                    p
+                }
+            } else {
+                return Err(EditError::InvalidDiff(format!(
+                    "invalid +++ header: {new_header}"
+                )));
+            };
+            let path = path_raw.split_whitespace().next().unwrap_or(path_raw);
+            if path == "/dev/null" {
+                // Handle deletion diff if needed, or extract from old_header
+                let old_p = if let Some(stripped) = old_header.strip_prefix("--- a/") {
+                    stripped
+                } else {
+                    old_header.strip_prefix("--- ").unwrap_or(&old_header[4..])
+                };
+                let fallback = old_p.split_whitespace().next().unwrap_or(old_p);
+                validate_path(fallback)?;
+            } else {
+                validate_path(path)?;
+            }
+            let target_path = if path == "/dev/null" {
+                let old_p = if let Some(stripped) = old_header.strip_prefix("--- a/") {
+                    stripped
+                } else {
+                    old_header.strip_prefix("--- ").unwrap_or(&old_header[4..])
+                };
+                old_p.split_whitespace().next().unwrap_or(old_p).to_owned()
+            } else {
+                path.to_owned()
+            };
+
+            let mut hunks = Vec::new();
+            while i < lines.len() && lines[i].starts_with("@@ ") {
+                let hunk_header = lines[i];
+                i += 1;
+                let parsed_hunk = parse_hunk_header(hunk_header)?;
+
+                let mut hunk_lines = Vec::new();
+
+                while i < lines.len() {
+                    let hl = lines[i];
+                    if hl.starts_with("@@ ") || hl.starts_with("--- ") {
+                        break;
+                    }
+                    if hl.starts_with("\\ No newline at end of file") {
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(rest) = hl.strip_prefix(' ') {
+                        hunk_lines.push(HunkLine::Context(rest.to_string()));
+                    } else if let Some(rest) = hl.strip_prefix('-') {
+                        hunk_lines.push(HunkLine::Del(rest.to_string()));
+                    } else if let Some(rest) = hl.strip_prefix('+') {
+                        hunk_lines.push(HunkLine::Add(rest.to_string()));
+                    } else if hl.is_empty() {
+                        // Empty line treated as context with empty string
+                        hunk_lines.push(HunkLine::Context("".to_string()));
+                    } else {
+                        break;
+                    }
+                    i += 1;
+                }
+                hunks.push(ParsedHunk {
+                    old_start: parsed_hunk.0,
+                    old_lines: parsed_hunk.1,
+                    new_start: parsed_hunk.2,
+                    new_lines: parsed_hunk.3,
+                    lines: hunk_lines,
+                });
+            }
+            file_diffs.push(ParsedFileDiff {
+                path: target_path,
+                hunks,
+            });
+        } else {
+            i += 1;
+        }
+    }
+
+    if file_diffs.is_empty() {
+        return Err(EditError::InvalidDiff("no valid file diffs found".into()));
+    }
+    Ok(file_diffs)
+}
+
+fn parse_hunk_header(header: &str) -> Result<(usize, usize, usize, usize), EditError> {
+    // Expected format: @@ -l,s +l,s @@ or @@ -l +l @@ etc.
+    let parts: Vec<&str> = header.split("@@").collect();
+    if parts.len() < 2 {
+        return Err(EditError::InvalidDiff(format!(
+            "invalid hunk header: {header}"
+        )));
+    }
+    let ranges = parts[1].trim();
+    let range_parts: Vec<&str> = ranges.split_whitespace().collect();
+    if range_parts.len() < 2 {
+        return Err(EditError::InvalidDiff(format!(
+            "invalid hunk ranges: {ranges}"
+        )));
+    }
+    let parse_range = |s: &str| -> Result<(usize, usize), EditError> {
+        let s = s
+            .strip_prefix('-')
+            .or_else(|| s.strip_prefix('+'))
+            .unwrap_or(s);
+        if let Some((start_str, len_str)) = s.split_once(',') {
+            let start = start_str
+                .parse()
+                .map_err(|_| EditError::InvalidDiff(format!("invalid start: {start_str}")))?;
+            let len = len_str
+                .parse()
+                .map_err(|_| EditError::InvalidDiff(format!("invalid len: {len_str}")))?;
+            Ok((start, len))
+        } else {
+            let start = s
+                .parse()
+                .map_err(|_| EditError::InvalidDiff(format!("invalid start: {s}")))?;
+            Ok((start, 1))
+        }
+    };
+    let (old_start, old_len) = parse_range(range_parts[0])?;
+    let (new_start, new_len) = parse_range(range_parts[1])?;
+    Ok((old_start, old_len, new_start, new_len))
+}
+
+pub(crate) fn apply_hunks_to_content(
+    content: &str,
+    hunks: &[ParsedHunk],
+    path: &str,
+) -> Result<String, EditError> {
+    let mut file_lines: Vec<String> = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.lines().map(|s| s.to_owned()).collect()
+    };
+    let _has_trailing_newline = content.ends_with('\n');
+
+    // Sort hunks descending by old_start so applying them doesn't shift earlier line numbers
+    let mut sorted_hunks: Vec<&ParsedHunk> = hunks.iter().collect();
+    sorted_hunks.sort_by_key(|a| std::cmp::Reverse(a.old_start));
+
+    for (hunk_idx, hunk) in sorted_hunks.iter().enumerate() {
+        let target_idx = if hunk.old_start == 0 {
+            0
+        } else {
+            hunk.old_start - 1
+        };
+
+        // Validate context + deletions match file lines
+        let mut file_cursor = target_idx;
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(expected) | HunkLine::Del(expected) => {
+                    if file_cursor >= file_lines.len() || file_lines[file_cursor] != *expected {
+                        return Err(EditError::HunkContextMismatch {
+                            path: path.to_owned(),
+                            hunk: hunk_idx + 1,
+                        });
+                    }
+                    if matches!(line, HunkLine::Context(_) | HunkLine::Del(_)) {
+                        file_cursor += 1;
+                    }
+                }
+                HunkLine::Add(_) => {}
+            }
+        }
+
+        // Apply hunk modifications
+        let mut new_hunk_lines = Vec::new();
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(text) => {
+                    new_hunk_lines.push(text.clone());
+                }
+                HunkLine::Del(_) => {
+                    // skip deleted line
+                }
+                HunkLine::Add(text) => {
+                    new_hunk_lines.push(text.clone());
+                }
+            }
+        }
+
+        let remove_count = hunk
+            .lines
+            .iter()
+            .filter(|l| matches!(l, HunkLine::Context(_) | HunkLine::Del(_)))
+            .count();
+        if target_idx + remove_count <= file_lines.len() {
+            file_lines.splice(target_idx..target_idx + remove_count, new_hunk_lines);
+        } else {
+            return Err(EditError::HunkContextMismatch {
+                path: path.to_owned(),
+                hunk: hunk_idx + 1,
+            });
+        }
+    }
+
+    if file_lines.is_empty() {
+        Ok("".into())
+    } else {
+        let mut result = file_lines.join("\n");
+        if content.ends_with('\n') {
+            result.push('\n');
+        }
+        Ok(result)
+    }
+}
+
 /// Internal preparation record for one file during a multi-operation patch.
 struct PrepareFile {
     path: String,
@@ -1119,21 +1393,32 @@ fn apply_normalized_operation(
             Ok(prepared)
         }
         EditOperation::Patch { old, new, .. } => {
-            let matches = find_matches(content, old);
-            if matches.is_empty() {
-                return Err(EditError::MatchNotFound {
-                    path: path.to_owned(),
-                });
+            if old.starts_with("--- ") || old.contains("\n--- ") {
+                let file_diffs = parse_unified_diff(old)?;
+                let file_diff = file_diffs
+                    .iter()
+                    .find(|fd| fd.path == *path)
+                    .ok_or_else(|| {
+                        EditError::InvalidDiff(format!("diff has no section for {path}"))
+                    })?;
+                apply_hunks_to_content(content, &file_diff.hunks, path)
+            } else {
+                let matches = find_matches(content, old);
+                if matches.is_empty() {
+                    return Err(EditError::MatchNotFound {
+                        path: path.to_owned(),
+                    });
+                }
+                let selected = &matches[0];
+                let start = selected.byte_offset;
+                let end = start + selected.length;
+                let mut prepared =
+                    String::with_capacity(content.len() + new.len().saturating_sub(old.len()));
+                prepared.push_str(&content[..start]);
+                prepared.push_str(new);
+                prepared.push_str(&content[end..]);
+                Ok(prepared)
             }
-            let selected = &matches[0];
-            let start = selected.byte_offset;
-            let end = start + selected.length;
-            let mut prepared =
-                String::with_capacity(content.len() + new.len().saturating_sub(old.len()));
-            prepared.push_str(&content[..start]);
-            prepared.push_str(new);
-            prepared.push_str(&content[end..]);
-            Ok(prepared)
         }
         EditOperation::ApplyDiff { .. } => {
             Err(EditError::UnsupportedTransaction { operation_count: 1 })
@@ -1226,12 +1511,45 @@ impl EditService {
         // Phase 1: grouping — deterministic path ordering (sorted, no HashMap).
         let mut affected: Vec<(String, Vec<(usize, EditOperation)>)> = Vec::new();
         for (idx, op) in transaction.operations.into_iter().enumerate() {
-            let paths = op.paths();
-            let path = paths.first().copied().unwrap_or("");
-            match affected.iter_mut().find(|(p, _)| p == path) {
-                Some((_, ops)) => ops.push((idx, op)),
-                None => {
-                    affected.push((path.to_owned(), vec![(idx, op)]));
+            match op {
+                EditOperation::ApplyDiff { ref diff } => {
+                    let file_diffs = parse_unified_diff(diff)?;
+                    for fd in file_diffs {
+                        let path = fd.path;
+                        match affected.iter_mut().find(|(p, _)| p == &path) {
+                            Some((_, ops)) => ops.push((
+                                idx,
+                                EditOperation::Patch {
+                                    path: path.clone(),
+                                    old: diff.clone(),
+                                    new: "".into(),
+                                },
+                            )),
+                            None => {
+                                affected.push((
+                                    path.clone(),
+                                    vec![(
+                                        idx,
+                                        EditOperation::Patch {
+                                            path: path.clone(),
+                                            old: diff.clone(),
+                                            new: "".into(),
+                                        },
+                                    )],
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let paths = op.paths();
+                    let path = paths.first().copied().unwrap_or("");
+                    match affected.iter_mut().find(|(p, _)| p == path) {
+                        Some((_, ops)) => ops.push((idx, op)),
+                        None => {
+                            affected.push((path.to_owned(), vec![(idx, op)]));
+                        }
+                    }
                 }
             }
         }
@@ -4523,5 +4841,221 @@ mod patch_tests {
         let err = svc.patch(tx).unwrap_err();
         assert!(matches!(err, EditError::EmptyMatch));
         assert_eq!(read_file(&tmp, "f.txt"), "content\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWE-005: unified-diff parser and applier tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod unified_diff_tests {
+    use super::*;
+    use std::fs;
+
+    fn setup() -> (tempfile::TempDir, EditService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = EditService::new(tmp.path().to_path_buf());
+        (tmp, svc)
+    }
+
+    fn write_file(tmp: &tempfile::TempDir, name: &str, content: &str) {
+        fs::write(tmp.path().join(name), content).unwrap();
+    }
+
+    fn read_file(tmp: &tempfile::TempDir, name: &str) -> String {
+        fs::read_to_string(tmp.path().join(name)).unwrap()
+    }
+
+    #[test]
+    fn parse_simple_replace_diff() {
+        let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old line\n+new line\n";
+        let parsed = parse_unified_diff(diff).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "f.txt");
+        assert_eq!(parsed[0].hunks.len(), 1);
+        let hunk = &parsed[0].hunks[0];
+        assert_eq!(hunk.old_start, 1);
+        assert_eq!(hunk.old_lines, 1);
+        assert_eq!(hunk.new_start, 1);
+        assert_eq!(hunk.new_lines, 1);
+        assert_eq!(hunk.lines.len(), 2);
+        assert!(matches!(&hunk.lines[0], HunkLine::Del(s) if s == "old line"));
+        assert!(matches!(&hunk.lines[1], HunkLine::Add(s) if s == "new line"));
+    }
+
+    #[test]
+    fn parse_multi_hunk_diff() {
+        let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n context1\n-old\n+new\n@@ -4 +4 @@\n context2\n-old2\n+new2\n";
+        let parsed = parse_unified_diff(diff).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "f.txt");
+        assert_eq!(parsed[0].hunks.len(), 2);
+    }
+
+    #[test]
+    fn parse_multi_file_diff() {
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old a\n+new a\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old b\n+new b\n";
+        let parsed = parse_unified_diff(diff).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].path, "a.txt");
+        assert_eq!(parsed[1].path, "b.txt");
+    }
+
+    #[test]
+    fn parse_diff_with_no_newline_at_end_of_file() {
+        let diff =
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n";
+        let parsed = parse_unified_diff(diff).unwrap();
+        assert_eq!(parsed[0].path, "f.txt");
+    }
+
+    #[test]
+    fn reject_binary_patch() {
+        let diff = "Binary files a.txt and b.txt differ\n";
+        let err = parse_unified_diff(diff).unwrap_err();
+        assert!(matches!(err, EditError::BinaryPatch(_)));
+    }
+
+    #[test]
+    fn reject_empty_diff() {
+        let diff = "";
+        let err = parse_unified_diff(diff).unwrap_err();
+        assert!(matches!(err, EditError::EmptyDiff));
+    }
+
+    #[test]
+    fn apply_simple_replace_hunk() {
+        let content = "old line\n";
+        let hunks = vec![ParsedHunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            lines: vec![
+                HunkLine::Del("old line".into()),
+                HunkLine::Add("new line".into()),
+            ],
+        }];
+        let result = apply_hunks_to_content(content, &hunks, "f.txt").unwrap();
+        assert_eq!(result, "new line\n");
+    }
+
+    #[test]
+    fn apply_addition_hunk() {
+        let content = "line1\nline2\n";
+        let hunks = vec![ParsedHunk {
+            old_start: 2,
+            old_lines: 1,
+            new_start: 2,
+            new_lines: 2,
+            lines: vec![
+                HunkLine::Context("line2".into()),
+                HunkLine::Add("inserted".into()),
+            ],
+        }];
+        let result = apply_hunks_to_content(content, &hunks, "f.txt").unwrap();
+        assert_eq!(result, "line1\nline2\ninserted\n");
+    }
+
+    #[test]
+    fn apply_deletion_hunk() {
+        let content = "line1\nline2\nline3\n";
+        let hunks = vec![ParsedHunk {
+            old_start: 2,
+            old_lines: 1,
+            new_start: 2,
+            new_lines: 0,
+            lines: vec![HunkLine::Del("line2".into())],
+        }];
+        let result = apply_hunks_to_content(content, &hunks, "f.txt").unwrap();
+        assert_eq!(result, "line1\nline3\n");
+    }
+
+    #[test]
+    fn apply_multiple_hunks_descending_order() {
+        let content = "a\nb\nc\nd\ne\n";
+        // Two hunks: delete line 2, delete line 4 (original numbering)
+        let hunks = vec![
+            ParsedHunk {
+                old_start: 2,
+                old_lines: 1,
+                new_start: 2,
+                new_lines: 0,
+                lines: vec![HunkLine::Del("b".into())],
+            },
+            ParsedHunk {
+                old_start: 4,
+                old_lines: 1,
+                new_start: 4,
+                new_lines: 0,
+                lines: vec![HunkLine::Del("d".into())],
+            },
+        ];
+        let result = apply_hunks_to_content(content, &hunks, "f.txt").unwrap();
+        assert_eq!(result, "a\nc\ne\n");
+    }
+
+    #[test]
+    fn reject_context_mismatch() {
+        let content = "different\n";
+        let hunks = vec![ParsedHunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            lines: vec![
+                HunkLine::Context("expected".into()),
+                HunkLine::Add("new".into()),
+            ],
+        }];
+        let err = apply_hunks_to_content(content, &hunks, "f.txt").unwrap_err();
+        assert!(matches!(err, EditError::HunkContextMismatch { .. }));
+    }
+
+    #[test]
+    fn apply_diff_via_edit_service() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "old line\n");
+
+        let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old line\n+new line\n";
+        let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+
+        let result = svc.patch(tx).unwrap();
+        assert_eq!(result.status, PatchStatus::Committed);
+        assert_eq!(read_file(&tmp, "f.txt"), "new line\n");
+    }
+
+    #[test]
+    fn apply_multi_file_diff_via_edit_service() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "a.txt", "old a\n");
+        write_file(&tmp, "b.txt", "old b\n");
+
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old a\n+new a\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old b\n+new b\n";
+        let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+
+        let result = svc.patch(tx).unwrap();
+        assert_eq!(result.status, PatchStatus::Committed);
+        assert_eq!(read_file(&tmp, "a.txt"), "new a\n");
+        assert_eq!(read_file(&tmp, "b.txt"), "new b\n");
+    }
+
+    #[test]
+    fn apply_diff_with_expected_state_conflict() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "current content\n");
+
+        let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let mut tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+        tx.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"stale content\n")),
+            ..Default::default()
+        });
+
+        let err = svc.patch(tx).unwrap_err();
+        assert!(matches!(err, EditError::PatchPreparationFailure { .. }));
+
+        assert_eq!(read_file(&tmp, "f.txt"), "current content\n");
     }
 }
