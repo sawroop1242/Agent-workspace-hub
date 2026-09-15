@@ -42,7 +42,7 @@ jobs:
           # CHANGES_REQUIRED verdicts land the checkpoint in FIXING; anything
           # else means this event is stale or out of order.
           if python scripts/awh_pipeline.py validate-event --agent fixer --feature "$FEATURE_ID" --pr "$PR"; then
-            echo 'Event validated against the checkpoint.'
+            :
           else
             code=$?
             if [ "$code" -eq 3 ]; then
@@ -52,6 +52,13 @@ jobs:
             fi
             exit "$code"
           fi
+          CHECKPOINT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
+          if [ -n "$EVENT_OPERATION_ID" ] && [ "$EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
+            echo "STALE_EVENT: fix event operation_id=$EVENT_OPERATION_ID does not match checkpoint operation_id=$CHECKPOINT_OP; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo 'Event identity and operation are current.'
 
       - name: Record fix-gate failure
         if: failure() && steps.validate_event.outputs.stale != 'true'
@@ -93,14 +100,8 @@ jobs:
 
       - name: Dispatch Agent 2 fix
         run: |
-          # Idempotent dispatch: the checkpoint already records this fix
-          # operation; a retry only re-notifies the same logical operation.
           CURRENT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
           test -n "$CURRENT_OP"
-          if [ -n "$EVENT_OPERATION_ID" ] && [ "$EVENT_OPERATION_ID" != "$CURRENT_OP" ]; then
-            echo "STALE_EVENT: dispatch payload operation $EVENT_OPERATION_ID does not match checkpoint operation $CURRENT_OP; terminating job."
-            exit 1
-          fi
           if [ -z "$REVIEW" ]; then
             REVIEW=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --jq '.[-1].body // empty')
             test -n "$REVIEW"
