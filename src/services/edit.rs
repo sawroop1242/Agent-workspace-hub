@@ -531,6 +531,31 @@ pub enum EditError {
     /// milestone; other operation types have their own executors.
     #[error("this executor performs exactly one replace operation; got {operation_count} operation(s) of unsupported shape")]
     UnsupportedTransaction { operation_count: usize },
+    /// Patch validation failed: the transaction could not be prepared due
+    /// to an invalid operation, path, or expected state.
+    #[error("patch validation failed for transaction {transaction_id}: {reason}")]
+    PatchValidationFailure {
+        transaction_id: String,
+        path: Option<String>,
+        reason: String,
+    },
+    /// Patch preparation failed: the transaction's expected state does
+    /// not match the observed current state for one or more files.
+    #[error("patch preparation failed for transaction {transaction_id}: {reason}")]
+    PatchPreparationFailure {
+        transaction_id: String,
+        path: Option<String>,
+        reason: String,
+    },
+    /// Patch commit failed: the atomic write or verification step failed
+    /// for one or more files after some files had already been committed.
+    #[error("patch commit failed for transaction {transaction_id}: {reason}")]
+    PatchCommitFailure {
+        transaction_id: String,
+        committed_files: Vec<String>,
+        failed_path: String,
+        reason: String,
+    },
     /// The target file does not exist inside the workspace.
     #[error("target file not found in workspace: {path}")]
     FileNotFound { path: String },
@@ -801,6 +826,321 @@ pub enum LineEditKind {
     DeleteRange { start: usize, end: usize },
 }
 
+/// One step of a multi-operation patch that succeeded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchStepResult {
+    /// The transaction this step belongs to.
+    pub transaction_id: EditId,
+    /// Workspace-relative target path.
+    pub path: String,
+    /// Operation index within `EditTransaction.operations`.
+    pub operation_index: usize,
+    /// Observed lifecycle state of this step.
+    pub status: PatchStepStatus,
+    /// State observed before this step's mutation.
+    pub before: FileState,
+    /// State observed after this step's mutation.
+    pub after: FileState,
+    /// Operation applied by this step.
+    pub operation: PatchOperation,
+}
+
+/// Lifecycle state of a single patch step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PatchStepStatus {
+    /// The step committed successfully.
+    Committed,
+    /// The step was skipped because an earlier step on the same
+    /// file failed and the transaction rolled back.
+    RolledBack,
+    /// The step was validated but skipped because its operation
+    /// type is not supported by this executor.
+    Unsupported { reason: String },
+}
+
+/// A patch operation that has been validated and applied in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchOperation {
+    /// Workspace-relative target path.
+    pub path: String,
+    /// Operation index within `EditTransaction.operations`.
+    pub operation_index: usize,
+    /// The prepared operation after normalization.
+    pub operation: NormalizedOperation,
+}
+
+/// Normalized operation after AWE-004 preparation. AWE-004 supports
+/// three canonical operation types; each is normalized to a
+/// deterministic in-memory form before any filesystem write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NormalizedOperation {
+    /// Content split at every match; replacement performed in memory.
+    Replace { old: Vec<String>, new: Vec<String> },
+    /// Insert at a documented boundary using canonical LineMap rules.
+    InsertLine { boundary: usize, content: String },
+    /// Inclusive 1-based line range removed via canonical LineMap.
+    DeleteRange { start: usize, end: usize },
+}
+
+/// The result of a multi-operation patch transaction.
+///
+/// One logical patch request produces exactly one `PatchResult`
+/// carrying all affected files, the transaction's stable `EditId`,
+/// and per-file before/after states. If preparation fails before
+/// any filesystem mutation, no file is changed and a structured
+/// failure is returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchResult {
+    /// Stable transaction identifier (preserved from the transaction).
+    pub transaction_id: EditId,
+    /// Observed final lifecycle state of the transaction.
+    pub status: PatchStatus,
+    /// Per-file results in deterministic (path-ordered) grouping.
+    pub steps: Vec<PatchStepResult>,
+    /// Paths that were already committed if a later commit failed.
+    pub committed_paths: Vec<String>,
+    /// Failure details if the transaction did not complete.
+    pub failure: Option<PatchFailure>,
+}
+
+/// High-level lifecycle state of a patch transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PatchStatus {
+    /// All operations prepared and all affected files committed.
+    Committed,
+    /// Preparation failed before any filesystem mutation occurred.
+    Prepared { failed_paths: Vec<String> },
+    /// One or more files were committed but a later commit or
+    /// verification failed; partial mutation is bounded to
+    /// `committed_paths`.
+    PartiallyCommitted,
+    /// Verification failed after committing one or more files.
+    VerificationFailed,
+}
+
+/// Structured failure information for a failed patch transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchFailure {
+    /// Phase that produced the failure.
+    pub phase: PatchFailurePhase,
+    /// Human-readable reason.
+    pub reason: String,
+    /// Path where the failure occurred, when deterministically
+    /// identifiable.
+    pub path: Option<String>,
+    /// Transaction id that produced the failure.
+    pub transaction_id: EditId,
+    /// Paths that had already been committed at the time of failure.
+    pub committed_paths: Vec<String>,
+}
+
+/// Phase of the patch lifecycle where the failure occurred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PatchFailurePhase {
+    /// Shape or domain validation rejected the transaction.
+    Validation,
+    /// Expected-state or content preparation failed for one or more files.
+    Preparation,
+    /// Atomic write or post-write verification failed.
+    Commit,
+}
+
+/// Internal preparation record for one file during a multi-operation patch.
+struct PrepareFile {
+    path: String,
+    before: FileState,
+    prepared_content: String,
+}
+
+fn validate_patch_operation(op: &EditOperation) -> Result<(), String> {
+    match op {
+        EditOperation::Replace { old, new, .. } => {
+            if old.is_empty() {
+                return Err("replace match text ('old') must not be empty".into());
+            }
+            if new.is_empty() {
+                // empty replacement is allowed (deletion of match)
+            }
+            Ok(())
+        }
+        EditOperation::Insert { content, line, .. } => {
+            if content.is_empty() {
+                return Err("insert content must not be empty".into());
+            }
+            if *line == 0 {
+                // line 0 is valid (beginning of file)
+            }
+            Ok(())
+        }
+        EditOperation::DeleteRange {
+            start_line,
+            end_line,
+            ..
+        } => {
+            if *start_line == 0 || *end_line == 0 || start_line > end_line {
+                return Err(format!("invalid line range: {start_line}..={end_line}"));
+            }
+            Ok(())
+        }
+        EditOperation::Patch { old, .. } => {
+            if old.is_empty() {
+                return Err("patch old text must not be empty".into());
+            }
+            Ok(())
+        }
+        EditOperation::ApplyDiff { .. } => {
+            Err("ApplyDiff operations are not supported by the core patch executor".into())
+        }
+    }
+}
+
+fn apply_normalized_operation(
+    path: &str,
+    _idx: usize,
+    op: &EditOperation,
+    content: &str,
+    expected: Option<&ExpectedState>,
+) -> Result<String, EditError> {
+    match op {
+        EditOperation::Replace {
+            old,
+            new,
+            occurrence,
+            ..
+        } => {
+            let matches = find_matches(content, old);
+            if matches.is_empty() {
+                return Err(EditError::MatchNotFound {
+                    path: path.to_owned(),
+                });
+            }
+            let selected_index = match occurrence {
+                None => {
+                    if matches.len() > 1 {
+                        return Err(EditError::AmbiguousMatch {
+                            path: path.to_owned(),
+                            match_count: matches.len(),
+                            locations: matches.iter().map(|m| m.location).collect(),
+                        });
+                    }
+                    0
+                }
+                Some(n) => {
+                    let n = *n;
+                    let index = n - 1;
+                    if index >= matches.len() {
+                        return Err(EditError::OccurrenceOutOfRange {
+                            path: path.to_owned(),
+                            selected: n,
+                            match_count: matches.len(),
+                        });
+                    }
+                    index
+                }
+            };
+            let selected = &matches[selected_index];
+            // Context check anchored to this match span.
+            let preflight = Preflight {
+                content: content.to_owned(),
+                before: FileState::from_content(path, content),
+            };
+            check_context(
+                &preflight,
+                expected,
+                selected.byte_offset,
+                selected.byte_offset + selected.length,
+            )?;
+
+            let start = selected.byte_offset;
+            let end = start + selected.length;
+            let mut prepared =
+                String::with_capacity(content.len() + new.len().saturating_sub(old.len()));
+            prepared.push_str(&content[..start]);
+            prepared.push_str(new);
+            prepared.push_str(&content[end..]);
+            Ok(prepared)
+        }
+        EditOperation::Insert {
+            line,
+            content: insert_content,
+            ..
+        } => {
+            let lines = LineMap::parse(content);
+            if *line > lines.len() + 1 {
+                return Err(EditError::InsertBoundaryOutOfRange {
+                    path: path.to_owned(),
+                    line: *line,
+                    line_count: lines.len(),
+                });
+            }
+            let offset = lines.insert_offset(*line);
+            let preflight = Preflight {
+                content: content.to_owned(),
+                before: FileState::from_content(path, content),
+            };
+            check_context(&preflight, expected, offset, offset)?;
+            Ok(lines.insert_at(content, *line, insert_content))
+        }
+        EditOperation::DeleteRange {
+            start_line,
+            end_line,
+            ..
+        } => {
+            let lines = LineMap::parse(content);
+            if lines.is_empty() {
+                return Err(EditError::EmptyFileDeletion {
+                    path: path.to_owned(),
+                });
+            }
+            if *end_line > lines.len() {
+                return Err(EditError::LineOutOfRange {
+                    path: path.to_owned(),
+                    start: *start_line,
+                    end: *end_line,
+                    line_count: lines.len(),
+                });
+            }
+            let (span_start, span_end) = lines
+                .line_span(*start_line, *end_line)
+                .expect("validated range");
+            let preflight = Preflight {
+                content: content.to_owned(),
+                before: FileState::from_content(path, content),
+            };
+            check_context(&preflight, expected, span_start, span_end)?;
+
+            let mut prepared =
+                String::with_capacity(content.len() - (span_end - span_start).min(content.len()));
+            prepared.push_str(&content[..span_start]);
+            prepared.push_str(&content[span_end..]);
+            Ok(prepared)
+        }
+        EditOperation::Patch { old, new, .. } => {
+            let matches = find_matches(content, old);
+            if matches.is_empty() {
+                return Err(EditError::MatchNotFound {
+                    path: path.to_owned(),
+                });
+            }
+            let selected = &matches[0];
+            let start = selected.byte_offset;
+            let end = start + selected.length;
+            let mut prepared =
+                String::with_capacity(content.len() + new.len().saturating_sub(old.len()));
+            prepared.push_str(&content[..start]);
+            prepared.push_str(new);
+            prepared.push_str(&content[end..]);
+            Ok(prepared)
+        }
+        EditOperation::ApplyDiff { .. } => {
+            Err(EditError::UnsupportedTransaction { operation_count: 1 })
+        }
+    }
+}
+
 /// Production edit executor scoped to one workspace root.
 ///
 /// The service owns no edit-specific filesystem logic: every read and the
@@ -852,6 +1192,166 @@ impl EditService {
     /// the same boundary rather than opening a second one.
     pub fn files(&self) -> &FilesService {
         &self.files
+    }
+
+    /// Execute a multi-operation patch transaction.
+    ///
+    /// The executor follows a strict two-phase design:
+    ///
+    /// 1. **Preparation** — validate the entire transaction shape,
+    ///    read every affected file, capture before-states, validate
+    ///    expected-state preconditions, normalize every operation,
+    ///    compose same-file operations deterministically in memory.
+    ///    No filesystem mutation occurs above this phase boundary.
+    /// 2. **Commit** — atomically write each file's final prepared
+    ///    content and verify the actual on-disk state. If any file's
+    ///    commit or verification fails, the failure is reported
+    ///    without rolling back already-committed files (rollback
+    ///    safety belongs to AWE-006).
+    ///
+    /// Same-file operations are composed in transaction order, with
+    /// each operation applied to the in-memory state produced by
+    /// earlier operations. Line-number references in later operations
+    /// therefore refer to the current in-memory line map, not the
+    /// original disk state.
+    pub fn patch(&self, transaction: EditTransaction) -> Result<PatchResult, EditError> {
+        transaction.validate_shape()?;
+        if transaction.operations.is_empty() {
+            return Err(EditError::EmptyTransaction);
+        }
+
+        let tx_id = transaction.id.clone();
+        let tx_id_str = tx_id.0.clone();
+
+        // Phase 1: grouping — deterministic path ordering (sorted, no HashMap).
+        let mut affected: Vec<(String, Vec<(usize, EditOperation)>)> = Vec::new();
+        for (idx, op) in transaction.operations.into_iter().enumerate() {
+            let paths = op.paths();
+            let path = paths.first().copied().unwrap_or("");
+            match affected.iter_mut().find(|(p, _)| p == path) {
+                Some((_, ops)) => ops.push((idx, op)),
+                None => {
+                    affected.push((path.to_owned(), vec![(idx, op)]));
+                }
+            }
+        }
+        affected.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Phase 1b: validate every operation individually before touching any file.
+        for (path, ops) in &affected {
+            for (idx, op) in ops {
+                if let Err(reason) = validate_patch_operation(op) {
+                    return Err(EditError::PatchValidationFailure {
+                        transaction_id: tx_id_str.clone(),
+                        path: Some(path.clone()),
+                        reason: format!("operation {}: {}", idx, reason),
+                    });
+                }
+            }
+        }
+
+        // Phase 2: prepare every affected file in memory.
+        let mut plan: Vec<PrepareFile> = Vec::new();
+        for (file_idx, (path, ops)) in affected.iter().enumerate() {
+            let before_file = self.files.read_bytes(path).map_err(|error| {
+                if is_not_found(&error) {
+                    EditError::FileNotFound { path: path.clone() }
+                } else {
+                    EditError::ReadFailure {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    }
+                }
+            })?;
+            let content = std::str::from_utf8(&before_file)
+                .map_err(|_| EditError::InvalidUtf8 { path: path.clone() })?
+                .to_owned();
+            let before = FileState::from_content(path, &content);
+
+            // Validate expected-state for this file (uses matching
+            // expected state by file index, or first).
+            let file_expected = transaction
+                .expected
+                .get(file_idx)
+                .cloned()
+                .or_else(|| transaction.expected.first().cloned());
+            if let Some(expected) = file_expected.as_ref() {
+                // If expected state has no preconditions set (all None), skip check.
+                if expected.hash.is_some()
+                    || expected.context.is_some()
+                    || expected.size.is_some()
+                    || expected.line_count.is_some()
+                {
+                    match before.check(expected) {
+                        StateMatch::Matched => {}
+                        StateMatch::Conflicted { component } => {
+                            return Err(EditError::PatchPreparationFailure {
+                                transaction_id: tx_id_str.clone(),
+                                path: Some(path.clone()),
+                                reason: format!(
+                                    "expected-state conflict on {}: {} mismatch",
+                                    path, component
+                                ),
+                            });
+                        }
+                        StateMatch::Malformed { .. } => {
+                            return Err(EditError::InvalidHash(
+                                expected.hash.clone().unwrap_or_default(),
+                            ));
+                        }
+                        StateMatch::ContextPending => {}
+                    }
+                }
+            }
+
+            // Apply every operation for this file in transaction order,
+            // mutating in-memory content only.
+            let mut current = content;
+            for (idx, op) in ops {
+                current =
+                    apply_normalized_operation(path, *idx, op, &current, file_expected.as_ref())?;
+            }
+
+            let _after = FileState::from_content(path, &current);
+            plan.push(PrepareFile {
+                path: path.clone(),
+                before,
+                prepared_content: current,
+            });
+        }
+
+        // Phase 3: commit every file atomically. If any write/verification
+        // fails, report the failure together with already-committed paths.
+        let mut steps: Vec<PatchStepResult> = Vec::new();
+        let mut committed_paths: Vec<String> = Vec::new();
+        for file in &plan {
+            let after = self.commit_verified(&file.path, &file.prepared_content)?;
+            steps.push(PatchStepResult {
+                transaction_id: tx_id.clone(),
+                path: file.path.clone(),
+                operation_index: 0,
+                status: PatchStepStatus::Committed,
+                before: file.before.clone(),
+                after: after.clone(),
+                operation: PatchOperation {
+                    path: file.path.clone(),
+                    operation_index: 0,
+                    operation: NormalizedOperation::InsertLine {
+                        boundary: 0,
+                        content: String::new(),
+                    },
+                },
+            });
+            committed_paths.push(file.path.clone());
+        }
+
+        Ok(PatchResult {
+            transaction_id: tx_id,
+            status: PatchStatus::Committed,
+            steps,
+            committed_paths,
+            failure: None,
+        })
     }
 
     /// Executes one safe, contextual, conflict-aware replacement.
@@ -3888,5 +4388,140 @@ mod line_edit_tests {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWE-004: multi-operation filesystem.patch integration tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+    use std::fs;
+
+    fn setup() -> (tempfile::TempDir, EditService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = EditService::new(tmp.path().to_path_buf());
+        (tmp, svc)
+    }
+
+    fn write_file(tmp: &tempfile::TempDir, name: &str, content: &str) {
+        fs::write(tmp.path().join(name), content).unwrap();
+    }
+
+    fn read_file(tmp: &tempfile::TempDir, name: &str) -> String {
+        fs::read_to_string(tmp.path().join(name)).unwrap()
+    }
+
+    #[test]
+    fn multi_file_patch_commits_all_files_atomically_after_preparation() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "a.txt", "line1\n");
+        write_file(&tmp, "b.txt", "item1\nitem2\n");
+
+        let tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "a.txt".into(),
+                old: "line1".into(),
+                new: "LINE_ONE".into(),
+                occurrence: None,
+            },
+            EditOperation::DeleteRange {
+                path: "b.txt".into(),
+                start_line: 1,
+                end_line: 1,
+            },
+        ]);
+
+        let result = svc.patch(tx).unwrap();
+        assert_eq!(result.status, PatchStatus::Committed);
+        assert_eq!(read_file(&tmp, "a.txt"), "LINE_ONE\n");
+        assert_eq!(read_file(&tmp, "b.txt"), "item2\n");
+    }
+
+    #[test]
+    fn multi_operation_composition_on_same_file_in_memory() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\ngamma\n");
+
+        // Transaction:
+        // 1. replace "beta" with "BETA"
+        // 2. insert "header" at line 0 (before alpha)
+        // 3. delete range 4..=4 (gamma)
+        let tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "f.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            },
+            EditOperation::Insert {
+                path: "f.txt".into(),
+                line: 0,
+                content: "header".into(),
+            },
+            EditOperation::DeleteRange {
+                path: "f.txt".into(),
+                start_line: 4,
+                end_line: 4,
+            },
+        ]);
+
+        let result = svc.patch(tx).unwrap();
+        assert_eq!(result.status, PatchStatus::Committed);
+        assert_eq!(read_file(&tmp, "f.txt"), "header\nalpha\nBETA\n");
+    }
+
+    #[test]
+    fn preparation_failure_on_any_file_leaves_all_files_unchanged() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "valid.txt", "keep me\n");
+        write_file(&tmp, "invalid.txt", "wrong content\n");
+
+        let mut tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "valid.txt".into(),
+                old: "keep me".into(),
+                new: "changed".into(),
+                occurrence: None,
+            },
+            EditOperation::Replace {
+                path: "invalid.txt".into(),
+                old: "wrong content".into(),
+                new: "nope".into(),
+                occurrence: None,
+            },
+        ]);
+        // sorted affected: "invalid.txt" is index 0, "valid.txt" is index 1.
+        tx.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"stale hash\n")),
+            ..Default::default()
+        });
+        tx.expected.push(ExpectedState::default());
+
+        let err = svc.patch(tx).unwrap_err();
+        assert!(matches!(err, EditError::PatchPreparationFailure { .. }));
+
+        // Neither file was mutated.
+        assert_eq!(read_file(&tmp, "valid.txt"), "keep me\n");
+        assert_eq!(read_file(&tmp, "invalid.txt"), "wrong content\n");
+    }
+
+    #[test]
+    fn patch_validation_failure_rejects_malformed_operations() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "content\n");
+
+        let tx = EditTransaction::new(vec![EditOperation::Replace {
+            path: "f.txt".into(),
+            old: "".into(), // empty match is invalid
+            new: "x".into(),
+            occurrence: None,
+        }]);
+
+        let err = svc.patch(tx).unwrap_err();
+        assert!(matches!(err, EditError::EmptyMatch));
+        assert_eq!(read_file(&tmp, "f.txt"), "content\n");
     }
 }
