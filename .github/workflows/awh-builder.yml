@@ -289,9 +289,13 @@ jobs:
         if: failure()
         run: |
           git checkout rust 2>/dev/null || true
+          PR_ARGS=()
+          if [ -n "${{ steps.pr.outputs.number }}" ]; then
+            PR_ARGS+=(--pr "${{ steps.pr.outputs.number }}")
+          fi
           python scripts/awh_pipeline.py record-failure \
             --agent builder --stage record-pr \
             --detail "failed to record the PR in the shared checkpoint; see workflow run logs" \
             --feature "$AWH_FEATURE_ID" \
             --operation-id "$AWH_EVENT_OPERATION_ID" \
-            --pr "${{ steps.pr.outputs.number }}" || true
+            "${PR_ARGS[@]}" || true
