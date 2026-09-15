@@ -270,14 +270,6 @@ jobs:
         run: |
           python scripts/awh_merge_guard.py --pr "$PR" --reviewed-sha "$REVIEWED_SHA" --feature "$FEATURE_ID"
 
-      - name: Record merge failure
-        if: failure()
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent merger --stage merge \
-            --detail "SHA-guarded squash merge failed; the checkpoint remains in MERGING for recovery" \
-            --feature "$FEATURE_ID" --pr "$PR" || true
-
       - name: Update backlog and state
         run: |
           python - <<'PY'
