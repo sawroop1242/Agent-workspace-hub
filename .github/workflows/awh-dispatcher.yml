@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: read
   pull-requests: read
 
@@ -14,12 +14,14 @@ concurrency:
   group: awh-autonomous-dispatcher
   cancel-in-progress: false
 
+env:
+  GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+  ORPHAN_PLANNING_STALE_MINUTES: 15
+
 jobs:
   dispatch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,6 +45,11 @@ jobs:
           if [ "$ACTION" = dispatch ]; then
             echo "event=$(jq -r '.event' /tmp/dispatch.json)" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Repair orphaned planning checkpoint
+        if: steps.plan.outputs.action == 'repair'
+        run: |
+          python scripts/repair_orphan_planning.py --stale-minutes "$ORPHAN_PLANNING_STALE_MINUTES"
 
       - name: Dispatch next checkpoint-owned event
         if: steps.plan.outputs.action == 'dispatch'
