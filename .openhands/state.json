@@ -1,8 +1,8 @@
 {
   "version": 4,
-  "status": "PLANNING",
+  "status": "IDLE",
   "operation_id": null,
-  "recovery_attempt": 0,
+  "recovery_attempt": 1,
   "recovery_claim": null,
   "active_feature": null,
   "active_pr": null,
@@ -10,7 +10,7 @@
   "active_pr_sha": null,
   "review_round": 0,
   "builder_attempt": 0,
-  "last_error": null,
+  "last_error": "recovered stale orphaned PLANNING checkpoint; safe to start a new operation",
   "last_review": "",
-  "updated_at": "2026-09-15T14:17:09.985915Z"
+  "updated_at": "2026-09-15T18:10:00Z"
 }
