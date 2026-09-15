@@ -54,8 +54,13 @@ jobs:
             fi
             exit "$code"
           fi
+          test -n "$AWH_EVENT_OPERATION_ID" || {
+            echo 'STALE_EVENT: builder dispatch has no operation_id; terminating job.'
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          }
           CHECKPOINT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
-          if [ -n "$AWH_EVENT_OPERATION_ID" ] && [ "$AWH_EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
+          if [ "$AWH_EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
             echo "STALE_EVENT: builder event operation_id=$AWH_EVENT_OPERATION_ID does not match checkpoint operation_id=$CHECKPOINT_OP; terminating job."
             echo 'stale=true' >> "$GITHUB_OUTPUT"
             exit 1
@@ -68,7 +73,8 @@ jobs:
           python scripts/awh_pipeline.py record-failure \
             --agent builder --stage checkpoint-validation \
             --detail "builder pre-flight failed (sync or event validation); see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" || true
+            --feature "$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" || true
 
       - name: Validate checkpoint before builder work
         run: python scripts/checkpoint_state.py validate
@@ -84,9 +90,11 @@ jobs:
       - name: Checkpoint builder stage with CAS and operation identity
         run: |
           test -n "$AWH_FEATURE_ID"
+          test -n "$AWH_EVENT_OPERATION_ID"
           python scripts/awh_pipeline.py begin-stage \
             --stage builder \
             --feature "$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" \
             --message "chore(automation): builder stage for $AWH_FEATURE_ID" \
             --set last_error=null
 
@@ -96,7 +104,8 @@ jobs:
           python scripts/awh_pipeline.py record-failure \
             --agent builder --stage begin \
             --detail "builder could not enter the BUILDING stage under CAS; see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" || true
+            --feature "$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" || true
 
       - name: Determine branch
         id: branch
@@ -169,7 +178,8 @@ jobs:
           python scripts/awh_pipeline.py record-failure \
             --agent builder --stage agent \
             --detail "OpenHands Agent 2 failed (non-retryable); see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" || true
+            --feature "$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" || true
 
       - name: Deterministic verification
         run: |
@@ -184,7 +194,8 @@ jobs:
           python scripts/awh_pipeline.py record-failure \
             --agent builder --stage verification \
             --detail "deterministic Rust verification failed (fmt/check/test/clippy); see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" || true
+            --feature "$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" || true
 
       - name: Commit and push feature branch
         env:
@@ -208,7 +219,8 @@ jobs:
             --agent builder --stage push \
             --detail "feature branch commit/push failed; see workflow run logs" \
             --feature "$AWH_FEATURE_ID" \
-            --branch "feature/$AWH_FEATURE_ID" || true
+            --branch "feature/$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" || true
 
       - name: Create or update PR
         id: pr
@@ -247,7 +259,8 @@ jobs:
           python scripts/awh_pipeline.py record-failure \
             --agent builder --stage pr \
             --detail "failed to create or update the feature PR; see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" || true
+            --feature "$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" || true
 
       - name: Record PR in state
         env:
@@ -280,4 +293,5 @@ jobs:
             --agent builder --stage record-pr \
             --detail "failed to record the PR in the shared checkpoint; see workflow run logs" \
             --feature "$AWH_FEATURE_ID" \
+            --operation-id "$AWH_EVENT_OPERATION_ID" \
             --pr "${{ steps.pr.outputs.number }}" || true
