@@ -47,36 +47,41 @@ jobs:
         run: python scripts/safe_git.py sync --branch rust
 
       - name: Validate PR identity before any review work
+        id: validate_event
         env:
           PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
         run: |
           test -n "$PR"
           PRDATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,isCrossRepository)
           if [ "$(echo "$PRDATA" | jq -r '.isCrossRepository')" != false ]; then
-            echo "STALE_EVENT: PR $PR is cross-repository; ignoring."
-            exit 0
+            echo "STALE_EVENT: PR $PR is cross-repository; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
           fi
           if [ "$(echo "$PRDATA" | jq -r '.baseRefName')" != rust ]; then
-            echo "STALE_EVENT: PR $PR does not target rust; ignoring."
-            exit 0
+            echo "STALE_EVENT: PR $PR does not target rust; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
           fi
           if [ "$(echo "$PRDATA" | jq -r '.state')" != OPEN ]; then
-            echo "STALE_EVENT: PR $PR is not open; ignoring."
-            exit 0
+            echo "STALE_EVENT: PR $PR is not open; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
           fi
           if python scripts/awh_pipeline.py validate-event --agent reviewer --pr "$PR" --feature "$AWH_EVENT_FEATURE"; then
             echo 'Event validated against the checkpoint.'
           else
             code=$?
             if [ "$code" -eq 3 ]; then
-              echo "STALE_EVENT: review event for PR $PR does not match the active checkpoint; ignoring."
-              exit 0
+              echo "STALE_EVENT: review event for PR $PR does not match the active checkpoint; terminating job."
+              echo 'stale=true' >> "$GITHUB_OUTPUT"
+              exit 1
             fi
             exit "$code"
           fi
 
       - name: Record review-gate failure
-        if: failure()
+        if: failure() && steps.validate_event.outputs.stale != 'true'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent reviewer --stage validation \
@@ -118,13 +123,15 @@ jobs:
           CURRENT=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
           if [ -z "$EXPECTED" ] || [ -z "$CURRENT" ]; then
             echo 'valid=false' >> "$GITHUB_OUTPUT"
-            echo 'REVIEW_INVALIDATED: missing checkpoint or current PR head SHA; standing down.'
-            exit 0
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            echo 'REVIEW_INVALIDATED: missing checkpoint or current PR head SHA; terminating job.'
+            exit 1
           fi
           if [ "$CURRENT" != "$EXPECTED" ]; then
             echo 'valid=false' >> "$GITHUB_OUTPUT"
-            echo "REVIEW_INVALIDATED: PR head changed before Agent 3 review (checkpoint=$EXPECTED current=$CURRENT); standing down."
-            exit 0
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            echo "REVIEW_INVALIDATED: PR head changed before Agent 3 review (checkpoint=$EXPECTED current=$CURRENT); terminating job."
+            exit 1
           fi
           echo 'valid=true' >> "$GITHUB_OUTPUT"
           echo "Agent 3 is pinned to reviewed SHA $EXPECTED"
