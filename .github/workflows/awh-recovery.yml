@@ -110,7 +110,7 @@ jobs:
             --owner "$RECOVERY_OWNER" \
             --to REVIEWING \
             --message "chore(automation): invalidate stale merge approval" \
-            --set active_pr_sha="$(python -c 'import json,os; print(json.dumps(os.environ["CURRENT"]))')"
+            --set active_pr_sha="$(printf '%s' "$CURRENT" | python -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')"
 
           jq -n \
             --arg feature "$FEATURE" \
