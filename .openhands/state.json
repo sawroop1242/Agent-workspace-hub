@@ -1,16 +1,16 @@
 {
   "version": 4,
-  "status": "BLOCKED",
-  "operation_id": "AWH-AUTO-003:BUILD:1",
+  "status": "IDLE",
+  "operation_id": null,
   "recovery_attempt": 0,
   "recovery_claim": null,
-  "active_feature": "AWH-AUTO-003",
+  "active_feature": null,
   "active_pr": null,
   "active_branch": null,
   "active_pr_sha": null,
   "review_round": 0,
-  "builder_attempt": 1,
-  "last_error": "{\"agent\": \"starter\", \"attempt\": 1, \"branch\": null, \"commit\": null, \"detail\": \"failed to dispatch the Agent 2 build event; recovery will resume from BUILDING\", \"feature_id\": \"AWH-AUTO-003\", \"operation_id\": \"AWH-AUTO-003:BUILD:1\", \"pr\": null, \"review_round\": 0, \"stage\": \"dispatch\", \"status_at_failure\": \"BUILDING\"}",
+  "builder_attempt": 0,
+  "last_error": null,
   "last_review": "",
-  "updated_at": "2026-09-15T11:24:33.562497Z"
+  "updated_at": "2026-09-15T14:00:00Z"
 }
