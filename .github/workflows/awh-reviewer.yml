@@ -29,10 +29,6 @@ jobs:
     timeout-minutes: 60
     env:
       GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-      K1: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
-      K2: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_2 }}
-      K3: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_3 }}
-      KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
       AWH_AGENT_ROLE: reviewer
       AWH_PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
       AWH_EVENT_FEATURE: ${{ github.event.client_payload.feature_id || '' }}
@@ -89,6 +85,9 @@ jobs:
 
       - name: Verify required LLM secrets
         if: steps.validate_event.outputs.stale != 'true'
+        env:
+          K1: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
+          KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
         run: |
           test -n "$K1" || { echo 'Missing AWH_AGENT3_NVIDIA_KEY_1'; exit 1; }
           test -n "$KF" || { echo 'Missing AWH_ROUTINE_NVIDIA_KEY'; exit 1; }
@@ -128,6 +127,10 @@ jobs:
       - name: Run semantic Agent 3 with key rotation
         if: steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'
         env:
+          K1: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
+          K2: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_2 }}
+          K3: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_3 }}
+          KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
           AWH_REVIEW_MODE: ${{ steps.validate_event.outputs.analysis_only == 'true' && 'analysis' || 'pipeline' }}
         run: |
           set +e
@@ -141,6 +144,12 @@ jobs:
             exit "$RC"
           done
           test "$SUCCESS" -eq 1
+
+      - name: Validate Agent 3 v2 evidence and verdict
+        if: steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'
+        env:
+          AWH_REVIEW_SHA: ${{ steps.validate_event.outputs.current_sha }}
+        run: python scripts/reviewer_validate.py
 
       - name: Record semantic review failure
         if: failure() && steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'
