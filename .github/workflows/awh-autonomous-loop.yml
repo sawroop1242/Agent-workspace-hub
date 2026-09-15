@@ -166,9 +166,6 @@ jobs:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
           TASK: ${{ steps.plan.outputs.task }}
         run: |
-          # Idempotent dispatch: the checkpoint already records this build
-          # operation (FEATURE:BUILD:1); a retry only re-notifies the same
-          # logical operation, never a second one.
           CURRENT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
           EXPECTED_OP="$FEATURE_ID:BUILD:1"
           if [ "$CURRENT_OP" != "$EXPECTED_OP" ]; then
@@ -196,6 +193,7 @@ jobs:
       PR: ${{ github.event.client_payload.pr_number }}
       FEATURE_ID: ${{ github.event.client_payload.feature_id }}
       EVENT_OPERATION_ID: ${{ github.event.client_payload.operation_id }}
+      REVIEWED_SHA: ${{ github.event.client_payload.reviewed_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -209,7 +207,7 @@ jobs:
       - name: Validate merge event against the authoritative checkpoint
         run: |
           test -n "$PR"
-          # The dispatch payload is a notification: the checkpoint is authoritative.
+          test -n "$REVIEWED_SHA"
           if python scripts/awh_pipeline.py validate-event --agent merger --pr "$PR" --feature "$FEATURE_ID"; then
             echo 'Merge event validated against the checkpoint.'
           else
@@ -221,13 +219,20 @@ jobs:
             exit "$code"
           fi
 
-      - name: Record merge-gate failure
-        if: failure()
+      - name: Verify immutable reviewed head before entering MERGING
         run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent merger --stage validation \
-            --detail "merge event failed checkpoint validation; see workflow run logs" \
-            --feature "$FEATURE_ID" --pr "$PR" || true
+          CHECKPOINT_SHA=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
+          CURRENT_SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
+          test -n "$CHECKPOINT_SHA"
+          test "$REVIEWED_SHA" = "$CHECKPOINT_SHA" || {
+            echo "STALE_EVENT: reviewed_sha=$REVIEWED_SHA does not match checkpoint active_pr_sha=$CHECKPOINT_SHA; refusing merge."
+            exit 0
+          }
+          if [ "$CURRENT_SHA" != "$REVIEWED_SHA" ]; then
+            echo "REVIEW_INVALIDATED: PR head changed from reviewed $REVIEWED_SHA to $CURRENT_SHA; refusing merge. The synchronize reviewer will bind a new SHA."
+            exit 0
+          fi
+          echo "Immutable review head verified: $REVIEWED_SHA"
 
       - name: Checkpoint merge stage with CAS and operation identity
         run: |
@@ -261,17 +266,16 @@ jobs:
             --detail "PR checks or mergeability verification failed; see workflow run logs" \
             --feature "$FEATURE_ID" --pr "$PR" || true
 
-      - name: Merge reviewed head with squash
+      - name: Merge reviewed head with SHA guard
         run: |
-          HEAD=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
-          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch --match-head-commit "$HEAD"
+          python scripts/awh_merge_guard.py --pr "$PR" --reviewed-sha "$REVIEWED_SHA" --feature "$FEATURE_ID"
 
       - name: Record merge failure
         if: failure()
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent merger --stage merge \
-            --detail "squash merge failed; the checkpoint remains in MERGING for recovery" \
+            --detail "SHA-guarded squash merge failed; the checkpoint remains in MERGING for recovery" \
             --feature "$FEATURE_ID" --pr "$PR" || true
 
       - name: Update backlog and state
