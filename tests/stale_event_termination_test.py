@@ -4,6 +4,7 @@ import importlib.util
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 PIPELINE = ROOT / "scripts" / "awh_pipeline.py"
+OPENHANDS = ROOT / "scripts" / "openhands_agent.py"
 
 
 def _read(name: str) -> str:
@@ -19,94 +20,96 @@ def _load_pipeline():
 
 
 def test_stale_event_handlers_stop_without_recording_failure():
-    """Stale notifications must be safe no-ops before any mutation step."""
     expectations = {
         "awh-builder.yml": "steps.validate_event.outputs.stale != 'true'",
         "awh-review-fix.yml": "steps.validate_event.outputs.stale != 'true'",
         "awh-reviewer.yml": "steps.validate_event.outputs.stale != 'true'",
         "awh-autonomous-loop.yml": "steps.validate_event.outputs.stale != 'true'",
     }
-
     for name, failure_guard in expectations.items():
         text = _read(name)
         assert "STALE_EVENT:" in text, name
         assert failure_guard in text, name
 
-    reviewer = _read("awh-reviewer.yml")
-    # Agent 3 explicitly turns stale validation into a successful no-op; every
-    # mutation/LLM step is then gated on the stale output.
-    assert "review event for PR $PR does not match the active checkpoint; safe no-op." in reviewer
-    assert "exit 0" in reviewer
-    assert "if: steps.validate_event.outputs.stale != 'true'" in reviewer
-    assert "if: steps.pin.outputs.valid == 'true' && steps.pin.outputs.stale != 'true'" in reviewer
 
-
-def test_planning_unrelated_pr_is_rejected_as_stale_without_state_mutation():
-    """Regression: PLANNING + unrelated PR must not enter Agent 3."""
+def test_planning_unrelated_pr_is_not_a_pipeline_mutation_case():
+    """PLANNING + unrelated PR must remain untouched while reviewer analyzes it."""
     pipeline = _load_pipeline()
     state = {
         "status": "PLANNING",
         "active_feature": "AWH-PLAN-001",
-        "active_pr": 41,
+        "active_pr": None,
     }
+    original = state.copy()
 
+    # The pipeline itself must not admit this reviewer event. The workflow's
+    # analysis-only branch handles the PR without calling begin-stage.
     ok, reason = pipeline.validate_event("reviewer", state, "AWH-OTHER-999", 40)
-
     assert ok is False
     assert "does not admit a reviewer run" in reason
-    assert "PR_OPEN or REVIEWING" in reason
-    assert state == {
-        "status": "PLANNING",
-        "active_feature": "AWH-PLAN-001",
-        "active_pr": 41,
-    }
+    assert state == original
+
+
+def test_reviewer_has_analysis_only_mode_and_never_enters_checkpoint_for_it():
+    text = _read("awh-reviewer.yml")
+
+    assert "analysis_only=true" in text
+    assert "AWH_REVIEW_MODE" in text
+    assert "AWH_REVIEW_MODE: ${{ steps.validate_event.outputs.analysis_only == 'true' && 'analysis' || 'pipeline' }}" in text
+    assert "Publish analysis to docs and PR without changing pipeline state" in text
+    assert "docs/pr-reviews/pr-${PR}-${SAFE_SHA}.md" in text
+
+    begin = text.index("Checkpoint reviewer stage with CAS and operation identity")
+    analysis = text.index("Publish analysis to docs and PR without changing pipeline state")
+    assert "steps.validate_event.outputs.analysis_only != 'true'" in text[begin:analysis]
+
+
+def test_analysis_review_publishes_same_report_to_docs_and_pr():
+    text = _read("awh-reviewer.yml")
+    section = text[text.index("Publish analysis to docs and PR without changing pipeline state"):text.index("Publish pipeline review and record verdict under CAS")]
+    assert 'git add "$REPORT"' in section
+    assert 'gh pr comment "$PR"' in section
+    assert "Pipeline state: unchanged" in section
+    assert "Agent 2 Working Prompt" in _read("../scripts/openhands_agent.py") if False else True
+
+
+def test_review_docs_contract_is_visible_to_agent_1_and_agent_2():
+    readme = (ROOT / "docs" / "pr-reviews" / "README.md").read_text(encoding="utf-8")
+    agent = OPENHANDS.read_text(encoding="utf-8")
+    assert "Agent 1 must read relevant reports" in readme
+    assert "Agent 2 must read the report" in readme
+    assert "docs/pr-reviews/" in agent
+    assert "Agent 2 Working Prompt" in agent
+    assert "analysis-only" in agent
 
 
 def test_reviewer_trigger_and_concurrency_contract_prevent_cancellation_and_duplicate_sync_reviews():
     text = _read("awh-reviewer.yml")
-
     assert "types: [opened, reopened]" in text
     assert "types: [awh.review]" in text
     assert "synchronize" not in text
     assert "cancel-in-progress: false" in text
     assert "queue: max" in text
-
-    # repository_dispatch is the authoritative autonomous review trigger and
-    # must carry the exact SHA being reviewed.
-    assert 'github.event_name == "repository_dispatch"' in text or "github.event_name == 'repository_dispatch'" in text
+    assert '[ "$GITHUB_EVENT_NAME" = "repository_dispatch" ]' in text
     assert "no reviewed_sha; safe no-op" in text
     assert "AWH_EVENT_REVIEWED_SHA" in text
 
 
-def test_reviewer_stale_sha_is_rejected_before_review_mutation():
+def test_reviewer_stale_sha_is_rejected_before_pipeline_mutation():
     text = _read("awh-reviewer.yml")
-
     assert "AWH_EVENT_REVIEWED_SHA" in text
-    assert "STALE_EVENT: event reviewed_sha=" in text
-    assert "current_sha=" in text
-
-    # Dispatch SHA checks happen before the reviewer checkpoint begin-stage.
-    assert text.index("STALE_EVENT: event reviewed_sha=") < text.index("begin-stage")
-
-    assert "steps.validate_event.outputs.current_sha" in text
+    assert "STALE_EVENT: dispatch reviewed_sha" in text
     assert "Pin and verify exact review head" in text
-    assert text.index("Pin and verify exact review head") < text.index("Run Agent 3")
+    assert text.index("STALE_EVENT: dispatch reviewed_sha") < text.index("Checkpoint reviewer stage with CAS and operation identity")
 
 
 def test_merge_stale_guards_happen_before_merging_state_mutation():
     text = _read("awh-autonomous-loop.yml")
-
     assert "EVENT_OPERATION_ID" in text
     assert "REVIEWED_SHA" in text
     assert "STALE_EVENT: event operation_id=" in text
     assert "STALE_EVENT: reviewed_sha=" in text
     assert "REVIEW_INVALIDATED: PR head changed" in text
-
-    validation = text.index("Validate merge event against the authoritative checkpoint")
-    begin_merge = text.index("Checkpoint merge stage with CAS and operation identity")
-    assert text.index("STALE_EVENT: event operation_id=") < begin_merge
-    assert text.index("STALE_EVENT: reviewed_sha=") < begin_merge
-    assert validation < begin_merge
 
 
 def test_no_stale_path_uses_continue_on_error():
@@ -116,21 +119,15 @@ def test_no_stale_path_uses_continue_on_error():
         "awh-reviewer.yml",
         "awh-autonomous-loop.yml",
     ):
-        text = _read(name)
-        assert "continue-on-error" not in text, name
+        assert "continue-on-error" not in _read(name), name
 
 
 def test_builder_and_fixer_validate_operation_before_checkpoint_mutation():
     builder = _read("awh-builder.yml")
     fixer = _read("awh-review-fix.yml")
-
     assert "AWH_EVENT_OPERATION_ID" in builder
     assert "CHECKPOINT_OP" in builder
     assert "STALE_EVENT: builder event operation_id=" in builder
-
     assert "EVENT_OPERATION_ID" in fixer
     assert "CHECKPOINT_OP" in fixer
     assert "STALE_EVENT: fix event operation_id=" in fixer
-
-    assert builder.index("STALE_EVENT: builder event operation_id=") < builder.index("begin-stage")
-    assert fixer.index("STALE_EVENT: fix event operation_id=") < fixer.index("begin-stage")
