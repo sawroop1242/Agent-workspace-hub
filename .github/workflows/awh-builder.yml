@@ -128,6 +128,8 @@ jobs:
         run: |
           if [ -n "$TASK_INPUT" ]; then
             printf '%s\n' "$TASK_INPUT" > /tmp/task.md
+          elif [ -s .openhands/generated-task.md ]; then
+            cp .openhands/generated-task.md /tmp/task.md
           else
             jq -r --arg id "$FEATURE_ID" '.features[] | select(.id==$id) | ("Feature ID: " + .id), ("# Feature\n" + .title), "# Goal\n" + (.acceptance_criteria|join("\n- ")), "# Acceptance Criteria\n" + (.acceptance_criteria|map("- " + .)|join("\n"))' .openhands/backlog.json > /tmp/task.md
           fi
@@ -213,10 +215,10 @@ jobs:
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
           FEATURE_ID: ${{ github.event.client_payload.feature_id }}
-          TASK: ${{ github.event.client_payload.task }}
         run: |
           EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base rust --state open --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then echo "number=$EXISTING" >> "$GITHUB_OUTPUT"; exit 0; fi
+          TASK=$(cat /tmp/task.md)
           BODY=$(cat <<EOF
           ## Autonomous Feature Delivery
 
