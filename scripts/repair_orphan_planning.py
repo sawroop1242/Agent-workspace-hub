@@ -104,9 +104,9 @@ def main() -> int:
 
     subprocess.run(["git", "config", "user.name", "AWH Recovery"], check=True)
     subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
-    subprocess.run(["git", "add", str(STATE)], check=True)
-    subprocess.run(["git", "commit", "-m", "chore(automation): recover orphaned planning checkpoint"], check=True)
-    result = subprocess.run(["git", "push", "origin", "rust"], capture_output=True, text=True)
+    subprocess.run(["git", "add", ".openhands/state.json"], cwd=ROOT, check=True)
+    subprocess.run(["git", "commit", "-m", "chore(automation): recover orphaned planning checkpoint"], cwd=ROOT, check=True)
+    result = subprocess.run(["git", "push", "origin", "rust"], cwd=ROOT, capture_output=True, text=True)
     if result.returncode != 0:
         print("LOST_CLAIM: remote checkpoint changed before orphan repair could be published", file=sys.stderr)
         print(result.stderr.strip(), file=sys.stderr)
