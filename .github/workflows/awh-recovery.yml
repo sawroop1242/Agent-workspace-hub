@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: '17,47 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [awh.recover]
 
 permissions:
   contents: write
@@ -42,12 +44,26 @@ jobs:
         run: |
           FEATURE=$(jq -r '.active_feature // ""' .openhands/state.json)
           OPERATION_ID=$(jq -r '.operation_id // ""' .openhands/state.json)
+          STATUS=$(jq -r '.status' .openhands/state.json)
           if [ -z "$FEATURE" ]; then
             echo 'No active feature on the shared checkpoint; nothing to recover.'
             exit 0
           fi
           echo "feature=$FEATURE" >> "$GITHUB_OUTPUT"
           echo "operation_id=$OPERATION_ID" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Validate explicit recovery request identity
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          REQUESTED_FEATURE='${{ github.event.client_payload.feature_id }}'
+          REQUESTED_OPERATION='${{ github.event.client_payload.operation_id }}'
+          CURRENT_FEATURE='${{ steps.observe.outputs.feature }}'
+          CURRENT_OPERATION='${{ steps.observe.outputs.operation_id }}'
+          if [ "$REQUESTED_FEATURE" != "$CURRENT_FEATURE" ] || [ "$REQUESTED_OPERATION" != "$CURRENT_OPERATION" ]; then
+            echo "STALE_RECOVERY_REQUEST: requested=$REQUESTED_FEATURE/$REQUESTED_OPERATION current=$CURRENT_FEATURE/$CURRENT_OPERATION"
+            exit 0
+          fi
 
       - name: Atomically claim recovery of stale work
         id: claim
@@ -101,7 +117,7 @@ jobs:
           test -n "$TARGET" -a -n "$REASON"
           echo "Recovery decision: $TARGET ($REASON)"
           if [ "$TARGET" = "BLOCKED" ]; then
-            echo 'No safe continuation; recovery claim will be released back to BLOCKED.'
+            echo 'No safe continuation; releasing recovery claim back to BLOCKED.'
             python scripts/awh_pipeline.py finalize-recovery \
               --owner "$RECOVERY_OWNER" --to BLOCKED \
               --message 'chore(automation): recovery found no safe continuation'
@@ -112,15 +128,19 @@ jobs:
             --message "chore(automation): recovery resumed as $TARGET"
           if [ -n "$EVENT" ]; then
             python3 - "$EVENT" "$PAYLOAD" <<'PY'
-          import json, os, subprocess, sys
-          event, payload = sys.argv[1], sys.argv[2]
-          checkpoint=json.load(open('.openhands/state.json'))
-          client_payload=json.loads(payload)
-          client_payload['operation_id']=checkpoint['operation_id']
-          body={"event_type":event,"client_payload":client_payload}
-          subprocess.run(["gh","api",f"repos/{os.environ['GITHUB_REPOSITORY']}/dispatches","--method","POST","--input","-"],input=json.dumps(body),text=True,check=True)
-          print(f"dispatched {event} for {checkpoint['operation_id']}")
-          PY
+import json, os, subprocess, sys
+
+event, payload = sys.argv[1], sys.argv[2]
+checkpoint = json.load(open('.openhands/state.json'))
+client_payload = json.loads(payload)
+client_payload['operation_id'] = checkpoint['operation_id']
+body = {'event_type': event, 'client_payload': client_payload}
+subprocess.run([
+    'gh', 'api', f"repos/{os.environ['GITHUB_REPOSITORY']}/dispatches",
+    '--method', 'POST', '--input', '-'
+], input=json.dumps(body), text=True, check=True)
+print(f"dispatched {event} for {checkpoint['operation_id']}")
+PY
           fi
 
       - name: Record recovery failure
