@@ -14,6 +14,7 @@ on:
       - 'tests/safe_git_test.py'
       - 'tests/awh_pipeline_test.py'
       - 'tests/awh_merge_guard_test.py'
+      - 'tests/automation_sha_contract_test.py'
       - '.github/workflows/awh-*.yml'
       - '.github/workflows/checkpoint-state-tests.yml'
   pull_request:
@@ -28,6 +29,7 @@ on:
       - 'tests/safe_git_test.py'
       - 'tests/awh_pipeline_test.py'
       - 'tests/awh_merge_guard_test.py'
+      - 'tests/automation_sha_contract_test.py'
       - '.github/workflows/awh-*.yml'
       - '.github/workflows/checkpoint-state-tests.yml'
   workflow_dispatch:
@@ -67,4 +69,4 @@ jobs:
 
       - name: Run pipeline safety regression tests
         if: runner.os != 'Windows'
-        run: python -m pytest -q tests/awh_pipeline_test.py tests/awh_merge_guard_test.py
+        run: python -m pytest -q tests/awh_pipeline_test.py tests/awh_merge_guard_test.py tests/automation_sha_contract_test.py
