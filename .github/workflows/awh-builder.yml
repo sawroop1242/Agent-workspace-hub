@@ -40,20 +40,22 @@ jobs:
         run: python scripts/safe_git.py sync --branch rust
 
       - name: Validate event against the authoritative checkpoint
+        id: validate_event
         run: |
           if python scripts/awh_pipeline.py validate-event --agent builder --feature "$AWH_FEATURE_ID"; then
             echo 'Event is current; proceeding as a builder run.'
           else
             code=$?
             if [ "$code" -eq 3 ]; then
-              echo 'STALE_EVENT: builder dispatch does not match the checkpoint; ignoring.'
-              exit 0
+              echo 'STALE_EVENT: builder dispatch does not match the checkpoint; terminating job.'
+              echo 'stale=true' >> "$GITHUB_OUTPUT"
+              exit 1
             fi
             exit "$code"
           fi
 
       - name: Record failure on workflow error
-        if: failure()
+        if: failure() && steps.validate_event.outputs.stale != 'true'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent builder --stage checkpoint-validation \
