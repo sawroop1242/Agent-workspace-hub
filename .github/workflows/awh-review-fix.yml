@@ -34,6 +34,7 @@ jobs:
         run: python scripts/safe_git.py sync --branch rust
 
       - name: Validate event against the authoritative checkpoint
+        id: validate_event
         run: |
           test -n "$FEATURE_ID"
           test -n "$PR"
@@ -45,14 +46,15 @@ jobs:
           else
             code=$?
             if [ "$code" -eq 3 ]; then
-              echo 'STALE_EVENT: review-complete event does not match the checkpoint; ignoring.'
-              exit 0
+              echo 'STALE_EVENT: review-complete event does not match the checkpoint; terminating job.'
+              echo 'stale=true' >> "$GITHUB_OUTPUT"
+              exit 1
             fi
             exit "$code"
           fi
 
       - name: Record fix-gate failure
-        if: failure()
+        if: failure() && steps.validate_event.outputs.stale != 'true'
         run: |
           python scripts/awh_pipeline.py record-failure \
             --agent fixer --stage validation \
@@ -96,8 +98,8 @@ jobs:
           CURRENT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
           test -n "$CURRENT_OP"
           if [ -n "$EVENT_OPERATION_ID" ] && [ "$EVENT_OPERATION_ID" != "$CURRENT_OP" ]; then
-            echo "STALE_EVENT: dispatch payload operation $EVENT_OPERATION_ID does not match checkpoint operation $CURRENT_OP; ignoring."
-            exit 0
+            echo "STALE_EVENT: dispatch payload operation $EVENT_OPERATION_ID does not match checkpoint operation $CURRENT_OP; terminating job."
+            exit 1
           fi
           if [ -z "$REVIEW" ]; then
             REVIEW=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --jq '.[-1].body // empty')
