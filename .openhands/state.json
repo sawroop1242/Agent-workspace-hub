@@ -1,16 +1,16 @@
 {
   "version": 4,
-  "status": "PLANNING",
-  "operation_id": null,
+  "status": "BUILDING",
+  "operation_id": "AWH-AUTO-003:BUILD:1",
   "recovery_attempt": 1,
   "recovery_claim": null,
-  "active_feature": null,
+  "active_feature": "AWH-AUTO-003",
   "active_pr": null,
   "active_branch": null,
   "active_pr_sha": null,
   "review_round": 0,
-  "builder_attempt": 0,
+  "builder_attempt": 1,
   "last_error": null,
   "last_review": "",
-  "updated_at": "2026-09-15T18:09:20.753805Z"
+  "updated_at": "2026-09-15T18:31:27.841976Z"
 }
