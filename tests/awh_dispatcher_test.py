@@ -54,8 +54,16 @@ def test_blocked_requests_recovery_without_reset():
 
 
 def test_active_planner_or_recovery_waits():
-    assert MODULE.plan_dispatch(state("PLANNING"))["action"] == "wait"
+    assert MODULE.plan_dispatch(state("PLANNING", active_feature="AWH-4"))["action"] == "wait"
     assert MODULE.plan_dispatch(state("RECOVERING"))["action"] == "wait"
+
+
+def test_orphan_planning_requests_repair():
+    result = MODULE.plan_dispatch(
+        state("PLANNING", active_feature=None, operation_id=None)
+    )
+    assert result["action"] == "repair"
+    assert "orphaned PLANNING" in result["reason"]
 
 
 def test_missing_identity_is_rejected():
