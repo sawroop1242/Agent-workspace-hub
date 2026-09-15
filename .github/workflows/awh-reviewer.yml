@@ -52,7 +52,7 @@ jobs:
           PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
         run: |
           test -n "$PR"
-          PRDATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,isCrossRepository)
+          PRDATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,isCrossRepository,headRefOid)
           if [ "$(echo "$PRDATA" | jq -r '.isCrossRepository')" != false ]; then
             echo "STALE_EVENT: PR $PR is cross-repository; terminating job."
             echo 'stale=true' >> "$GITHUB_OUTPUT"
@@ -69,7 +69,7 @@ jobs:
             exit 1
           fi
           if python scripts/awh_pipeline.py validate-event --agent reviewer --pr "$PR" --feature "$AWH_EVENT_FEATURE"; then
-            echo 'Event validated against the checkpoint.'
+            :
           else
             code=$?
             if [ "$code" -eq 3 ]; then
@@ -79,6 +79,19 @@ jobs:
             fi
             exit "$code"
           fi
+          CHECKPOINT_SHA=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
+          CURRENT_SHA=$(echo "$PRDATA" | jq -r '.headRefOid')
+          if [ -n "$AWH_EVENT_REVIEWED_SHA" ] && [ "$AWH_EVENT_REVIEWED_SHA" != "$CHECKPOINT_SHA" ]; then
+            echo "STALE_EVENT: event reviewed_sha=$AWH_EVENT_REVIEWED_SHA does not match checkpoint active_pr_sha=$CHECKPOINT_SHA; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ -n "$AWH_EVENT_REVIEWED_SHA" ] && [ "$AWH_EVENT_REVIEWED_SHA" != "$CURRENT_SHA" ]; then
+            echo "REVIEW_INVALIDATED: event reviewed_sha=$AWH_EVENT_REVIEWED_SHA does not match current PR head $CURRENT_SHA; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "PR identity validated at head $CURRENT_SHA."
 
       - name: Record review-gate failure
         if: failure() && steps.validate_event.outputs.stale != 'true'
@@ -95,24 +108,6 @@ jobs:
           echo 'Required Agent 3 key and routine fallback are configured.'
           [ -n "$K2" ] && echo 'Optional Agent 3 key 2 configured.' || echo 'Optional Agent 3 key 2 not configured.'
           [ -n "$K3" ] && echo 'Optional Agent 3 key 3 configured.' || echo 'Optional Agent 3 key 3 not configured.'
-
-      - name: Checkpoint reviewer stage with CAS and operation identity
-        env:
-          PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
-        run: |
-          test -n "$PR"
-          FEATURE=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName' | sed 's#^feature/##')
-          test -n "$FEATURE"
-          BRANCH=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName')
-          SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
-          test -n "$SHA"
-          python scripts/awh_pipeline.py begin-stage \
-            --stage reviewer \
-            --feature "$FEATURE" \
-            --pr "$PR" \
-            --branch "$BRANCH" \
-            --sha "$SHA" \
-            --message "chore(automation): reviewer stage for $FEATURE PR $PR"
 
       - name: Pin and verify exact review head
         id: pin
@@ -134,7 +129,26 @@ jobs:
             exit 1
           fi
           echo 'valid=true' >> "$GITHUB_OUTPUT"
-          echo "Agent 3 is pinned to reviewed SHA $EXPECTED"
+          echo "Agent 3 is pinned to reviewed SHA $EXPECTED before checkpoint mutation."
+
+      - name: Checkpoint reviewer stage with CAS and operation identity
+        env:
+          PR: ${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
+        run: |
+          test -n "$PR"
+          FEATURE=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName' | sed 's#^feature/##')
+          test -n "$FEATURE"
+          BRANCH=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName')
+          SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
+          test -n "$SHA"
+          test "$SHA" = "$(jq -r '.active_pr_sha // empty' .openhands/state.json)"
+          python scripts/awh_pipeline.py begin-stage \
+            --stage reviewer \
+            --feature "$FEATURE" \
+            --pr "$PR" \
+            --branch "$BRANCH" \
+            --sha "$SHA" \
+            --message "chore(automation): reviewer stage for $FEATURE PR $PR"
 
       - name: Install OpenHands SDK and built-in tools
         if: steps.pin.outputs.valid == 'true'
