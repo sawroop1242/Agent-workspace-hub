@@ -86,3 +86,11 @@ def test_analysis_review_is_non_mutating_and_pipeline_review_is_sha_bound():
     assert "Pipeline state: **unchanged**" in workflow
     assert "state.get('active_pr_sha') != data['headRefOid']" in workflow
     assert "--expect-operation-id" in workflow
+
+
+def test_analysis_only_failure_paths_never_record_checkpoint_failures():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    validation = workflow[workflow.index("Record validation failure"):workflow.index("Verify required LLM secrets")]
+    semantic = workflow[workflow.index("Record semantic review failure"):workflow.index("Publish analysis-only evidence to docs and PR")]
+    assert "analysis_only != 'true'" in validation
+    assert "analysis_only != 'true'" in semantic
