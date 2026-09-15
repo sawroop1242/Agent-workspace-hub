@@ -7,16 +7,32 @@ on:
       - '.openhands/state.json'
       - '.openhands/state.schema.json'
       - 'scripts/checkpoint_state.py'
+      - 'scripts/safe_git.py'
+      - 'scripts/awh_pipeline.py'
+      - 'scripts/awh_merge_guard.py'
       - 'tests/checkpoint_state_test.py'
-      - '.github/workflows/awh-recovery.yml'
+      - 'tests/safe_git_test.py'
+      - 'tests/awh_pipeline_test.py'
+      - 'tests/awh_merge_guard_test.py'
+      - 'tests/automation_sha_contract_test.py'
+      - 'tests/stale_event_termination_test.py'
+      - '.github/workflows/awh-*.yml'
       - '.github/workflows/checkpoint-state-tests.yml'
   pull_request:
     paths:
       - '.openhands/state.json'
       - '.openhands/state.schema.json'
       - 'scripts/checkpoint_state.py'
+      - 'scripts/safe_git.py'
+      - 'scripts/awh_pipeline.py'
+      - 'scripts/awh_merge_guard.py'
       - 'tests/checkpoint_state_test.py'
-      - '.github/workflows/awh-recovery.yml'
+      - 'tests/safe_git_test.py'
+      - 'tests/awh_pipeline_test.py'
+      - 'tests/awh_merge_guard_test.py'
+      - 'tests/automation_sha_contract_test.py'
+      - 'tests/stale_event_termination_test.py'
+      - '.github/workflows/awh-*.yml'
       - '.github/workflows/checkpoint-state-tests.yml'
   workflow_dispatch:
 
@@ -51,4 +67,8 @@ jobs:
         run: python scripts/checkpoint_state.py validate
 
       - name: Run checkpoint regression tests
-        run: python -m pytest -q tests/checkpoint_state_test.py
+        run: python -m pytest -q tests/checkpoint_state_test.py tests/safe_git_test.py
+
+      - name: Run pipeline safety regression tests
+        if: runner.os != 'Windows'
+        run: python -m pytest -q tests/awh_pipeline_test.py tests/awh_merge_guard_test.py tests/automation_sha_contract_test.py tests/stale_event_termination_test.py

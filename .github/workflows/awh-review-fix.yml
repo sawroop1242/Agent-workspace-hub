@@ -17,6 +17,12 @@ jobs:
     if: github.event.client_payload.review_state == 'CHANGES_REQUIRED'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+      PR: ${{ github.event.client_payload.pr_number }}
+      FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+      REVIEW: ${{ github.event.client_payload.review }}
+      EVENT_OPERATION_ID: ${{ github.event.client_payload.operation_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,58 +30,90 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
-      - name: Validate checkpoint and checkpoint fix
-        env:
-          PR: ${{ github.event.client_payload.pr_number }}
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
-          REVIEW: ${{ github.event.client_payload.review }}
+      - name: Sync checkpoint from the shared branch
+        run: python scripts/safe_git.py sync --branch rust
+
+      - name: Validate event against the authoritative checkpoint
+        id: validate_event
         run: |
-          python scripts/checkpoint_state.py validate
-          ROUND=$(jq -r '.review_round' .openhands/state.json)
-          if [ "$ROUND" -ge 3 ]; then
-            echo "Maximum review rounds reached; leaving feature blocked."
-            exit 1
-          fi
           test -n "$FEATURE_ID"
           test -n "$PR"
-          test -n "$REVIEW"
-          NEXT=$((ROUND + 1))
-          python scripts/checkpoint_state.py update \
-            --set status='"FIXING"' \
-            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
-            --set active_pr="$PR" \
-            --set review_round="$NEXT" \
-            --set last_review="$(python -c 'import json,os; print(json.dumps(os.environ["REVIEW"]))')" \
-            --set last_error=null
-          git config user.name 'AWH Automation'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .openhands/state.json
-          git commit -m "chore(automation): start review fix round" || true
-          git push origin rust
+          # The dispatch payload is a notification: the checkpoint is authoritative.
+          # CHANGES_REQUIRED verdicts land the checkpoint in FIXING; anything
+          # else means this event is stale or out of order.
+          if python scripts/awh_pipeline.py validate-event --agent fixer --feature "$FEATURE_ID" --pr "$PR"; then
+            :
+          else
+            code=$?
+            if [ "$code" -eq 3 ]; then
+              echo 'STALE_EVENT: review-complete event does not match the checkpoint; terminating job.'
+              echo 'stale=true' >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            exit "$code"
+          fi
+          CHECKPOINT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
+          if [ -n "$EVENT_OPERATION_ID" ] && [ "$EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
+            echo "STALE_EVENT: fix event operation_id=$EVENT_OPERATION_ID does not match checkpoint operation_id=$CHECKPOINT_OP; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo 'Event identity and operation are current.'
 
-      - name: Collect reviewer feedback
-        env:
-          GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-          PR: ${{ github.event.client_payload.pr_number }}
+      - name: Record fix-gate failure
+        if: failure() && steps.validate_event.outputs.stale != 'true'
         run: |
-          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --comments > /tmp/pr.txt
-          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate > /tmp/reviews.json
+          python scripts/awh_pipeline.py record-failure \
+            --agent fixer --stage validation \
+            --detail "review-fix event validation failed; see workflow run logs" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
+
+      - name: Checkpoint fix round with CAS and operation identity
+        run: |
+          python scripts/awh_pipeline.py begin-stage \
+            --stage fixer \
+            --feature "$FEATURE_ID" \
+            --pr "$PR" \
+            --message "chore(automation): fix round for $FEATURE_ID PR $PR" \
+            --set last_review="$REVIEW"
+
+      - name: Enforce maximum review rounds
+        run: |
+          ROUND=$(jq -r '.review_round' .openhands/state.json)
+          if [ "$ROUND" -ge 3 ]; then
+            echo "Maximum review rounds reached ($ROUND); blocking the feature."
+            python scripts/awh_pipeline.py record-failure \
+              --agent fixer --stage rounds \
+              --detail "maximum review rounds (3) reached; feature left blocked for human review" \
+              --feature "$FEATURE_ID" --pr "$PR" || true
+            exit 1
+          fi
+          echo "Fix round $ROUND of 3 recorded."
+
+      - name: Record fix-checkpoint failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent fixer --stage begin \
+            --detail "review-fix could not enter the FIXING stage under CAS; see workflow run logs" \
+            --feature "$FEATURE_ID" --pr "$PR" || true
 
       - name: Dispatch Agent 2 fix
-        env:
-          GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-          PR: ${{ github.event.client_payload.pr_number }}
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
-          REVIEW: ${{ github.event.client_payload.review }}
         run: |
+          CURRENT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
+          test -n "$CURRENT_OP"
           if [ -z "$REVIEW" ]; then
-            REVIEW=$(python - <<'PY'
-          import json
-          d=json.load(open('/tmp/reviews.json'))
-          print(d[-1].get('body','') if d else '')
-          PY
-            )
+            REVIEW=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --jq '.[-1].body // empty')
+            test -n "$REVIEW"
           fi
-          test -n "$REVIEW"
-          jq -n --arg feature "$FEATURE_ID" --arg review "$REVIEW" '{event_type:"awh.fix",client_payload:{feature_id:$feature,review:$review}}' > /tmp/payload.json
+          jq -n --arg feature "$FEATURE_ID" --arg review "$REVIEW" --arg op "$CURRENT_OP" \
+            '{event_type:"awh.fix",client_payload:{feature_id:$feature,review:$review,operation_id:$op}}' > /tmp/payload.json
           gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/payload.json
+
+      - name: Record dispatch failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent fixer --stage dispatch \
+            --detail "failed to dispatch the Agent 2 fix event; see workflow run logs" \
+            --feature "$FEATURE_ID" --pr "$PR" || true

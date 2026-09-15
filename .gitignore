@@ -14,3 +14,4 @@ Thumbs.db
 
 # Local AWH runtime state (custom MCP configs may hold credentials)
 /.agent/
+__pycache__/

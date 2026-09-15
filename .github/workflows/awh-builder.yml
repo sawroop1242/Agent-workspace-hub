@@ -27,12 +27,48 @@ jobs:
       K2: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_2 }}
       K3: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_3 }}
       KF: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+      AWH_FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+      AWH_EVENT_OPERATION_ID: ${{ github.event.client_payload.operation_id }}
+      AWH_EVENT_REVIEW: ${{ github.event.client_payload.review }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: rust
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+
+      - name: Sync checkpoint from the shared branch
+        run: python scripts/safe_git.py sync --branch rust
+
+      - name: Validate event against the authoritative checkpoint
+        id: validate_event
+        run: |
+          if python scripts/awh_pipeline.py validate-event --agent builder --feature "$AWH_FEATURE_ID"; then
+            :
+          else
+            code=$?
+            if [ "$code" -eq 3 ]; then
+              echo 'STALE_EVENT: builder dispatch does not match the checkpoint; terminating job.'
+              echo 'stale=true' >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            exit "$code"
+          fi
+          CHECKPOINT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
+          if [ -n "$AWH_EVENT_OPERATION_ID" ] && [ "$AWH_EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
+            echo "STALE_EVENT: builder event operation_id=$AWH_EVENT_OPERATION_ID does not match checkpoint operation_id=$CHECKPOINT_OP; terminating job."
+            echo 'stale=true' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo 'Event identity and operation are current.'
+
+      - name: Record failure on workflow error
+        if: failure() && steps.validate_event.outputs.stale != 'true'
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent builder --stage checkpoint-validation \
+            --detail "builder pre-flight failed (sync or event validation); see workflow run logs" \
+            --feature "$AWH_FEATURE_ID" || true
 
       - name: Validate checkpoint before builder work
         run: python scripts/checkpoint_state.py validate
@@ -45,23 +81,22 @@ jobs:
           [ -n "$K2" ] && echo 'Optional Agent 2 key 2 configured.' || echo 'Optional Agent 2 key 2 not configured.'
           [ -n "$K3" ] && echo 'Optional Agent 2 key 3 configured.' || echo 'Optional Agent 2 key 3 not configured.'
 
-      - name: Checkpoint builder attempt
-        env:
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+      - name: Checkpoint builder stage with CAS and operation identity
         run: |
-          test -n "$FEATURE_ID"
-          CURRENT=$(jq -r '.builder_attempt' .openhands/state.json)
-          NEXT=$((CURRENT + 1))
-          python scripts/checkpoint_state.py update \
-            --set status='"BUILDING"' \
-            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
-            --set builder_attempt="$NEXT" \
+          test -n "$AWH_FEATURE_ID"
+          python scripts/awh_pipeline.py begin-stage \
+            --stage builder \
+            --feature "$AWH_FEATURE_ID" \
+            --message "chore(automation): builder stage for $AWH_FEATURE_ID" \
             --set last_error=null
-          git config user.name 'AWH Automation'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .openhands/state.json
-          git commit -m 'chore(automation): checkpoint builder attempt' || true
-          git push origin rust
+
+      - name: Record failure on workflow error
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent builder --stage begin \
+            --detail "builder could not enter the BUILDING stage under CAS; see workflow run logs" \
+            --feature "$AWH_FEATURE_ID" || true
 
       - name: Determine branch
         id: branch
@@ -78,7 +113,10 @@ jobs:
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             git fetch origin "$BRANCH:$BRANCH"
             git checkout "$BRANCH"
-            git reset --hard "origin/$BRANCH"
+            git merge --ff-only "origin/$BRANCH" || {
+              echo "Feature branch $BRANCH diverged from origin; refusing to reset or overwrite it." >&2
+              exit 1
+            }
           else
             git checkout -b "$BRANCH" origin/rust
           fi
@@ -123,6 +161,14 @@ jobs:
           done
           test "$SUCCESS" -eq 1
 
+      - name: Record Agent 2 failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent builder --stage agent \
+            --detail "OpenHands Agent 2 failed (non-retryable); see workflow run logs" \
+            --feature "$AWH_FEATURE_ID" || true
+
       - name: Deterministic verification
         run: |
           cargo fmt --all -- --check
@@ -130,7 +176,15 @@ jobs:
           cargo test --all-targets
           cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Commit and push
+      - name: Record verification failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent builder --stage verification \
+            --detail "deterministic Rust verification failed (fmt/check/test/clippy); see workflow run logs" \
+            --feature "$AWH_FEATURE_ID" || true
+
+      - name: Commit and push feature branch
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
           FEATURE_ID: ${{ github.event.client_payload.feature_id }}
@@ -144,6 +198,15 @@ jobs:
           git add -A
           git commit -m "feat(${FEATURE_ID}): implement assigned feature"
           git push --set-upstream origin "$BRANCH"
+
+      - name: Record feature-branch push failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent builder --stage push \
+            --detail "feature branch commit/push failed; see workflow run logs" \
+            --feature "$AWH_FEATURE_ID" \
+            --branch "feature/$AWH_FEATURE_ID" || true
 
       - name: Create or update PR
         id: pr
@@ -176,6 +239,14 @@ jobs:
           NUMBER=$(gh pr create --repo "$GITHUB_REPOSITORY" --base rust --head "$BRANCH" --title "feat(${FEATURE_ID}): autonomous implementation" --body "$BODY" --json number --jq '.number')
           echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
 
+      - name: Record PR creation failure
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent builder --stage pr \
+            --detail "failed to create or update the feature PR; see workflow run logs" \
+            --feature "$AWH_FEATURE_ID" || true
+
       - name: Record PR in state
         env:
           PR: ${{ steps.pr.outputs.number }}
@@ -183,15 +254,28 @@ jobs:
           FEATURE_ID: ${{ github.event.client_payload.feature_id }}
         run: |
           git checkout rust
-          git pull --ff-only origin rust
-          python scripts/checkpoint_state.py update \
-            --set status='"PR_OPEN"' \
+          python scripts/safe_git.py sync --branch rust
+          SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
+          test -n "$SHA"
+          python scripts/checkpoint_state.py transition \
+            --expect-status BUILDING --expect-status REVIEWING \
+            --to PR_OPEN \
             --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
             --set active_pr="$PR" \
             --set active_branch="$(python -c 'import json,os; print(json.dumps(os.environ["BRANCH"]))')" \
+            --set active_pr_sha="$(python -c 'import json,os; print(json.dumps(os.environ["SHA"]))')" \
             --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
-          git commit -m "chore(automation): record PR ${{ steps.pr.outputs.number }}" || true
-          git push origin rust
+          python scripts/safe_git.py push --branch rust --message "chore(automation): record PR ${{ steps.pr.outputs.number }}"
+
+      - name: Record checkpoint failure
+        if: failure()
+        run: |
+          git checkout rust 2>/dev/null || true
+          python scripts/awh_pipeline.py record-failure \
+            --agent builder --stage record-pr \
+            --detail "failed to record the PR in the shared checkpoint; see workflow run logs" \
+            --feature "$AWH_FEATURE_ID" \
+            --pr "${{ steps.pr.outputs.number }}" || true

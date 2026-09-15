@@ -1,12 +1,16 @@
 {
-  "version": 2,
-  "status": "BUILDING",
-  "active_feature": "",
+  "version": 4,
+  "status": "PLANNING",
+  "operation_id": null,
+  "recovery_attempt": 0,
+  "recovery_claim": null,
+  "active_feature": null,
   "active_pr": null,
   "active_branch": null,
+  "active_pr_sha": null,
   "review_round": 0,
   "builder_attempt": 0,
   "last_error": null,
   "last_review": "",
-  "updated_at": "2026-09-13T14:51:12.967940Z"
+  "updated_at": "2026-09-13T10:37:37.609336Z"
 }

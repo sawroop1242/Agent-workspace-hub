@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: read
+  pull-requests: read
 
 concurrency:
   group: awh-checkpoint-recovery
@@ -20,6 +21,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
       STALE_MINUTES: 90
+      LEASE_MINUTES: 120
+      RECOVERY_OWNER: awh-recovery-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,57 +30,135 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
-      - name: Validate checkpoint and recover stale work
+      - name: Sync checkpoint from the shared branch
         run: |
-          python scripts/checkpoint_state.py validate
-          python - <<'PY'
-          import json, os, subprocess
-          from datetime import datetime, timezone
-          from pathlib import Path
+          git config user.name 'AWH Recovery'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python scripts/safe_git.py sync --branch rust
 
-          state = json.loads(Path('.openhands/state.json').read_text(encoding='utf-8'))
-          status = state['status']
-          feature = state['active_feature']
-          pr = state['active_pr']
-          updated = state['updated_at']
-          stale_minutes = int(os.environ['STALE_MINUTES'])
+      - name: Observe the identity to recover
+        id: observe
+        run: |
+          FEATURE=$(jq -r '.active_feature // ""' .openhands/state.json)
+          OPERATION_ID=$(jq -r '.operation_id // ""' .openhands/state.json)
+          if [ -z "$FEATURE" ]; then
+            echo 'No active feature on the shared checkpoint; nothing to recover (the loop re-plans).'
+            exit 0
+          fi
+          echo "feature=$FEATURE" >> "$GITHUB_OUTPUT"
+          echo "operation_id=$OPERATION_ID" >> "$GITHUB_OUTPUT"
 
-          if status in {'IDLE', 'COMPLETED', 'BLOCKED'}:
-              print(f'No recoverable checkpoint: status={status}')
-              raise SystemExit(0)
+      - name: Atomically claim recovery of stale work
+        id: claim
+        if: steps.observe.outputs.feature != ''
+        run: |
+          result="$(python scripts/awh_pipeline.py claim-recovery \
+            --feature "${{ steps.observe.outputs.feature }}" \
+            --operation-id "${{ steps.observe.outputs.operation_id }}" \
+            --claim-owner "$RECOVERY_OWNER" \
+            --stale-minutes "$STALE_MINUTES" \
+            --lease-minutes "$LEASE_MINUTES" | tail -n1)"
 
-          if not updated:
-              stale = True
-          else:
-              stamp = datetime.fromisoformat(updated.replace('Z', '+00:00'))
-              age = (datetime.now(timezone.utc) - stamp).total_seconds() / 60
-              stale = age >= stale_minutes
-              print(f'Checkpoint status={status}, feature={feature}, PR={pr}, age={age:.1f}m, stale={stale}')
-          if not stale:
-              raise SystemExit(0)
+          case "$result" in
+            CLAIMED)
+              echo "Recovery claim acquired"
+              ;;
+            LOST_CLAIM)
+              echo "Another recovery worker won the claim; exiting safely"
+              ;;
+            NO_OP)
+              echo "Nothing recoverable right now; exiting safely"
+              ;;
+            *)
+              echo "::error::Recovery claim failed (result: $result)"
+              exit 1
+              ;;
+          esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
 
-          repo = os.environ['GITHUB_REPOSITORY']
-          def dispatch(event_type, payload):
-              body = json.dumps({'event_type': event_type, 'client_payload': payload})
-              subprocess.run(['gh', 'api', f'repos/{repo}/dispatches', '--method', 'POST', '--input', '-'], input=body, text=True, check=True)
+      - name: Repair an invalidated merge approval before normal recovery
+        id: sha_repair
+        if: steps.claim.outputs.result == 'CLAIMED'
+        run: |
+          STALE_STATUS=$(jq -r '.recovery_claim.stale_status // empty' .openhands/state.json)
+          if [ "$STALE_STATUS" != "MERGING" ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PR=$(jq -r '.active_pr // empty' .openhands/state.json)
+          FEATURE=$(jq -r '.active_feature // empty' .openhands/state.json)
+          EXPECTED=$(jq -r '.active_pr_sha // empty' .openhands/state.json)
+          if [ -z "$PR" ] || [ -z "$EXPECTED" ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PRDATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,isCrossRepository,headRefOid)
+          if [ "$(echo "$PRDATA" | jq -r '.state')" != OPEN ] || \
+             [ "$(echo "$PRDATA" | jq -r '.baseRefName')" != rust ] || \
+             [ "$(echo "$PRDATA" | jq -r '.isCrossRepository')" != false ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CURRENT=$(echo "$PRDATA" | jq -r '.headRefOid')
+          if [ "$CURRENT" = "$EXPECTED" ]; then
+            echo 'handled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          if status == 'PLANNING':
-              payload = {'reason': 'checkpoint_resume'}
-              if feature:
-                  payload['feature_id'] = feature
-              dispatch('awh.start', payload)
-          elif status == 'BUILDING':
-              if not feature:
-                  raise SystemExit('BUILDING checkpoint has no active_feature; refusing unsafe recovery.')
-              dispatch('awh.build', {'feature_id': feature, 'reason': 'checkpoint_resume'})
-          elif status == 'FIXING':
-              if not feature or not state['last_review']:
-                  raise SystemExit('FIXING checkpoint is missing active_feature or saved reviewer feedback; refusing unsafe recovery.')
-              dispatch('awh.fix', {'feature_id': feature, 'review': state['last_review'], 'reason': 'checkpoint_resume'})
-          elif status in {'REVIEWING', 'PR_OPEN'}:
-              if not pr:
-                  raise SystemExit(f'{status} checkpoint has no active_pr; refusing unsafe recovery.')
-              dispatch('awh.review', {'pr_number': pr, 'feature_id': feature or '', 'reason': 'checkpoint_resume'})
-          else:
-              raise SystemExit(f'Unknown checkpoint status: {status}')
+          echo "REVIEW_INVALIDATED: MERGING checkpoint reviewed $EXPECTED but PR head is now $CURRENT."
+          python scripts/awh_pipeline.py finalize-recovery \
+            --owner "$RECOVERY_OWNER" \
+            --to REVIEWING \
+            --message "chore(automation): invalidate stale merge approval" \
+            --set active_pr_sha="$(printf '%s' "$CURRENT" | python -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')"
+
+          jq -n \
+            --arg feature "$FEATURE" \
+            --arg pr "$PR" \
+            --arg sha "$CURRENT" \
+            '{event_type:"awh.review",client_payload:{feature_id:$feature,pr_number:($pr|tonumber),reviewed_sha:$sha,reason:"merge approval invalidated by head change"}}' > /tmp/review-payload.json
+          gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/review-payload.json
+          echo 'handled=true' >> "$GITHUB_OUTPUT"
+
+      - name: Inspect reality and decide the safe continuation
+        if: steps.claim.outputs.result == 'CLAIMED' && steps.sha_repair.outputs.handled != 'true'
+        run: |
+          python scripts/awh_pipeline.py decide-recovery | tee /tmp/decision.txt
+          TARGET=$(sed -n 's/^TARGET=//p' /tmp/decision.txt | head -n1)
+          REASON=$(sed -n 's/^REASON=//p' /tmp/decision.txt | head -n1)
+          EVENT=$(sed -n 's/^DISPATCH_EVENT=//p' /tmp/decision.txt | head -n1)
+          PAYLOAD=$(sed -n 's/^DISPATCH_PAYLOAD=//p' /tmp/decision.txt | head -n1)
+          test -n "$TARGET" -a -n "$REASON"
+          echo "Recovery decision: $TARGET ($REASON)"
+          if [ "$TARGET" = "BLOCKED" ]; then
+            python scripts/awh_pipeline.py record-failure \
+              --agent recovery --stage decide \
+              --detail "recovery found no safe continuation: $REASON" || true
+            exit 0
+          fi
+
+          python scripts/awh_pipeline.py finalize-recovery \
+            --owner "$RECOVERY_OWNER" \
+            --to "$TARGET" \
+            --message "chore(automation): recovery resumed as $TARGET"
+
+          if [ -n "$EVENT" ]; then
+            python3 - "$EVENT" "$PAYLOAD" <<'PY'
+          import json, os, subprocess, sys
+          event, payload = sys.argv[1], sys.argv[2]
+          body = {"event_type": event, "client_payload": json.loads(payload)}
+          subprocess.run(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/dispatches",
+                          "--method", "POST", "--input", "-"],
+                          input=json.dumps(body), text=True, check=True)
+          print(f"dispatched {event}")
           PY
+          else
+            echo 'No dispatch required by the recovery decision.'
+          fi
+
+      - name: Record recovery failure
+        if: failure() && steps.claim.outputs.result != 'LOST_CLAIM' && steps.claim.outputs.result != 'NO_OP'
+        run: |
+          python scripts/awh_pipeline.py record-failure \
+            --agent recovery --stage recover \
+            --detail "recovery could not claim, repair, decide, or resume the pipeline; see workflow run logs" || true
