@@ -460,7 +460,12 @@ impl EditTransaction {
                         return Err(EditError::InvalidOccurrence);
                     }
                 }
-                EditOperation::Insert { path, .. } => validate_path(path)?,
+                EditOperation::Insert { path, content, .. } => {
+                    validate_path(path)?;
+                    if content.is_empty() {
+                        return Err(EditError::EmptyInsertContent);
+                    }
+                }
                 EditOperation::DeleteRange {
                     path,
                     start_line,
@@ -507,6 +512,9 @@ pub enum EditError {
     InvalidLineRange { start: usize, end: usize },
     #[error("unified diff must not be empty")]
     EmptyDiff,
+    /// Insertion content must not be empty; it is the text to insert.
+    #[error("insert content must not be empty")]
+    EmptyInsertContent,
     #[error("expected-state hash must be 64 lowercase hex characters: {0}")]
     InvalidHash(String),
     #[error("expected-state context must not be empty when supplied")]
@@ -554,6 +562,27 @@ pub enum EditError {
         selected: usize,
         match_count: usize,
     },
+    /// An insert boundary line is outside the file's valid boundary range.
+    /// Boundaries are 0 (beginning of file) through line_count + 1 (EOF);
+    /// a positive N inserts before logical line N. No silent clamping.
+    #[error("insert boundary {line} is out of range: file has {line_count} line(s)")]
+    InsertBoundaryOutOfRange {
+        path: String,
+        line: usize,
+        line_count: usize,
+    },
+    /// A delete-range line is outside the file's existing line range.
+    /// Deletion is 1-based inclusive over existing lines only.
+    #[error("line range {start}..={end} is out of range: file has {line_count} line(s)")]
+    LineOutOfRange {
+        path: String,
+        start: usize,
+        end: usize,
+        line_count: usize,
+    },
+    /// Deletion from a file with no logical lines.
+    #[error("cannot delete lines from a file with no lines: {path}")]
+    EmptyFileDeletion { path: String },
     /// A supplied expected-state precondition (hash, size, or line count)
     /// does not match the observed current state. The stale state is never
     /// silently overwritten. Boxed to keep the error type small on the
@@ -738,6 +767,40 @@ pub struct EditResult {
     pub location: MatchLocation,
 }
 
+/// The outcome of one successfully committed line-oriented edit
+/// operation (insert or delete-range). Line coordinates follow the one
+/// canonical convention: 1-based logical lines as counted by
+/// [`FileState::line_count`]; insert boundaries additionally allow `0`
+/// (beginning of file) and `line_count + 1` (EOF).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineEditResult {
+    /// Identity of the executed transaction, for correlation.
+    pub id: EditId,
+    /// Workspace-relative target path.
+    pub path: String,
+    /// Observed final lifecycle state of the transaction.
+    pub status: EditStatus,
+    /// State observed before mutation.
+    pub before: FileState,
+    /// State observed after the committed mutation.
+    pub after: FileState,
+    /// Which line-oriented operation committed.
+    pub kind: LineEditKind,
+}
+
+/// Which line-oriented primitive committed in a [`LineEditResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LineEditKind {
+    /// Text inserted at a boundary. `boundary` is the requested line
+    /// boundary as documented on [`EditOperation::Insert`]: 0 = beginning
+    /// of file, 1..=line_count = before that logical line,
+    /// line_count + 1 = end of file.
+    Insert { boundary: usize },
+    /// An inclusive 1-based range of logical lines removed.
+    DeleteRange { start: usize, end: usize },
+}
+
 /// Production edit executor scoped to one workspace root.
 ///
 /// The service owns no edit-specific filesystem logic: every read and the
@@ -837,60 +900,17 @@ impl EditService {
             });
         };
 
-        // 3. Path syntax. Containment is enforced again by the filesystem
-        //    boundary below on both the read and the atomic write.
-        validate_path(path)?;
+        // 3–5. Shared preflight: path syntax, contained read, UTF-8
+        //      classification, observed before-state, and expected-state
+        //      preconditions.
+        let current = self.preflight(path, transaction.expected.first())?;
 
-        // 4. Read current bytes and decode UTF-8. Binary content fails
-        //    closed here rather than being reinterpreted as text.
-        let bytes = self.files.read_bytes(path).map_err(|error| {
-            if is_not_found(&error) {
-                EditError::FileNotFound { path: path.clone() }
-            } else {
-                EditError::ReadFailure {
-                    path: path.clone(),
-                    message: error.to_string(),
-                }
-            }
-        })?;
-        let content = std::str::from_utf8(&bytes)
-            .map_err(|_| EditError::InvalidUtf8 { path: path.clone() })?;
-
-        // 5. Observed pre-mutation state.
-        let before = FileState::from_content(path, content);
-
-        // 6. Expected-state preconditions, in the model's fixed order:
-        //    hash, then size, then line count. Context is resolved below
-        //    after match selection (it must contain the selected match).
-        let expected = transaction.expected.first();
-        if let Some(expected) = expected {
-            match before.check(expected) {
-                StateMatch::Matched => {}
-                StateMatch::Conflicted { component } => {
-                    return Err(EditError::ExpectedStateConflict(Box::new(
-                        ExpectedStateConflictPayload {
-                            path: path.clone(),
-                            component,
-                            expected: ExpectedStateSummary::of(expected),
-                            actual: before,
-                        },
-                    )));
-                }
-                StateMatch::Malformed { .. } => {
-                    // Shape validation already rejects malformed expected
-                    // states; treat a malformed state as a hard failure.
-                    return Err(EditError::InvalidHash(
-                        expected.hash.clone().unwrap_or_default(),
-                    ));
-                }
-                StateMatch::ContextPending => {
-                    // hash/size/line_count held; resolve context below.
-                }
-            }
-        }
-
-        // 7. Locate literal matches (left-to-right, non-overlapping).
-        let matches = find_matches(content, old);
+        // 6b/7. Context precondition uses the canonical matcher, anchored
+        //       to the affected span of this operation (the selected
+        //       match; the selection itself happens first so the span is
+        //       known). Matches of `old` are located left-to-right,
+        //       non-overlapping.
+        let matches = find_matches(&current.content, old);
         if matches.is_empty() {
             return Err(EditError::MatchNotFound { path: path.clone() });
         }
@@ -919,44 +939,12 @@ impl EditService {
             }
         };
         let selected = &matches[selected_index];
-
-        // 6b. Context precondition: exactly one occurrence of the context
-        //     in the current content, containing the selected match. This
-        //     is the service-side resolution of the model's
-        //     `ContextPending` result — the location-specific check the
-        //     transport-independent model deliberately cannot perform.
-        if let Some(expected) = expected {
-            if let Some(context) = expected.context.as_deref() {
-                let context_matches = find_matches(content, context);
-                match context_matches.as_slice() {
-                    [] => {
-                        return Err(EditError::ContextConflict {
-                            path: path.clone(),
-                            reason: ContextConflictReason::Missing,
-                        });
-                    }
-                    [only] => {
-                        let contains = only.byte_offset <= selected.byte_offset
-                            && selected.byte_offset + selected.length
-                                <= only.byte_offset + only.length;
-                        if !contains {
-                            return Err(EditError::ContextConflict {
-                                path: path.clone(),
-                                reason: ContextConflictReason::NotAnchored,
-                            });
-                        }
-                    }
-                    _ => {
-                        return Err(EditError::ContextConflict {
-                            path: path.clone(),
-                            reason: ContextConflictReason::Ambiguous {
-                                count: context_matches.len(),
-                            },
-                        });
-                    }
-                }
-            }
-        }
+        check_context(
+            &current,
+            transaction.expected.first(),
+            selected.byte_offset,
+            selected.byte_offset + selected.length,
+        )?;
 
         // 8. Prepare the complete new content in memory. Splicing at
         //    `str::find` byte offsets is UTF-8-safe: match boundaries are
@@ -964,30 +952,263 @@ impl EditService {
         let start = selected.byte_offset;
         let end = start + selected.length;
         let mut prepared =
-            String::with_capacity(content.len() + new.len().saturating_sub(old.len()));
-        prepared.push_str(&content[..start]);
+            String::with_capacity(current.content.len() + new.len().saturating_sub(old.len()));
+        prepared.push_str(&current.content[..start]);
         prepared.push_str(new);
-        prepared.push_str(&content[end..]);
+        prepared.push_str(&current.content[end..]);
 
-        // 9. Atomic commit through the canonical filesystem boundary.
-        let after_predicted = FileState::from_content(path, &prepared);
-        self.files
-            .write_atomic(path, &prepared)
-            .map_err(|error| EditError::WriteFailure {
+        // 9–11. Atomic commit, verified re-read, and result.
+        let after = self.commit_verified(path, &prepared)?;
+        Ok(EditResult {
+            id: transaction.id,
+            path: path.clone(),
+            status: EditStatus::Committed,
+            before: current.before,
+            after,
+            match_count: matches.len(),
+            selected_occurrence: selected_index + 1,
+            location: selected.location,
+        })
+    }
+
+    /// Executes one safe, conflict-aware line insertion.
+    ///
+    /// Semantics (all deterministic, all enforced before mutation):
+    ///
+    /// - **Boundaries**: `line = 0` inserts at the beginning of the file;
+    ///   `1..=N` inserts immediately before logical line N (N = current
+    ///   line count); `N + 1` inserts at end of file. Any other boundary
+    ///   fails with [`EditError::InsertBoundaryOutOfRange`] — never a
+    ///   silent clamp.
+    /// - **Literal content**: inserted text is used exactly as supplied;
+    ///   no trimming, Unicode normalization, or regex interpretation.
+    /// - **Newline policy**: the insertion is normalized to stand on its
+    ///   own logical line(s). A supplied trailing newline is respected and
+    ///   not doubled; a missing one is added exactly once when needed so
+    ///   inserted text never concatenates into an adjacent existing line.
+    ///   Outside the edited boundary the file's existing bytes — including
+    ///   CRLF endings and any missing final newline — are preserved
+    ///   byte-for-byte.
+    /// - **Expected state**: the same hash/size/line-count/context
+    ///   contract as [`EditService::replace`], checked before any line
+    ///   boundary is resolved.
+    pub fn insert(&self, transaction: EditTransaction) -> Result<LineEditResult, EditError> {
+        transaction.validate_shape()?;
+        let [operation] = transaction.operations.as_slice() else {
+            return Err(EditError::UnsupportedTransaction {
+                operation_count: transaction.operations.len(),
+            });
+        };
+        let EditOperation::Insert {
+            path,
+            line,
+            content,
+        } = operation
+        else {
+            return Err(EditError::UnsupportedTransaction {
+                operation_count: transaction.operations.len(),
+            });
+        };
+
+        let current = self.preflight(path, transaction.expected.first())?;
+
+        // Canonical line map, shared with delete_range. `line_count` here
+        // equals the `FileState` count by construction.
+        let lines = LineMap::parse(&current.content);
+
+        // Validate the boundary against the map: no clamping. The valid
+        // boundary range is 0 (BOF) ..= line_count + 1 (EOF).
+        if *line > lines.len() + 1 {
+            return Err(EditError::InsertBoundaryOutOfRange {
                 path: path.clone(),
+                line: *line,
+                line_count: lines.len(),
+            });
+        }
+
+        // The affected span for context anchoring is the insertion point:
+        // a zero-width point at the boundary byte offset.
+        let offset = lines.insert_offset(*line);
+        check_context(&current, transaction.expected.first(), offset, offset)?;
+
+        // Prepare the resulting content in memory under the canonical
+        // newline policy: inserted text is literal except it is made
+        // line-complete, and everything outside the insertion point is
+        // preserved byte-for-byte.
+        let prepared = lines.insert_at(&current.content, *line, content);
+
+        let after = self.commit_verified(path, &prepared)?;
+        Ok(LineEditResult {
+            id: transaction.id,
+            path: path.clone(),
+            status: EditStatus::Committed,
+            before: current.before,
+            after,
+            kind: LineEditKind::Insert { boundary: *line },
+        })
+    }
+
+    /// Executes one safe, conflict-aware inclusive line-range deletion.
+    ///
+    /// Semantics (all deterministic, all enforced before mutation):
+    ///
+    /// - **Range**: `start_line..=end_line` are 1-based inclusive logical
+    ///   line numbers, exactly the lines counted by
+    ///   [`FileState::line_count`]. Zero, reversed ranges, or ranges
+    ///   beyond the last line fail with structured errors — never a
+    ///   silent clamp.
+    /// - **Empty file**: an empty file has zero logical lines; any
+    ///   positive range fails with [`EditError::EmptyFileDeletion`].
+    /// - **Result**: deleting all lines yields an empty file; the
+    ///   remaining bytes (including terminators of surviving lines) are
+    ///   preserved byte-for-byte.
+    /// - **Expected state**: the same hash/size/line-count/context
+    ///   contract as [`EditService::replace`].
+    pub fn delete_range(&self, transaction: EditTransaction) -> Result<LineEditResult, EditError> {
+        transaction.validate_shape()?;
+        let [operation] = transaction.operations.as_slice() else {
+            return Err(EditError::UnsupportedTransaction {
+                operation_count: transaction.operations.len(),
+            });
+        };
+        let EditOperation::DeleteRange {
+            path,
+            start_line,
+            end_line,
+        } = operation
+        else {
+            return Err(EditError::UnsupportedTransaction {
+                operation_count: transaction.operations.len(),
+            });
+        };
+
+        let current = self.preflight(path, transaction.expected.first())?;
+
+        let lines = LineMap::parse(&current.content);
+
+        // Deletion requires existing logical lines.
+        if lines.is_empty() {
+            return Err(EditError::EmptyFileDeletion { path: path.clone() });
+        }
+        // Shape validation already rejected 0 and reversed ranges; the
+        // range must additionally exist within the file.
+        if *end_line > lines.len() {
+            return Err(EditError::LineOutOfRange {
+                path: path.clone(),
+                start: *start_line,
+                end: *end_line,
+                line_count: lines.len(),
+            });
+        }
+
+        // The affected span for context anchoring is the removed byte
+        // range, so a context precondition must still be present around
+        // the lines being deleted.
+        let (span_start, span_end) = lines
+            .line_span(*start_line, *end_line)
+            .expect("validated range");
+        check_context(&current, transaction.expected.first(), span_start, span_end)?;
+
+        // Prepare the resulting content: everything before the first
+        // deleted line's start and after the last deleted line's end.
+        let mut prepared = String::with_capacity(
+            current.content.len() - (span_end - span_start).min(current.content.len()),
+        );
+        prepared.push_str(&current.content[..span_start]);
+        prepared.push_str(&current.content[span_end..]);
+
+        let after = self.commit_verified(path, &prepared)?;
+        Ok(LineEditResult {
+            id: transaction.id,
+            path: path.clone(),
+            status: EditStatus::Committed,
+            before: current.before,
+            after,
+            kind: LineEditKind::DeleteRange {
+                start: *start_line,
+                end: *end_line,
+            },
+        })
+    }
+
+    /// Shared preflight for every edit executor: path syntax, contained
+    /// read with UTF-8 classification, observed before-state, and the
+    /// expected-state preconditions (hash, size, line count). No
+    /// filesystem mutation happens here; context is checked separately
+    /// because it must anchor to the operation's affected span, which
+    /// each executor resolves after its own location logic.
+    fn preflight(
+        &self,
+        path: &str,
+        expected: Option<&ExpectedState>,
+    ) -> Result<Preflight, EditError> {
+        validate_path(path)?;
+        let bytes = self.files.read_bytes(path).map_err(|error| {
+            if is_not_found(&error) {
+                EditError::FileNotFound {
+                    path: path.to_owned(),
+                }
+            } else {
+                EditError::ReadFailure {
+                    path: path.to_owned(),
+                    message: error.to_string(),
+                }
+            }
+        })?;
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|_| EditError::InvalidUtf8 {
+                path: path.to_owned(),
+            })?
+            .to_owned();
+        let before = FileState::from_content(path, &content);
+        if let Some(expected) = expected {
+            match before.check(expected) {
+                StateMatch::Matched => {}
+                StateMatch::Conflicted { component } => {
+                    return Err(EditError::ExpectedStateConflict(Box::new(
+                        ExpectedStateConflictPayload {
+                            path: path.to_owned(),
+                            component,
+                            expected: ExpectedStateSummary::of(expected),
+                            actual: before,
+                        },
+                    )));
+                }
+                StateMatch::Malformed { .. } => {
+                    // Shape validation already rejects malformed expected
+                    // states; treat a malformed state as a hard failure.
+                    return Err(EditError::InvalidHash(
+                        expected.hash.clone().unwrap_or_default(),
+                    ));
+                }
+                StateMatch::ContextPending => {
+                    // hash/size/line_count held; context is resolved by
+                    // the executor once the affected span is known.
+                }
+            }
+        }
+        Ok(Preflight { content, before })
+    }
+
+    /// Shared commit for every edit executor: atomic write through the
+    /// canonical filesystem boundary, then a verified re-read whose
+    /// observed state must equal the prepared content's state. Returns
+    /// the verified after-state.
+    fn commit_verified(&self, path: &str, prepared: &str) -> Result<FileState, EditError> {
+        let after_predicted = FileState::from_content(path, prepared);
+        self.files
+            .write_atomic(path, prepared)
+            .map_err(|error| EditError::WriteFailure {
+                path: path.to_owned(),
                 message: error.to_string(),
             })?;
-
-        // 10. Verified post-commit observation. The re-read uses the same
-        //     containment boundary; a mismatch means external interference
-        //     and is reported honestly.
         let observed = self.files.read(path).map_err(|error| {
             if is_not_found(&error) {
                 EditError::VerificationFailed(Box::new(VerificationFailurePayload {
-                    path: path.clone(),
+                    path: path.to_owned(),
                     expected: after_predicted.clone(),
                     actual: FileState {
-                        path: path.clone(),
+                        path: path.to_owned(),
                         hash: String::new(),
                         size: 0,
                         line_count: 0,
@@ -995,7 +1216,7 @@ impl EditService {
                 }))
             } else {
                 EditError::ReadFailure {
-                    path: path.clone(),
+                    path: path.to_owned(),
                     message: error.to_string(),
                 }
             }
@@ -1004,25 +1225,20 @@ impl EditService {
         if after != after_predicted {
             return Err(EditError::VerificationFailed(Box::new(
                 VerificationFailurePayload {
-                    path: path.clone(),
+                    path: path.to_owned(),
                     expected: after_predicted,
                     actual: after,
                 },
             )));
         }
-
-        // 11. Committed result.
-        Ok(EditResult {
-            id: transaction.id,
-            path: path.clone(),
-            status: EditStatus::Committed,
-            before,
-            after,
-            match_count: matches.len(),
-            selected_occurrence: selected_index + 1,
-            location: selected.location,
-        })
+        Ok(after)
     }
+}
+
+/// The shared preflight observation every executor starts from.
+struct Preflight {
+    content: String,
+    before: FileState,
 }
 
 /// One located literal match with its deterministic coordinates.
@@ -1075,6 +1291,206 @@ fn is_not_found(error: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+/// The canonical context precondition shared by every executor:
+/// when the caller supplies `ExpectedState.context`, it must occur
+/// exactly once in the current content and contain the affected span
+/// of this operation (`span_start..span_end`; insertion points pass the
+/// same offset twice, making containment a point test). This is the
+/// service-side resolution of the model's `ContextPending` result — the
+/// location-specific check the transport-independent model deliberately
+/// cannot perform. It is used unchanged by replace, insert, and
+/// delete_range.
+fn check_context(
+    current: &Preflight,
+    expected: Option<&ExpectedState>,
+    span_start: usize,
+    span_end: usize,
+) -> Result<(), EditError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let Some(context) = expected.context.as_deref() else {
+        return Ok(());
+    };
+    let path = &current.before.path;
+    let context_matches = find_matches(&current.content, context);
+    match context_matches.as_slice() {
+        [] => Err(EditError::ContextConflict {
+            path: path.clone(),
+            reason: ContextConflictReason::Missing,
+        }),
+        [only] => {
+            let contains =
+                only.byte_offset <= span_start && span_end <= only.byte_offset + only.length;
+            if contains {
+                Ok(())
+            } else {
+                Err(EditError::ContextConflict {
+                    path: path.clone(),
+                    reason: ContextConflictReason::NotAnchored,
+                })
+            }
+        }
+        many => Err(EditError::ContextConflict {
+            path: path.clone(),
+            reason: ContextConflictReason::Ambiguous { count: many.len() },
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LineMap: the single canonical line-boundary model (AWE-003).
+// ---------------------------------------------------------------------------
+
+/// The one internal representation of logical line boundaries, shared by
+/// insert and delete-range (and available to later line-oriented
+/// milestones) so no two executors ever disagree about line semantics.
+///
+/// A *logical line* is the text between line terminators, matching
+/// [`FileState::line_count`] exactly: `"a\nb\n"` has two lines; `"a\nb"`
+/// (no trailing newline) has two lines; `""` has zero lines. A bare `\\r`
+/// is not a terminator; `\\r\\n` is one terminator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LineMap {
+    /// Byte offset where each logical line starts, one per line.
+    starts: Vec<usize>,
+    /// Byte offset just past each line's terminator (i.e. the start of
+    /// the next line, or content end for the last line). For a final
+    /// line without a trailing newline, this is the content end.
+    ends: Vec<usize>,
+    /// Length of each line's terminator: 0 for a final line without a
+    /// trailing newline, 1 for LF, 2 for CRLF.
+    terminators: Vec<usize>,
+    content_len: usize,
+}
+
+impl LineMap {
+    /// Parses the canonical line boundaries of `content` in one scan.
+    pub(crate) fn parse(content: &str) -> Self {
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        let mut terminators = Vec::new();
+        let mut line_start = 0;
+        let bytes = content.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\n' {
+                // Terminator is "\n" or "\r\n".
+                let terminator_len = if i > 0 && bytes[i - 1] == b'\r' { 2 } else { 1 };
+                starts.push(line_start);
+                ends.push(i + 1);
+                terminators.push(terminator_len);
+                line_start = i + 1;
+            }
+            i += 1;
+        }
+        // Trailing text without a final newline is its own line.
+        if line_start < bytes.len() {
+            starts.push(line_start);
+            ends.push(bytes.len());
+            terminators.push(0);
+        }
+        Self {
+            starts,
+            ends,
+            terminators,
+            content_len: bytes.len(),
+        }
+    }
+
+    /// Number of logical lines; equals [`FileState::line_count`].
+    pub(crate) fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
+    /// Byte offset of the insertion point for a boundary line:
+    /// 0 = beginning of file, 1..=len = before that logical line,
+    /// len + 1 = end of file. The boundary must already be validated
+    /// (see [`EditService::insert`]).
+    pub(crate) fn insert_offset(&self, boundary: usize) -> usize {
+        debug_assert!(boundary <= self.len() + 1);
+        if boundary == 0 {
+            0
+        } else if boundary <= self.len() {
+            self.starts[boundary - 1]
+        } else {
+            // EOF: after the final terminator, or content end when the
+            // file has no trailing newline. Inserting at EOF always
+            // begins a fresh line: the boundary offset sits after the
+            // last line's terminator (or at 0 for an empty file).
+            self.content_len
+        }
+    }
+
+    /// Byte range (start, end) covered by the inclusive 1-based line
+    /// range `start_line..=end_line`, including the terminators of
+    /// every removed line. `end` is the start of the line after the
+    /// range (or content end). Returns `None` when the range is not
+    /// fully within the file; callers must validate first.
+    pub(crate) fn line_span(&self, start_line: usize, end_line: usize) -> Option<(usize, usize)> {
+        if start_line == 0 || end_line == 0 || start_line > end_line || end_line > self.len() {
+            return None;
+        }
+        let start = self.starts[start_line - 1];
+        let end = self.ends[end_line - 1];
+        Some((start, end))
+    }
+
+    /// The file's line-ending style: CRLF when its first line ends with
+    /// CRLF, otherwise LF. LF is the default for an empty file.
+    pub(crate) fn terminator_str(&self) -> &'static str {
+        self.terminators
+            .first()
+            .map_or("\n", |t| if *t == 2 { "\r\n" } else { "\n" })
+    }
+
+    /// Whether the final logical line lacks a trailing newline.
+    pub(crate) fn lacks_trailing_newline(&self) -> bool {
+        !self.is_empty() && self.terminators[self.len() - 1] == 0
+    }
+
+    /// Builds the content resulting from inserting `inserted` at the
+    /// boundary `boundary` into `file` (the content this map was parsed
+    /// from), applying the canonical newline policy:
+    ///
+    /// - The inserted text is literal. The one deterministic adjustment:
+    ///   it is suffixed with exactly one terminator (the file's own
+    ///   style, or LF for an initially empty file) when it does not
+    ///   already end in one, so an insertion before an existing line can
+    ///   never concatenate onto that line.
+    /// - Inserting at EOF into a file whose final line lacks a trailing
+    ///   newline first completes that final line with the file's own
+    ///   terminator, so the inserted text stands on its own line.
+    /// - Every byte outside the inserted region — including CRLF
+    ///   endings, internal content, and a missing final newline when
+    ///   inserting elsewhere — is preserved byte-for-byte.
+    pub(crate) fn insert_at(&self, file: &str, boundary: usize, inserted: &str) -> String {
+        let terminator = self.terminator_str();
+        let mut text = inserted.to_string();
+        if !text.ends_with('\n') {
+            text.push_str(terminator);
+        }
+        let mut prepared = String::with_capacity(file.len() + text.len() + terminator.len());
+        // EOF insertion into a file lacking a final newline: complete
+        // the last existing line first, then append the inserted text.
+        if boundary == self.len() + 1 && self.lacks_trailing_newline() {
+            prepared.push_str(file);
+            prepared.push_str(terminator);
+            prepared.push_str(&text);
+            return prepared;
+        }
+        let offset = self.insert_offset(boundary);
+        prepared.push_str(&file[..offset]);
+        prepared.push_str(&text);
+        prepared.push_str(&file[offset..]);
+        prepared
+    }
 }
 
 #[cfg(test)]
@@ -2442,6 +2858,1033 @@ mod replace_tests {
                     let disk = std::fs::read(tmp.path().join("f.txt")).unwrap();
                     prop_assert_eq!(result.after.hash, sha256_hex(&disk));
                     prop_assert_eq!(result.after.size, disk.len() as u64);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWE-003: canonical line-boundary model tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod line_map_tests {
+    use super::*;
+
+    /// The line map must agree exactly with `FileState::line_count`, which
+    /// is the canonical definition of a logical line.
+    #[test]
+    fn line_count_agrees_with_file_state() {
+        for content in [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\nb\n",
+            "\r\n",
+            "a\r\n",
+            "a\r\nb\r\n",
+            "a\rb",
+            "\n\n\n",
+            "alpha\nbeta\ngamma\n",
+        ] {
+            let map = LineMap::parse(content);
+            let state = FileState::from_content("f", content);
+            assert_eq!(
+                map.len(),
+                state.line_count,
+                "LineMap and FileState disagree on {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_file_has_zero_lines() {
+        let map = LineMap::parse("");
+        assert!(map.is_empty());
+        assert!(!map.lacks_trailing_newline());
+    }
+
+    #[test]
+    fn trailing_newline_is_not_an_extra_line() {
+        let map = LineMap::parse("a\nb\n");
+        assert_eq!(map.len(), 2);
+        assert!(!map.lacks_trailing_newline());
+    }
+
+    #[test]
+    fn missing_trailing_newline_is_detected() {
+        let map = LineMap::parse("a\nb");
+        assert_eq!(map.len(), 2);
+        assert!(map.lacks_trailing_newline());
+    }
+
+    #[test]
+    fn lone_carriage_return_is_not_a_terminator() {
+        let map = LineMap::parse("a\rb");
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn crlf_is_one_terminator() {
+        let map = LineMap::parse("a\r\nb\r\n");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.terminator_str(), "\r\n");
+    }
+
+    #[test]
+    fn mixed_endings_use_first_line_style() {
+        let map = LineMap::parse("a\r\nb\n");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.terminator_str(), "\r\n");
+    }
+
+    // ---------- insert_offset boundary table ----------
+
+    #[test]
+    fn insert_offset_boundary_table() {
+        let map = LineMap::parse("l1\nl2\nl3\n");
+        assert_eq!(map.len(), 3);
+        // 0 = beginning of file
+        assert_eq!(map.insert_offset(0), 0);
+        // 1 = before the first logical line
+        assert_eq!(map.insert_offset(1), 0);
+        // N = before logical line N
+        assert_eq!(map.insert_offset(2), "l1\n".len());
+        assert_eq!(map.insert_offset(3), "l1\nl2\n".len());
+        // len + 1 = EOF
+        assert_eq!(map.insert_offset(4), "l1\nl2\nl3\n".len());
+    }
+
+    #[test]
+    fn insert_offset_eof_without_trailing_newline() {
+        let map = LineMap::parse("l1\nl2");
+        assert_eq!(map.insert_offset(3), "l1\nl2".len());
+    }
+
+    #[test]
+    fn insert_offset_empty_file() {
+        let map = LineMap::parse("");
+        assert_eq!(map.insert_offset(0), 0);
+        assert_eq!(map.insert_offset(1), 0);
+    }
+
+    // ---------- line_span ----------
+
+    #[test]
+    fn line_span_includes_terminators() {
+        let map = LineMap::parse("alpha\nbeta\ngamma\ndelta\n");
+        // Deleting 2..=3 removes "beta\ngamma\n" fully.
+        assert_eq!(
+            map.line_span(2, 3),
+            Some(("alpha\n".len(), "alpha\nbeta\ngamma\n".len()))
+        );
+        // Deleting 1..=1 removes only the first line.
+        assert_eq!(map.line_span(1, 1), Some((0, "alpha\n".len())));
+        // Deleting 4..=4 removes the last line including its terminator.
+        assert_eq!(
+            map.line_span(4, 4),
+            Some((
+                "alpha\nbeta\ngamma\n".len(),
+                "alpha\nbeta\ngamma\ndelta\n".len()
+            ))
+        );
+    }
+
+    #[test]
+    fn line_span_rejects_invalid_ranges() {
+        let map = LineMap::parse("a\nb\n");
+        assert_eq!(map.line_span(0, 1), None);
+        assert_eq!(map.line_span(1, 0), None);
+        assert_eq!(map.line_span(2, 1), None);
+        assert_eq!(map.line_span(1, 3), None);
+    }
+
+    #[test]
+    fn line_span_partial_final_line_without_newline() {
+        // "a\nb" — deleting 2..=2 removes "b" with no terminator.
+        let map = LineMap::parse("a\nb");
+        assert_eq!(map.line_span(2, 2), Some((2, 3)));
+    }
+
+    // ---------- insert_at newline policy ----------
+
+    #[test]
+    fn insert_at_adds_missing_terminator_in_file_style() {
+        let map = LineMap::parse("a\r\nb\r\n");
+        assert_eq!(map.insert_at("a\r\nb\r\n", 1, "new"), "new\r\na\r\nb\r\n");
+    }
+
+    #[test]
+    fn insert_at_respects_supplied_terminator_without_doubling() {
+        let map = LineMap::parse("a\nb\n");
+        assert_eq!(map.insert_at("a\nb\n", 1, "new\n"), "new\na\nb\n");
+    }
+
+    #[test]
+    fn insert_at_eof_completes_missing_final_newline() {
+        let map = LineMap::parse("a\nb");
+        assert_eq!(map.insert_at("a\nb", 3, "new"), "a\nb\nnew\n");
+    }
+
+    #[test]
+    fn insert_at_eof_crlf_without_trailing_newline() {
+        let map = LineMap::parse("a\r\nb");
+        assert_eq!(map.insert_at("a\r\nb", 3, "new"), "a\r\nb\r\nnew\r\n");
+    }
+
+    #[test]
+    fn insert_at_empty_file_defaults_to_lf() {
+        let map = LineMap::parse("");
+        assert_eq!(map.insert_at("", 0, "new"), "new\n");
+        assert_eq!(map.insert_at("", 1, "new"), "new\n");
+    }
+
+    #[test]
+    fn insert_at_preserves_surrounding_bytes_byte_for_byte() {
+        let map = LineMap::parse("a\nb\n");
+        assert_eq!(map.insert_at("a\nb\n", 2, "X"), "a\nX\nb\n");
+        // Inserting into a file missing its final newline keeps that
+        // missing newline when inserting before an earlier line.
+        let map2 = LineMap::parse("a\nb");
+        assert_eq!(map2.insert_at("a\nb", 1, "X"), "X\na\nb");
+    }
+
+    #[test]
+    fn insert_at_literal_multiline_content() {
+        let map = LineMap::parse("a\nb\n");
+        assert_eq!(map.insert_at("a\nb\n", 2, "x\ny\n"), "a\nx\ny\nb\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWE-003: line-oriented executor integration tests (real filesystem).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod line_edit_tests {
+    use super::*;
+    use std::fs;
+
+    fn setup() -> (tempfile::TempDir, EditService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = EditService::new(tmp.path().to_path_buf());
+        (tmp, svc)
+    }
+
+    fn insert_tx(path: &str, line: usize, content: &str) -> EditTransaction {
+        EditTransaction::single(EditOperation::Insert {
+            path: path.into(),
+            line,
+            content: content.into(),
+        })
+    }
+
+    fn delete_tx(path: &str, start: usize, end: usize) -> EditTransaction {
+        EditTransaction::single(EditOperation::DeleteRange {
+            path: path.into(),
+            start_line: start,
+            end_line: end,
+        })
+    }
+
+    fn with_expected(mut tx: EditTransaction, expected: ExpectedState) -> EditTransaction {
+        assert_eq!(tx.operations.len(), 1);
+        tx.expected.push(expected);
+        tx
+    }
+
+    fn write_file(tmp: &tempfile::TempDir, name: &str, content: &str) {
+        fs::write(tmp.path().join(name), content).unwrap();
+    }
+
+    fn read_file(tmp: &tempfile::TempDir, name: &str) -> String {
+        fs::read_to_string(tmp.path().join(name)).unwrap()
+    }
+
+    fn read_bytes(tmp: &tempfile::TempDir, name: &str) -> Vec<u8> {
+        fs::read(tmp.path().join(name)).unwrap()
+    }
+
+    fn current_hash(tmp: &tempfile::TempDir, name: &str) -> String {
+        sha256_hex(&read_bytes(tmp, name))
+    }
+
+    // ---------- 1. Insert: boundary table ----------
+
+    #[test]
+    fn insert_at_line_zero_prepends_to_the_file() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        let result = svc.insert(insert_tx("f.txt", 0, "new")).unwrap();
+        assert_eq!(result.status, EditStatus::Committed);
+        assert_eq!(read_file(&tmp, "f.txt"), "new\nl1\nl2\n");
+        assert_eq!(result.kind, LineEditKind::Insert { boundary: 0 });
+        assert_eq!(result.after.line_count, 3);
+    }
+
+    #[test]
+    fn insert_at_line_one_is_also_before_the_first_line() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        svc.insert(insert_tx("f.txt", 1, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "new\nl1\nl2\n");
+    }
+
+    #[test]
+    fn insert_before_middle_line() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\nl3\n");
+        let result = svc.insert(insert_tx("f.txt", 2, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\nnew\nl2\nl3\n");
+        assert_eq!(result.before.line_count, 3);
+        assert_eq!(result.after.line_count, 4);
+    }
+
+    #[test]
+    fn insert_before_last_line() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\nl3\n");
+        svc.insert(insert_tx("f.txt", 3, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\nl2\nnew\nl3\n");
+    }
+
+    #[test]
+    fn insert_at_eof_boundary() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        svc.insert(insert_tx("f.txt", 3, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\nl2\nnew\n");
+    }
+
+    #[test]
+    fn insert_into_empty_file() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "");
+        let result = svc.insert(insert_tx("f.txt", 0, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "new\n");
+        assert_eq!(result.before.line_count, 0);
+        assert_eq!(result.after.line_count, 1);
+        // Boundary 1 is also valid on an empty file (EOF).
+        write_file(&tmp, "g.txt", "");
+        svc.insert(insert_tx("g.txt", 1, "x")).unwrap();
+        assert_eq!(read_file(&tmp, "g.txt"), "x\n");
+    }
+
+    #[test]
+    fn insert_content_with_trailing_newline_is_not_doubled() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\n");
+        svc.insert(insert_tx("f.txt", 1, "new\n")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "new\nl1\n");
+    }
+
+    #[test]
+    fn insert_multiline_content() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        svc.insert(insert_tx("f.txt", 2, "a\nb\n")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\na\nb\nl2\n");
+    }
+
+    #[test]
+    fn insert_at_eof_of_file_missing_final_newline_completes_it() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2");
+        svc.insert(insert_tx("f.txt", 3, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\nl2\nnew\n");
+    }
+
+    #[test]
+    fn insert_before_earlier_line_of_file_missing_final_newline_keeps_it_missing() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2");
+        svc.insert(insert_tx("f.txt", 1, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "new\nl1\nl2");
+    }
+
+    #[test]
+    fn repeated_inserts_are_deterministic() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\n");
+        svc.insert(insert_tx("f.txt", 0, "one")).unwrap();
+        svc.insert(insert_tx("f.txt", 2, "two")).unwrap();
+        svc.insert(insert_tx("f.txt", 3, "three")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "one\ntwo\nthree\na\n");
+    }
+
+    #[test]
+    fn insert_boundary_beyond_eof_is_rejected_without_clamping() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        let before = read_bytes(&tmp, "f.txt");
+        let err = svc.insert(insert_tx("f.txt", 4, "x")).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::InsertBoundaryOutOfRange {
+                line: 4,
+                line_count: 2,
+                ..
+            }
+        ));
+        assert_eq!(read_bytes(&tmp, "f.txt"), before);
+    }
+
+    #[test]
+    fn insert_empty_content_is_rejected_by_shape_validation() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\n");
+        let err = svc.insert(insert_tx("f.txt", 1, "")).unwrap_err();
+        assert!(matches!(err, EditError::EmptyInsertContent));
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\n");
+    }
+
+    // ---------- 2. Insert: newline and Unicode policy ----------
+
+    #[test]
+    fn insert_into_crlf_file_uses_crlf_for_the_inserted_line() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\r\nl2\r\n");
+        svc.insert(insert_tx("f.txt", 2, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\r\nnew\r\nl2\r\n");
+    }
+
+    #[test]
+    fn insert_does_not_convert_the_rest_of_a_crlf_file() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\r\nl2\r\n");
+        svc.insert(insert_tx("f.txt", 0, "new")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "new\r\nl1\r\nl2\r\n");
+    }
+
+    #[test]
+    fn insert_unicode_line_is_preserved_and_surrounding_bytes_untouched() {
+        let (tmp, svc) = setup();
+        let content = "alpha\nबीटा\ngamma\n";
+        write_file(&tmp, "f.txt", content);
+        svc.insert(insert_tx("f.txt", 2, "नई पंक्ति 😀")).unwrap();
+        let after = read_file(&tmp, "f.txt");
+        assert_eq!(after, "alpha\nनई पंक्ति 😀\nबीटा\ngamma\n");
+        // The untouched Devanagari line is byte-identical.
+        assert!(after.contains("बीटा"));
+        assert!(!after.contains("\r"));
+    }
+
+    #[test]
+    fn insert_before_cjk_and_combining_characters() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "日本語\ncafe\u{301}\n");
+        svc.insert(insert_tx("f.txt", 2, "中文")).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "日本語\n中文\ncafe\u{301}\n");
+    }
+
+    // ---------- 3. Delete-range semantics ----------
+
+    #[test]
+    fn delete_first_line_only() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\ngamma\ndelta\n");
+        let result = svc.delete_range(delete_tx("f.txt", 1, 1)).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "beta\ngamma\ndelta\n");
+        assert_eq!(result.before.line_count, 4);
+        assert_eq!(result.after.line_count, 3);
+        assert_eq!(result.kind, LineEditKind::DeleteRange { start: 1, end: 1 });
+    }
+
+    #[test]
+    fn delete_middle_range_is_inclusive() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\ngamma\ndelta\n");
+        svc.delete_range(delete_tx("f.txt", 2, 3)).unwrap();
+        // 2..=3 removes exactly beta and gamma — not delta, not line 1.
+        assert_eq!(read_file(&tmp, "f.txt"), "alpha\ndelta\n");
+    }
+
+    #[test]
+    fn delete_last_line_only() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\ngamma\n");
+        svc.delete_range(delete_tx("f.txt", 3, 3)).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn delete_all_lines_yields_an_empty_file() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\n");
+        let result = svc.delete_range(delete_tx("f.txt", 1, 2)).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "");
+        assert_eq!(result.after.size, 0);
+        assert_eq!(result.after.hash, sha256_hex(b""));
+        assert_eq!(result.after.line_count, 0);
+    }
+
+    #[test]
+    fn delete_single_line_file() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "only\n");
+        svc.delete_range(delete_tx("f.txt", 1, 1)).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "");
+    }
+
+    #[test]
+    fn delete_only_line_without_trailing_newline() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "only");
+        svc.delete_range(delete_tx("f.txt", 1, 1)).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "");
+    }
+
+    #[test]
+    fn delete_range_of_file_missing_trailing_newline_preserves_the_rest() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\nb\nc");
+        svc.delete_range(delete_tx("f.txt", 2, 2)).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "a\nc");
+    }
+
+    #[test]
+    fn delete_crlf_lines_keeps_remaining_crlf_bytes() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\r\nb\r\nc\r\n");
+        svc.delete_range(delete_tx("f.txt", 2, 2)).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "a\r\nc\r\n");
+    }
+
+    #[test]
+    fn delete_unicode_lines_leaves_remaining_bytes_untouched() {
+        let (_tmp, svc) = setup();
+        write_file(&_tmp, "f.txt", "alpha\nबीटा\ngamma\n中文\n");
+        let before_bytes = read_bytes(&_tmp, "f.txt");
+        svc.delete_range(delete_tx("f.txt", 2, 2)).unwrap();
+        let after = read_file(&_tmp, "f.txt");
+        assert_eq!(after, "alpha\ngamma\n中文\n");
+        // The result is the concatenation of content before the deleted
+        // span and content after the deleted span, both preserved
+        // byte-for-byte. The prefix "alpha\n" + suffix "gamma\n中文\n".
+        let prefix_end = "alpha\n".len();
+        let deleted_end = "alpha\nबीटा\n".len();
+        let expected_suffix = &before_bytes[deleted_end..];
+        assert_eq!(&after.as_bytes()[prefix_end..], expected_suffix);
+    }
+
+    #[test]
+    fn delete_from_empty_file_fails() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "");
+        let err = svc.delete_range(delete_tx("f.txt", 1, 1)).unwrap_err();
+        assert!(matches!(err, EditError::EmptyFileDeletion { .. }));
+        assert_eq!(read_file(&tmp, "f.txt"), "");
+    }
+
+    #[test]
+    fn delete_zero_line_is_rejected_by_shape() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\nb\n");
+        let err = svc.delete_range(delete_tx("f.txt", 0, 1)).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::InvalidLineRange { start: 0, end: 1 }
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "a\nb\n");
+    }
+
+    #[test]
+    fn delete_reversed_range_is_rejected_by_shape() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\nb\n");
+        let err = svc.delete_range(delete_tx("f.txt", 2, 1)).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::InvalidLineRange { start: 2, end: 1 }
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "a\nb\n");
+    }
+
+    #[test]
+    fn delete_end_beyond_last_line_is_rejected_without_clamping() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\nb\n");
+        let before = read_bytes(&tmp, "f.txt");
+        let err = svc.delete_range(delete_tx("f.txt", 2, 3)).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::LineOutOfRange {
+                start: 2,
+                end: 3,
+                line_count: 2,
+                ..
+            }
+        ));
+        assert_eq!(read_bytes(&tmp, "f.txt"), before);
+    }
+
+    #[test]
+    fn delete_start_beyond_last_line_is_rejected() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\nb\n");
+        let err = svc.delete_range(delete_tx("f.txt", 3, 3)).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::LineOutOfRange { line_count: 2, .. }
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "a\nb\n");
+    }
+
+    // ---------- 4. Expected-state discipline ----------
+
+    #[test]
+    fn insert_with_matching_hash_succeeds() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        let tx = with_expected(
+            insert_tx("f.txt", 1, "new"),
+            ExpectedState {
+                hash: Some(current_hash(&tmp, "f.txt")),
+                ..Default::default()
+            },
+        );
+        svc.insert(tx).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "new\nl1\nl2\n");
+    }
+
+    #[test]
+    fn insert_with_stale_hash_conflicts_and_leaves_the_file_untouched() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "current\n");
+        let tx = with_expected(
+            insert_tx("f.txt", 1, "new"),
+            ExpectedState {
+                hash: Some(sha256_hex(b"stale\n")),
+                ..Default::default()
+            },
+        );
+        let err = svc.insert(tx).unwrap_err();
+        match err {
+            EditError::ExpectedStateConflict(payload) => {
+                assert_eq!(payload.path, "f.txt");
+                assert_eq!(payload.component, ExpectedComponent::Hash);
+                assert_eq!(payload.actual.hash, sha256_hex(b"current\n"));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        assert_eq!(read_file(&tmp, "f.txt"), "current\n");
+    }
+
+    #[test]
+    fn delete_with_stale_hash_conflicts_and_leaves_the_file_untouched() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\nl3\n");
+        let tx = with_expected(
+            delete_tx("f.txt", 2, 2),
+            ExpectedState {
+                hash: Some(sha256_hex(b"something else\n")),
+                ..Default::default()
+            },
+        );
+        let err = svc.delete_range(tx).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::ExpectedStateConflict(ref payload)
+                if payload.component == ExpectedComponent::Hash
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\nl2\nl3\n");
+    }
+
+    #[test]
+    fn insert_with_stale_line_count_conflicts() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        let tx = with_expected(
+            insert_tx("f.txt", 1, "new"),
+            ExpectedState {
+                line_count: Some(7),
+                ..Default::default()
+            },
+        );
+        let err = svc.insert(tx).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::ExpectedStateConflict(ref payload)
+                if payload.component == ExpectedComponent::LineCount
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\nl2\n");
+    }
+
+    #[test]
+    fn delete_with_stale_size_conflicts() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "l1\nl2\n");
+        let tx = with_expected(
+            delete_tx("f.txt", 1, 1),
+            ExpectedState {
+                size: Some(999),
+                ..Default::default()
+            },
+        );
+        let err = svc.delete_range(tx).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::ExpectedStateConflict(ref payload)
+                if payload.component == ExpectedComponent::Size
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "l1\nl2\n");
+    }
+
+    #[test]
+    fn insert_context_must_contain_the_insertion_point() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\n");
+        let anchored = with_expected(
+            insert_tx("f.txt", 1, "new"),
+            ExpectedState {
+                context: Some("alpha\n".into()),
+                ..Default::default()
+            },
+        );
+        svc.insert(anchored).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "new\nalpha\nbeta\n");
+    }
+
+    #[test]
+    fn insert_context_not_anchored_to_the_insertion_point_conflicts() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\n");
+        let tx = with_expected(
+            insert_tx("f.txt", 1, "new"),
+            ExpectedState {
+                context: Some("beta\n".into()),
+                ..Default::default()
+            },
+        );
+        let err = svc.insert(tx).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::ContextConflict {
+                reason: ContextConflictReason::NotAnchored,
+                ..
+            }
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn delete_context_must_contain_the_removed_range() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\ngamma\n");
+        let tx = with_expected(
+            delete_tx("f.txt", 2, 3),
+            ExpectedState {
+                context: Some("alpha\nbeta\ngamma\n".into()),
+                ..Default::default()
+            },
+        );
+        svc.delete_range(tx).unwrap();
+        assert_eq!(read_file(&tmp, "f.txt"), "alpha\n");
+
+        // A context that does not span the removed lines conflicts.
+        write_file(&tmp, "g.txt", "alpha\nbeta\ngamma\n");
+        let tx = with_expected(
+            delete_tx("g.txt", 2, 3),
+            ExpectedState {
+                context: Some("alpha\n".into()),
+                ..Default::default()
+            },
+        );
+        let err = svc.delete_range(tx).unwrap_err();
+        assert!(matches!(err, EditError::ContextConflict { .. }));
+        assert_eq!(read_file(&tmp, "g.txt"), "alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn delete_missing_context_conflicts() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\nb\n");
+        let tx = with_expected(
+            delete_tx("f.txt", 1, 1),
+            ExpectedState {
+                context: Some("zzz\n".into()),
+                ..Default::default()
+            },
+        );
+        let err = svc.delete_range(tx).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::ContextConflict {
+                reason: ContextConflictReason::Missing,
+                ..
+            }
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "a\nb\n");
+    }
+
+    #[test]
+    fn ambiguous_context_conflicts_for_line_edits() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "x\nx\n");
+        let tx = with_expected(
+            insert_tx("f.txt", 1, "new"),
+            ExpectedState {
+                context: Some("x\n".into()),
+                ..Default::default()
+            },
+        );
+        let err = svc.insert(tx).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::ContextConflict {
+                reason: ContextConflictReason::Ambiguous { count: 2 },
+                ..
+            }
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "x\nx\n");
+    }
+
+    // ---------- 5. Errors, paths, and zero-mutation ----------
+
+    #[test]
+    fn line_edit_missing_file_fails_without_creating_it() {
+        let (tmp, svc) = setup();
+        let err = svc.insert(insert_tx("missing.txt", 1, "x")).unwrap_err();
+        assert!(matches!(err, EditError::FileNotFound { .. }));
+        assert!(!tmp.path().join("missing.txt").exists());
+        let err = svc
+            .delete_range(delete_tx("missing.txt", 1, 1))
+            .unwrap_err();
+        assert!(matches!(err, EditError::FileNotFound { .. }));
+    }
+
+    #[test]
+    fn line_edit_absolute_path_is_rejected() {
+        let (_tmp, svc) = setup();
+        let err = svc.insert(insert_tx("/etc/passwd", 1, "x")).unwrap_err();
+        assert!(matches!(err, EditError::InvalidPath { .. }));
+        let err = svc
+            .delete_range(delete_tx("/etc/passwd", 1, 1))
+            .unwrap_err();
+        assert!(matches!(err, EditError::InvalidPath { .. }));
+    }
+
+    #[test]
+    fn line_edit_traversal_path_is_rejected() {
+        let (tmp, svc) = setup();
+        let err = svc.insert(insert_tx("../outside.txt", 1, "x")).unwrap_err();
+        assert!(matches!(err, EditError::InvalidPath { .. }));
+        let err = svc
+            .delete_range(delete_tx("../outside.txt", 1, 1))
+            .unwrap_err();
+        assert!(matches!(err, EditError::InvalidPath { .. }));
+        assert!(!tmp.path().join("../outside.txt").exists());
+    }
+
+    #[test]
+    fn line_edit_non_utf8_file_fails_closed() {
+        let (_tmp, svc) = setup();
+        fs::write(_tmp.path().join("bin.dat"), b"\xff\xfe\x00binary").unwrap();
+        let err = svc.insert(insert_tx("bin.dat", 1, "x")).unwrap_err();
+        assert!(matches!(err, EditError::InvalidUtf8 { .. }));
+        let err = svc.delete_range(delete_tx("bin.dat", 1, 1)).unwrap_err();
+        assert!(matches!(err, EditError::InvalidUtf8 { .. }));
+        assert_eq!(
+            fs::read(_tmp.path().join("bin.dat")).unwrap(),
+            b"\xff\xfe\x00binary".to_vec()
+        );
+    }
+
+    #[test]
+    fn line_edit_wrong_operation_is_unsupported() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\n");
+        let tx = EditTransaction::single(EditOperation::Replace {
+            path: "f.txt".into(),
+            old: "a".into(),
+            new: "b".into(),
+            occurrence: None,
+        });
+        let err = svc.insert(tx).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::UnsupportedTransaction { operation_count: 1 }
+        ));
+        let err = svc
+            .delete_range(EditTransaction::single(EditOperation::Insert {
+                path: "f.txt".into(),
+                line: 1,
+                content: "x".into(),
+            }))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::UnsupportedTransaction { operation_count: 1 }
+        ));
+        assert_eq!(read_file(&tmp, "f.txt"), "a\n");
+    }
+
+    #[test]
+    fn insert_symlink_escape_is_rejected_by_the_containment_boundary() {
+        let (tmp, svc) = setup();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("real.txt"), "target\n").unwrap();
+        write_file(&tmp, "f.txt", "inside\n");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path().join("real.txt"), tmp.path().join("link.txt"))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let err = svc.insert(insert_tx("link.txt", 1, "x")).unwrap_err();
+            assert!(
+                matches!(err, EditError::ReadFailure { .. }),
+                "expected containment rejection, got {err:?}"
+            );
+            // The target outside the workspace was never touched.
+            assert_eq!(
+                fs::read_to_string(outside.path().join("real.txt")).unwrap(),
+                "target\n"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_result_state_is_accurate() {
+        let (tmp, svc) = setup();
+        let original = "alpha\nbeta\n";
+        write_file(&tmp, "f.txt", original);
+        let result = svc.insert(insert_tx("f.txt", 2, "gamma")).unwrap();
+        let resulting = "alpha\ngamma\nbeta\n";
+        assert_eq!(result.before.hash, sha256_hex(original.as_bytes()));
+        assert_eq!(result.before.size, original.len() as u64);
+        assert_eq!(result.before.line_count, 2);
+        assert_eq!(result.after.hash, sha256_hex(resulting.as_bytes()));
+        assert_eq!(result.after.size, resulting.len() as u64);
+        assert_eq!(result.after.line_count, 3);
+        assert_eq!(
+            (result.before.hash, result.after.hash),
+            (
+                sha256_hex(original.as_bytes()),
+                sha256_hex(resulting.as_bytes())
+            )
+        );
+    }
+
+    #[test]
+    fn delete_result_hashes_are_correct() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "alpha\nbeta\ngamma\n");
+        let result = svc.delete_range(delete_tx("f.txt", 1, 2)).unwrap();
+        let resulting = "gamma\n";
+        assert_eq!(result.after.hash, sha256_hex(resulting.as_bytes()));
+        assert_eq!(
+            result.after.hash,
+            sha256_hex(read_bytes(&tmp, "f.txt").as_slice())
+        );
+    }
+
+    #[test]
+    fn line_edits_leave_no_staging_leftovers() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "a\n");
+        // One failure (invalid boundary) and one success; either way only
+        // f.txt may remain in the workspace root.
+        let _ = svc.insert(insert_tx("f.txt", 5, "x"));
+        svc.insert(insert_tx("f.txt", 1, "y")).unwrap();
+        let entries: Vec<std::ffi::OsString> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("f.txt")]);
+    }
+
+    // ---------- 6. Property-oriented invariants ----------
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// A successful inclusive deletion removes exactly the requested
+            /// logical lines: the result is the concatenation of the content
+            /// before and after the deleted span, byte-for-byte.
+            #[test]
+            fn delete_removes_exactly_the_requested_lines(
+                head in 0usize..6,
+                removed in 1usize..4,
+                tail in 0usize..6,
+                crlf in any::<bool>(),
+                final_newline in any::<bool>(),
+            ) {
+                let terminator = if crlf { "\r\n" } else { "\n" };
+                let mut content = String::new();
+                for i in 0..head { content.push_str(&format!("h{i}")); content.push_str(terminator); }
+                for i in 0..removed { content.push_str(&format!("r{i}")); content.push_str(terminator); }
+                for i in 0..tail { content.push_str(&format!("t{i}")); content.push_str(terminator); }
+                if !final_newline && !content.is_empty() {
+                    // Strip the final terminator to model a missing final
+                    // newline. The last line then has no terminator.
+                    let cut = content.len() - terminator.len();
+                    content.truncate(cut);
+                }
+                if content.is_empty() { return Ok(()); }
+
+                let (_tmp, svc) = setup();
+                std::fs::write(_tmp.path().join("f.txt"), &content).unwrap();
+
+                let start = head + 1;
+                let end = head + removed;
+                let result = svc.delete_range(delete_tx("f.txt", start, end)).unwrap();
+
+                let head_part: String = {
+                    let mut s = String::new();
+                    for i in 0..head {
+                        s.push_str(&format!("h{i}"));
+                        s.push_str(terminator);
+                    }
+                    s
+                };
+                let tail_part: String = {
+                    let mut s = String::new();
+                    if tail > 0 {
+                        for i in 0..tail {
+                            s.push_str(&format!("t{i}"));
+                            s.push_str(terminator);
+                        }
+                        if !final_newline {
+                            let cut = s.len() - terminator.len();
+                            s.truncate(cut);
+                        }
+                    }
+                    s
+                };
+                let expected = head_part + &tail_part;
+
+                let disk = std::fs::read(_tmp.path().join("f.txt")).unwrap();
+                prop_assert_eq!(&disk, expected.as_bytes());
+                let disk_hash = sha256_hex(&disk);
+                prop_assert_eq!(&result.after.hash, &disk_hash);
+                // Remaining lines = head lines + tail lines
+                prop_assert_eq!(result.after.line_count, head + tail);
+            }
+
+            /// An invalid boundary never mutates the file.
+            #[test]
+            fn invalid_insert_boundary_never_mutates(
+                lines in 0usize..5,
+                content in ".*",
+                boundary in any::<u16>(),
+            ) {
+                let terminator = "\n";
+                let mut file = String::new();
+                for _ in 0..lines { file.push('x'); file.push_str(terminator); }
+                let tmp = tempfile::tempdir().unwrap();
+                let svc = EditService::new(tmp.path().to_path_buf());
+                std::fs::write(tmp.path().join("f.txt"), &file).unwrap();
+                let boundary = boundary as usize;
+                if boundary > lines + 1 {
+                    let before = std::fs::read(tmp.path().join("f.txt")).unwrap();
+                    let _ = svc.insert(insert_tx("f.txt", boundary, &content)).is_err();
+                    let after = std::fs::read(tmp.path().join("f.txt")).unwrap();
+                    prop_assert_eq!(before, after);
                 }
             }
         }
