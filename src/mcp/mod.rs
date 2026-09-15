@@ -109,7 +109,7 @@ pub use github::{resolve_repo_target, GithubProvider, RepoTarget};
 pub use global_mcp::{
     GlobalMcpEntry, GlobalMcpRegistry, GlobalMcpStore, ProjectMcpReferences, ProjectMcpRefs,
 };
-pub use http::{build_router, serve, AppState, HttpServerConfig};
+pub use http::{build_router, serve, validate_sec_002_policy, AppState, HttpServerConfig};
 pub use memory::{MemoryEntry, MemoryMcp, MemoryScope};
 pub use observability::{
     client_name_version, McpEvent, McpHook, McpHooks, ToolMetrics, ToolMetricsSnapshot, MAX_HOOKS,

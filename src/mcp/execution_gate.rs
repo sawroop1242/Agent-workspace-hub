@@ -52,10 +52,12 @@ pub fn authorize(
 /// the exact same [`PersistentTrustStore`]/[`authorize`] machinery that gates
 /// custom MCP servers.
 ///
-/// Semantics (Phase 2 — binary trust, per coarse permission):
-/// * **No record** for this id (the common case, and every pre-existing
-///   workspace) means the workspace has opted into no restriction: every
-///   built-in tool call behaves exactly as before.
+/// Semantics (SEC-001 — deny High-risk until explicitly authorized):
+/// * **No record** for this id means no High-risk built-in tool may run:
+///   `terminal.run`, `connector.invoke`, and every registry-declared High
+///   mutation (the `github.*` mutations) are denied by default. Medium-risk
+///   workspace-local mutations keep the pre-SEC-001 opt-in behavior — no
+///   record means no *restriction* configured for them.
 /// * **A record** means the workspace has opted in: the tool's
 ///   registry-declared `required_permissions` must be covered by the record's
 ///   approved permissions, and the record's trust level must permit
@@ -63,7 +65,7 @@ pub fn authorize(
 ///
 /// The same string doubles as the reserved scope label granted inside the
 /// record's list-valued permissions (filesystem/environment/secrets):
-/// Phase 2 is binary per permission, so granting e.g. the filesystem
+/// capabilities are binary per permission, so granting e.g. the filesystem
 /// capability means the approval's filesystem list contains this label — it
 /// is a reserved scope marker, never a real path. Path-scoped policy arrives
 /// with the Phase 3 policy engine; per-agent scoping with Phase 5.
@@ -78,12 +80,20 @@ const BUILTIN_TOOL_TRUST_VERSION: &str = "local";
 /// registry risk is Medium or High.
 ///
 /// This reuses the exact [`authorize`] machinery already gating custom MCP
-/// servers — there is no second, parallel trust mechanism. It differs from
-/// the custom-server path in one deliberate, documented way: the absence of a
-/// trust record for [`BUILTIN_TOOL_TRUST_ID`] means "no restriction
-/// configured" (backward compatible) rather than "untrusted" — the workspace's
-/// own tools were executing freely before this gate existed, and a missing
-/// record must not change that. Every other path fails closed:
+/// servers — there is no second, parallel trust mechanism. The risk classes
+/// differ in one deliberate, documented way (SEC-001):
+///
+/// * **High-risk built-ins fail closed by default.** With no record for
+///   [`BUILTIN_TOOL_TRUST_ID`] the call is denied: these tools execute
+///   arbitrary host processes, dispatch arbitrary connector tools, or mutate
+///   external providers, so absence of an authorization record can never
+///   implicitly grant them. The denial names the required trust identity.
+/// * **Medium-risk workspace-local mutations keep the opt-in default.** A
+///   missing record means "no restriction configured" (backward compatible
+///   for the pre-SEC-001 workspace-local surface); a present record
+///   restricts them exactly as before.
+///
+/// Every other path fails closed:
 ///
 /// * the name is not in the tool registry → deny (the registry is the source
 ///   of truth for risk; an ungatable name must not execute),
@@ -93,9 +103,13 @@ const BUILTIN_TOOL_TRUST_VERSION: &str = "local";
 ///   naming the missing permission.
 ///
 /// Low-risk (read-only) tools are out of the gate's scope by design and pass
-/// through, so they are unchanged by this phase. Dynamic (`provider.tool`)
-/// tools never reach this function — they are gated by the existing
-/// custom-provider path.
+/// through, so they are unchanged. Dynamic (`provider.tool`) tools never
+/// reach this function — they are gated by the existing custom-provider
+/// path.
+///
+/// The High-risk rule is data-driven off the registry's `ToolRisk` metadata,
+/// not a hard-coded tool list: any future registry entry declared High
+/// inherits default-deny automatically.
 pub fn authorize_builtin_tool(
     tool: &str,
     trust: Option<&PersistentTrustStore>,
@@ -117,10 +131,18 @@ pub fn authorize_builtin_tool(
         });
     };
     let store = store.to_store();
-    // Backward-compatible default: no record for the reserved identity means
-    // the workspace never opted into built-in tool restrictions, so every
-    // Medium/High built-in tool keeps its pre-gate behavior.
     let Some(approval) = store.get(BUILTIN_TOOL_TRUST_ID) else {
+        // SEC-001: High-risk built-ins are denied until explicitly
+        // authorized — no record for the reserved identity is denial, not
+        // implicit allow. Medium-risk workspace-local mutations retain the
+        // pre-SEC-001 opt-in default (no record = no restriction).
+        if definition.risk == ToolRisk::High {
+            audit_deny("builtin_tool_denied", "authorization_required", tool);
+            return Err(BuiltinToolAuthorizationError::AuthorizationRequired {
+                tool: tool.to_string(),
+                id: BUILTIN_TOOL_TRUST_ID.to_string(),
+            });
+        }
         return Ok(());
     };
     let requested = requested_permissions(definition.required_permissions);
@@ -317,15 +339,33 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn builtin_gate_allows_when_no_record_exists() {
-        // Backward compatibility: a workspace with no "awh.builtin" record
-        // must not see any behavior change for Medium/High static tools.
+    fn builtin_gate_denies_high_risk_tools_without_a_record() {
+        // SEC-001: with no "awh.builtin" record (every default deployment),
+        // High-risk built-ins are denied until explicitly authorized.
+        let store = PersistentTrustStore::from_store(&TrustStore::default());
+        for tool in ["terminal.run", "connector.invoke", "github.pr_create"] {
+            assert_eq!(
+                authorize_builtin_tool(tool, Some(&store)),
+                Err(BuiltinToolAuthorizationError::AuthorizationRequired {
+                    tool: tool.to_string(),
+                    id: BUILTIN_TOOL_TRUST_ID.to_string(),
+                }),
+                "{tool} must be denied by default"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_gate_keeps_medium_risk_tools_working_without_a_record() {
+        // SEC-001 scopes the default-deny to the High-risk class: the
+        // workspace-local Medium mutations keep the pre-SEC-001 opt-in
+        // behavior (no record = no restriction configured).
         let store = PersistentTrustStore::from_store(&TrustStore::default());
         for tool in [
-            "terminal.run",
             "git.commit",
             "workspace.write_file",
             "memory.store",
+            "tasks.create",
         ] {
             assert_eq!(
                 authorize_builtin_tool(tool, Some(&store)),

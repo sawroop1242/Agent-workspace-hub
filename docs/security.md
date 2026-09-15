@@ -82,6 +82,14 @@ for future hardening:
 ## Secure defaults
 
 - Fail closed: any denied decision is a hard error, never a silent passthrough.
+- **High-risk built-in MCP tools are denied by default (SEC-001).**
+  `terminal.run`, `connector.invoke`, and the `github.*` mutations
+  require an explicit `awh.builtin` trust record before the dispatcher
+  will run them (`awh mcp trust awh.builtin --network --process
+  --filesystem`; see the [built-in tool gate](mcp.md) section). Any
+  future registry-declared High-risk tool inherits the default-deny.
+  Lower-risk reads and workspace-local mutations keep their existing
+  behavior; external-MCP server trust semantics are unchanged.
 - Default message/body limit: **10 MiB**.
 - Default request/HTTP timeout: **30 seconds**.
 - Default circuit-breaker threshold: **5** consecutive failures; cooldown **30 s**.
@@ -117,6 +125,18 @@ The remote (HTTP/SSE) transport is disabled by default; stdio is the only
 transport enabled unless `awh mcp serve --transport sse` is invoked. Remote MCP
 enforces the following, all of which fail closed:
 
+- **Non-loopback binds require TLS (SEC-002).** A plaintext bind is allowed
+  only on loopback addresses (`127.0.0.1`, `::1`, or `localhost` — and
+  `localhost` only when it resolves entirely to loopback). Any other host
+  (`0.0.0.0`, `::`, a LAN/public IP, or an unrecognized hostname) with no TLS
+  is rejected at startup **before a TCP listener is created**, with an error
+  that names the bind address and explains both options: enable TLS
+  (`AWH_TLS_CERT`/`AWH_TLS_KEY` or `--tls-cert`/`--tls-key`) or bind a
+  loopback address. Because the default `AWH_HOST` is `0.0.0.0`, a remote
+  serve without TLS fails closed out of the box — public plaintext startup
+  is impossible. Invalid or half-configured TLS material is likewise rejected
+  before any socket binds: the TLS acceptor is built before the listener, so
+  a misconfigured public server never opens even a transient socket.
 - **Authentication is mandatory.** The expected API key is read from `AWH_API_KEY`
   (or the variable named by `--api-key-env`). If it is unset or empty, the server
   refuses to start. Comparisons use a constant-time routine (`subtle`).

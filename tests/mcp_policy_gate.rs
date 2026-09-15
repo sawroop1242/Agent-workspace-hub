@@ -29,10 +29,33 @@ use serde_json::{json, Value};
 use tempfile::tempdir;
 
 /// An empty persistent trust store: present, but with no `awh.builtin`
-/// record — so Phase 2's coarse gate allows every Medium/High tool, letting
-/// these tests isolate the *policy* layer's effect.
+/// record. Used by the default-deny interplay test at the bottom of this
+/// file; the rest of the harness uses the full grant (see below) so the
+/// policy layer stays isolated.
 fn empty_trust_store() -> PersistentTrustStore {
     PersistentTrustStore::from_store(&TrustStore::default())
+}
+
+/// The full-grant `awh.builtin` record (network + process + filesystem).
+/// The policy tests exercise `terminal.run` (a High-risk tool since
+/// SEC-001), so they need the dispatcher's coarse gate to pass in order to
+/// reach the *policy* checkpoint this file isolates.
+fn full_grant_trust_store() -> PersistentTrustStore {
+    let mut store = TrustStore::default();
+    store
+        .approve(
+            BUILTIN_TOOL_TRUST_ID,
+            TrustLevel::Reviewed,
+            McpPermissions {
+                network: true,
+                process: true,
+                filesystem: vec![BUILTIN_TOOL_TRUST_ID.to_string()],
+                ..McpPermissions::default()
+            },
+            "local".to_string(),
+        )
+        .expect("valid approval");
+    PersistentTrustStore::from_store(&store)
 }
 
 /// A restrictive `awh.builtin` record granting no capabilities: the least
@@ -57,12 +80,12 @@ fn restrictive_trust_store() -> PersistentTrustStore {
     PersistentTrustStore::from_store(&store)
 }
 
-/// Builds a dispatcher with an empty (allow-everything) trust store and an
-/// injected policy store rooted at `policy_root`. Injecting the store lets a
-/// test write rules under a controlled directory before the dispatcher is
-/// constructed — and, crucially, proves the dispatcher *reads* the policy
-/// store at construction time (the same snapshot-on-construction behavior as
-/// the trust store).
+/// Builds a dispatcher with a full-grant (allow-everything-at-the-coarse-gate)
+/// trust store and an injected policy store rooted at `policy_root`.
+/// Injecting the store lets a test write rules under a controlled directory
+/// before the dispatcher is constructed — and, crucially, proves the
+/// dispatcher *reads* the policy store at construction time (the same
+/// snapshot-on-construction behavior as the trust store).
 async fn dispatcher_with_policy(
     project_root: &std::path::Path,
     policy_root: &std::path::Path,
@@ -70,7 +93,7 @@ async fn dispatcher_with_policy(
     McpDispatcher::new_async(project_root.to_path_buf())
         .await
         .expect("dispatcher")
-        .with_trust_store(empty_trust_store())
+        .with_trust_store(full_grant_trust_store())
         .with_policy_store(PolicyStore::new(policy_root))
 }
 
@@ -673,4 +696,44 @@ fn exactly_three_policy_call_sites() {
         entry_count, 3,
         "exactly three RESOURCE_SCOPED_TOOLS entries expected, found {entry_count}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// G. SEC-001 interplay: the coarse gate default-deny precedes the policy layer
+// ---------------------------------------------------------------------------
+
+/// SEC-001 ordering proof at the real dispatcher boundary: with no
+/// `awh.builtin` record at all, `terminal.run` is denied by the coarse
+/// built-in gate (BUILTIN_TOOL_DENIED_CODE) even when a policy rule would
+/// also deny it — the coarse authorization decision is made first, so the
+/// workspace-local deny-only policy layer never becomes the only thing
+/// standing between an unauthorized caller and a High-risk tool.
+#[tokio::test]
+async fn no_trust_record_denies_terminal_run_before_policy() {
+    let project = tempdir().expect("tempdir");
+    let policy_dir = tempdir().expect("policy tempdir");
+    let store = PolicyStore::new(policy_dir.path());
+    store.add(&rule("r9", "terminal.run", "git")).unwrap();
+    let dispatcher = McpDispatcher::new_async(project.path().to_path_buf())
+        .await
+        .expect("dispatcher")
+        .with_trust_store(empty_trust_store())
+        .with_policy_store(PolicyStore::new(policy_dir.path()));
+
+    let error =
+        call_tool_expect_error(&dispatcher, "terminal.run", json!({"program": "git"})).await;
+    // The coarse gate's denial, not the policy rule's (-32004): the
+    // message must be the SEC-001 authorization-required error naming the
+    // grant command, proving which layer produced it.
+    assert_eq!(
+        error["code"],
+        json!(BUILTIN_TOOL_DENIED_CODE),
+        "got: {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("awh mcp trust awh.builtin"),
+        "the coarse default-deny must surface, not the policy denial: {message}"
+    );
+    assert!(any_audited_action("builtin_tool_denied"));
 }

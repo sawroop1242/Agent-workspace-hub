@@ -284,6 +284,102 @@ configuration → enabled? → trust decision → permission validation
 This is the *current* trust boundary — a per-server execution gate. It is
 not the future AWH-wide Tool Broker / capability system.
 
+### Built-in tools: High-risk tools are denied until authorized (SEC-001)
+
+Every **static (built-in) AWH tool** — the `workspace.*`, `git.*`,
+`memory.*`, `tasks.*`, `skills.*`, `terminal.run`, `connector.invoke`,
+and `github.*` tools listed by `tools/list` — is gated by the *same*
+trust machinery that gates custom MCP servers. The reserved trust
+identity is **`awh.builtin`**; the gate lives in the dispatcher's
+`authorize_builtin` checkpoint, driven by the **canonical Tool
+Registry** (`src/mcp/tool_registry.rs`) risk metadata and required
+permissions. There is no second authorization engine.
+
+The risk classes behave differently on a **default deployment** (no
+`awh.builtin` trust record, which is how every workspace starts):
+
+| Registry risk | Tools | Default (no record) | With a record |
+| --- | --- | --- | --- |
+| `low` | reads (`workspace.read_file`, `git.log`, `memory.get`, …) | **allowed** (out of the gate's scope by design) | allowed |
+| `medium` | workspace-local mutations (`workspace.write_file`, `workspace.delete_file`, `git.commit`, `memory.store`, `tasks.create`, …) | **allowed** (opt-in restriction: no record = no restriction configured) | restricted to the record's grants |
+| `high` | `terminal.run`, `connector.invoke`, and the `github.*` mutations (`pr_create`, `pr_merge`, `pr_review`, `issue_create`, `issue_comment`, `release_create`, `workflow_dispatch`) | **DENIED** (SEC-001 default-deny) | restricted to the record's grants |
+
+The High-risk rule is data-driven: it keys off the registry entry's
+`risk: high` declaration, **not** a hard-coded tool list, so any future
+registry entry declared High inherits the default-deny automatically.
+
+**Why High-risk fails closed.** `terminal.run` executes arbitrary host
+commands, `connector.invoke` dispatches arbitrary provider tools, and
+the `github.*` mutations act on external providers. Absence of an
+authorization record can never implicitly grant those capabilities
+(the forensic finding from PR #43 classified the previous default-allow
+behavior as P0).
+
+**Granting authorization** (least privilege — grant only what you need):
+
+```bash
+# Everything the built-in gate can cover:
+awh mcp trust awh.builtin --network --process --filesystem
+
+# Or narrower grants; each capability enables only the tools that
+# require it:
+awh mcp trust awh.builtin --process     # terminal.run
+awh mcp trust awh.builtin --network     # connector.invoke + github.* mutations
+awh mcp trust awh.builtin --filesystem  # workspace/git/filesystem mutations
+
+# Inspect and revoke:
+awh mcp list
+awh mcp revoke awh.builtin
+```
+
+`awh mcp trust awh.builtin` is only accepted for the reserved id; the
+same flags as any server grant (`--network`, `--process`,
+`--filesystem`) map to the coarse capabilities the gate checks. A
+record grants exactly what it names: `--process` alone enables
+`terminal.run` but still denies `connector.invoke` (which requires
+`network`), and vice versa.
+
+**Failure modes, all fail closed:**
+
+* No `awh.builtin` record + High-risk tool → denied with error code
+  `-32003` and an actionable message naming the tool and the exact
+  `awh mcp trust awh.builtin …` grant to run.
+* A record that does not grant a required capability → denied, naming
+  the missing permission.
+* A blocked/unknown trust level, or a version pin that no longer
+  matches (the trust model's stale-grant equivalent) → denied.
+* A revoked record (`awh mcp revoke awh.builtin`) → back to
+  default-deny.
+* A corrupt or unreadable trust store (`~/.agent-workspace-hub/
+  trust.json`) → denied; the gate never falls back to allow.
+* A tool name not in the registry → denied (`Unregistered`).
+
+**What does NOT change (regression-pinned):**
+
+* External (custom) MCP server trust semantics — no record denies,
+  matching record allows — are untouched; the built-in gate reuses the
+  same `authorize` machinery but reads only the reserved `awh.builtin`
+  identity, never a server's record.
+* Low-risk reads and Medium-risk workspace-local mutations keep working
+  on a default deployment; only the externally-effectful High tools
+  require a grant.
+* Denial is audited (`builtin_tool_denied`) and allows are audited
+  (`builtin_tool_allowed`) on both the allow and deny paths.
+* The workspace-local deny-only policy layer (PR #20) still runs after
+  the coarse gate and narrows `workspace.write_file`,
+  `workspace.delete_file`, and `terminal.run` per resource pattern.
+
+**Invocation boundary map** (who can reach a High-risk built-in, and
+what governs them):
+
+| Entry point | Gated by | Notes |
+| --- | --- | --- |
+| MCP `tools/call` (stdio, SSE, HTTP) | `awh.builtin` gate | The agent tool plane; this is the SEC-001 subject. Proven by test at the full dispatcher boundary with no-execution proof. |
+| Dynamic `provider.tool` + generic `connector.invoke` | custom-server trust + the `awh.builtin` gate for `connector.invoke` | `connector.invoke` is High-risk and gated like any other High built-in; direct `provider.tool` dispatch keeps the custom-server gate. |
+| TUI interactive terminal command | operator interaction (intentionally trusted) | The operator's own keyboard: a human running a command in the TUI shell is the same principal who would grant `awh.builtin` — an agent-trust record would add no boundary, only friction. Documented as the trusted operator boundary. |
+| Control API `/api/v1/terminal/run` | bearer-token authentication (intentionally operator-scoped) | The operator's control plane (used by the dashboard); every non-health route requires a bearer token, the server refuses to start without one, and the token-holder is the operator — again the trust principal. Not an MCP tool invocation; not governed by `awh.builtin` by design. |
+| CLI | no terminal-execution command exists | `awh` has no `terminal` subcommand; the only trust-plane CLI commands are `awh mcp trust/revoke`, which write records. |
+
 ### Sandbox (platform-specific, honestly stated)
 
 Custom stdio MCP servers are spawned through a sandbox when enabled. What

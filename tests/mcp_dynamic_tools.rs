@@ -45,6 +45,32 @@ fn ok_result(text: &str) -> ToolCallResult {
     }
 }
 
+/// The full-grant `awh.builtin` trust record (what
+/// `awh mcp trust awh.builtin --network --process --filesystem` writes), so
+/// the coarse built-in gate permits the gated tools this file exercises
+/// (`connector.invoke` is High-risk since SEC-001) and the tests keep
+/// isolating schema validation.
+fn full_grant_builtin_trust() -> agent_workspace_hub::mcp::PersistentTrustStore {
+    use agent_workspace_hub::mcp::{
+        McpPermissions, PersistentTrustStore, TrustLevel, TrustStore, BUILTIN_TOOL_TRUST_ID,
+    };
+    let mut store = TrustStore::default();
+    store
+        .approve(
+            BUILTIN_TOOL_TRUST_ID,
+            TrustLevel::Reviewed,
+            McpPermissions {
+                network: true,
+                process: true,
+                filesystem: vec![BUILTIN_TOOL_TRUST_ID.to_string()],
+                ..McpPermissions::default()
+            },
+            "local".to_string(),
+        )
+        .expect("valid approval");
+    PersistentTrustStore::from_store(&store)
+}
+
 fn request(id: Value, method: &str, params: Value) -> String {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
 }
@@ -59,11 +85,18 @@ async fn dispatch(dispatcher: &McpDispatcher, input: &str, lifecycle: &SessionLi
 
 /// A dispatcher on a tempdir with one initialized session, ready for
 /// `tools/list` / `tools/call`.
+///
+/// The trust store is injected with a full-grant `awh.builtin` record so the
+/// coarse built-in gate (SEC-001: High-risk default-deny, which covers
+/// `connector.invoke`) does not shadow the schema-validation behavior this
+/// file isolates. The default-deny itself is pinned in
+/// tests/mcp_builtin_tool_gate.rs.
 async fn ready_dispatcher() -> (McpDispatcher, SessionLifecycle, tempfile::TempDir) {
     let dir = tempdir().expect("tempdir");
     let dispatcher = McpDispatcher::new_async(dir.path().to_path_buf())
         .await
-        .expect("dispatcher");
+        .expect("dispatcher")
+        .with_trust_store(full_grant_builtin_trust());
     let lifecycle = SessionLifecycle::default();
     let input = request(
         json!(1),

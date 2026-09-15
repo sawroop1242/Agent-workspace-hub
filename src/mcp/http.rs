@@ -8,6 +8,12 @@
 //! Remote access is mandatory bearer-token authenticated, bounded by request
 //! size/time/connection limits, and exposes no secrets or internal paths in
 //! error responses.
+//!
+//! ## Security: SEC-002 TLS Guard
+//!
+//! Non-loopback MCP HTTP/SSE binds require TLS. Plaintext is only allowed for
+//! loopback addresses (`127.0.0.1`, `::1`). This prevents accidental exposure
+//! of bearer tokens and MCP traffic on public interfaces.
 
 use crate::mcp::auth;
 use crate::mcp::dispatcher::{DispatchResult, McpDispatcher};
@@ -24,7 +30,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -89,11 +95,27 @@ pub struct AppState {
 }
 
 /// Serves the remote MCP server over HTTP (optionally TLS) until shutdown.
+///
+/// ## SEC-002 Security Enforcement
+///
+/// This function enforces the SEC-002 policy: non-loopback binds require TLS.
+/// The check happens before binding, ensuring no plaintext listener starts on
+/// public interfaces.
 pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> Result<()> {
     config.tls.validate()?;
     if config.api_key.is_empty() {
         anyhow::bail!("refusing to serve remote MCP without an API key");
     }
+
+    // SEC-002: Enforce TLS for non-loopback binds
+    validate_sec_002_policy(&config.host, config.tls.enabled())?;
+
+    // SEC-002: build the TLS acceptor BEFORE binding any socket. With the
+    // acceptor built first, invalid TLS material on a non-loopback bind
+    // fails closed before a single public TCP listener exists — a
+    // misconfigured public server can never briefly open a plaintext-
+    // capable socket while the error surfaces.
+    let acceptor = config.tls.build_acceptor()?;
 
     let state = AppState {
         dispatcher,
@@ -112,8 +134,6 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
         .with_context(|| format!("failed to bind {addr}"))?;
 
     // Never log the API key; only log the bind address and TLS status.
-    let acceptor = config.tls.build_acceptor()?;
-
     tracing::info!(event = "http_server_started", addr = %addr, tls = config.tls.enabled());
     crate::mcp::audit::audit_allow("server_start", "http", &addr);
 
@@ -133,6 +153,77 @@ pub async fn serve(config: HttpServerConfig, dispatcher: Arc<McpDispatcher>) -> 
             .await
             .context("HTTP server terminated with error"),
     }
+}
+
+/// SEC-002: Validates that non-loopback binds have TLS enabled.
+///
+/// This is the core security enforcement for SEC-002. It checks the actual
+/// bind address semantics rather than relying on string matching alone.
+///
+/// # Policy Matrix
+///
+/// | Bind Address | TLS Disabled | TLS Enabled |
+/// |--------------|--------------|-------------|
+/// | 127.0.0.1    | ALLOW        | ALLOW       |
+/// | ::1          | ALLOW        | ALLOW       |
+/// | localhost    | ALLOW*       | ALLOW       |
+/// | 0.0.0.0      | REJECT       | ALLOW       |
+/// | ::           | REJECT       | ALLOW       |
+/// | non-loopback | REJECT       | ALLOW       |
+///
+/// *localhost is resolved and checked against actual loopback addresses.
+/// If resolution fails, we fail closed (reject).
+pub fn validate_sec_002_policy(host: &str, tls_enabled: bool) -> Result<()> {
+    if tls_enabled {
+        return Ok(());
+    }
+
+    let is_loopback = is_loopback_host(host)?;
+
+    if !is_loopback {
+        audit_deny("sec_002_tls_guard", "non_loopback_plaintext_rejected", host);
+        anyhow::bail!(
+            "SEC-002 violation: TLS is required for non-loopback MCP HTTP/SSE binds. \
+             Attempted plaintext bind on '{}' which is not a loopback address. \
+             Enable TLS or use a loopback address (127.0.0.1, ::1).",
+            host
+        );
+    }
+
+    Ok(())
+}
+
+/// Determines if a host string represents a loopback address.
+///
+/// Uses actual IP address semantics via std::net types rather than string
+/// matching. Handles direct IP addresses and `localhost` via resolution.
+/// Fails closed if resolution is ambiguous or fails.
+fn is_loopback_host(host: &str) -> Result<bool> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ip.is_loopback());
+    }
+
+    if host.eq_ignore_ascii_case("localhost") {
+        let addrs: Vec<SocketAddr> = (host, 80)
+            .to_socket_addrs()
+            .with_context(|| format!("failed to resolve '{}'", host))?
+            .collect();
+
+        if addrs.is_empty() {
+            anyhow::bail!(
+                "SEC-002: failed to resolve '{}' to any addresses, rejecting as non-loopback",
+                host
+            );
+        }
+
+        return Ok(addrs.iter().all(|addr| addr.ip().is_loopback()));
+    }
+
+    anyhow::bail!(
+        "SEC-002: host '{}' is neither a recognized IP address nor 'localhost'. \
+         For security, only explicit loopback IPs (127.0.0.1, ::1) or 'localhost' are allowed for plaintext.",
+        host
+    );
 }
 
 /// A [`axum::serve::Listener`] that wraps accepted TCP streams in TLS.
@@ -156,8 +247,6 @@ impl axum::serve::Listener for TlsListener {
             };
             match self.acceptor.accept(stream).await {
                 Ok(tls) => return (tls, addr),
-                // Handshake failure (e.g. plaintext against a TLS port): drop
-                // the stream and keep accepting. Never log key material.
                 Err(_) => continue,
             }
         }
@@ -172,9 +261,6 @@ impl axum::serve::Listener for TlsListener {
 pub fn build_router(state: AppState, config: &HttpServerConfig) -> Router {
     let cors = build_cors(config);
 
-    // `/sse` and `/mcp` require a valid bearer token; `/health` does not.
-    // Rate limiting runs after authentication (spec §25): 401s never
-    // consume quota, and only valid tokens reach the limiter.
     let protected = Router::new()
         .route("/sse", get(sse_handler))
         .route("/mcp", post(mcp_handler))
@@ -202,7 +288,6 @@ pub fn build_router(state: AppState, config: &HttpServerConfig) -> Router {
 /// Builds the CORS layer: restrictive by default, configurable allow-list.
 fn build_cors(config: &HttpServerConfig) -> CorsLayer {
     if config.allowed_origins.is_empty() {
-        // No CORS headers at all → browsers restrict cross-origin by default.
         CorsLayer::new()
             .allow_origin(AllowOrigin::list([]))
             .allow_methods([])
@@ -262,10 +347,8 @@ async fn authenticate(
     }
 }
 
-/// Rate-limit middleware (spec §25: runs after authentication, so
-/// rejected 401s never burn quota). Keyed on `X-Forwarded-For`'s first
-/// value — tunnels and reverse proxies set it — falling back to the
-/// shared "direct" bucket for connections with no proxy header.
+/// Rate-limit middleware keyed on the first `X-Forwarded-For` value, or the
+/// shared direct bucket when no proxy header is present.
 async fn rate_limit_guard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -293,9 +376,6 @@ async fn rate_limit_guard(
                 })),
             )
                 .into_response();
-            // The retry-after value is a rendered integer, so this cannot
-            // fail; if it ever did, serve the response without the header
-            // rather than panicking inside a request handler.
             if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
                 response
                     .headers_mut()
@@ -308,7 +388,6 @@ async fn rate_limit_guard(
 
 /// `GET /sse` — establishes an isolated SSE session and streams events.
 async fn sse_handler(State(state): State<AppState>) -> Response {
-    // Enforce the session limit (fail closed on exhaustion).
     if state.sessions.len().await >= state.max_sessions {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -321,18 +400,16 @@ async fn sse_handler(State(state): State<AppState>) -> Response {
     let session_id = session.id.clone();
     let receiver = session.subscribe();
 
-    // The first event announces the client's dedicated POST endpoint.
     let endpoint_event = Event::default()
         .event("endpoint")
         .data(session.endpoint.clone());
 
-    // Convert broadcast events into SSE frames.
     let stream = BroadcastStream::new(receiver).filter_map(|item| match item {
         Ok(SseEvent::Endpoint(url)) => Some(Ok(Event::default().event("endpoint").data(url))),
         Ok(SseEvent::Message(value)) => Some(Ok(Event::default()
             .event("message")
             .data(value.to_string()))),
-        Err(_) => None, // broadcast lag: client must reconnect
+        Err(_) => None,
     });
 
     let initial =
@@ -340,10 +417,6 @@ async fn sse_handler(State(state): State<AppState>) -> Response {
 
     let keepalive = state.sse_keepalive;
 
-    // Keep the session alive for exactly as long as the SSE stream is being
-    // served, then remove it. The stream's `Drop` runs when the response body
-    // is dropped — i.e. when the client disconnects or the connection closes —
-    // so cleanup is tied to the actual stream lifetime rather than detached.
     let guarded = SessionGuard {
         inner: initial.chain(stream),
         registry: Arc::clone(&state.sessions),
@@ -355,14 +428,7 @@ async fn sse_handler(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// A [`Stream`] wrapper that removes its SSE session from the registry when the
-/// stream is dropped.
-///
-/// `Sse` (via `axum`) drops the body stream when the client disconnects or the
-/// connection is closed, which drops this guard and removes the session. This
-/// keeps the session alive for exactly the duration the client is connected —
-/// never shorter (the prior detached `tokio::spawn` could remove it before the
-/// client used its endpoint) and never leaking a session after disconnect.
+/// A stream wrapper that removes its SSE session from the registry when dropped.
 struct SessionGuard<S> {
     inner: S,
     registry: Arc<SessionRegistry>,
@@ -371,8 +437,6 @@ struct SessionGuard<S> {
 
 impl<S> Drop for SessionGuard<S> {
     fn drop(&mut self) {
-        // Removal is async; spawn a task using the registry's own handle since
-        // `Drop` cannot await. The registry is `Arc`-owned so it outlives this.
         let registry = Arc::clone(&self.registry);
         let session_id = self.session_id.clone();
         tokio::spawn(async move {
@@ -388,8 +452,6 @@ where
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        // SAFETY: `SessionGuard` never structurally pins its fields and is not
-        // `Drop`-pin-projected, so it is safe to project to the inner stream.
         unsafe {
             let this = self.get_unchecked_mut();
             Pin::new_unchecked(&mut this.inner).poll_next(cx)
@@ -415,9 +477,6 @@ async fn mcp_handler(
         }
     };
 
-    // Reject bodies that are not well-formed JSON before dispatching, so a
-    // malformed HTTP request fails with a clear 400 rather than an opaque
-    // JSON-RPC error pushed over the stream.
     if serde_json::from_str::<Value>(&body).is_err() {
         return (
             StatusCode::BAD_REQUEST,
@@ -453,8 +512,6 @@ async fn mcp_handler(
         }
     };
 
-    // Enforce the MCP initialization lifecycle per session (the dispatcher's
-    // gate flips the session's state when the initialize exchange succeeds).
     let result = state
         .dispatcher
         .dispatch_with_lifecycle(&body, &session.lifecycle)
@@ -480,10 +537,6 @@ struct McpQuery {
 }
 
 /// Signals graceful shutdown on SIGINT/SIGTERM.
-///
-/// Handler installation failures degrade gracefully: the server keeps
-/// serving (it can still be killed outright), rather than panicking at
-/// startup — the shutdown path is best-effort, never fatal (§20).
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -522,10 +575,6 @@ mod tests {
     use super::*;
     use crate::mcp::sse::SseEvent;
 
-    /// Verifies the session is retained while the guard's stream is alive and
-    /// removed once the guard is dropped (client disconnect). This guards the
-    /// regression where a detached `tokio::spawn` removed the session before the
-    /// client ever used its endpoint.
     #[tokio::test]
     async fn session_guard_removes_session_on_drop_only() {
         let registry = Arc::new(SessionRegistry::new());
@@ -533,7 +582,6 @@ mod tests {
         let session_id = session.id.clone();
         assert_eq!(registry.len().await, 1);
 
-        // A finite stream that yields one event then EOF.
         let inner = tokio_stream::iter(vec![SseEvent::Endpoint("/mcp".to_string())]);
         let guarded = SessionGuard {
             inner,
@@ -541,29 +589,18 @@ mod tests {
             session_id: session_id.clone(),
         };
 
-        // While the guard is alive (not dropped), the session must still exist.
         let mut pinned = Box::pin(guarded);
         let first = std::future::poll_fn(|cx| Pin::new(&mut pinned).poll_next(cx)).await;
         assert!(first.is_some());
-        assert_eq!(
-            registry.len().await,
-            1,
-            "session must not be removed while alive"
-        );
+        assert_eq!(registry.len().await, 1);
 
-        // Drop the guard to simulate the client disconnecting.
         drop(pinned);
 
-        // Removal is async; yield until the spawned cleanup task runs.
         let mut attempts = 0;
         while registry.len().await != 0 && attempts < 100 {
             tokio::task::yield_now().await;
             attempts += 1;
         }
-        assert_eq!(
-            registry.len().await,
-            0,
-            "session must be removed after the guard is dropped"
-        );
+        assert_eq!(registry.len().await, 0);
     }
 }

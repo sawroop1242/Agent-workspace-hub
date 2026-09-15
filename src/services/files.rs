@@ -70,6 +70,18 @@ impl FilesService {
         Ok(joined)
     }
 
+    /// Reads raw bytes under the root, enforcing the size cap. Containment
+    /// is the same canonical `resolve_checked` boundary as every other
+    /// operation. Callers own text/binary interpretation of the bytes.
+    pub fn read_bytes(&self, relative: &str) -> Result<Vec<u8>> {
+        let path = self.resolve_checked(relative)?;
+        let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if meta.len() > MAX_FILE_BYTES {
+            bail!("file exceeds the {} byte limit", MAX_FILE_BYTES);
+        }
+        fs::read(&path).with_context(|| format!("read {}", path.display()))
+    }
+
     /// Reads a UTF-8 text file under the root, enforcing the size cap.
     pub fn read(&self, relative: &str) -> Result<String> {
         let path = self.resolve_checked(relative)?;
@@ -91,6 +103,67 @@ impl FilesService {
                 .with_context(|| format!("create parent of {}", path.display()))?;
         }
         fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+    }
+
+    /// Atomically writes a UTF-8 text file under the root, enforcing the
+    /// size cap and the canonical containment boundary.
+    ///
+    /// The complete content is first written to a unique temporary file in
+    /// the target's own directory, flushed to disk, and then renamed over
+    /// the target. A `rename(2)` within the same filesystem is atomic, so
+    /// concurrent readers observe either the previous complete content or
+    /// the new complete content — never a truncated or partially written
+    /// file. This is the canonical commit boundary for edit operations:
+    /// prepare in memory, commit in one step.
+    ///
+    /// On any failure before the rename (containment, size cap, temp-file
+    /// creation, write, flush) the target is left untouched and the
+    /// temporary file is removed. A failure of the rename itself likewise
+    /// leaves the target untouched. The parent directory is fsynced
+    /// best-effort so the rename survives a crash on platforms that
+    /// support directory fsync.
+    ///
+    /// Known limitation (shared with every operation in this service):
+    /// path resolution and the final rename are separate steps, so a
+    /// final-component symlink swap between them is not prevented
+    /// (final-component TOCTOU). Stronger safe-open primitives belong to
+    /// the dedicated filesystem hardening work.
+    pub fn write_atomic(&self, relative: &str, content: &str) -> Result<()> {
+        let path = self.resolve_checked(relative)?;
+        if content.len() as u64 > MAX_FILE_BYTES {
+            bail!("content exceeds the {} byte limit", MAX_FILE_BYTES);
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("target has no parent directory"))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parent of {}", path.display()))?;
+        // Same-directory temp file: guarantees the rename stays on one
+        // filesystem, where it is atomic.
+        let mut temp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("create temp file in {}", parent.display()))?;
+        std::io::Write::write_all(&mut temp, content.as_bytes())
+            .with_context(|| format!("stage {}", path.display()))?;
+        std::io::Write::flush(&mut temp).with_context(|| format!("stage {}", path.display()))?;
+        temp.as_file()
+            .sync_all()
+            .with_context(|| format!("sync {}", path.display()))?;
+        temp.persist(&path).map_err(|error| {
+            // The temp file is returned on failure and dropped here,
+            // removing it; the target is untouched.
+            anyhow::Error::new(error.error).context(format!(
+                "commit {} (staged as {})",
+                path.display(),
+                error.file.path().display()
+            ))
+        })?;
+        // Best-effort directory fsync so the rename itself is durable.
+        // Not portable to every platform/filesystem; a failure here never
+        // fails the write.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 
     /// Deletes a file or (empty or not) directory under the root. The

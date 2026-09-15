@@ -454,10 +454,16 @@ pub fn validate_schema(
     Ok(())
 }
 
-/// Shared depth counter for [`DepthGuard`]. Module-scoped so `acquire` and
-/// `Drop` reference the SAME static (function-local statics would be
-/// distinct items and the counter would never balance).
-static VALIDATION_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// Recursion counter for DepthGuard. Depth is a property of one recursive
+// validation, which runs on a single thread; a thread-local counter keeps
+// unrelated concurrent validations (parallel test threads, concurrent MCP
+// calls) from pooling their depths and spuriously tripping
+// MAX_SCHEMA_DEPTH. Module-scoped so `acquire` and `Drop` reference the
+// SAME cell (function-local statics would be distinct items and the
+// counter would never balance).
+thread_local! {
+    static VALIDATION_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Bounded-recursion guard: each nested schema application consumes one
 /// level; beyond [`MAX_SCHEMA_DEPTH`] validation fails closed instead of
@@ -468,9 +474,15 @@ struct DepthGuard {
 
 impl DepthGuard {
     fn acquire() -> Result<Self, SchemaError> {
-        let current = VALIDATION_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if current >= MAX_SCHEMA_DEPTH {
-            VALIDATION_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let too_deep = VALIDATION_DEPTH.with(|depth| {
+            if depth.get() >= MAX_SCHEMA_DEPTH {
+                true
+            } else {
+                depth.set(depth.get() + 1);
+                false
+            }
+        });
+        if too_deep {
             return Err(SchemaError::new(
                 SchemaKeyword::ResourceLimit,
                 "arguments",
@@ -484,7 +496,7 @@ impl DepthGuard {
 
 impl Drop for DepthGuard {
     fn drop(&mut self) {
-        VALIDATION_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        VALIDATION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 

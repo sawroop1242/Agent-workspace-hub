@@ -43,6 +43,17 @@ pub enum BuiltinToolAuthorizationError {
     #[error("built-in tool '{tool}' denied: trust store unavailable (fail closed)")]
     StoreUnavailable { tool: String },
 
+    /// A High-risk built-in tool was called with no trust record for the
+    /// built-in identity at all. SEC-001: High-risk built-ins are
+    /// deny-by-default, so absence of a record is denial — the operator must
+    /// explicitly grant the required capability first.
+    #[error(
+        "built-in tool '{tool}' denied: High-risk tools require explicit authorization \
+         (no trust record for '{id}'); grant it with: awh mcp trust {id} \
+         --network --process --filesystem"
+    )]
+    AuthorizationRequired { tool: String, id: String },
+
     /// A trust record for the built-in identity exists, but it does not grant
     /// a permission the tool's registry entry requires.
     #[error("built-in tool '{tool}' denied: permission '{permission}' not granted to {id}")]
@@ -71,6 +82,7 @@ impl BuiltinToolAuthorizationError {
         match self {
             Self::Unregistered { tool, .. }
             | Self::StoreUnavailable { tool, .. }
+            | Self::AuthorizationRequired { tool, .. }
             | Self::PermissionDenied { tool, .. }
             | Self::TrustLevelDenied { tool, .. } => tool,
         }
