@@ -1,0 +1,71 @@
+name: AWH Verified Merge
+
+on:
+  repository_dispatch:
+    types: [awh.merge]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+
+env:
+  AWH_LLM_MODEL: moonshotai/kimi-k3
+  AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+
+jobs:
+  merge:
+    if: github.event.client_payload.feature_id != '' && github.event.client_payload.operation_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+      FEATURE_ID: ${{ github.event.client_payload.feature_id }}
+      OPERATION_ID: ${{ github.event.client_payload.operation_id }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+      REVIEWED_SHA: ${{ github.event.client_payload.reviewed_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: rust
+          fetch-depth: 0
+          token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+
+      - name: Validate identity and checkpoint
+        run: |
+          python scripts/checkpoint_state.py validate
+          test "$(jq -r '.status' .openhands/state.json)" = MERGING
+          test "$(jq -r '.active_feature' .openhands/state.json)" = "$FEATURE_ID"
+          test "$(jq -r '.operation_id' .openhands/state.json)" = "$OPERATION_ID"
+          test "$(jq -r '.active_pr' .openhands/state.json)" = "$PR_NUMBER"
+          test "$(jq -r '.active_pr_sha' .openhands/state.json)" = "$REVIEWED_SHA"
+
+      - name: Validate feature identifier
+        run: python scripts/validate_feature_id.py "$FEATURE_ID"
+
+      - name: Verify PR identity and exact head SHA
+        run: |
+          REPO=$(gh pr view "$PR_NUMBER" --json baseRefName,headRefOid,headRepository,headRepositoryOwner,state --jq '[.baseRefName,.headRefOid,.headRepository.name,.headRepositoryOwner.login,.state] | @tsv')
+          read -r BASE HEAD HEAD_REPO HEAD_OWNER STATE <<< "$REPO"
+          test "$BASE" = rust
+          test "$HEAD" = "$REVIEWED_SHA"
+          test "$HEAD_REPO" = "${GITHUB_REPOSITORY#*/}"
+          test "$HEAD_OWNER" = "${GITHUB_REPOSITORY%/*}"
+          test "$STATE" = OPEN
+
+      - name: Require independent CI success on reviewed SHA
+        run: python scripts/merge_ci_gate.py "$PR_NUMBER" "$REVIEWED_SHA"
+
+      - name: Merge exact reviewed SHA
+        run: |
+          python scripts/awh_merge_guard.py validate --pr "$PR_NUMBER" --sha "$REVIEWED_SHA"
+          gh pr merge "$PR_NUMBER" --squash --delete-branch --match-head-commit "$REVIEWED_SHA"
+
+      - name: Mark completed
+        run: |
+          python scripts/checkpoint_state.py transition --expect-status MERGING --to COMPLETED --set active_pr=null --set active_branch=null --set active_pr_sha=null --set last_error=null
+          git config user.name 'AWH Automation'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .openhands/state.json
+          python scripts/safe_git.py push --branch rust --message "chore(automation): complete $FEATURE_ID"
