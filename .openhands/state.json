@@ -1,6 +1,6 @@
 {
   "version": 4,
-  "status": "PLANNING",
+  "status": "IDLE",
   "operation_id": "AWH-AUTO-003:BUILD:1",
   "recovery_attempt": 1,
   "recovery_claim": null,
