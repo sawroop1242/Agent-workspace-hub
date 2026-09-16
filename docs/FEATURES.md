@@ -39,6 +39,11 @@ Basic: `awh fs read|write|stat|search|hash|verify`
 
 Controlled edits: `awh fs patch|replace|insert|delete-range|apply-diff|history|rollback`
 
+**Implementation status:**
+
+- **AWE-008 — Post-edit verification: Completed.** Verification reads the actual resulting filesystem state, captures the resulting `FileState`, distinguishes verification failure from apply failure and stale-state conflict, and integrates with the established rollback/recovery path.
+- AWE-009 and later editing milestones remain separate implementation work and must not be inferred as completed from this status.
+
 Every consequential edit follows:
 
 ```text
