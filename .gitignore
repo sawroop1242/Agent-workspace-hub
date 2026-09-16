@@ -1,17 +1,1 @@
-# Rust build artifacts
-/target
-
-# Test output
-**/*.rs.bk
-
-# Environment files
-.env
-.env.*
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Local AWH runtime state (custom MCP configs may hold credentials)
-/.agent/
-__pycache__/
+Nothing should be ignored based on the provided file changes. The only modified file is a Python source file (`scripts/awh_pipeline.py`), which should not be added to .gitignore.

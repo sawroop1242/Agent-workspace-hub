@@ -62,9 +62,9 @@ def begin_stage(stage,feature,extra,message,expected_operation_id=None):
   n=int(state[cf]); parsed=split_operation_id(state['operation_id'])
   if expected_operation_id is not None:
    if not parsed or parsed[0]!=prefix or parsed[1]!=n:print('STALE_EVENT: checkpoint operation_id is inconsistent with the current stage counter; doing nothing.');raise SystemExit(STALE_EXIT)
-   op=expected_operation_id
-  elif parsed and parsed[0]==prefix and parsed[1]==n:op=state['operation_id']
-  elif parsed is None or parsed[0]!=prefix:n+=1;op=f'{prefix}:{n}';assignments[cf]=n
+   op=expected_operation_id; print(f'idempotent retry for operation {op}')
+  elif parsed and parsed[0]==prefix and parsed[1]==n:op=state['operation_id']; print(f'idempotent retry for operation {op}')
+  elif parsed is None or parsed[0]!=prefix:n+=1;op=f'{prefix}:{n}';assignments[cf]=n; print(f'new operation ({op.split(":")[-1]})')
   else:raise SystemExit(STALE_EXIT)
  if expected_operation_id is not None and op!=expected_operation_id:print('STALE_EVENT: computed operation_id does not match event operation_id; doing nothing.');raise SystemExit(STALE_EXIT)
  assignments['operation_id']=op; args=['transition']
