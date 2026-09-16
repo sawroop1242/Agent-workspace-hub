@@ -49,7 +49,7 @@ def validate_event(agent,state,feature,pr):
   if ap is not None and pr!=ap:return False,f'event pr {pr} does not match active_pr {ap}'
   if af is not None and feature is not None and feature!=af:return False,f'event feature {feature!r} does not match active_feature {af!r}'
  elif status=='PLANNING' and af is not None and feature and feature!=af:return False,f'resume requested {feature!r} but active_feature is {af!r}'
- return True,'event agrees with checkpoint'
+ return True,'Event validated: event agrees with checkpoint'
 def begin_stage(stage,feature,extra,message,expected_operation_id=None):
  spec=STAGES[stage]; state=load_state(); ok,reason=validate_event(spec['agent'],state,feature,extra.get('active_pr'))
  if not ok:print(f'STALE_EVENT: {reason}; doing nothing.');raise SystemExit(STALE_EXIT)
@@ -64,7 +64,8 @@ def begin_stage(stage,feature,extra,message,expected_operation_id=None):
    if not parsed or parsed[0]!=prefix or parsed[1]!=n:print('STALE_EVENT: checkpoint operation_id is inconsistent with the current stage counter; doing nothing.');raise SystemExit(STALE_EXIT)
    op=expected_operation_id; print(f'idempotent retry for operation {op}')
   elif parsed and parsed[0]==prefix and parsed[1]==n:op=state['operation_id']; print(f'idempotent retry for operation {op}')
-  elif parsed is None or parsed[0]!=prefix:n+=1;op=f'{prefix}:{n}';assignments[cf]=n; print(f'new operation ({op.split(":")[-1]})')
+  elif parsed is None or parsed[0]!=prefix:
+   n+=1;op=f'{prefix}:{n}';assignments[cf]=n;print(f'new operation {op} (attempt {n})')
   else:raise SystemExit(STALE_EXIT)
  if expected_operation_id is not None and op!=expected_operation_id:print('STALE_EVENT: computed operation_id does not match event operation_id; doing nothing.');raise SystemExit(STALE_EXIT)
  assignments['operation_id']=op; args=['transition']
@@ -167,12 +168,15 @@ def _parse_assignments(pairs):
 def main():
  p=argparse.ArgumentParser();sp=p.add_subparsers(dest='command',required=True)
  q=sp.add_parser('validate-event');q.add_argument('--agent',required=True);q.add_argument('--feature');q.add_argument('--pr',type=int)
- q=sp.add_parser('begin-stage');q.add_argument('--stage',choices=STAGES);q.add_argument('--feature',required=True);q.add_argument('--operation-id');q.add_argument('--message',required=True);q.add_argument('--set',action='append',default=[])
+ q=sp.add_parser('begin-stage');q.add_argument('--stage',choices=STAGES);q.add_argument('--feature',required=True);q.add_argument('--pr',type=int);q.add_argument('--operation-id');q.add_argument('--message',required=True);q.add_argument('--set',action='append',default=[])
  q=sp.add_parser('claim-recovery');q.add_argument('--feature',required=True);q.add_argument('--operation-id',required=True);q.add_argument('--claim-owner',required=True);q.add_argument('--stale-minutes',type=int,default=90);q.add_argument('--lease-minutes',type=int,default=120)
  sp.add_parser('decide-recovery');q=sp.add_parser('finalize-recovery');q.add_argument('--owner',required=True);q.add_argument('--to',required=True);q.add_argument('--message',required=True);q.add_argument('--set',action='append',default=[])
  q=sp.add_parser('record-failure');q.add_argument('--agent',required=True);q.add_argument('--stage',required=True);q.add_argument('--detail',required=True);q.add_argument('--feature');q.add_argument('--pr',type=int);q.add_argument('--branch');q.add_argument('--commit');q.add_argument('--operation-id');a=p.parse_args()
  if a.command=='validate-event':ok,r=validate_event(a.agent,load_state(),a.feature,a.pr);print(r);return 0 if ok else STALE_EXIT
- if a.command=='begin-stage':begin_stage(a.stage,a.feature,_parse_assignments(a.set),a.message,a.operation_id);return 0
+ if a.command=='begin-stage':
+  extra=_parse_assignments(a.set)
+  if a.pr is not None:extra['active_pr']=a.pr
+  begin_stage(a.stage,a.feature,extra,a.message,a.operation_id);return 0
  if a.command=='claim-recovery':print(claim_recovery(feature_id=a.feature,expected_operation_id=a.operation_id,claim_owner=a.claim_owner,stale_minutes=a.stale_minutes,lease_minutes=a.lease_minutes).value);return 0
  if a.command=='decide-recovery':s=load_state();po,pm,be=inspect_github(s.get('active_pr'),s);d=decide_recovery(s,po,pm,be);print(f"TARGET={d['target']}");print(f"REASON={d['reason']}");x=d.get('dispatch');print(f"DISPATCH_EVENT={x.get('event','') if x else ''}");print(f"DISPATCH_PAYLOAD={json.dumps({k:v for k,v in (x or {}).items() if k!='event'})}");return 0
  if a.command=='finalize-recovery':finalize_recovery(a.owner,a.to,_parse_assignments(a.set),a.message);return 0
