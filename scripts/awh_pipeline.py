@@ -56,7 +56,7 @@ def begin_stage(stage,feature,extra,message,expected_operation_id=None):
  if expected_operation_id is not None:
   if not expected_operation_id.strip():print('STALE_EVENT: event operation_id is empty; doing nothing.');raise SystemExit(STALE_EXIT)
   if state['operation_id']!=expected_operation_id:print(f'STALE_EVENT: event operation_id {expected_operation_id!r} does not match checkpoint operation_id {state["operation_id"]!r}; doing nothing.');raise SystemExit(STALE_EXIT)
- assignments=dict(extra); assignments['active_feature']=feature; assignments.setdefault('last_error',None); cf=spec['counter']; prefix=f'{feature}:{spec["op"]}'
+ assignments=dict(extra); assignments['active_feature']=feature; assignments.setdefault('last_error',None); cf=spec['counter']; prefix=f'{feature}:{spec["op"]}'; checkpoint_operation_id=state['operation_id']
  if cf is None:op=f'{prefix}'
  else:
   n=int(state[cf]); parsed=split_operation_id(state['operation_id'])
@@ -70,7 +70,10 @@ def begin_stage(stage,feature,extra,message,expected_operation_id=None):
  if expected_operation_id is not None and op!=expected_operation_id:print('STALE_EVENT: computed operation_id does not match event operation_id; doing nothing.');raise SystemExit(STALE_EXIT)
  assignments['operation_id']=op; args=['transition']
  for st in sorted(AGENT_ADMITTED_STATUSES[spec['agent']]):args+=['--expect-status',st]
- args+=['--to',spec['target'],'--expect-operation-id',op]
+ args+=['--to',spec['target']]
+ # CAS against the checkpoint operation being consumed. For a new operation,
+ # op is the value being written, so expecting op here would always fail.
+ if checkpoint_operation_id:args+=['--expect-operation-id',checkpoint_operation_id]
  for k,v in assignments.items():args+=['--set',f'{k}={json.dumps(v)}']
  run_checkpoint(args);stage_and_push(None,message);print(f'operation_id={op}');return {'operation_id':op,'status':spec['target']}
 class ClaimResult(enum.Enum):CLAIMED='CLAIMED';LOST_CLAIM='LOST_CLAIM';NO_OP='NO_OP'
