@@ -4,7 +4,7 @@ The AWH repository contains a sequential GitHub Actions control plane for three 
 
 `Agent 1 (plan) -> Agent 2 (build) -> PR -> Agent 3 (review) -> CI gate -> Agent 1 (merge) -> next feature`
 
-All three agents use the **same model: `moonshotai/kimi-k3`**, hosted by NVIDIA's OpenAI-compatible NIM API at `https://integrate.api.nvidia.com/v1`.
+Agent 1 and Agent 3 use **`deepseek-ai/deepseek-v4-flash-0731`**, while Agent 2 remains on its existing model configuration. All model calls use NVIDIA's OpenAI-compatible NIM API at `https://integrate.api.nvidia.com/v1`.
 
 ## Minimum key requirement
 
@@ -105,10 +105,12 @@ Do not put NVIDIA API keys in repository files or workflow YAML.
 
 The model and endpoint are fixed in the workflows:
 
-- Model: `moonshotai/kimi-k3`
-- Base URL: `https://integrate.api.nvidia.com/v1`
+- **Agent 1:** `deepseek-ai/deepseek-v4-flash-0731`
+- **Agent 2:** existing builder model configuration
+- **Agent 3:** `deepseek-ai/deepseek-v4-flash-0731`
+- **Base URL:** `https://integrate.api.nvidia.com/v1`
 
-No per-agent model selection is used.
+Model selection is role-specific in the workflows; Agent 1 and Agent 3 now share the DeepSeek model while Agent 2 is unchanged.
 
 ## Starting the loop
 
