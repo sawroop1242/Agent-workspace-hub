@@ -44,7 +44,6 @@ jobs:
       - name: Sync checkpoint from the shared branch
         run: python scripts/safe_git.py sync --branch rust
       - name: Validate event against the authoritative checkpoint
-        id: validate_event
         run: |
           python scripts/checkpoint_state.py validate
           test -n "$AWH_FEATURE_ID"; test -n "$AWH_EVENT_OPERATION_ID"
@@ -57,8 +56,7 @@ jobs:
           test -n "$K1" || { echo 'Missing required secret: AWH_AGENT2_NVIDIA_KEY_1'; exit 1; }
           test -n "$KF" || { echo 'Missing required secret: AWH_ROUTINE_NVIDIA_KEY'; exit 1; }
       - name: Checkpoint builder stage with CAS and operation identity
-        run: |
-          python scripts/awh_pipeline.py begin-stage --stage builder --feature "$AWH_FEATURE_ID" --operation-id "$AWH_EVENT_OPERATION_ID" --message "chore(automation): builder stage for $AWH_FEATURE_ID" --set last_error=null
+        run: python scripts/awh_pipeline.py begin-stage --stage builder --feature "$AWH_FEATURE_ID" --operation-id "$AWH_EVENT_OPERATION_ID" --message "chore(automation): builder stage for $AWH_FEATURE_ID" --set last_error=null
       - name: Determine branch
         id: branch
         run: echo "name=feature/${AWH_FEATURE_ID}" >> "$GITHUB_OUTPUT"
@@ -124,3 +122,7 @@ jobs:
           SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid); test -n "$SHA"
           python scripts/checkpoint_state.py transition --expect-status BUILDING --expect-status REVIEWING --to PR_OPEN --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["AWH_FEATURE_ID"]))')" --set active_pr="$PR" --set active_branch="$(python -c 'import json,os; print(json.dumps(os.environ["BRANCH"]))')" --set active_pr_sha="$(python -c 'import json,os; print(json.dumps(os.environ["SHA"]))')" --set last_error=null
           git add .openhands/state.json; python scripts/safe_git.py push --branch rust --message "chore(automation): record PR $PR"
+      - name: Record builder failure for recovery
+        if: failure()
+        run: |
+          python scripts/awh_pipeline.py record-failure --agent builder --stage agent --detail "Agent 2 builder workflow failed; see workflow run logs" --feature "$AWH_FEATURE_ID" --operation-id "$AWH_EVENT_OPERATION_ID" || true
