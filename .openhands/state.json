@@ -1,6 +1,6 @@
 {
   "version": 4,
-  "status": "PLANNING",
+  "status": "BLOCKED",
   "operation_id": "AWH-AUTO-003:BUILD:1",
   "recovery_attempt": 1,
   "recovery_claim": null,
@@ -10,7 +10,7 @@
   "active_pr_sha": null,
   "review_round": 0,
   "builder_attempt": 1,
-  "last_error": null,
+  "last_error": "{\"agent\": \"starter\", \"attempt\": 1, \"branch\": null, \"commit\": null, \"detail\": \"planner produced a task but the BUILDING checkpoint failed; see workflow run logs\", \"feature_id\": \"AWE-010\", \"operation_id\": \"AWH-AUTO-003:BUILD:1\", \"pr\": null, \"review_round\": 0, \"stage\": \"plan\", \"status_at_failure\": \"PLANNING\"}",
   "last_review": "",
-  "updated_at": "2026-09-16T15:18:45.857553Z"
+  "updated_at": "2026-09-16T15:21:51.089670Z"
 }
