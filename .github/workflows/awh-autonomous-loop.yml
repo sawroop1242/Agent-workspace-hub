@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWH_LLM_MODEL: moonshotai/kimi-k3
+  AWH_LLM_MODEL: deepseek-ai/deepseek-v4-flash-0731
   AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
   OPENHANDS_SDK_COMMIT: 22c85eb0e0db8f4386380d095e9fe6933af2e65f
 
@@ -131,7 +131,7 @@ jobs:
             "openhands-sdk @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-sdk" \
             "openhands-tools @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-tools"
 
-      - name: Plan next feature with Agent 1 and rotate Kimi K3 keys on rate limit
+      - name: Plan next feature with Agent 1 and rotate DeepSeek keys on rate limit
         if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
         id: plan
         env:
@@ -142,7 +142,7 @@ jobs:
           SUCCESS=0
           for KEY_NAME in K1 K2 K3 KF; do
             KEY="${!KEY_NAME}"; [ -n "$KEY" ] || continue
-            echo "Agent 1: trying NVIDIA Kimi K3 key pool slot $KEY_NAME"
+            echo "Agent 1: trying NVIDIA DeepSeek key pool slot $KEY_NAME"
             AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/task.txt 2>&1
             RC=$?; cat /tmp/task.txt
             if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
