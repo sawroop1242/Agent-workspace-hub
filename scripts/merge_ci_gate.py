@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 
-REQUIRED = {"fmt", "clippy", "build", "test"}
+REQUIRED = {"fmt", "clippy", "Build / test (ubuntu-latest)", "Dependency vulnerability audit"}
 
 
 def main() -> int:
