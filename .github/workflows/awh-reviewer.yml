@@ -13,7 +13,7 @@ concurrency:
   group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number || github.event.client_payload.pr_number }}
   cancel-in-progress: false
 env:
-  AWH_LLM_MODEL: moonshotai/kimi-k3
+  AWH_LLM_MODEL: deepseek-ai/deepseek-v4-flash-0731
   AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
   OPENHANDS_SDK_COMMIT: 22c85eb0e0db8f4386380d095e9fe6933af2e65f
 jobs:
