@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Fail-closed CI gate for an exact PR head SHA.
-
-The LLM review verdict is intentionally not consulted here. This gate only
-answers whether GitHub reports every required check as successful for the
-exact commit that was reviewed.
-"""
+"""Fail-closed CI gate for an exact PR head SHA."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
@@ -19,26 +15,29 @@ def main() -> int:
         print("usage: merge_ci_gate.py <pr-number> <expected-sha>", file=sys.stderr)
         return 2
     pr, expected_sha = sys.argv[1:]
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        print("CI gate failed: GITHUB_REPOSITORY is required", file=sys.stderr)
+        return 2
     raw = subprocess.check_output(
-        ["gh", "pr", "checks", pr, "--json", "name,state,oid"], text=True
+        ["gh", "api", f"repos/{repo}/commits/{expected_sha}/check-runs", "--paginate", "--jq", ".check_runs[] | {name,status,conclusion,head_sha}"],
+        text=True,
     )
-    checks = json.loads(raw)
+    checks = [json.loads(line) for line in raw.splitlines() if line.strip()]
     by_name = {item["name"]: item for item in checks}
     missing = sorted(REQUIRED - by_name.keys())
     if missing:
-        print(f"CI gate failed: missing required checks: {', '.join(missing)}", file=sys.stderr)
+        print(f"CI gate failed for PR #{pr}: missing required checks: {', '.join(missing)}", file=sys.stderr)
+        return 1
+    wrong_sha = [name for name in REQUIRED if by_name[name].get("head_sha") != expected_sha]
+    if wrong_sha:
+        print("CI gate failed: check SHA mismatch: " + ", ".join(sorted(wrong_sha)), file=sys.stderr)
         return 1
     bad = []
-    wrong_sha = []
     for name in sorted(REQUIRED):
         item = by_name[name]
-        if item.get("oid") != expected_sha:
-            wrong_sha.append(f"{name}={item.get('oid')}")
-        if item.get("state") != "SUCCESS":
-            bad.append(f"{name}={item.get('state')}")
-    if wrong_sha:
-        print("CI gate failed: check SHA mismatch: " + ", ".join(wrong_sha), file=sys.stderr)
-        return 1
+        if item.get("status") != "completed" or item.get("conclusion") != "success":
+            bad.append(f"{name}={item.get('status')}/{item.get('conclusion')}")
     if bad:
         print("CI gate failed: required checks are not successful: " + ", ".join(bad), file=sys.stderr)
         return 1
