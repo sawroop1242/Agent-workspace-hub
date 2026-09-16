@@ -15,6 +15,7 @@ concurrency:
 
 env:
   AWH_LLM_MODEL: moonshotai/kimi-k3
+  AWH_LLM_FALLBACK_MODEL: deepseek-ai/deepseek-v4-flash-0731
   AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
   OPENHANDS_SDK_COMMIT: 22c85eb0e0db8f4386380d095e9fe6933af2e65f
 
@@ -78,17 +79,39 @@ jobs:
           python -m pip install --disable-pip-version-check \
             "openhands-sdk @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-sdk" \
             "openhands-tools @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-tools"
-      - name: Run Agent 2 with key rotation
+      - name: Run Agent 2 with Kimi K3 and fallback model
         env:
           AWH_AGENT_ROLE: builder
         run: |
-          export AWH_TASK="$(cat /tmp/task.md)"; set +e; SUCCESS=0
-          for KEY_NAME in K1 K2 K3 KF; do KEY="${!KEY_NAME}"; [ -n "$KEY" ] || continue
-            AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/agent2.txt 2>&1; RC=$?; cat /tmp/agent2.txt
+          export AWH_TASK="$(cat /tmp/task.md)"
+          set +e
+          SUCCESS=0
+          echo "Starting Agent 2 with primary model: $AWH_LLM_MODEL"
+          for KEY_NAME in K1 K2 K3 KF; do
+            KEY="${!KEY_NAME}"
+            [ -n "$KEY" ] || continue
+            echo "Trying primary model $AWH_LLM_MODEL with key $KEY_NAME"
+            AWH_LLM_API_KEY="$KEY" AWH_LLM_MODEL="$AWH_LLM_MODEL" python scripts/openhands_agent.py > /tmp/agent2.txt 2>&1
+            RC=$?
+            cat /tmp/agent2.txt
             if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
-            if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/agent2.txt; then continue; fi
-            exit "$RC"
+            echo "Primary model failed with exit code $RC on key $KEY_NAME."
           done
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "Primary model $AWH_LLM_MODEL failed. Switching Agent 2 to fallback model: $AWH_LLM_FALLBACK_MODEL"
+            for KEY_NAME in K1 K2 K3 KF; do
+              KEY="${!KEY_NAME}"
+              [ -n "$KEY" ] || continue
+              echo "Trying fallback model $AWH_LLM_FALLBACK_MODEL with key $KEY_NAME"
+              AWH_LLM_API_KEY="$KEY" AWH_LLM_MODEL="$AWH_LLM_FALLBACK_MODEL" python scripts/openhands_agent.py > /tmp/agent2-fallback.txt 2>&1
+              RC=$?
+              cat /tmp/agent2-fallback.txt
+              if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
+              echo "Fallback model failed with exit code $RC on key $KEY_NAME."
+            done
+          fi
+
           test "$SUCCESS" -eq 1
       - name: Deterministic verification
         run: |
