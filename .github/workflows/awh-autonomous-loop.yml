@@ -29,6 +29,7 @@ concurrency:
 env:
   AWH_LLM_MODEL: moonshotai/kimi-k3
   AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+  OPENHANDS_SDK_COMMIT: 22c85eb0e0db8f4386380d095e9fe6933af2e65f
 
 jobs:
   start-feature:
@@ -89,8 +90,7 @@ jobs:
           OPERATION_ID=$(jq -r '.operation_id // empty' .openhands/state.json)
           test -n "$FEATURE"
           test -n "$OPERATION_ID"
-          jq -n --arg feature "$FEATURE" --arg operation "$OPERATION_ID" \
-            '{event_type:"awh.recover",client_payload:{feature_id:$feature,operation_id:$operation}}' > /tmp/recovery-payload.json
+          jq -n --arg feature "$FEATURE" --arg operation "$OPERATION_ID" '{event_type:"awh.recover",client_payload:{feature_id:$feature,operation_id:$operation}}' > /tmp/recovery-payload.json
           gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/recovery-payload.json
           echo "Recovery requested for $FEATURE / $OPERATION_ID."
 
@@ -106,7 +106,6 @@ jobs:
         run: |
           test -n "$K1" || { echo 'Missing required secret: AWH_AGENT1_NVIDIA_KEY_1'; exit 1; }
           test -n "$KF" || { echo 'Missing required secret: AWH_ROUTINE_NVIDIA_KEY'; exit 1; }
-          echo 'Required Agent 1 key and routine fallback are configured.'
           [ -n "$K2" ] && echo 'Optional Agent 1 key 2 configured.' || echo 'Optional Agent 1 key 2 not configured.'
           [ -n "$K3" ] && echo 'Optional Agent 1 key 3 configured.' || echo 'Optional Agent 1 key 3 not configured.'
 
@@ -115,14 +114,7 @@ jobs:
         env:
           FEATURE_ID: ${{ inputs.feature_id || github.event.client_payload.feature_id || '' }}
         run: |
-          python scripts/checkpoint_state.py transition \
-            --expect-status IDLE --expect-status COMPLETED \
-            --to PLANNING \
-            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ.get("FEATURE_ID") or None))')" \
-            --set active_pr=null \
-            --set active_branch=null \
-            --set active_pr_sha=null \
-            --set last_error=null
+          python scripts/checkpoint_state.py transition --expect-status IDLE --expect-status COMPLETED --to PLANNING --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ.get("FEATURE_ID") or None))')" --set active_pr=null --set active_branch=null --set active_pr_sha=null --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
@@ -130,14 +122,14 @@ jobs:
 
       - name: Record planner-start failure
         if: failure() && steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent starter --stage begin \
-            --detail "planner start checkpoint failed; see workflow run logs" || true
+        run: python scripts/awh_pipeline.py record-failure --agent starter --stage begin --detail "planner start checkpoint failed; see workflow run logs" || true
 
-      - name: Install OpenHands SDK and built-in tools
+      - name: Install pinned OpenHands SDK and built-in tools
         if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
-        run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.0,<2' 'openhands-tools>=1.0,<2'
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "openhands-sdk @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-sdk" \
+            "openhands-tools @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-tools"
 
       - name: Plan next feature with Agent 1 and rotate Kimi K3 keys on rate limit
         if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
@@ -149,23 +141,18 @@ jobs:
           set +e
           SUCCESS=0
           for KEY_NAME in K1 K2 K3 KF; do
-            KEY="${!KEY_NAME}"
-            [ -n "$KEY" ] || continue
+            KEY="${!KEY_NAME}"; [ -n "$KEY" ] || continue
             echo "Agent 1: trying NVIDIA Kimi K3 key pool slot $KEY_NAME"
             AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/task.txt 2>&1
-            RC=$?
-            cat /tmp/task.txt
+            RC=$?; cat /tmp/task.txt
             if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
-            if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/task.txt; then
-              echo "Rate limit detected for $KEY_NAME; rotating to the next key."
-              continue
-            fi
-            echo "Agent 1 failed for a non-rate-limit reason."
+            if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/task.txt; then continue; fi
             exit "$RC"
           done
           test "$SUCCESS" -eq 1
           FEATURE_ID=$(sed -n 's/^Feature ID: *//p' /tmp/task.txt | head -n1)
           test -n "$FEATURE_ID"
+          python scripts/validate_feature_id.py "$FEATURE_ID"
           test -s .openhands/generated-task.md
           echo "feature_id=$FEATURE_ID" >> "$GITHUB_OUTPUT"
 
@@ -174,17 +161,7 @@ jobs:
         env:
           FEATURE_ID: ${{ steps.plan.outputs.feature_id }}
         run: |
-          python scripts/checkpoint_state.py transition \
-            --expect-status PLANNING \
-            --to BUILDING \
-            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
-            --set operation_id="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"] + ":BUILD:1"))')" \
-            --set active_pr=null \
-            --set active_branch=null \
-            --set review_round=0 \
-            --set builder_attempt=1 \
-            --set last_error=null \
-            --set last_review='""'
+          python scripts/checkpoint_state.py transition --expect-status PLANNING --to BUILDING --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" --set operation_id="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"] + ":BUILD:1"))')" --set active_pr=null --set active_branch=null --set active_pr_sha=null --set review_round=0 --set builder_attempt=1 --set last_error=null --set last_review='""'
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json .openhands/generated-task.md
@@ -192,11 +169,7 @@ jobs:
 
       - name: Record build-checkpoint failure
         if: failure() && steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent starter --stage plan \
-            --detail "planner produced a task but the BUILDING checkpoint failed; see workflow run logs" \
-            --feature "${{ steps.plan.outputs.feature_id }}" || true
+        run: python scripts/awh_pipeline.py record-failure --agent starter --stage plan --detail "planner produced a task but the BUILDING checkpoint failed; see workflow run logs" --feature "${{ steps.plan.outputs.feature_id }}" || true
 
       - name: Dispatch Agent 2
         if: steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
@@ -205,19 +178,11 @@ jobs:
         run: |
           CURRENT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
           EXPECTED_OP="$FEATURE_ID:BUILD:1"
-          if [ "$CURRENT_OP" != "$EXPECTED_OP" ]; then
-            echo "Refusing to dispatch: checkpoint operation '$CURRENT_OP' is not '$EXPECTED_OP'."
-            exit 1
-          fi
+          test "$CURRENT_OP" = "$EXPECTED_OP"
           test -s .openhands/generated-task.md
-          jq -n --arg feature "$FEATURE_ID" --arg op "$CURRENT_OP" \
-            '{event_type:"awh.build",client_payload:{feature_id:$feature,operation_id:$op}}' > /tmp/payload.json
+          jq -n --arg feature "$FEATURE_ID" --arg op "$CURRENT_OP" '{event_type:"awh.build",client_payload:{feature_id:$feature,operation_id:$op}}' > /tmp/payload.json
           gh api "repos/$GITHUB_REPOSITORY/dispatches" --method POST --input /tmp/payload.json
 
       - name: Record dispatch failure
         if: failure() && steps.checkpoint_gate.outputs.checkpoint_action == 'plan'
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent starter --stage dispatch \
-            --detail "failed to dispatch the Agent 2 build event; recovery will resume from BUILDING" \
-            --feature "${{ steps.plan.outputs.feature_id }}" || true
+        run: python scripts/awh_pipeline.py record-failure --agent starter --stage dispatch --detail "failed to dispatch the Agent 2 build event; recovery will resume from BUILDING" --feature "${{ steps.plan.outputs.feature_id }}" || true
