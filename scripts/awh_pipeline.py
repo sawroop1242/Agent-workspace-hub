@@ -49,33 +49,37 @@ def validate_event(agent,state,feature,pr):
   if ap is not None and pr!=ap:return False,f'event pr {pr} does not match active_pr {ap}'
   if af is not None and feature is not None and feature!=af:return False,f'event feature {feature!r} does not match active_feature {af!r}'
  elif status=='PLANNING' and af is not None and feature and feature!=af:return False,f'resume requested {feature!r} but active_feature is {af!r}'
- return True,'event agrees with checkpoint'
+ return True,'Event validated'
 def begin_stage(stage,feature,extra,message,expected_operation_id=None):
  spec=STAGES[stage]; state=load_state(); ok,reason=validate_event(spec['agent'],state,feature,extra.get('active_pr'))
  if not ok:print(f'STALE_EVENT: {reason}; doing nothing.');raise SystemExit(STALE_EXIT)
  if expected_operation_id is not None:
   if not expected_operation_id.strip():print('STALE_EVENT: event operation_id is empty; doing nothing.');raise SystemExit(STALE_EXIT)
   if state['operation_id']!=expected_operation_id:print(f'STALE_EVENT: event operation_id {expected_operation_id!r} does not match checkpoint operation_id {state["operation_id"]!r}; doing nothing.');raise SystemExit(STALE_EXIT)
- assignments=dict(extra); assignments['active_feature']=feature; assignments.setdefault('last_error',None); cf=spec['counter']; prefix=f'{feature}:{spec["op"]}'
- if cf is None:op=f'{prefix}'
+ assignments=dict(extra); assignments['active_feature']=feature; assignments.setdefault('last_error',None); cf=spec['counter']; prefix=f'{feature}:{spec["op"]}'; current_op=state['operation_id']
+ if cf is None:
+  op=f'{prefix}'
+  if state['operation_id']==op:print(f'idempotent retry for operation {op}')
  else:
   n=int(state[cf]); parsed=split_operation_id(state['operation_id'])
   if expected_operation_id is not None:
    if not parsed or parsed[0]!=prefix or parsed[1]!=n:print('STALE_EVENT: checkpoint operation_id is inconsistent with the current stage counter; doing nothing.');raise SystemExit(STALE_EXIT)
-   op=expected_operation_id
-  elif parsed and parsed[0]==prefix and parsed[1]==n:op=state['operation_id']
-  elif parsed is None or parsed[0]!=prefix:n+=1;op=f'{prefix}:{n}';assignments[cf]=n
-  else:raise SystemExit(STALE_EXIT)
+   op=expected_operation_id; print(f'idempotent retry for operation {op}')
+  elif parsed and parsed[0]==prefix and parsed[1]==n:op=state['operation_id']; print(f'idempotent retry for operation {op}')
+  elif parsed is None or parsed[0]!=prefix:n+=1;op=f'{prefix}:{n}';assignments[cf]=n; print(f'new operation (attempt {n})')
+  elif parsed[0]==prefix and parsed[1]>n:print(f'STALE_EVENT: refusing to guess; checkpoint has {state["operation_id"]!r} but counter is {n}');raise SystemExit(3)
+  elif parsed[0]==prefix and parsed[1]<n:print(f'STALE_EVENT: refusing to guess; checkpoint has {state["operation_id"]!r} but counter is {n}');raise SystemExit(3)
+  else:raise SystemExit(f'STALE_EVENT: unexpected operation_id/counter mismatch')
  if expected_operation_id is not None and op!=expected_operation_id:print('STALE_EVENT: computed operation_id does not match event operation_id; doing nothing.');raise SystemExit(STALE_EXIT)
  assignments['operation_id']=op; args=['transition']
  for st in sorted(AGENT_ADMITTED_STATUSES[spec['agent']]):args+=['--expect-status',st]
- args+=['--to',spec['target'],'--expect-operation-id',op]
+ args+=['--to',spec['target'],'--expect-operation-id',current_op]
  for k,v in assignments.items():args+=['--set',f'{k}={json.dumps(v)}']
  run_checkpoint(args);stage_and_push(None,message);print(f'operation_id={op}');return {'operation_id':op,'status':spec['target']}
 class ClaimResult(enum.Enum):CLAIMED='CLAIMED';LOST_CLAIM='LOST_CLAIM';NO_OP='NO_OP'
 def sync_to_remote():load_script_module('safe_git').sync(SHARED_BRANCH)
 def claim_recovery(*,feature_id,expected_operation_id,claim_owner,stale_minutes=90,lease_minutes=120):
- if not claim_owner.strip():raise SystemExit('claim owner required')
+ if not claim_owner.strip():print('non-empty --claim-owner required');raise SystemExit(1)
  cp=load_script_module('checkpoint_state');sync_to_remote();state=read_remote_state()
  if state is None:raise SystemExit('cannot read remote checkpoint')
  status=state['status']
@@ -83,13 +87,13 @@ def claim_recovery(*,feature_id,expected_operation_id,claim_owner,stale_minutes=
  claim=state.get('recovery_claim')
  if status=='RECOVERING':return _handle_existing_claim(state,claim,claim_owner,feature_id,expected_operation_id,lease_minutes)
  age=minutes_since(state.get('updated_at'))
- if age is None or age<stale_minutes:print('Checkpoint is not safely stale; refusing recovery.');return ClaimResult.NO_OP
+ if age is None or age<stale_minutes:print('Checkpoint is not stale; refusing recovery.');return ClaimResult.NO_OP
  if state['active_feature']!=feature_id or state['operation_id']!=expected_operation_id:return ClaimResult.LOST_CLAIM
  return _publish_claim(state,feature_id=feature_id,claim_owner=claim_owner,expect_status=status,expect_operation_id=state['operation_id'],stale_status=status)
 def _handle_existing_claim(state,claim,owner,feature,expected,lease):
  if claim and claim.get('owner')==owner:
   if claim.get('feature_id')!=feature or claim.get('operation_id')!=expected:return ClaimResult.LOST_CLAIM
-  return ClaimResult.CLAIMED
+  print('recovery claim already held by this owner');return ClaimResult.CLAIMED
  if claim:
   age=minutes_since(claim.get('claimed_at'))
   if age is None or age<lease:return ClaimResult.LOST_CLAIM
@@ -143,7 +147,8 @@ def decide_recovery(state,pr_open,pr_merged,branch_exists):
  return {'target':'BLOCKED','dispatch':None,'reason':f'no safe continuation from {s!r}'}
 def finalize_recovery(owner,target,assignments,message):
  state=load_state();claim=state.get('recovery_claim') or {}
- if state['status']!='RECOVERING' or claim.get('owner') not in (None,owner):raise SystemExit(STALE_EXIT)
+ if state['status']!='RECOVERING':print('STALE_EVENT');raise SystemExit(STALE_EXIT)
+ if claim.get('owner') not in (None,owner):print('STALE_EVENT: recovery claim owned by another worker');raise SystemExit(STALE_EXIT)
  if target not in {'BLOCKED','BUILDING','PLANNING','PR_OPEN','REVIEWING','FIXING','MERGING','COMPLETED'}:raise SystemExit(f'invalid recovery target {target}')
  payload=dict(assignments);payload['recovery_claim']=None;payload.setdefault('last_error',None)
  if target!='BLOCKED' and claim.get('operation_id'):payload['operation_id']=claim['operation_id']
@@ -156,7 +161,7 @@ def record_failure(agent,stage,detail,feature,pr,branch,commit,expected_operatio
   if not expected_operation_id.strip():print('STALE_EVENT: failure report has no operation_id; doing nothing.');return False
   if s['operation_id']!=expected_operation_id:print(f'STALE_EVENT: failure report operation_id {expected_operation_id!r} does not match checkpoint operation_id {s["operation_id"]!r}; doing nothing.');return False
  d=json.dumps({'agent':agent,'stage':stage,'operation_id':s['operation_id'],'feature_id':feature or s['active_feature'],'pr':pr or s['active_pr'],'branch':branch or s['active_branch'],'commit':commit,'attempt':s['builder_attempt'],'review_round':s['review_round'],'status_at_failure':s['status'],'detail':sanitize_detail(detail)},sort_keys=True);print(d)
- if s['status'] not in cp.STALEABLE_STATUSES:return False
+ if s['status'] not in cp.STALEABLE_STATUSES:print('checkpoint status is terminal; recording diagnostic without state mutation');return True
  args=['transition','--expect-status',s['status'],'--to','BLOCKED','--set',f'last_error={json.dumps(d)}']
  if s['operation_id']:args+=['--expect-operation-id',s['operation_id']]
  run_checkpoint(args);stage_and_push(cp,f'chore(automation): record {agent} {stage} failure');return True
@@ -167,12 +172,15 @@ def _parse_assignments(pairs):
 def main():
  p=argparse.ArgumentParser();sp=p.add_subparsers(dest='command',required=True)
  q=sp.add_parser('validate-event');q.add_argument('--agent',required=True);q.add_argument('--feature');q.add_argument('--pr',type=int)
- q=sp.add_parser('begin-stage');q.add_argument('--stage',choices=STAGES);q.add_argument('--feature',required=True);q.add_argument('--operation-id');q.add_argument('--message',required=True);q.add_argument('--set',action='append',default=[])
+ q=sp.add_parser('begin-stage');q.add_argument('--stage',choices=STAGES);q.add_argument('--feature',required=True);q.add_argument('--operation-id');q.add_argument('--pr',type=int);q.add_argument('--message',required=True);q.add_argument('--set',action='append',default=[])
  q=sp.add_parser('claim-recovery');q.add_argument('--feature',required=True);q.add_argument('--operation-id',required=True);q.add_argument('--claim-owner',required=True);q.add_argument('--stale-minutes',type=int,default=90);q.add_argument('--lease-minutes',type=int,default=120)
  sp.add_parser('decide-recovery');q=sp.add_parser('finalize-recovery');q.add_argument('--owner',required=True);q.add_argument('--to',required=True);q.add_argument('--message',required=True);q.add_argument('--set',action='append',default=[])
  q=sp.add_parser('record-failure');q.add_argument('--agent',required=True);q.add_argument('--stage',required=True);q.add_argument('--detail',required=True);q.add_argument('--feature');q.add_argument('--pr',type=int);q.add_argument('--branch');q.add_argument('--commit');q.add_argument('--operation-id');a=p.parse_args()
  if a.command=='validate-event':ok,r=validate_event(a.agent,load_state(),a.feature,a.pr);print(r);return 0 if ok else STALE_EXIT
- if a.command=='begin-stage':begin_stage(a.stage,a.feature,_parse_assignments(a.set),a.message,a.operation_id);return 0
+ if a.command=='begin-stage':
+  extra=_parse_assignments(a.set)
+  if a.pr is not None:extra['active_pr']=a.pr
+  begin_stage(a.stage,a.feature,extra,a.message,a.operation_id);return 0
  if a.command=='claim-recovery':print(claim_recovery(feature_id=a.feature,expected_operation_id=a.operation_id,claim_owner=a.claim_owner,stale_minutes=a.stale_minutes,lease_minutes=a.lease_minutes).value);return 0
  if a.command=='decide-recovery':s=load_state();po,pm,be=inspect_github(s.get('active_pr'),s);d=decide_recovery(s,po,pm,be);print(f"TARGET={d['target']}");print(f"REASON={d['reason']}");x=d.get('dispatch');print(f"DISPATCH_EVENT={x.get('event','') if x else ''}");print(f"DISPATCH_PAYLOAD={json.dumps({k:v for k,v in (x or {}).items() if k!='event'})}");return 0
  if a.command=='finalize-recovery':finalize_recovery(a.owner,a.to,_parse_assignments(a.set),a.message);return 0
