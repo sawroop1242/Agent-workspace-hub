@@ -177,7 +177,10 @@ def main():
  sp.add_parser('decide-recovery');q=sp.add_parser('finalize-recovery');q.add_argument('--owner',required=True);q.add_argument('--to',required=True);q.add_argument('--message',required=True);q.add_argument('--set',action='append',default=[])
  q=sp.add_parser('record-failure');q.add_argument('--agent',required=True);q.add_argument('--stage',required=True);q.add_argument('--detail',required=True);q.add_argument('--feature');q.add_argument('--pr',type=int);q.add_argument('--branch');q.add_argument('--commit');q.add_argument('--operation-id');a=p.parse_args()
  if a.command=='validate-event':ok,r=validate_event(a.agent,load_state(),a.feature,a.pr);print(r);return 0 if ok else STALE_EXIT
- if a.command=='begin-stage':extra=_parse_assignments(a.set);extra['active_pr']=a.pr;begin_stage(a.stage,a.feature,extra,a.message,a.operation_id);return 0
+ if a.command=='begin-stage':
+  extra=_parse_assignments(a.set)
+  if a.pr is not None:extra['active_pr']=a.pr
+  begin_stage(a.stage,a.feature,extra,a.message,a.operation_id);return 0
  if a.command=='claim-recovery':print(claim_recovery(feature_id=a.feature,expected_operation_id=a.operation_id,claim_owner=a.claim_owner,stale_minutes=a.stale_minutes,lease_minutes=a.lease_minutes).value);return 0
  if a.command=='decide-recovery':s=load_state();po,pm,be=inspect_github(s.get('active_pr'),s);d=decide_recovery(s,po,pm,be);print(f"TARGET={d['target']}");print(f"REASON={d['reason']}");x=d.get('dispatch');print(f"DISPATCH_EVENT={x.get('event','') if x else ''}");print(f"DISPATCH_PAYLOAD={json.dumps({k:v for k,v in (x or {}).items() if k!='event'})}");return 0
  if a.command=='finalize-recovery':finalize_recovery(a.owner,a.to,_parse_assignments(a.set),a.message);return 0
