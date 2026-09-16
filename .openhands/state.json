@@ -1,10 +1,10 @@
 {
   "version": 4,
-  "status": "IDLE",
+  "status": "PLANNING",
   "operation_id": "AWH-AUTO-003:BUILD:1",
   "recovery_attempt": 1,
   "recovery_claim": null,
-  "active_feature": "AWH-AUTO-003",
+  "active_feature": "AWE-010",
   "active_pr": null,
   "active_branch": null,
   "active_pr_sha": null,
@@ -12,5 +12,5 @@
   "builder_attempt": 1,
   "last_error": null,
   "last_review": "",
-  "updated_at": "2026-09-16T05:16:22.357090Z"
+  "updated_at": "2026-09-16T15:18:45.857553Z"
 }
