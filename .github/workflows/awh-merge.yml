@@ -10,13 +10,9 @@ permissions:
   checks: read
   actions: read
 
-env:
-  AWH_LLM_MODEL: moonshotai/kimi-k3
-  AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-
 jobs:
   merge:
-    if: github.event.client_payload.feature_id != '' && github.event.client_payload.operation_id != ''
+    if: github.event.client_payload.feature_id != '' && github.event.client_payload.operation_id != '' && github.event.client_payload.pr_number != '' && github.event.client_payload.reviewed_sha != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -46,25 +42,23 @@ jobs:
 
       - name: Verify PR identity and exact head SHA
         run: |
-          REPO=$(gh pr view "$PR_NUMBER" --json baseRefName,headRefOid,headRepository,headRepositoryOwner,state --jq '[.baseRefName,.headRefOid,.headRepository.name,.headRepositoryOwner.login,.state] | @tsv')
-          read -r BASE HEAD HEAD_REPO HEAD_OWNER STATE <<< "$REPO"
-          test "$BASE" = rust
-          test "$HEAD" = "$REVIEWED_SHA"
-          test "$HEAD_REPO" = "${GITHUB_REPOSITORY#*/}"
-          test "$HEAD_OWNER" = "${GITHUB_REPOSITORY%/*}"
-          test "$STATE" = OPEN
+          DATA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,headRefOid,headRepository,headRepositoryOwner,state,isCrossRepository)
+          test "$(echo "$DATA" | jq -r .baseRefName)" = rust
+          test "$(echo "$DATA" | jq -r .headRefOid)" = "$REVIEWED_SHA"
+          test "$(echo "$DATA" | jq -r .headRepository.name)" = "${GITHUB_REPOSITORY#*/}"
+          test "$(echo "$DATA" | jq -r .headRepositoryOwner.login)" = "${GITHUB_REPOSITORY%/*}"
+          test "$(echo "$DATA" | jq -r .isCrossRepository)" = false
+          test "$(echo "$DATA" | jq -r .state)" = OPEN
 
       - name: Require independent CI success on reviewed SHA
         run: python scripts/merge_ci_gate.py "$PR_NUMBER" "$REVIEWED_SHA"
 
-      - name: Merge exact reviewed SHA
-        run: |
-          python scripts/awh_merge_guard.py validate --pr "$PR_NUMBER" --sha "$REVIEWED_SHA"
-          gh pr merge "$PR_NUMBER" --squash --delete-branch --match-head-commit "$REVIEWED_SHA"
+      - name: Merge exact reviewed SHA through merge guard
+        run: python scripts/awh_merge_guard.py --pr "$PR_NUMBER" --reviewed-sha "$REVIEWED_SHA" --feature "$FEATURE_ID"
 
       - name: Mark completed
         run: |
-          python scripts/checkpoint_state.py transition --expect-status MERGING --to COMPLETED --set active_pr=null --set active_branch=null --set active_pr_sha=null --set last_error=null
+          python scripts/checkpoint_state.py transition --expect-status MERGING --expect-operation-id "$OPERATION_ID" --to COMPLETED --set active_pr=null --set active_branch=null --set active_pr_sha=null --set last_error=null
           git config user.name 'AWH Automation'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
