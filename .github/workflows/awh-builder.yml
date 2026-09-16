@@ -16,6 +16,7 @@ concurrency:
 env:
   AWH_LLM_MODEL: moonshotai/kimi-k3
   AWH_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+  OPENHANDS_SDK_COMMIT: 22c85eb0e0db8f4386380d095e9fe6933af2e65f
 
 jobs:
   build:
@@ -36,267 +37,90 @@ jobs:
           ref: rust
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-
       - name: Configure git identity
         run: |
           git config user.name 'AWH Builder Agent'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-
       - name: Sync checkpoint from the shared branch
         run: python scripts/safe_git.py sync --branch rust
-
       - name: Validate event against the authoritative checkpoint
         id: validate_event
         run: |
-          if python scripts/awh_pipeline.py validate-event --agent builder --feature "$AWH_FEATURE_ID"; then
-            :
-          else
-            code=$?
-            if [ "$code" -eq 3 ]; then
-              echo 'STALE_EVENT: builder dispatch does not match the checkpoint; terminating job.'
-              echo 'stale=true' >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-            exit "$code"
-          fi
-          test -n "$AWH_EVENT_OPERATION_ID" || {
-            echo 'STALE_EVENT: builder dispatch has no operation_id; terminating job.'
-            echo 'stale=true' >> "$GITHUB_OUTPUT"
-            exit 1
-          }
+          python scripts/checkpoint_state.py validate
+          test -n "$AWH_FEATURE_ID"; test -n "$AWH_EVENT_OPERATION_ID"
+          python scripts/validate_feature_id.py "$AWH_FEATURE_ID"
+          python scripts/awh_pipeline.py validate-event --agent builder --feature "$AWH_FEATURE_ID"
           CHECKPOINT_OP=$(jq -r '.operation_id // empty' .openhands/state.json)
-          if [ "$AWH_EVENT_OPERATION_ID" != "$CHECKPOINT_OP" ]; then
-            echo "STALE_EVENT: builder event operation_id=$AWH_EVENT_OPERATION_ID does not match checkpoint operation_id=$CHECKPOINT_OP; terminating job."
-            echo 'stale=true' >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          echo 'Event identity and operation are current.'
-
-      - name: Record failure on workflow error
-        if: failure() && steps.validate_event.outputs.stale != 'true'
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent builder --stage checkpoint-validation \
-            --detail "builder pre-flight failed (sync or event validation); see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" || true
-
-      - name: Validate checkpoint before builder work
-        run: python scripts/checkpoint_state.py validate
-
+          test "$AWH_EVENT_OPERATION_ID" = "$CHECKPOINT_OP"
       - name: Verify required LLM secrets
         run: |
           test -n "$K1" || { echo 'Missing required secret: AWH_AGENT2_NVIDIA_KEY_1'; exit 1; }
           test -n "$KF" || { echo 'Missing required secret: AWH_ROUTINE_NVIDIA_KEY'; exit 1; }
-          echo 'Required Agent 2 key and routine fallback are configured.'
-          [ -n "$K2" ] && echo 'Optional Agent 2 key 2 configured.' || echo 'Optional Agent 2 key 2 not configured.'
-          [ -n "$K3" ] && echo 'Optional Agent 2 key 3 configured.' || echo 'Optional Agent 2 key 3 not configured.'
-
       - name: Checkpoint builder stage with CAS and operation identity
         run: |
-          test -n "$AWH_FEATURE_ID"
-          test -n "$AWH_EVENT_OPERATION_ID"
-          python scripts/awh_pipeline.py begin-stage \
-            --stage builder \
-            --feature "$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" \
-            --message "chore(automation): builder stage for $AWH_FEATURE_ID" \
-            --set last_error=null
-
-      - name: Record failure on workflow error
-        if: failure()
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent builder --stage begin \
-            --detail "builder could not enter the BUILDING stage under CAS; see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" || true
-
+          python scripts/awh_pipeline.py begin-stage --stage builder --feature "$AWH_FEATURE_ID" --operation-id "$AWH_EVENT_OPERATION_ID" --message "chore(automation): builder stage for $AWH_FEATURE_ID" --set last_error=null
       - name: Determine branch
         id: branch
-        env:
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
-        run: |
-          test -n "$FEATURE_ID"
-          echo "name=feature/${FEATURE_ID}" >> "$GITHUB_OUTPUT"
-
+        run: echo "name=feature/${AWH_FEATURE_ID}" >> "$GITHUB_OUTPUT"
       - name: Create or update feature branch
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
         run: |
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            git fetch origin "$BRANCH:$BRANCH"
-            git checkout "$BRANCH"
-            git merge --ff-only "origin/$BRANCH" || {
-              echo "Feature branch $BRANCH diverged from origin; refusing to reset or overwrite it." >&2
-              exit 1
-            }
-          else
-            git checkout -b "$BRANCH" origin/rust
-          fi
-
+            git fetch origin "$BRANCH:$BRANCH"; git checkout "$BRANCH"; git merge --ff-only "origin/$BRANCH"
+          else git checkout -b "$BRANCH" origin/rust; fi
       - name: Resolve task contract
-        env:
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
-          TASK_INPUT: ${{ github.event.client_payload.task }}
         run: |
-          if [ -n "$TASK_INPUT" ]; then
-            printf '%s\n' "$TASK_INPUT" > /tmp/task.md
-          elif [ -s .openhands/generated-task.md ]; then
-            cp .openhands/generated-task.md /tmp/task.md
-          else
-            jq -r --arg id "$FEATURE_ID" '.features[] | select(.id==$id) | ("Feature ID: " + .id), ("# Feature\n" + .title), "# Goal\n" + (.acceptance_criteria|join("\n- ")), "# Acceptance Criteria\n" + (.acceptance_criteria|join("\n- "))' < docs/features.json > /tmp/task.md
-          fi
+          if [ -n "$AWH_EVENT_REVIEW" ]; then printf '%s\n' "$AWH_EVENT_REVIEW" > /tmp/task.md
+          elif [ -s .openhands/generated-task.md ]; then cp .openhands/generated-task.md /tmp/task.md
+          else jq -r --arg id "$AWH_FEATURE_ID" '.features[] | select(.id==$id) | ("Feature ID: " + .id), ("# Feature\n" + .title), "# Goal\n" + (.acceptance_criteria|join("\n- ")), "# Acceptance Criteria\n" + (.acceptance_criteria|join("\n- "))' docs/features.json > /tmp/task.md; fi
           test -s /tmp/task.md
-
-      - name: Install OpenHands SDK and built-in tools
-        run: python -m pip install --disable-pip-version-check 'openhands-sdk>=1.2,<2' 'openhands-tools>=1.2,<2'
-
-      - name: Run Agent 2 with optional three-key Kimi K3 rotation and required routine fallback
+      - name: Install pinned OpenHands SDK and built-in tools
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "openhands-sdk @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-sdk" \
+            "openhands-tools @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_SDK_COMMIT}#subdirectory=openhands-tools"
+      - name: Run Agent 2 with key rotation
         env:
           AWH_AGENT_ROLE: builder
-          AWH_REVIEW: ${{ github.event.client_payload.review }}
         run: |
-          export AWH_TASK="$(cat /tmp/task.md)"
-          set +e
-          SUCCESS=0
-          for KEY_NAME in K1 K2 K3 KF; do
-            KEY="${!KEY_NAME}"
-            [ -n "$KEY" ] || continue
-            echo "Agent 2: trying NVIDIA Kimi K3 key pool slot $KEY_NAME"
-            AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/agent2.txt 2>&1
-            RC=$?
-            cat /tmp/agent2.txt
+          export AWH_TASK="$(cat /tmp/task.md)"; set +e; SUCCESS=0
+          for KEY_NAME in K1 K2 K3 KF; do KEY="${!KEY_NAME}"; [ -n "$KEY" ] || continue
+            AWH_LLM_API_KEY="$KEY" python scripts/openhands_agent.py > /tmp/agent2.txt 2>&1; RC=$?; cat /tmp/agent2.txt
             if [ "$RC" -eq 0 ]; then SUCCESS=1; break; fi
-            if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/agent2.txt; then
-              echo "Rate limit detected for $KEY_NAME; rotating to the next key."
-              continue
-            fi
-            echo "Agent 2 failed for a non-rate-limit reason."
+            if grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests' /tmp/agent2.txt; then continue; fi
             exit "$RC"
           done
           test "$SUCCESS" -eq 1
-
-      - name: Record Agent 2 failure
-        if: failure()
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent builder --stage agent \
-            --detail "OpenHands Agent 2 failed (non-retryable); see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" || true
-
       - name: Deterministic verification
         run: |
           cargo fmt --all -- --check
           cargo check --all-targets
           cargo test --all-targets
           cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Record verification failure
-        if: failure()
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent builder --stage verification \
-            --detail "deterministic Rust verification failed (fmt/check/test/clippy); see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" || true
-
       - name: Commit and push feature branch
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
         run: |
-          if git diff --quiet && git diff --cached --quiet; then
-            echo 'No changes produced by Agent 2.'
-            exit 1
-          fi
           git add -A
-          git commit -m "feat(${FEATURE_ID}): implement assigned feature"
+          git diff --cached --quiet && { echo 'No changes produced by Agent 2.'; exit 1; }
+          git commit -m "feat(${AWH_FEATURE_ID}): implement assigned feature"
           git push --set-upstream origin "$BRANCH"
-
-      - name: Record feature-branch push failure
-        if: failure()
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent builder --stage push \
-            --detail "feature branch commit/push failed; see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" \
-            --branch "feature/$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" || true
-
       - name: Create or update PR
         id: pr
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
         run: |
           EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base rust --state open --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then echo "number=$EXISTING" >> "$GITHUB_OUTPUT"; exit 0; fi
-          TASK=$(cat /tmp/task.md)
-          BODY=$(cat <<EOF
-          ## Autonomous Feature Delivery
-
-          **Feature:** \`$FEATURE_ID\`
-
-          Agent 2 implemented this change from the Agent 1 task contract.
-
-          ### Task contract
-          $TASK
-
-          ### Verification
-          - cargo fmt --all -- --check
-          - cargo check --all-targets
-          - cargo test --all-targets
-          - cargo clippy --all-targets --all-features -- -D warnings
-
-          Agent 3 review is required before autonomous merge.
-          EOF
-          )
-          NUMBER=$(gh pr create --repo "$GITHUB_REPOSITORY" --base rust --head "$BRANCH" --title "feat(${FEATURE_ID}): autonomous implementation" --body "$BODY" --json number --jq '.number')
+          NUMBER=$(gh pr create --repo "$GITHUB_REPOSITORY" --base rust --head "$BRANCH" --title "feat(${AWH_FEATURE_ID}): autonomous implementation" --body "Agent 2 implementation from the persisted Agent 1 task contract. Agent 3 review is required." --json number --jq '.number')
           echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
-
-      - name: Record PR creation failure
-        if: failure()
-        run: |
-          python scripts/awh_pipeline.py record-failure \
-            --agent builder --stage pr \
-            --detail "failed to create or update the feature PR; see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" || true
-
       - name: Record PR in state
         env:
           PR: ${{ steps.pr.outputs.number }}
           BRANCH: ${{ steps.branch.outputs.name }}
-          FEATURE_ID: ${{ github.event.client_payload.feature_id }}
         run: |
-          git checkout rust
-          python scripts/safe_git.py sync --branch rust
-          SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')
-          test -n "$SHA"
-          python scripts/checkpoint_state.py transition \
-            --expect-status BUILDING --expect-status REVIEWING \
-            --to PR_OPEN \
-            --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["FEATURE_ID"]))')" \
-            --set active_pr="$PR" \
-            --set active_branch="$(python -c 'import json,os; print(json.dumps(os.environ["BRANCH"]))')" \
-            --set active_pr_sha="$(python -c 'import json,os; print(json.dumps(os.environ["SHA"]))')" \
-            --set last_error=null
-          git add .openhands/state.json
-          python scripts/safe_git.py push --branch rust --message "chore(automation): record PR ${{ steps.pr.outputs.number }}"
-
-      - name: Record checkpoint failure
-        if: failure()
-        run: |
-          git checkout rust 2>/dev/null || true
-          PR_ARGS=()
-          if [ -n "${{ steps.pr.outputs.number }}" ]; then
-            PR_ARGS+=(--pr "${{ steps.pr.outputs.number }}")
-          fi
-          python scripts/awh_pipeline.py record-failure \
-            --agent builder --stage record-pr \
-            --detail "failed to record the PR in the shared checkpoint; see workflow run logs" \
-            --feature "$AWH_FEATURE_ID" \
-            --operation-id "$AWH_EVENT_OPERATION_ID" \
-            "${PR_ARGS[@]}" || true
+          git checkout rust; python scripts/safe_git.py sync --branch rust
+          SHA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid); test -n "$SHA"
+          python scripts/checkpoint_state.py transition --expect-status BUILDING --expect-status REVIEWING --to PR_OPEN --set active_feature="$(python -c 'import json,os; print(json.dumps(os.environ["AWH_FEATURE_ID"]))')" --set active_pr="$PR" --set active_branch="$(python -c 'import json,os; print(json.dumps(os.environ["BRANCH"]))')" --set active_pr_sha="$(python -c 'import json,os; print(json.dumps(os.environ["SHA"]))')" --set last_error=null
+          git add .openhands/state.json; python scripts/safe_git.py push --branch rust --message "chore(automation): record PR $PR"
