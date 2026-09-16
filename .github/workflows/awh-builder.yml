@@ -37,6 +37,11 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
+      - name: Configure git identity
+        run: |
+          git config user.name 'AWH Builder Agent'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
       - name: Sync checkpoint from the shared branch
         run: python scripts/safe_git.py sync --branch rust
 
@@ -140,7 +145,7 @@ jobs:
           elif [ -s .openhands/generated-task.md ]; then
             cp .openhands/generated-task.md /tmp/task.md
           else
-            jq -r --arg id "$FEATURE_ID" '.features[] | select(.id==$id) | ("Feature ID: " + .id), ("# Feature\n" + .title), "# Goal\n" + (.acceptance_criteria|join("\n- ")), "# Acceptance Criteria\n" + (.acceptance_criteria|map("- " + .)|join("\n"))' .openhands/backlog.json > /tmp/task.md
+            jq -r --arg id "$FEATURE_ID" '.features[] | select(.id==$id) | ("Feature ID: " + .id), ("# Feature\n" + .title), "# Goal\n" + (.acceptance_criteria|join("\n- ")), "# Acceptance Criteria\n" + (.acceptance_criteria|join("\n- "))' .openhands/state.json > /tmp/task.md
           fi
           test -s /tmp/task.md
 
@@ -206,8 +211,6 @@ jobs:
             echo 'No changes produced by Agent 2.'
             exit 1
           fi
-          git config user.name 'AWH Builder Agent'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git commit -m "feat(${FEATURE_ID}): implement assigned feature"
           git push --set-upstream origin "$BRANCH"
@@ -280,8 +283,6 @@ jobs:
             --set active_branch="$(python -c 'import json,os; print(json.dumps(os.environ["BRANCH"]))')" \
             --set active_pr_sha="$(python -c 'import json,os; print(json.dumps(os.environ["SHA"]))')" \
             --set last_error=null
-          git config user.name 'AWH Automation'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .openhands/state.json
           python scripts/safe_git.py push --branch rust --message "chore(automation): record PR ${{ steps.pr.outputs.number }}"
 
