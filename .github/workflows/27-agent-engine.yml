@@ -188,11 +188,14 @@ jobs:
             -o artifacts/agent-engine/agent-trajectory.json \
             | tee artifacts/agent-engine/agent-output.txt
 
-      - name: Run deterministic AWH verification
+      - name: Run deterministic AWH verification (initial)
+        id: verify_initial
         if: inputs.mode == 'implement' || inputs.mode == 'repair'
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
+          log="artifacts/agent-engine/deterministic-verification-initial.txt"
+          : > "$log"
           {
             echo '== cargo fmt =='
             cargo fmt --all -- --check
@@ -202,7 +205,109 @@ jobs:
             cargo test --all-targets
             echo '== cargo clippy =='
             cargo clippy --all-targets --all-features -- -D warnings
-          } 2>&1 | tee artifacts/agent-engine/deterministic-verification.txt
+          } 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+            echo 'Initial verification: PASS' | tee artifacts/agent-engine/verification-initial-result.txt
+          else
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+            echo "status=$status" > artifacts/agent-engine/verification-initial-result.txt
+            echo 'Initial verification: FAIL' | tee -a artifacts/agent-engine/verification-initial-result.txt
+          fi
+          exit 0
+
+      - name: Preserve initial failure evidence
+        if: inputs.mode == 'implement' && steps.verify_initial.outputs.passed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp artifacts/agent-engine/deterministic-verification-initial.txt artifacts/agent-engine/repair-input-verification.txt
+          git status --short > artifacts/agent-engine/repair-input-status.txt
+          git diff --check > artifacts/agent-engine/repair-input-diff-check.txt 2>&1 || true
+          git diff -- . > artifacts/agent-engine/repair-input.patch
+          cat > artifacts/agent-engine/repair-task.txt <<EOF
+          $(cat artifacts/agent-engine/task.txt)
+
+          A bounded automatic repair is now authorized: this is the ONLY repair attempt for this implement run.
+
+          The initial deterministic verification failed. Read these failure artifacts before changing code:
+          - artifacts/agent-engine/repair-input-verification.txt
+          - artifacts/agent-engine/repair-input-status.txt
+          - artifacts/agent-engine/repair-input-diff-check.txt
+          - artifacts/agent-engine/repair-input.patch
+
+          Repair only the actual failure. Preserve the feature scope, tests, security boundaries, and runtime separation.
+          Do not weaken, delete, skip, or rewrite tests merely to obtain a pass.
+          If the failure cannot be safely repaired within this single attempt, stop and report the run as failed.
+          Run the full AWH verification contract after the repair.
+          EOF
+
+      - name: Run bounded repair attempt
+        if: inputs.mode == 'implement' && steps.verify_initial.outputs.passed != 'true'
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          OPENAI_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          mini \
+            -c artifacts/agent-engine/config/mini-awh.yml \
+            -t "$(cat artifacts/agent-engine/repair-task.txt)" \
+            -o artifacts/agent-engine/repair-trajectory.json \
+            | tee artifacts/agent-engine/repair-output.txt
+          echo 'repair-attempts=1' > artifacts/agent-engine/repair-result.txt
+          echo 'repair-bound=1' >> artifacts/agent-engine/repair-result.txt
+
+      - name: Run deterministic AWH verification (final)
+        id: verify_final
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        shell: bash
+        run: |
+          set +e
+          log="artifacts/agent-engine/deterministic-verification-final.txt"
+          : > "$log"
+          {
+            echo '== cargo fmt =='
+            cargo fmt --all -- --check
+            echo '== cargo check =='
+            cargo check --all-targets
+            echo '== cargo test =='
+            cargo test --all-targets
+            echo '== cargo clippy =='
+            cargo clippy --all-targets --all-features -- -D warnings
+          } 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+            echo 'FINAL_RESULT=PASS' | tee artifacts/agent-engine/final-result.txt
+          else
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+            echo "FINAL_RESULT=FAIL" | tee artifacts/agent-engine/final-result.txt
+            echo "verification_exit_code=$status" >> artifacts/agent-engine/final-result.txt
+          fi
+          exit 0
+
+      - name: Record repair loop outcome
+        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
+        shell: bash
+        run: |
+          set -euo pipefail
+          initial="${{ steps.verify_initial.outputs.passed }}"
+          final="${{ steps.verify_final.outputs.passed }}"
+          if [ -z "$initial" ]; then initial='not-run'; fi
+          if [ -z "$final" ]; then final='not-run'; fi
+          {
+            echo "initial_verification=$initial"
+            echo "repair_attempts=${{ inputs.mode == 'implement' && '1-if-needed' || '0' }}"
+            echo "final_verification=$final"
+            if [ "$final" = 'true' ]; then
+              echo 'result=PASS'
+            else
+              echo 'result=FAIL'
+            fi
+          } | tee artifacts/agent-engine/repair-loop-result.txt
 
       - name: Check external runtime separation
         if: always()
@@ -270,6 +375,18 @@ jobs:
           path: artifacts/agent-engine/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Final pass/fail gate
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.verify_final.outputs.passed }}" != 'true' ]; then
+            echo 'AWH agent-engine final result: FAIL'
+            echo 'The bounded repair policy was exhausted or the repair did not restore deterministic verification.'
+            exit 1
+          fi
+          echo 'AWH agent-engine final result: PASS'
 
       - name: Final no-push boundary
         if: always()
