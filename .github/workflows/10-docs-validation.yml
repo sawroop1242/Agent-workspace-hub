@@ -1,0 +1,253 @@
+name: AWH Documentation Validation
+
+on:
+  pull_request:
+    branches:
+      - rust
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: awh-docs-validation-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# DOCUMENTATION VALIDATION BOUNDARY:
+# This workflow is an external, read-only validation layer for AWH.
+# It checks documentation consistency and required project/agent contracts.
+# It must never become an AWH runtime dependency, modify repository files,
+# commit changes, push branches, or install documentation tooling into AWH.
+# Any helper tooling used below exists only on the temporary GitHub runner.
+
+jobs:
+  docs-validation:
+    name: Documentation validation (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout AWH revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Capture validation context
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "revision=$(git rev-parse HEAD)"
+            echo "base_revision=${{ github.event.pull_request.base.sha || 'manual-dispatch' }}"
+            echo "head_revision=${{ github.event.pull_request.head.sha || github.sha }}"
+          } | tee docs-validation-context.txt
+
+      - name: Verify clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Verify required documentation exists
+        id: required_docs
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            README.md
+            docs/PROJECT_CONTEXT.md
+            docs/PROJECT_ROADMAP.md
+            docs/PROJECT_ROADMAP_STATUS.md
+            docs/PROJECT_STATUS.md
+            docs/FEATURES.md
+            docs/CLI.md
+            docs/architecture.md
+            docs/security.md
+            docs/threat-model.md
+            docs/mcp.md
+            docs/configuration.md
+            docs/development.md
+            docs/testing.md
+            docs/release.md
+            docs/INSTALL.md
+            docs/completeness-audit.md
+            docs/error.md
+            docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md
+            docs/ROADMAP_GAP_MATRIX.md
+            docs/RECONCILED_ROADMAP_V2.md
+            docs/issue-resolving-prompts/README.md
+            .github/agent/system.md
+            .github/agent/rules.md
+            .github/agent/verification.md
+            .github/agent/task-template.md
+            .github/agent/completion.md
+          )
+
+          : > required-docs-report.txt
+          missing=0
+          for path in "${required[@]}"; do
+            if [[ -s "$path" ]]; then
+              echo "PASS $path" | tee -a required-docs-report.txt
+            else
+              echo "FAIL $path" | tee -a required-docs-report.txt
+              missing=1
+            fi
+          done
+
+          exit "$missing"
+
+      - name: Validate Markdown files and local links
+        id: markdown_links
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          from urllib.parse import unquote, urlparse
+
+          roots = [Path("README.md"), Path("docs")]
+          files = []
+          for root in roots:
+              if root.is_file():
+                  files.append(root)
+              elif root.is_dir():
+                  files.extend(sorted(root.rglob("*.md")))
+
+          files = sorted(set(files))
+          failures = []
+          report = []
+
+          for path in files:
+              text = path.read_text(encoding="utf-8")
+              if not text.strip():
+                  failures.append(f"EMPTY {path}")
+                  continue
+
+              # Validate Markdown links that point at repository-local files.
+              for match in re.finditer(r"!?\[[^\]]*\]\(([^)]+)\)", text):
+                  target = match.group(1).strip().split()[0].strip("<>")
+                  if not target or target.startswith(("#", "mailto:", "http://", "https://")):
+                      continue
+
+                  parsed = urlparse(target)
+                  if parsed.scheme or parsed.netloc:
+                      continue
+
+                  relative = unquote(parsed.path)
+                  if not relative:
+                      continue
+
+                  candidate = (path.parent / relative).resolve()
+                  repo_root = Path.cwd().resolve()
+                  try:
+                      candidate.relative_to(repo_root)
+                  except ValueError:
+                      failures.append(f"OUTSIDE_REPO {path} -> {target}")
+                      continue
+
+                  if not candidate.exists():
+                      failures.append(f"BROKEN {path} -> {target}")
+
+          report.append(f"Markdown files checked: {len(files)}")
+          if failures:
+              report.extend(failures)
+              Path("markdown-link-report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+              sys.exit(1)
+
+          report.append("All repository-local Markdown links resolved.")
+          Path("markdown-link-report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+          PY
+
+      - name: Verify external agent infrastructure remains separated
+        id: runtime_boundary
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          forbidden='(mini-swe-agent|swe-agent|swe-rex|swe-bench|swebench|swe-smith|swe_smith|codeclash|sb-cli)'
+
+          # External agent/evaluation names are expected in .github/agent docs,
+          # prompts, and workflow documentation. They must not enter the Rust
+          # product dependency graph or source runtime.
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo "External agent/benchmark tooling detected in AWH dependency manifests."
+            exit 1
+          fi
+
+          if grep -Eiq "$forbidden" src --include='*.rs'; then
+            echo "External agent/benchmark tooling detected in AWH Rust runtime source."
+            exit 1
+          fi
+
+          echo "Runtime separation passed: external build/evaluation tooling is documented outside the AWH runtime."
+
+      - name: Check documentation whitespace
+        id: diff_check
+        continue-on-error: true
+        run: git diff --check
+
+      - name: Collect documentation validation metadata
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git status --short > git-status.txt 2>&1
+          git diff --stat > git-diff-stat.txt 2>&1
+          git diff --name-only > git-diff-files.txt 2>&1
+
+          {
+            echo "=== documentation validation outcomes ==="
+            echo "required_docs=${{ steps.required_docs.outcome }}"
+            echo "markdown_links=${{ steps.markdown_links.outcome }}"
+            echo "runtime_boundary=${{ steps.runtime_boundary.outcome }}"
+            echo "diff_check=${{ steps.diff_check.outcome }}"
+            echo "=== repository status ==="
+            cat git-status.txt
+          } > docs-validation-report.txt
+
+          cat docs-validation-report.txt
+
+      - name: Upload documentation validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-docs-validation-${{ github.run_id }}
+          path: |
+            docs-validation-context.txt
+            docs-validation-report.txt
+            required-docs-report.txt
+            markdown-link-report.txt
+            git-status.txt
+            git-diff-stat.txt
+            git-diff-files.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Enforce documentation validation
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.required_docs.outcome }}" != "success" ||
+                "${{ steps.markdown_links.outcome }}" != "success" ||
+                "${{ steps.runtime_boundary.outcome }}" != "success" ||
+                "${{ steps.diff_check.outcome }}" != "success" ]]; then
+            echo "Documentation validation failed. See uploaded artifacts."
+            exit 1
+          fi
+
+      - name: Verify read-only repository state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- .; then
+            echo "Tracked AWH files were modified during documentation validation."
+            git status --short
+            git diff -- .
+            exit 1
+          fi
