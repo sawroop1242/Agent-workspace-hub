@@ -1,0 +1,160 @@
+name: AWH E2E Validation
+
+on:
+  pull_request:
+    branches: [rust]
+  workflow_dispatch:
+
+concurrency:
+  group: awh-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# This workflow is deliberately read-only. It validates the AWH product from
+# outside the runtime; it must never become an AWH dependency or modify the repo.
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Capture environment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts
+          {
+            echo "# E2E environment"
+            echo "OS=${RUNNER_OS}"
+            echo "ARCH=${RUNNER_ARCH}"
+            echo "REF=${GITHUB_REF}"
+            echo "SHA=${GITHUB_SHA}"
+            rustc --version || true
+            cargo --version || true
+          } | tee artifacts/environment.txt
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify repository is clean before validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Required Rust formatting check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Required Rust build check
+        shell: bash
+        run: cargo check --all-targets
+
+      - name: Required Rust test suite
+        shell: bash
+        run: cargo test --all-targets
+
+      - name: Required Rust Clippy check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build AWH CLI
+        shell: bash
+        run: cargo build --locked
+
+      - name: CLI smoke validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/debug/awh --version
+          ./target/debug/awh --help
+          ./target/debug/awh status
+
+      - name: CLI help surface validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/debug/awh --help > artifacts/awh-help.txt
+          ./target/debug/awh --version > artifacts/awh-version.txt
+          ./target/debug/awh status > artifacts/awh-status.txt
+
+      - name: MCP stdio smoke validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"github-actions-e2e","version":"1.0"}}}' \
+            | ./target/debug/awh mcp serve > artifacts/mcp-stdio.txt
+          test -s artifacts/mcp-stdio.txt
+          grep -q 'agent-workspace-hub' artifacts/mcp-stdio.txt
+
+      - name: MCP boundary and runtime separation checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          # External agents/benchmarks/evaluation tools must not become runtime dependencies.
+          if grep -Eiq '(swe-bench|swe-smith|codeclash|swe-rex|mini-swe-agent|swe-agent|sb-cli|openhands)' Cargo.toml Cargo.lock; then
+            echo 'Forbidden external agent/benchmark dependency detected in AWH runtime manifests.'
+            exit 1
+          fi
+          # E2E validation is an external CI concern; it must not modify AWH source files.
+          git diff --quiet -- .
+
+      - name: Collect diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cargo metadata --format-version 1 > artifacts/cargo-metadata.json
+          cargo tree --all-features > artifacts/cargo-tree.txt
+          git status --short > artifacts/git-status.txt
+          git diff --check > artifacts/diff-check.txt
+          git diff -- . > artifacts/tracked-diff.txt
+          find target -maxdepth 3 -type f -name 'awh*' -print > artifacts/target-binaries.txt 2>/dev/null || true
+
+      - name: Upload E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-e2e-${{ runner.os }}-${{ runner.arch }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final read-only integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ignore generated diagnostic files; fail only if tracked AWH files changed.
+          git diff --quiet -- .
+          echo 'E2E validation completed without modifying tracked AWH files.'
+
+  e2e-gate:
+    name: E2E Gate
+    if: always()
+    needs: [e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Enforce matrix result
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.e2e.result }}" != "success" ]]; then
+            echo "One or more E2E platform validations failed."
+            exit 1
+          fi
+          echo 'All AWH CLI/MCP E2E platform validations passed.'
