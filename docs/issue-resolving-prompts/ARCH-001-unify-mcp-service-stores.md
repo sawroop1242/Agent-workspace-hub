@@ -2,9 +2,9 @@
 
 ## 0. Mission
 
-Implement ARCH-001 as a production-grade architecture/convergence change that removes divergent business-logic and persistence implementations between the MCP layer and AWH's canonical service/core layer.
+Implement ARCH-001 as a production-grade architecture/convergence change that removes divergent domain logic and persistence implementations between MCP and AWH's canonical service/core layer.
 
-The target architecture is:
+Target architecture:
 
 ```text
 Agent / MCP / CLI / TUI / Control API
@@ -19,35 +19,35 @@ Agent / MCP / CLI / TUI / Control API
        canonical persistence/stores
                 │
                 ▼
-          .agent / workspace
+          workspace / .agent
 ```
 
-MCP must become an adapter over canonical services rather than an alternate implementation of filesystem, memory, task, connector, or related domain behavior.
+MCP must become an adapter over canonical services. It must not remain an alternate implementation of filesystem, memory, task, connector, or other domain behavior.
 
-Do not perform a speculative rewrite. First establish the current implementation truth from source, tests, schemas, persistence formats, and callers; then migrate one domain at a time with compatibility and recovery evidence.
+Do not perform a speculative rewrite. Establish current implementation truth first, then migrate incrementally with compatibility, concurrency, security, and recovery evidence.
 
 ---
 
 ## 1. Non-negotiable execution rules
 
-1. Work only on ARCH-001.
-2. Do not begin ARCH-002 or any later issue/prompt.
-3. Do not reopen or redesign the completed AWE-001, AWE-002, or AWE-003 editing milestones unless ARCH-001 exposes a concrete integration defect that must be fixed for correctness.
+1. Work only on ARCH-001. Do not begin ARCH-002, FS-001, GIT-001, or later work.
+2. Do not reopen AWE-001/AWE-002/AWE-003 unless ARCH-001 exposes a concrete integration defect required for correctness.
+3. A canonical owner may already exist, or may need to be extracted/created during ARCH-001. Do not assume every domain already has a reusable service.
 4. Do not create a second authorization, policy, filesystem-security, audit, snapshot, or edit engine inside MCP.
-5. Do not make MCP-specific business rules when an authoritative service already exists.
+5. Do not create a second domain store merely because a shared helper or model exists.
 6. Preserve public behavior unless an intentional migration requires a documented compatibility change.
 7. Prefer incremental migration over a flag-day rewrite.
-8. Every migrated domain must have tests proving MCP and non-MCP callers reach the same authoritative implementation.
-9. Fail closed on unreadable/corrupt persistent state and authorization/security failures; never silently fall back to an unsafe duplicate store.
-10. Do not delete a legacy store until its consumers, persistence format, migration path, and rollback implications are understood and tested.
-11. Do not claim a domain is unified merely because MCP calls a helper; prove that the helper is the single authoritative owner of the domain behavior and persistence semantics.
-12. Keep the patch scoped. If unrelated defects are discovered, record them as follow-up work unless they are required to make ARCH-001 correct and testable.
+8. Every migrated domain must prove that MCP and other production interfaces reach the same authoritative implementation.
+9. Fail closed on corrupt/unreadable security state and never silently fall back to an unsafe duplicate store.
+10. Do not delete a legacy store until its production consumers, tests, persistence format, migration path, rollback implications, and restart behavior are understood and verified.
+11. Shared state is not sufficient evidence of architectural unification. One authoritative service/store implementation is required.
+12. Keep the patch scoped to ARCH-001. Record unrelated defects as follow-up work unless they block correctness or verification.
 
 ---
 
-## 2. Repository and architecture preflight — mandatory before coding
+## 2. Mandatory forensic preflight
 
-Before modifying code, inspect the current `rust` branch and build an implementation map.
+Before coding, inspect the current `rust` branch and the ARCH-001 issue.
 
 Read at minimum:
 
@@ -59,245 +59,410 @@ Read at minimum:
 - `docs/mcp.md`
 - `docs/CLI.md`
 - `docs/testing.md`
-- the current ARCH-001 issue
-- all relevant modules under `src/mcp/`
-- all relevant canonical services under `src/services/`
-- relevant domain/model modules
-- relevant persistence/configuration modules
-- existing integration and security tests
+- relevant security/authorization documentation
+- all relevant `src/mcp/` modules
+- all relevant `src/services/` modules
+- domain/model modules
+- persistence/configuration modules
+- integration, concurrency, and security tests
 
-Then search the complete repository for:
+Search the complete repository for at least:
 
 - `MemoryMcp`
 - `TasksMcp`
 - `ConnectorsMcp`
 - filesystem/workspace MCP implementations
+- `FilesService`
 - `StoreLock`
-- JSON persistence paths under `.agent/`
-- memory schemas and serializers
-- task status/priority models
-- connector models and registries
-- canonical `FilesService`/filesystem helpers
-- policy/capability checks
-- audit calls
-- snapshot/provenance calls
-- MCP dispatcher/tool registry registrations
-- CLI/TUI/Control API callers of the same domains
+- `.agent/` persistence paths
+- memory/task/connector models and serializers
+- `PolicyStore`
+- `PersistentTrustStore`
+- capability/policy authorization
+- caller/session/agent/workspace context
+- audit/provenance/snapshot code
+- MCP dispatcher and tool registry
+- CLI/TUI/control-plane callers of the same domains
+- direct `std::fs`/`tokio::fs` persistence inside MCP domain code
 
-The current codebase already contains a cross-process `StoreLock` for JSON-backed project stores; it explicitly documents MemoryMcp, TasksMcp, and ConnectorsMcp persistence under `.agent/`. Treat that as evidence to investigate, not as proof that the architecture is already unified. fileciteturn282file0L2-L2
+The current branch contains MCP-side domain implementations and JSON-backed stores, while filesystem operations already have canonical service/edit infrastructure. Verify all such facts against current source before relying on them.
 
-The current repository also exposes MCP domain implementations and store-related modules through `src/mcp/`; existing documentation identifies separate JSON-backed memory, task, connector, policy, and trust persistence paths. Verify all such statements against current source before relying on them. fileciteturn283file1L29-L48 fileciteturn283file3L67-L95
+Build this forensic matrix before implementation:
 
-Produce a private forensic matrix before implementation:
+| Domain/store | Current owner | Canonical target owner | Persistence | Schema/model | Locking | Security boundary | Other callers | Migration risk | Disposition |
+|---|---|---|---|---|---|---|---|---|---|
+| Filesystem | verify | verify/create | verify | verify | verify | verify | verify | verify | migrate/retain |
+| Memory | verify | verify/create | verify | verify | verify | verify | verify | verify | migrate/retain |
+| Tasks | verify | verify/create | verify | verify | verify | verify | verify | verify | migrate/retain |
+| Connectors | verify | verify/create | verify | verify | verify | verify | verify | verify | migrate/retain |
+| Policy | verify | security authority | verify | verify | verify | policy | verify | verify | separate |
+| Trust | verify | security authority | verify | verify | verify | trust | verify | verify | separate |
+| Other | verify | verify/create | verify | verify | verify | verify | verify | verify | classify |
 
-| Domain | MCP owner | Canonical service/core owner | Persistence | Schema/model | Locking | Security/policy | Other callers | Migration risk |
-|---|---|---|---|---|---|---|---|---|
-| Filesystem | verify | verify | verify | verify | verify | verify | verify | verify |
-| Memory | verify | verify | verify | verify | verify | verify | verify | verify |
-| Tasks | verify | verify | verify | verify | verify | verify | verify | verify |
-| Connectors | verify | verify | verify | verify | verify | verify | verify | verify |
-
-Do not code until the matrix is sufficiently complete to identify the authoritative owner for each domain.
+Do not code until every relevant persistent domain has an explicit disposition.
 
 ---
 
-## 3. Define “canonical owner” precisely
+## 3. Canonical-owner definition
 
-For ARCH-001, a canonical owner is the single production implementation responsible for:
+A canonical owner is the single production implementation responsible for the domain's:
 
-- domain invariants
-- input validation
-- authorization/security integration where applicable
+- invariants
+- validation
+- lifecycle/state transitions
 - persistence semantics
-- locking/concurrency semantics
 - serialization/deserialization
+- locking/concurrency semantics
 - corruption handling
 - error vocabulary
-- lifecycle/state transitions
 - migration compatibility
-- observable behavior shared by all interfaces
+- security integration where applicable
+- observable behavior shared by interfaces
 
-A thin MCP adapter may translate JSON-RPC/MCP arguments and results, but it must not independently reimplement those responsibilities.
+A common helper, shared struct, or shared file is not enough.
 
-The following are not sufficient by themselves:
+The following do NOT constitute unification:
 
-- calling a common utility while retaining MCP-local persistence
-- sharing structs while maintaining separate stores
-- sharing a JSON file while maintaining different validation/state machines
-- duplicating code with equivalent behavior
-- routing only one MCP operation to the service while other operations still mutate MCP-local state
+- MCP calls a helper but still persists data itself
+- two stores use the same JSON schema
+- two stores point at the same file but have different validation/state logic
+- duplicated code with equivalent behavior
+- only some MCP operations route through a service
+
+If no canonical owner exists, extract or create one as part of ARCH-001 rather than preserving an MCP implementation and calling it canonical.
 
 ---
 
-## 4. Target architecture
+## 4. Explicit ownership and dependency contract
 
-Establish one authoritative implementation per domain.
+The final architecture must make these ownership boundaries observable in code.
 
-### 4.1 Filesystem
+### MCP adapter owns only
 
-All filesystem reads, writes, deletes, path validation, workspace containment, symlink protections, atomic mutation, edit semantics, expected-state checks, verification, rollback, and related security behavior must remain in the canonical filesystem/edit services.
+- MCP/JSON-RPC wire schemas
+- request/response mechanics
+- transport concerns
+- MCP tool metadata
+- wire-to-domain conversion
+- MCP error envelopes
+- legitimate MCP session/transport/request state
 
-MCP must not maintain a parallel filesystem implementation.
+### Dispatcher owns only
 
-For editing, preserve the existing canonical chain and do not bypass it:
+- request context extraction
+- caller/session/workspace resolution handoff
+- argument decoding/validation handoff
+- policy/capability decision orchestration
+- canonical service invocation
+- domain-error-to-MCP-error mapping
+
+`dispatcher.rs` must not become a new domain service or persistence layer.
+
+### Tool registry owns only
+
+- tool names
+- schemas
+- metadata
+- risk classification/registration data
+- routing metadata
+
+It must not own domain state or persistence.
+
+### Canonical services own
+
+- domain operations
+- domain invariants
+- validation
+- lifecycle/state transitions
+- authorization integration where applicable
+- orchestration of stores and filesystem primitives
+
+### Canonical stores own
+
+- persistence
+- serialization
+- schema versions
+- atomic writes
+- store locking
+- corruption handling
+- migrations
+- persistence-specific errors
+
+Do not introduce a giant generic "super-store" solely to hide incompatible domains.
+
+---
+
+## 5. Service construction, dependency injection, and workspace ownership
+
+Every migrated service must have an explicit construction contract.
+
+Determine and document in code/tests:
+
+- service lifetime
+- workspace/project binding
+- agent/session context requirements
+- store construction and ownership
+- dependency ownership
+- test injection/mocking strategy
+- initialization behavior
+- whether a service is request-scoped, session-scoped, workspace-scoped, or process-scoped
+
+A canonical store must never accidentally become process-global when its state is workspace-scoped.
+
+The construction path must make it impossible or clearly unsafe to operate on the wrong workspace.
+
+For every persistent domain answer:
 
 ```text
-MCP filesystem/edit tool
-        ↓
-canonical service boundary
-        ↓
+Which workspace owns this state?
+Where is it persisted?
+Who constructs the store?
+Who may access it?
+How is isolation enforced?
+How is the same store reached by MCP/CLI/TUI/control callers?
+```
+
+---
+
+## 6. Filesystem domain
+
+Filesystem behavior must have one canonical implementation.
+
+All filesystem reads/writes/deletes, path validation, workspace containment, symlink protections, atomic mutation, expected-state checking, verification, rollback, and related mutation semantics must remain behind the canonical filesystem/edit service boundary.
+
+Preserve the existing editing architecture:
+
+```text
+MCP edit tool
+    ↓
+canonical service
+    ↓
 EditTransaction / EditService
-        ↓
-filesystem security + atomic mutation
-        ↓
+    ↓
+filesystem security + mutation
+    ↓
 verification / provenance / audit as applicable
 ```
 
-Do not reintroduce whole-file rewrite fallbacks that bypass precise edit semantics.
+MCP must not directly persist files or implement a parallel mutation engine.
 
-### 4.2 Memory
+Do not weaken AWE edit semantics or reintroduce whole-file rewrite fallbacks that bypass precise mutation behavior.
 
-Identify the authoritative memory domain model and persistence format.
+FS-001 owns the deeper filesystem TOCTOU/mutation-coordination hardening. ARCH-001 must establish the correct canonical ownership boundary without attempting to absorb unrelated FS-001 work.
+
+---
+
+## 7. Memory domain
+
+Establish one canonical memory domain owner.
 
 Requirements:
 
 - one canonical memory model
-- one canonical serializer/deserializer
-- one authoritative persistence location/format for project memory
-- one locking/concurrency strategy
+- one serializer/deserializer
+- one authoritative project-memory persistence location/format
+- one locking strategy appropriate to the store
 - one validation/error model
-- one migration mechanism for existing MCP-local or legacy formats
-- MCP adapter delegates to the canonical owner
+- explicit migration for legacy/MCP-local formats
+- all MCP memory operations delegate to the canonical owner
 
-If multiple formats currently exist, implement an explicit versioned migration rather than silently interpreting incompatible data.
+Migration must be deterministic, idempotent, atomic, corruption-aware, recoverable, and tested.
 
-Migration must be:
-
-- deterministic
-- idempotent
-- atomic
-- corruption-aware
-- recoverable
-- tested against representative legacy data
-
-Do not discard data that cannot be safely migrated.
-
-### 4.3 Tasks
-
-Identify and consolidate task models and status vocabulary.
-
-Requirements:
-
-- one canonical `Task` representation
-- one canonical task ID model
-- one canonical priority model
-- one canonical status vocabulary and transition rules
-- one persistence format
-- one locking/concurrency strategy
-- one validation/error model
-- MCP delegates rather than maintaining an independent task state machine
-
-Explicitly test status compatibility if the MCP and service layers currently use different names, values, or transition semantics.
-
-### 4.4 Connectors
-
-Identify the authoritative connector model, registry, persistence, enable/disable semantics, provider configuration, and security boundary.
-
-MCP must not maintain a second connector registry or second lifecycle/persistence implementation.
-
-Preserve the distinction between:
-
-- connector configuration/state
-- external MCP/provider trust
-- capability/policy authorization
-- actual connector invocation
-
-Do not collapse these security boundaries merely to simplify storage.
-
-### 4.5 Other stores discovered during forensics
-
-If additional MCP-local stores are discovered, classify each as:
-
-1. canonical and reusable;
-2. adapter-only state that legitimately belongs to MCP transport/session handling;
-3. duplicate domain state that must migrate under ARCH-001;
-4. intentionally separate security/trust state that must remain separate for a documented reason.
-
-Do not force transport/session state into domain persistence merely to satisfy the word “unify.”
+Do not silently discard unsupported or corrupt data.
 
 ---
 
-## 5. Store and persistence contract
+## 8. Tasks domain
 
-For every canonical persistent store, establish a common set of guarantees where applicable:
+Establish one canonical task owner.
+
+Requirements:
+
+- one canonical Task representation
+- one task-ID model
+- one priority model
+- one status vocabulary
+- one transition/state-machine definition
+- one persistence owner
+- one concurrency strategy appropriate to the store
+- one validation/error model
+- MCP delegates to the canonical implementation
+
+If current MCP and service semantics differ, define explicit compatibility mapping and tests before removing the old behavior.
+
+---
+
+## 9. Connectors domain
+
+Establish one canonical connector configuration/state owner.
+
+Unification must preserve the distinction between:
+
+1. connector configuration/state;
+2. external MCP/provider trust;
+3. capability/policy authorization;
+4. actual connector invocation/session behavior.
+
+Do not merge security/trust stores into connector persistence simply to reduce store count.
+
+Do not create a second connector registry or lifecycle implementation in MCP.
+
+---
+
+## 10. Policy and trust are security authorities, not generic domain stores
+
+`PolicyStore`, `PersistentTrustStore`, or equivalent security authorities must be explicitly classified during forensics.
+
+ARCH-001 must NOT merge, alias, replace, or co-own these stores with ordinary memory/task/connector persistence merely for architectural symmetry.
+
+If policy or trust persistence is migrated, the migration must preserve the security authority, fail-closed semantics, identity scope, and existing tested authorization behavior.
+
+Any proposed change to security-store ownership requires explicit justification and dedicated regression tests.
+
+Transport/session state that is legitimately MCP-local may remain MCP-local. The agent must classify state rather than treating every MCP-local file as a defect.
+
+---
+
+## 11. Persistence contract
+
+For each canonical persistent domain, apply the following guarantees where semantically applicable:
 
 - deterministic path resolution
-- workspace/project scoping
+- workspace scoping/isolation
 - schema/version identification
 - atomic writes
-- bounded locking
+- bounded lock acquisition
 - stale-lock recovery where supported
-- corrupt-store detection
-- fail-closed behavior
-- explicit migration/version handling
+- corruption detection
+- fail-closed behavior where security requires it
+- explicit migrations
 - no partial writes
 - clear serialization errors
 - bounded resource usage
 - deterministic ordering where observable
-- concurrent read-modify-write correctness
+- correct concurrent read-modify-write semantics
 - restart persistence
 
-Reuse the existing `StoreLock` where its semantics are appropriate rather than inventing another lock mechanism. The current implementation uses exclusive lock-file creation, bounded acquisition, stale-lock reclamation, and cleanup on guard drop; any migration must preserve or deliberately improve those concurrency guarantees. fileciteturn282file0L2-L2
+Reuse `StoreLock` when its semantics fit. Do not assume it is a universal locking primitive; a domain may require another concurrency mechanism when justified by its semantics.
 
-Do not create a generic “super-store” abstraction solely to hide incompatible domain models. Unification means one authoritative owner per domain, not one giant undifferentiated database API.
-
----
-
-## 6. MCP adapter boundary
-
-Refactor MCP so each tool follows this pattern:
-
-```text
-MCP request
-  → schema/argument validation
-  → caller/session/workspace context
-  → policy/capability authorization
-  → canonical service call
-  → canonical store/service behavior
-  → canonical error mapping
-  → MCP response
-```
-
-The MCP layer may own:
-
-- MCP JSON schema
-- JSON-RPC request/response mechanics
-- transport concerns
-- MCP tool metadata
-- conversion between wire types and domain types
-- MCP-specific error envelopes
-- MCP session/transport state
-
-The MCP layer must not own:
-
-- duplicate domain stores
-- duplicate filesystem security
-- duplicate mutation engines
-- duplicate task state machines
-- duplicate memory schemas
-- duplicate connector registries
-- alternate policy engines
-- alternate audit semantics
-
-Inspect `dispatcher.rs` and `tool_registry.rs` carefully because MCP tool registration and dispatch currently expose domain operations such as workspace, memory, tasks, and connectors. The final architecture must ensure those tools delegate consistently rather than embedding divergent domain behavior. fileciteturn281file5L139-L147 fileciteturn281file3L97-L105
+Never use an unsafe unlocked fallback merely because a lock cannot be acquired.
 
 ---
 
-## 7. Identity, authorization, and security preservation
+## 12. Hard invariant: no direct MCP domain persistence
 
-ARCH-001 must integrate with the existing authorization architecture rather than bypass it.
+After migration, MCP domain adapters must not directly implement persistence for migrated domains.
 
-For every migrated mutation, preserve the ordering:
+Prohibited in MCP domain/tool/dispatcher code unless an explicitly documented architecture exception exists:
+
+- direct reads/writes of `.agent/<domain>` files
+- direct JSON persistence for domain state
+- direct `OpenOptions`/file replacement for domain stores
+- direct filesystem mutation that bypasses canonical services
+- MCP-local duplicate serializers/state machines/registries
+
+Approved MCP-local persistence may exist only for genuinely transport/session/security state with an explicit classification and ownership rationale.
+
+Add architecture/conformance checks where practical so this invariant remains enforceable.
+
+---
+
+## 13. Migration strategy — dependency driven, not predetermined
+
+Do not blindly follow a fixed domain order. Determine migration order from the actual dependency graph, shared invariants, testability, and risk.
+
+For each domain use:
+
+### Phase A — Inventory
+
+Identify every producer, consumer, persistence path, schema, and security dependency.
+
+### Phase B — Canonical contract
+
+Define or extract the authoritative service/domain/store boundary.
+
+### Phase C — Construction and ownership
+
+Wire workspace, context, store, and service dependencies explicitly.
+
+### Phase D — Compatibility
+
+If required, translate legacy inputs/formats into the canonical representation.
+
+### Phase E — Data migration
+
+Migrate existing data atomically and idempotently.
+
+### Phase F — Cutover
+
+Route all production callers through the canonical implementation.
+
+### Phase G — Verification
+
+Prove domain equivalence, persistence correctness, security preservation, concurrency behavior, restart behavior, and failure semantics.
+
+### Phase H — Cleanup
+
+Only after the deletion gate is satisfied, remove or deprecate the duplicate implementation.
+
+The order of filesystem, memory, tasks, connectors, and other domains must be chosen from the forensic dependency graph. A different order is valid if evidence shows it reduces risk.
+
+---
+
+## 14. Initialization and lifecycle semantics
+
+For every persistent store explicitly distinguish:
+
+- missing store on first use
+- valid empty store
+- malformed/corrupt store
+- unsupported schema version
+- permission failure
+- interrupted migration
+- partially written state
+
+A missing first-run store may be initialized only when the domain contract explicitly permits it.
+
+A malformed or unreadable authoritative store must not silently become a new empty store.
+
+Document whether initialization is eager or lazy and test restart behavior.
+
+---
+
+## 15. Migration rollback and deletion gates
+
+A migration is not complete until both success and failure paths are tested.
+
+### Migration rollback requirements
+
+Test that:
+
+- migration failure leaves the source/legacy data valid when rollback semantics require it;
+- canonical data is never partially migrated;
+- crash/restart during migration is recoverable;
+- repeated migration is safe/idempotent;
+- successful migration is followed by normal reads/writes;
+- no supported data is silently lost.
+
+### Legacy deletion gate
+
+Do not delete a legacy store/implementation until all are true:
+
+- zero production callers remain;
+- no test relies on the legacy path as an authority;
+- canonical persistence is verified across restart;
+- migration is verified on representative legacy data;
+- rollback/recovery behavior is understood;
+- repository search shows no unintended references;
+- documentation no longer describes the legacy implementation as authoritative.
+
+Deprecation is preferred before irreversible deletion when compatibility risk is non-trivial.
+
+---
+
+## 16. Security and identity preservation
+
+For every migrated mutation preserve the effective ordering:
 
 ```text
 identify caller
@@ -305,468 +470,215 @@ identify caller
 → capability/policy decision
 → domain validation
 → canonical service/store operation
-→ audit where required
+→ audit/provenance where required
 ```
 
-Never move authorization below a persistence mutation.
+Never move authorization below persistence.
 
-Never let the new shared store become a way to bypass:
+The migration must not bypass:
 
-- capability grants
-- policy decisions
-- agent/session identity
-- workspace containment
+- agent identity
+- session scope
+- workspace isolation
+- capabilities
+- policy
 - path validation
 - symlink protections
 - MCP trust controls
 - high-risk built-in tool restrictions
 - audit requirements
 
-Unknown or unauthorized operations must remain denied.
-
-Corrupt policy/security state must remain fail closed.
+Unknown or unauthorized operations remain denied.
 
 ---
 
-## 8. Migration strategy
+## 17. Failure and recovery matrix
 
-Use an incremental migration, preferably in this order unless forensic evidence proves a safer order:
-
-1. establish canonical interfaces/contracts;
-2. migrate filesystem/workspace behavior where duplicate MCP behavior remains;
-3. migrate memory;
-4. migrate tasks;
-5. migrate connectors;
-6. remove or deprecate orphaned MCP stores;
-7. add architecture/conformance tests;
-8. update documentation and migration notes.
-
-For every domain:
-
-### Phase A — inventory
-
-Identify every producer and consumer.
-
-### Phase B — canonical contract
-
-Define the service/domain API and persistence contract without duplicating business logic.
-
-### Phase C — compatibility adapter
-
-If required, allow old MCP calls to translate into the canonical representation temporarily.
-
-### Phase D — data migration
-
-Migrate existing persisted data atomically and idempotently.
-
-### Phase E — cutover
-
-Route all MCP operations to the canonical implementation.
-
-### Phase F — verification
-
-Prove behavior equivalence and persistence correctness.
-
-### Phase G — cleanup
-
-Remove or deprecate the duplicate implementation only after all references are gone and migration/recovery evidence exists.
-
----
-
-## 9. Backward compatibility
-
-Before changing schemas or persistence paths, determine:
-
-- existing released formats
-- current on-disk files
-- old field names
-- old status values
-- old IDs
-- optional/missing fields
-- empty-store behavior
-- unknown fields
-- corrupted files
-- partially migrated files
-
-Migration must not silently convert invalid state into valid-looking state.
-
-If a compatibility layer is required, make it explicit, bounded, testable, and removable.
-
-Do not keep two authoritative representations indefinitely.
-
----
-
-## 10. Failure and recovery semantics
-
-Define behavior for:
+Define and test behavior for:
 
 - missing store
-- empty store
-- malformed JSON
-- schema-version mismatch
+- valid empty store
+- malformed JSON/data
+- schema mismatch
 - unknown fields where relevant
 - interrupted write
-- failed atomic rename
+- atomic rename failure
 - lock timeout
 - stale lock
 - concurrent writer
 - migration failure
 - migration crash/restart
 - permission denied
-- path outside workspace
-- symlink escape
+- wrong workspace
+- traversal/symlink escape
 - authorization denial
-- service-level validation failure
+- service validation failure
 - MCP serialization failure
 
-For all mutation failures, determine whether zero-mutation semantics are required and test them.
-
-A failed migration must not leave the canonical store in a partially migrated state.
-
-A failed read must not silently instantiate an empty authoritative store unless that behavior is explicitly safe and documented.
+For every mutation, define whether failure guarantees zero mutation, partial mutation, or transactional rollback. Do not leave this implicit.
 
 ---
 
-## 11. Concurrency requirements
+## 18. Concurrency requirements
 
-This project is explicitly designed for multiple agents and potentially multiple processes.
-
-Test real read-modify-write races for migrated persistent stores.
+AWH supports multiple agents/processes. Test real cross-task and, where practical, cross-process races.
 
 Requirements:
 
 - no lost updates
-- bounded lock acquisition
+- bounded contention
 - no indefinite deadlock
-- stale-lock recovery where supported
+- safe stale-lock handling where supported
 - no unsafe unlocked fallback
-- deterministic behavior after contention
-- safe concurrent readers/writers
-- correct behavior across independent processes where practical
+- deterministic behavior under contention
+- correct concurrent readers/writers
+- correct read-modify-write semantics
+- restart-safe persisted state
 
-Do not assume an in-process mutex is sufficient for project persistence. The current `StoreLock` documentation specifically identifies cross-process contention as a requirement. fileciteturn282file0L2-L2
+Do not substitute an in-process mutex for cross-process persistence coordination when the domain requires process-level isolation.
 
 ---
 
-## 12. Testing strategy
+## 19. Testing and architecture conformance
 
-Add behavior-focused tests at several layers.
+### Canonical service tests
 
-### 12.1 Canonical service unit tests
+For every migrated domain test create/read/update/delete as supported, invalid input, missing data, duplicate data, persistence failure, serialization failure, corrupt state, authorization failure, and concurrency.
 
-For each migrated domain:
+### MCP delegation tests
 
-- create
-- read
-- update
-- delete where supported
-- invalid input
-- missing item
-- duplicate item
-- persistence failure
-- serialization failure
-- corrupted state
-- authorization failure
-- concurrent access
-
-### 12.2 Migration tests
-
-Test:
-
-- representative legacy store → canonical store
-- empty legacy store
-- large legacy store
-- malformed legacy store
-- unsupported schema version
-- unknown fields
-- interrupted migration simulation
-- repeated migration/idempotence
-- migration followed by normal reads/writes
-- migration preserves all supported data
-
-### 12.3 MCP conformance tests
-
-For every MCP operation that was migrated, prove:
+For every migrated MCP operation prove:
 
 ```text
 MCP request → canonical service
 ```
 
-and not:
+not:
 
 ```text
 MCP request → MCP-local domain implementation
 ```
 
-Where practical, instrument or mock the canonical service boundary and assert that the MCP adapter reaches it.
+Instrument or inject the service boundary where practical.
 
-### 12.4 Cross-interface equivalence tests
+### Cross-interface tests
 
-For representative operations:
+Representative operations from MCP, CLI, TUI/control paths must produce equivalent authoritative domain state and persistence results.
 
-```text
-MCP → canonical service
-CLI → canonical service
-TUI/control path → canonical service
-```
+### Migration tests
 
-must produce equivalent domain state and persistence results.
+Cover representative legacy data, empty data, malformed data, unsupported versions, unknown fields, interrupted migration, idempotence, restart, and data preservation.
 
-Do not compare only JSON response formatting; compare authoritative domain state.
+### Architecture checks
 
-### 12.5 Architecture/conformance tests
+Add static/structural tests where practical to detect:
 
-Create tests or static checks that fail when a new MCP module introduces a duplicate domain store or direct persistence path without an explicit architecture exception.
-
-At minimum detect/review:
-
-- MCP-local JSON persistence
-- duplicate task structs/status enums
+- MCP-local domain JSON persistence
+- duplicate task state machines
 - duplicate memory serializers
 - duplicate connector registries
 - direct filesystem mutation from MCP tools
-- direct `.agent` store writes outside canonical store owners
+- direct `.agent` writes outside canonical store owners
 
-Avoid brittle textual checks if an AST/module-level check or architectural test can provide stronger guarantees.
+Prefer module/AST-level checks over brittle text matching when practical.
 
-### 12.6 Security regression tests
+### Security regression tests
 
-Pin that migration does not bypass:
-
-- workspace containment
-- symlink protection
-- policy
-- capabilities
-- identity/session scope
-- MCP trust
-- high-risk built-in denial
-- audit requirements
+Pin workspace containment, identity/session scope, policy/capabilities, trust, high-risk tool restrictions, symlink protections, and audit behavior.
 
 ---
 
-## 13. Filesystem and encoding edge cases
+## 20. Compatibility and edge cases
 
-For all migrated persistent stores and filesystem adapters, test where applicable:
+Before changing schemas or paths inspect:
 
-- UTF-8
-- Devanagari
-- CJK
-- emoji
-- spaces in paths
-- Unicode filenames
-- empty files/stores
-- large records
-- newline variations
-- missing final newline where textual files are involved
+- released/on-disk formats
+- old field names
+- old IDs
+- old status values
+- optional/missing fields
+- empty stores
+- unknown fields
+- corrupted files
+- partially migrated files
+- Unicode/UTF-8 data
+- Devanagari/CJK/emoji
+- spaces and Unicode filenames
 - nested workspaces
-- symlinks
-- path traversal
-- concurrent access
-- read-only/permission failures
+- read-only permissions
+- large records and bounded resource behavior
 
 Do not assume ASCII-only data.
 
 ---
 
-## 14. Performance and resource limits
+## 21. Verification protocol
 
-Measure before and after where the migration changes persistence behavior.
+Before declaring ARCH-001 complete:
 
-Avoid:
+1. Re-run repository-wide searches for all legacy MCP domain owners and persistence paths.
+2. Confirm each migrated domain has exactly one authoritative production owner.
+3. Confirm service construction enforces workspace/context ownership.
+4. Confirm MCP dispatcher/tool registry remain adapter/routing layers.
+5. Confirm no unauthorized direct MCP persistence remains.
+6. Confirm policy/trust remain correctly separated security authorities.
+7. Run formatting, compilation, unit tests, integration tests, concurrency tests, migration tests, and security regressions relevant to the changed code.
+8. Test restart persistence.
+9. Test migration failure and recovery.
+10. Review the final diff for unrelated changes.
+11. Update documentation only where it describes the new authoritative architecture or migration behavior.
 
-- loading unbounded stores into memory without limits
-- repeated full-store serialization for every tiny operation when a safer bounded approach exists
-- excessive lock hold times
-- repeated migration on every request
-- duplicate parsing of the same state
-
-Migration should normally happen once per legacy format/version and then operate on the canonical format.
-
-Do not sacrifice security or correctness merely for micro-optimizations.
-
----
-
-## 15. Documentation requirements
-
-Update documentation only after implementation facts are established.
-
-Document:
-
-- canonical owner for each domain
-- MCP adapter boundary
-- persistence locations/formats
-- schema versions
-- migration behavior
-- compatibility policy
-- locking/concurrency behavior
-- error behavior
-- security boundaries
-- which MCP-local stores were removed/deprecated
-- any intentional exceptions and why they are not domain duplication
-
-Do not claim “single source of truth” unless the code and tests prove it.
-
-Keep architecture documentation aligned with source and tests.
+If a verification requirement cannot be executed in the environment, report exactly what was and was not verified; do not claim success by inference.
 
 ---
 
-## 16. Required implementation evidence
+## 22. Definition of Done
 
-Before declaring ARCH-001 complete, provide evidence for every domain migrated:
+ARCH-001 is complete only when:
 
-| Requirement | Evidence |
-|---|---|
-| One canonical owner | source path + call graph evidence |
-| MCP delegates | MCP adapter/source evidence |
-| No duplicate persistence | repository search + architecture test |
-| Canonical schema | model/serializer source |
-| Migration | migration code + tests |
-| Locking | implementation + concurrency tests |
-| Corruption handling | tests |
-| Security preserved | authorization/security tests |
-| Cross-interface equivalence | integration tests |
-| Restart persistence | filesystem integration tests |
-| Documentation | updated docs |
-
-No row may be marked complete without concrete evidence.
-
----
-
-## 17. Verification commands
-
-Run the complete Rust verification suite after implementation:
-
-```bash
-cargo fmt --all -- --check
-cargo check --all-targets
-cargo test --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-Also run targeted tests for:
-
-- every migrated store/domain
-- migrations
-- MCP adapters
-- architecture/conformance checks
-- concurrency
-- corruption/recovery
-- security/authorization
-
-If repository-specific scripts or CI checks exist, run the relevant ones too.
-
-Do not report success from compilation alone.
+- MCP no longer owns duplicate migrated domain logic/persistence;
+- canonical owners exist for every migrated domain, including newly extracted services where necessary;
+- workspace/service/store construction is explicit and safe;
+- direct MCP domain persistence is eliminated or explicitly justified as non-domain state;
+- filesystem operations route through the canonical service boundary;
+- memory/tasks/connectors have one authoritative domain implementation each;
+- policy/trust security authorities remain appropriately separate;
+- migrations are deterministic, atomic, idempotent, and recoverable;
+- legacy deletion gates are satisfied;
+- concurrent access is tested according to each store's real semantics;
+- MCP, CLI, TUI/control callers converge on the same authoritative behavior;
+- security/identity/policy guarantees remain intact;
+- architecture conformance tests prevent regression;
+- relevant documentation reflects the actual implementation.
 
 ---
 
-## 18. Git/diff discipline
-
-Before finalizing:
-
-```bash
-git status --short
-git diff --stat
-git diff --check
-git diff
-```
-
-Review every changed file.
-
-Reject unrelated changes unless they are strictly necessary for ARCH-001 correctness.
-
-Do not modify future issue prompts, unrelated architecture, product features, or research work.
-
----
-
-## 19. Definition of Done
-
-ARCH-001 is complete only when all applicable conditions are true:
-
-- [ ] canonical owner identified for every targeted domain
-- [ ] MCP no longer owns duplicate domain business logic
-- [ ] MCP no longer owns duplicate persistent stores for migrated domains
-- [ ] filesystem behavior routes through canonical services
-- [ ] memory uses one authoritative model/store with migration
-- [ ] tasks use one authoritative model/status vocabulary
-- [ ] connectors use one authoritative model/store/registry boundary
-- [ ] persistence formats are versioned or explicitly compatible
-- [ ] migrations are atomic, idempotent, corruption-aware, and tested
-- [ ] locking is correct for concurrent agents/processes
-- [ ] no unsafe unlocked fallback exists
-- [ ] security/capability/policy checks remain authoritative
-- [ ] MCP/CLI/other interfaces share domain semantics
-- [ ] architecture/conformance tests prevent regression
-- [ ] corrupted state fails safely
-- [ ] restart persistence is verified
-- [ ] Unicode and relevant filesystem edge cases pass
-- [ ] targeted tests pass
-- [ ] full fmt/check/test/clippy gates pass
-- [ ] documentation reflects actual implementation
-- [ ] final diff contains no unrelated architectural changes
-
----
-
-## 20. Explicit non-goals
+## 23. Non-goals
 
 Do not use ARCH-001 to:
 
-- redesign the entire AWH architecture
-- create a generic workflow engine
-- create a generic database abstraction for every subsystem
-- replace MCP itself
-- redesign agent identity/session architecture
-- redesign the policy engine
-- redesign Git integration
-- redesign the editing transaction model
-- add unrelated UI features
-- add a new model/router layer
-- merge AWH Compute research into the core AWH architecture
-- claim future roadmap items as implemented
-
-If a discovered dependency genuinely requires one of these, document it as a blocker/follow-up rather than silently expanding scope.
+- redesign the entire MCP protocol layer;
+- redesign authorization from scratch;
+- replace the existing AWE editing architecture;
+- implement FS-001's complete TOCTOU solution;
+- implement GIT-001 worktree isolation;
+- merge security/trust authorities into ordinary domain stores without explicit security justification;
+- introduce a speculative database migration unrelated to the observed architecture problem;
+- rewrite unrelated modules for style or cleanup.
 
 ---
 
-## 21. Final implementation report
+## 24. Hard stop conditions
 
-At completion, report:
+Stop and report instead of guessing when:
 
-1. forensic findings;
-2. canonical owner selected for each domain;
-3. files changed;
-4. files removed/deprecated, with justification;
-5. migration format and compatibility behavior;
-6. MCP adapter changes;
-7. security/authorization preservation;
-8. concurrency/locking behavior;
-9. architecture/conformance tests;
-10. targeted test results;
-11. full CI-equivalent verification results;
-12. remaining known limitations;
-13. explicit evidence for each Definition-of-Done item.
+- the authoritative owner cannot be established from source/tests;
+- two stores have incompatible semantics that require an unresolved product decision;
+- migration could lose data and no safe compatibility rule exists;
+- security-store ownership would change without sufficient evidence;
+- workspace ownership/isolation cannot be proven;
+- concurrency semantics are unclear;
+- a required behavior change would exceed ARCH-001 scope;
+- tests contradict the assumed architecture and the contradiction cannot be safely resolved.
 
-Clearly distinguish:
-
-- implemented
-- tested
-- partially validated
-- intentionally deferred
-- blocked by another issue
-
-Never turn “planned” into “complete.”
-
----
-
-## 22. HARD STOP
-
-After ARCH-001 is implemented, tested, documented, and verified:
-
-**STOP.**
-
-Do not begin ARCH-002 or any later issue.
-
-Do not proactively modify another issue prompt.
-
-Do not broaden the architecture beyond the accepted ARCH-001 scope.
-
-The next issue must be started only by an explicit instruction to move next.
+The objective is not merely fewer files or fewer stores. The objective is one demonstrably authoritative implementation per domain, with explicit boundaries, safe persistence, preserved security, recoverable migration, and consistent behavior across all AWH interfaces.
