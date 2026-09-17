@@ -1,0 +1,185 @@
+name: AWH Release Notes Validation
+
+on:
+  pull_request:
+    branches: [rust]
+  workflow_dispatch:
+
+concurrency:
+  group: awh-release-notes-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Release-notes validation is CI-only and read-only. It must never become an
+# AWH runtime dependency or publish/edit release metadata.
+permissions:
+  contents: read
+
+jobs:
+  release-notes:
+    name: Release Notes Validation (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Capture environment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            rustc --version || true
+            cargo --version || true
+          } | tee artifacts/environment.txt
+
+      - name: Verify repository is clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Required Rust formatting check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Required Rust build check
+        shell: bash
+        run: cargo check --all-targets
+
+      - name: Required Rust test suite
+        shell: bash
+        run: cargo test --all-targets
+
+      - name: Required Rust Clippy check
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build locked release artifact
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Validate release notes sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/release-notes
+
+          # Inspect common release-note/changelog sources without generating or
+          # publishing release content. Missing optional files are recorded.
+          found=0
+          for file in CHANGELOG.md RELEASE_NOTES.md docs/CHANGELOG.md docs/RELEASE_NOTES.md; do
+            if [ -f "$file" ]; then
+              found=1
+              cp "$file" "artifacts/release-notes/$(echo "$file" | tr '/' '_')"
+            fi
+          done
+          printf 'release_notes_source_found=%s\n' "$found" > artifacts/release-notes/source-summary.txt
+
+          # Validate UTF-8/text readability and reject obvious credential material.
+          while IFS= read -r -d '' file; do
+            if ! python3 - "$file" <<'PY'
+          import pathlib, sys
+          pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          PY
+            then
+              echo "Unreadable UTF-8 release-notes source: $file"
+              exit 1
+            fi
+          done < <(find artifacts/release-notes -type f -print0)
+
+          if grep -RniE '(BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|gh[pousr]_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_-]{20,})' artifacts/release-notes; then
+            echo 'Potential credential material found in release notes.'
+            exit 1
+          fi
+
+      - name: Validate release-facing project metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in Cargo.toml Cargo.lock README.md docs/PROJECT_CONTEXT.md docs/PROJECT_ROADMAP_STATUS.md; do
+            if [ -f "$file" ]; then
+              echo "present: $file"
+            else
+              echo "missing: $file"
+            fi
+          done | tee artifacts/release-metadata-presence.txt
+
+          cargo metadata --locked --format-version 1 > artifacts/cargo-metadata.json
+          cargo tree --locked --all-features > artifacts/cargo-tree.txt
+          sha256sum Cargo.toml Cargo.lock > artifacts/manifest-sha256.txt
+
+      - name: Validate release notes do not claim CI-only tooling as runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='swe-bench|swe-smith|codeclash|swe-rex|mini-swe-agent|swe-agent|sb-cli|openhands|prometheus|opentelemetry|opentelemetry-otlp|grafana|jaeger|datadog|sentry|honeycomb|newrelic|cargo-audit|cargo-deny|gitleaks|semgrep|trivy|cosign|sigstore'
+
+          # The release-notes check is about preventing CI-only infrastructure
+          # from being represented as an AWH runtime dependency. Mentions in
+          # CI workflow documentation are allowed and are not runtime evidence.
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo 'Forbidden CI-only tooling detected in AWH runtime manifests.'
+            grep -Ein "$forbidden" Cargo.toml Cargo.lock || true
+            exit 1
+          fi
+          if grep -RniE "$forbidden" src 2>/dev/null; then
+            echo 'Forbidden CI-only tooling reference detected under src/.'
+            exit 1
+          fi
+
+      - name: Record release-notes validation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# AWH release-notes validation scope'
+            echo 'This workflow validates release-note source files and release-facing metadata.'
+            echo 'It does not generate, publish, tag, edit, or upload GitHub release notes.'
+            echo 'It does not add release-note tooling or dependencies to the AWH runtime.'
+            echo "source_commit=$(git rev-parse HEAD)"
+          } | tee artifacts/release-notes-validation-scope.txt
+
+      - name: Collect final diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git status --short > artifacts/final-git-status.txt
+          git diff --check > artifacts/final-diff-check.txt
+          git diff -- . > artifacts/final-tracked-diff.txt
+          cargo metadata --locked --format-version 1 > artifacts/final-cargo-metadata.json 2>&1
+          cargo tree --locked --all-features > artifacts/final-cargo-tree.txt 2>&1
+          sha256sum target/release/awh > artifacts/awh-release-sha256.txt 2>/dev/null || true
+
+      - name: Upload release-notes validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-release-notes-validation
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final read-only integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet -- .
+          echo 'Release-notes validation completed without modifying tracked AWH files.'
