@@ -14,6 +14,7 @@ runtime_boundary:
     - SWE-bench
     - SWE-smith
 
+# depends_on ids absent from features: are treated as pre-existing/external capabilities and do not block selection.
 features:
   - id: workspace.agent-grade-editing
     phase: 2

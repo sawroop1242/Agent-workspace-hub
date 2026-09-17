@@ -28,8 +28,11 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = ROOT / ".github/agent-engine/feature-registry.yml"
-STATE_DIR = ROOT / ".github/agent-engine/state"
-ARTIFACT_DIR = ROOT / ".github/agent-engine/artifacts"
+# These paths match the workflow's "Upload agent evidence" step so that
+# state and evidence are uploaded instead of being lost with the runner.
+STATE_DIR = ROOT / "artifacts/agent-engine/state"
+ARTIFACT_DIR = ROOT / "artifacts/agent-engine/artifacts"
+PROMPTS_DIR = ROOT / ".github/agent-engine/prompts"
 MAX_REPAIR_ATTEMPTS = 1
 DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_NVIDIA_MODEL = "deepseek-ai/deepseek-v4-flash-0731"
@@ -89,15 +92,28 @@ def get_features(registry: dict[str, Any]) -> list[dict[str, Any]]:
     return [f for f in features if isinstance(f, dict) and f.get("id")]
 
 
+def unmet_registered_dependencies(feature: dict[str, Any], features: list[dict[str, Any]],
+                                  completed: list[str]) -> list[str]:
+    registered = {f["id"] for f in features}
+    return [dep for dep in feature.get("depends_on", []) or []
+            if dep in registered and dep not in completed]
+
+
 def select_feature(features: list[dict[str, Any]], requested_id: str | None,
                    completed: list[str]) -> dict[str, Any] | None:
     if requested_id:
         for feature in features:
             if feature["id"] == requested_id:
+                unmet = unmet_registered_dependencies(feature, features, completed)
+                if unmet:
+                    print(f"BLOCKED: {requested_id} depends on unresolved feature {unmet[0]}")
+                    raise SystemExit(1)
                 return feature
         raise ValueError(f"Feature not found: {requested_id}")
     priority = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-    candidates = [f for f in features if f["id"] not in completed]
+    candidates = [f for f in features
+                  if f["id"] not in completed
+                  and not unmet_registered_dependencies(f, features, completed)]
     candidates.sort(key=lambda f: (priority.get(str(f.get("priority", "P3")), 99), str(f["id"])))
     return candidates[0] if candidates else None
 
@@ -138,6 +154,13 @@ def deterministic_verify(artifact_dir: Path) -> tuple[bool, dict[str, Any]]:
     return passed_all, result
 
 
+def read_prompt(filename: str) -> str:
+    path = PROMPTS_DIR / filename
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
 def build_agent_task(feature: dict[str, Any], repair: bool = False) -> str:
     task = f"""You are working on Agent Workspace Hub (AWH).
 
@@ -168,13 +191,19 @@ Rules:
 6. Run deterministic verification.
 7. Leave the branch ready for review.
 """
-    if repair:
-        task += """
+    planner = read_prompt("planner.md")
+    if planner:
+        task += f"""
 
-This is the single allowed REPAIR attempt. Read the previous deterministic
-verification evidence, reproduce the actual failure, and make the smallest
-coherent correction. Do not weaken tests to obtain a passing result.
+Planning guidance (.github/agent-engine/prompts/planner.md):
+{planner}
 """
+    if repair:
+        repair_prompt = read_prompt("repair.md")
+        task += f"""
+
+You are running the single allowed REPAIR attempt.
+{repair_prompt}"""
     return task.strip()
 
 
@@ -322,6 +351,11 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
         "repair_completed": repair_ok,
         "final_verification": final_passed,
         "decision": decision,
+        "deterministic_gate": "PASS" if final_passed else "FAIL",
+        "external_evaluation": "NOT_RUN",
+        "evidence_hierarchy_used": True,
+        "base_revision": state.get("base_revision", "unknown"),
+        "candidate_revision": branch,
         "verification_source_of_truth": "deterministic AWH verification",
         "repair_attempt_limit": MAX_REPAIR_ATTEMPTS,
         "timestamp": utc_now(),
