@@ -8,21 +8,22 @@ on:
         required: true
         type: choice
         options:
+          - orchestrate
           - plan
           - implement
           - repair
           - evaluate-preflight
           - task-generation-preflight
-        default: plan
+        default: orchestrate
       feature_id:
         description: "Feature registry ID, for example workspace.agent-grade-editing"
         required: true
         type: string
       model:
-        description: "LiteLLM-compatible model name used by mini-SWE-agent"
+        description: "NVIDIA OpenAI-compatible model name used by the orchestrator"
         required: false
         type: string
-        default: ""
+        default: "deepseek-ai/deepseek-v4-flash"
       cost_limit:
         description: "Maximum agent cost in USD; 0 disables the limit"
         required: false
@@ -45,7 +46,7 @@ jobs:
   agent-engine:
     name: ${{ inputs.mode }} / ${{ inputs.feature_id }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
       - name: Checkout AWH
@@ -91,19 +92,41 @@ jobs:
           block = registry[start:end].strip()
           Path("artifacts/agent-engine/selected-feature.yml").write_text(block + "\n")
 
-          task = f'''AWH external engineering task.\n\nTask ID: {feature_id}\nMode: {mode}\n\nRead the selected feature registry entry below, then read the mandatory AWH agent contract and all relevant project documentation before changing anything.\n\n{block}\n\nMandatory reading:\n- .github/agent/system.md\n- .github/agent/rules.md\n- .github/agent/verification.md\n- docs/PROJECT_CONTEXT.md\n- docs/PROJECT_ROADMAP.md\n- docs/PROJECT_ROADMAP_STATUS.md\n- .github/agent-engine/prompts/{'repair.md' if mode == 'repair' else 'worker.md'}\n\nFor plan mode, do not modify source; produce an implementation plan and acceptance criteria.\nFor implement mode, implement only this feature and add focused tests.\nFor repair mode, diagnose and repair the captured failing verification evidence if present.\nNever add mini-SWE-agent, SWE-ReX, SWE-bench, SWE-smith, or other CI tooling to AWH runtime dependencies.\nNever push to rust/main.\nRun the repository verification contract before claiming success.\n'''
+          task = f'''AWH external engineering task.\n\nTask ID: {feature_id}\nMode: {mode}\n\nRead the selected feature registry entry below, then read the mandatory AWH agent contract and all relevant project documentation before changing anything.\n\n{block}\n\nMandatory reading:\n- .github/agent/system.md\n- .github/agent/rules.md\n- .github/agent/verification.md\n- docs/PROJECT_CONTEXT.md\n- docs/PROJECT_ROADMAP.md\n- docs/PROJECT_ROADMAP_STATUS.md\n- .github/agent-engine/prompts/{'repair.md' if mode == 'repair' else 'worker.md'}\n\nFor plan mode, do not modify source; produce an implementation plan and acceptance criteria.\nFor implement mode, implement only this feature and add focused tests.\nFor repair mode, diagnose and repair the captured failing verification evidence if present.\nFor orchestrate mode, use the external Python orchestrator; deterministic AWH verification remains the source of truth.\nNever add mini-SWE-agent, SWE-ReX, SWE-bench, SWE-smith, or other CI tooling to AWH runtime dependencies.\nNever push to rust/main.\nRun the repository verification contract before claiming success.\n'''
           Path("artifacts/agent-engine/task.txt").write_text(task)
           PY
           cat artifacts/agent-engine/task.txt
 
       - name: Install external agent infrastructure
-        if: inputs.mode == 'plan' || inputs.mode == 'implement' || inputs.mode == 'repair'
+        if: inputs.mode == 'plan' || inputs.mode == 'implement' || inputs.mode == 'repair' || inputs.mode == 'orchestrate'
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --disable-pip-version-check --no-input --quiet 'mini-swe-agent[full]' swe-rex
+          python3 -m pip install --disable-pip-version-check --no-input --quiet 'mini-swe-agent[full]' swe-rex pyyaml
           mini --version
           python3 -c 'import swerex; print("SWE-ReX import: OK")'
+          python3 -c 'import yaml; print("PyYAML import: OK")'
+
+      - name: Run Python long-running orchestrator
+        if: inputs.mode == 'orchestrate'
+        env:
+          AWH_ROUTINE_NVIDIA_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+          AWH_NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
+          AWH_NVIDIA_MODEL: ${{ inputs.model }}
+          AWH_AGENT_COST_LIMIT: ${{ inputs.cost_limit }}
+          AWH_USE_SWEREX: ${{ inputs.use_swerex }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AWH_ROUTINE_NVIDIA_KEY"
+          test -n "$AWH_NVIDIA_MODEL"
+          python3 .github/agent-engine/orchestrator.py \
+            --feature "${{ inputs.feature_id }}" \
+            --model "$AWH_NVIDIA_MODEL" \
+            --cost-limit "$AWH_AGENT_COST_LIMIT" \
+            --once
 
       - name: Prepare isolated agent branch
         if: inputs.mode == 'implement' || inputs.mode == 'repair'
@@ -118,9 +141,10 @@ jobs:
         if: inputs.mode == 'plan'
         env:
           MODEL_NAME: ${{ inputs.model }}
-          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
-          OPENAI_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+          OPENAI_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
           OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
+          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
         shell: bash
         run: |
           set -euo pipefail
@@ -175,8 +199,9 @@ jobs:
       - name: Run implementation or repair agent
         if: inputs.mode == 'implement' || inputs.mode == 'repair'
         env:
-          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
-          OPENAI_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
+          OPENAI_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
           OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
         shell: bash
         run: |
@@ -273,8 +298,9 @@ jobs:
         if: inputs.mode == 'implement' && steps.verify_initial.outputs.passed != 'true'
         id: repair_attempt
         env:
-          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
-          OPENAI_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
+          OPENAI_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
           OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
         shell: bash
         run: |
