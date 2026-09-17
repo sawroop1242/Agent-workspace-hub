@@ -190,7 +190,7 @@ jobs:
 
       - name: Run deterministic AWH verification (initial)
         id: verify_initial
-        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
         shell: bash
         run: |
           set +e
@@ -262,7 +262,7 @@ jobs:
 
       - name: Run deterministic AWH verification (final)
         id: verify_final
-        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
         shell: bash
         run: |
           set +e
@@ -313,18 +313,21 @@ jobs:
         if: always()
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           forbidden='mini-swe-agent|swe-rex|swe-bench|swe-smith|swe-agent|sb-cli|openhands|cargo-audit|cargo-deny|gitleaks|semgrep|trivy|cosign|sigstore'
           if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
             echo 'External engineering/evaluation tooling leaked into AWH dependency manifests.'
             grep -Ein "$forbidden" Cargo.toml Cargo.lock || true
+            echo 'Runtime separation: FAIL' | tee artifacts/agent-engine/runtime-separation.txt
             exit 1
           fi
           if grep -RniE "$forbidden" src 2>/dev/null; then
             echo 'External engineering/evaluation tooling leaked into AWH source.'
+            echo 'Runtime separation: FAIL' | tee artifacts/agent-engine/runtime-separation.txt
             exit 1
           fi
           echo 'Runtime separation: PASS' | tee artifacts/agent-engine/runtime-separation.txt
+          exit 0
 
       - name: Capture patch and final state
         if: always()
@@ -377,13 +380,18 @@ jobs:
           retention-days: 14
 
       - name: Final pass/fail gate
-        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ steps.verify_final.outputs.passed }}" != 'true' ]; then
+          final='${{ steps.verify_final.outputs.passed }}'
+          runtime='FAIL'
+          if [ -f artifacts/agent-engine/runtime-separation.txt ]; then
+            runtime="$(cat artifacts/agent-engine/runtime-separation.txt)"
+          fi
+          if [ "$final" != 'true' ] || [ "$runtime" != 'Runtime separation: PASS' ]; then
             echo 'AWH agent-engine final result: FAIL'
-            echo 'The bounded repair policy was exhausted or the repair did not restore deterministic verification.'
+            echo 'The bounded repair policy was exhausted, deterministic verification failed, or runtime separation failed.'
             exit 1
           fi
           echo 'AWH agent-engine final result: PASS'
