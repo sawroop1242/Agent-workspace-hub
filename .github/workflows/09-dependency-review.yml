@@ -1,0 +1,183 @@
+name: AWH Dependency Review
+
+on:
+  pull_request:
+    branches:
+      - rust
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: awh-dependency-review-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# DEPENDENCY REVIEW BOUNDARY:
+# This workflow is an external, read-only validation layer. It inspects the
+# dependency changes associated with a pull request and the checked-out AWH
+# dependency graph. It does not modify Cargo.toml/Cargo.lock, publish packages,
+# push commits, or introduce dependency-review tooling into the AWH runtime.
+# Any tools installed below exist only on the temporary GitHub Actions runner.
+
+jobs:
+  dependency-review:
+    name: Dependency review (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout AWH revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Capture dependency review context
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "revision=$(git rev-parse HEAD)"
+            echo "base_revision=${{ github.event.pull_request.base.sha || 'manual-dispatch' }}"
+            echo "head_revision=${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "rustc=$(rustc --version 2>/dev/null || true)"
+            echo "cargo=$(cargo --version 2>/dev/null || true)"
+          } | tee dependency-review-context.txt
+
+      - name: Verify clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Audit resolved dependencies
+        id: audit
+        continue-on-error: true
+        run: |
+          cargo audit --json > cargo-audit.json
+          cargo audit > cargo-audit.txt
+
+      - name: Generate dependency graph
+        id: dependency_graph
+        continue-on-error: true
+        run: |
+          cargo tree --all-features > cargo-tree.txt
+          cargo metadata --format-version 1 > cargo-metadata.json
+
+      - name: Inspect pull request dependency changes
+        id: changed_dependencies
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > dependency-diff.txt
+
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+
+          if [[ -n "$base" && -n "$head" ]]; then
+            git diff --unified=80 "$base" "$head" -- Cargo.toml Cargo.lock > dependency-diff.txt
+          else
+            echo "Manual dispatch: no pull-request base/head available." > dependency-diff.txt
+          fi
+
+          cat dependency-diff.txt
+
+      - name: Check for prohibited external runtime dependencies
+        id: runtime_boundary
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='(mini-swe-agent|swe-agent|swe-rex|swe-bench|swebench|swe-smith|swe_smith|codeclash|sb-cli|openhands)'
+
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo "Prohibited external agent/benchmark tooling detected in AWH dependency manifests."
+            exit 1
+          fi
+
+          if grep -Eiq "$forbidden" cargo-tree.txt; then
+            echo "Prohibited external agent/benchmark tooling detected in the resolved dependency graph."
+            exit 1
+          fi
+
+          echo "Runtime boundary passed: external evaluation tooling is not an AWH dependency."
+
+      - name: Validate Cargo manifests
+        id: manifest_validation
+        continue-on-error: true
+        run: |
+          cargo check --all-targets
+          cargo test --all-targets
+
+      - name: Collect dependency review metadata
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git diff --check > git-diff-check.txt 2>&1
+          git status --short > git-status.txt 2>&1
+          cargo tree --duplicates > cargo-duplicates.txt 2>&1
+
+          {
+            echo "=== dependency review outcomes ==="
+            echo "audit=${{ steps.audit.outcome }}"
+            echo "dependency_graph=${{ steps.dependency_graph.outcome }}"
+            echo "changed_dependencies=${{ steps.changed_dependencies.outcome }}"
+            echo "runtime_boundary=${{ steps.runtime_boundary.outcome }}"
+            echo "manifest_validation=${{ steps.manifest_validation.outcome }}"
+            echo "=== repository status ==="
+            cat git-status.txt
+          } > dependency-review-report.txt
+          cat dependency-review-report.txt
+
+      - name: Upload dependency review artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-dependency-review-${{ github.run_id }}
+          path: |
+            dependency-review-context.txt
+            dependency-review-report.txt
+            dependency-diff.txt
+            cargo-audit.json
+            cargo-audit.txt
+            cargo-tree.txt
+            cargo-duplicates.txt
+            cargo-metadata.json
+            git-diff-check.txt
+            git-status.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Enforce dependency review
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.audit.outcome }}" != "success" ||
+                "${{ steps.dependency_graph.outcome }}" != "success" ||
+                "${{ steps.changed_dependencies.outcome }}" != "success" ||
+                "${{ steps.runtime_boundary.outcome }}" != "success" ||
+                "${{ steps.manifest_validation.outcome }}" != "success" ]]; then
+            echo "Dependency review failed. See uploaded artifacts."
+            exit 1
+          fi
+
+      - name: Verify read-only repository state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- .; then
+            echo "Tracked AWH files were modified during dependency review."
+            git status --short
+            git diff -- .
+            exit 1
+          fi
