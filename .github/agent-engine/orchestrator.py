@@ -32,7 +32,7 @@ STATE_DIR = ROOT / ".github/agent-engine/state"
 ARTIFACT_DIR = ROOT / ".github/agent-engine/artifacts"
 MAX_REPAIR_ATTEMPTS = 1
 DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_NVIDIA_MODEL = "qwen/qwen3-coder-480b-a35b-instruct"
+DEFAULT_NVIDIA_MODEL = "deepseek-ai/deepseek-v4-flash-0731"
 
 
 def utc_now() -> str:
