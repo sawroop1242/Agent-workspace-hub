@@ -1,0 +1,280 @@
+name: AWH External Agent Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Agent-engine operation"
+        required: true
+        type: choice
+        options:
+          - plan
+          - implement
+          - repair
+          - evaluate-preflight
+          - task-generation-preflight
+        default: plan
+      feature_id:
+        description: "Feature registry ID, for example workspace.agent-grade-editing"
+        required: true
+        type: string
+      model:
+        description: "LiteLLM-compatible model name used by mini-SWE-agent"
+        required: false
+        type: string
+        default: ""
+      cost_limit:
+        description: "Maximum agent cost in USD; 0 disables the limit"
+        required: false
+        type: string
+        default: "3"
+      use_swerex:
+        description: "Run mini-SWE-agent through its SWE-ReX Docker environment"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: awh-agent-engine-${{ github.workflow }}-${{ github.ref }}-${{ inputs.feature_id }}
+  cancel-in-progress: true
+
+# External engineering infrastructure only. No AWH repository write permission.
+permissions:
+  contents: read
+
+jobs:
+  agent-engine:
+    name: ${{ inputs.mode }} / ${{ inputs.feature_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout AWH
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Capture base revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/agent-engine
+          echo "${GITHUB_SHA}" > artifacts/agent-engine/base-revision.txt
+          git status --short > artifacts/agent-engine/base-status.txt
+          git diff --check
+
+      - name: Validate feature registry and select task
+        env:
+          FEATURE_ID: ${{ inputs.feature_id }}
+          MODE: ${{ inputs.mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          feature_id = os.environ["FEATURE_ID"]
+          mode = os.environ["MODE"]
+          registry = Path(".github/agent-engine/feature-registry.yml").read_text()
+          marker = re.search(rf"(?m)^  - id: {re.escape(feature_id)}\\s*$", registry)
+          if not marker:
+              raise SystemExit(f"Unknown feature_id: {feature_id}")
+          start = marker.start()
+          nxt = re.search(r"(?m)^  - id: ", registry[marker.end():])
+          end = marker.end() + (nxt.start() if nxt else len(registry) - marker.end())
+          block = registry[start:end].strip()
+          Path("artifacts/agent-engine/selected-feature.yml").write_text(block + "\n")
+
+          task = f'''AWH external engineering task.\n\nTask ID: {feature_id}\nMode: {mode}\n\nRead the selected feature registry entry below, then read the mandatory AWH agent contract and all relevant project documentation before changing anything.\n\n{block}\n\nMandatory reading:\n- .github/agent/system.md\n- .github/agent/rules.md\n- .github/agent/verification.md\n- docs/PROJECT_CONTEXT.md\n- docs/PROJECT_ROADMAP.md\n- docs/PROJECT_ROADMAP_STATUS.md\n- .github/agent-engine/prompts/{'repair.md' if mode == 'repair' else 'worker.md'}\n\nFor plan mode, do not modify source; produce an implementation plan and acceptance criteria.\nFor implement mode, implement only this feature and add focused tests.\nFor repair mode, diagnose and repair the captured failing verification evidence if present.\nNever add mini-SWE-agent, SWE-ReX, SWE-bench, SWE-smith, or other CI tooling to AWH runtime dependencies.\nNever push to rust/main.\nRun the repository verification contract before claiming success.\n'''
+          Path("artifacts/agent-engine/task.txt").write_text(task)
+          PY
+          cat artifacts/agent-engine/task.txt
+
+      - name: Install external agent infrastructure
+        if: inputs.mode == 'plan' || inputs.mode == 'implement' || inputs.mode == 'repair'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input --quiet 'mini-swe-agent[full]' swe-rex
+          mini --version
+          python3 -c 'import swerex; print("SWE-ReX import: OK")'
+
+      - name: Prepare isolated agent branch
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="agent/${{ inputs.feature_id }}-${GITHUB_RUN_ID}"
+          git switch -c "$branch"
+          echo "$branch" > artifacts/agent-engine/task-branch.txt
+
+      - name: Run planner
+        if: inputs.mode == 'plan'
+        env:
+          MODEL_NAME: ${{ inputs.model }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          OPENAI_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$MODEL_NAME" ]; then
+            echo 'A model is required for plan mode.'
+            exit 1
+          fi
+          mini -y --exit-immediately \
+            -m "$MODEL_NAME" \
+            -l "${{ inputs.cost_limit }}" \
+            -t "$(cat artifacts/agent-engine/task.txt)" \
+            -o artifacts/agent-engine/planner-trajectory.json \
+            | tee artifacts/agent-engine/planner-output.txt
+
+      - name: Prepare SWE-ReX agent configuration
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        env:
+          MODEL_NAME: ${{ inputs.model }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$MODEL_NAME" ]; then
+            echo 'A model is required for implement/repair mode.'
+            exit 1
+          fi
+          mkdir -p artifacts/agent-engine/config
+          cat > artifacts/agent-engine/config/mini-awh.yml <<EOF
+          model:
+            model_class: litellm
+            model_name: "$MODEL_NAME"
+          agent:
+            step_limit: 100
+            cost_limit: ${{ inputs.cost_limit }}
+            mode: yolo
+            confirm_exit: false
+          environment:
+            environment_class: ${{ inputs.use_swerex && 'swerex_docker' || 'docker' }}
+            cwd: /workspace
+            image: rust:latest
+            timeout: 180
+            run_args:
+              - "--rm"
+              - "--network"
+              - "none"
+              - "--cap-drop"
+              - "ALL"
+              - "--volume"
+              - "${GITHUB_WORKSPACE}:/workspace"
+          EOF
+          cat artifacts/agent-engine/config/mini-awh.yml
+
+      - name: Run implementation or repair agent
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          OPENAI_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
+          OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          mini \
+            -c artifacts/agent-engine/config/mini-awh.yml \
+            -t "$(cat artifacts/agent-engine/task.txt)" \
+            -o artifacts/agent-engine/agent-trajectory.json \
+            | tee artifacts/agent-engine/agent-output.txt
+
+      - name: Run deterministic AWH verification
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '== cargo fmt =='
+            cargo fmt --all -- --check
+            echo '== cargo check =='
+            cargo check --all-targets
+            echo '== cargo test =='
+            cargo test --all-targets
+            echo '== cargo clippy =='
+            cargo clippy --all-targets --all-features -- -D warnings
+          } 2>&1 | tee artifacts/agent-engine/deterministic-verification.txt
+
+      - name: Check external runtime separation
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='mini-swe-agent|swe-rex|swe-bench|swe-smith|swe-agent|sb-cli|openhands|cargo-audit|cargo-deny|gitleaks|semgrep|trivy|cosign|sigstore'
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo 'External engineering/evaluation tooling leaked into AWH dependency manifests.'
+            grep -Ein "$forbidden" Cargo.toml Cargo.lock || true
+            exit 1
+          fi
+          if grep -RniE "$forbidden" src 2>/dev/null; then
+            echo 'External engineering/evaluation tooling leaked into AWH source.'
+            exit 1
+          fi
+          echo 'Runtime separation: PASS' | tee artifacts/agent-engine/runtime-separation.txt
+
+      - name: Capture patch and final state
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git diff --check > artifacts/agent-engine/final-diff-check.txt 2>&1
+          git status --short > artifacts/agent-engine/final-status.txt
+          git diff -- . > artifacts/agent-engine/agent.patch
+          git log -1 --oneline > artifacts/agent-engine/final-commit.txt
+          git diff --stat > artifacts/agent-engine/diff-stat.txt
+
+      - name: SWE-bench evaluation preflight
+        if: inputs.mode == 'evaluate-preflight'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input --quiet 'mini-swe-agent[full]'
+          mini-extra swebench --help > artifacts/agent-engine/swebench-help.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('artifacts/agent-engine/evaluation-scope.txt').write_text(
+              'SWE-bench is evaluation-only. Benchmark grading criteria must not be modified.\n'
+              'AWH deterministic tests remain the source-of-truth gate.\n'
+          )
+          PY
+
+      - name: SWE-smith task-generation preflight
+        if: inputs.mode == 'task-generation-preflight'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input --quiet swesmith
+          python3 -m swesmith --help > artifacts/agent-engine/swesmith-help.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('artifacts/agent-engine/task-generation-scope.txt').write_text(
+              'SWE-smith is task-generation/evaluation infrastructure only.\n'
+              'Generated AWH tasks must be reproducible and must not modify benchmark grading criteria.\n'
+          )
+          PY
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-agent-engine-${{ inputs.mode }}-${{ inputs.feature_id }}
+          path: artifacts/agent-engine/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final no-push boundary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'This workflow has contents:read and does not push, merge, tag, publish, or create a PR.'
+          echo 'Agent output is evidence/patch material for the normal AWH review process.'
