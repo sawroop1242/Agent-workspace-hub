@@ -1,0 +1,206 @@
+name: AWH Release Validation
+
+on:
+  pull_request:
+    branches:
+      - rust
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: awh-release-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# RELEASE VALIDATION BOUNDARY:
+# This workflow validates that the checked-out AWH revision is suitable for
+# release packaging. It is intentionally read-only: it does not create a
+# release, publish artifacts, push commits, or modify the AWH runtime.
+# Release validation may build temporary binaries for verification, but those
+# binaries remain workflow artifacts and are not runtime dependencies.
+
+jobs:
+  validate:
+    name: Release validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout AWH revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Capture release context
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "revision=$(git rev-parse HEAD)"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "package_version=$(sed -n 's/^version = \"\([^\"]*\)\"/\1/p' Cargo.toml | head -n1)"
+          } | tee release-context.txt
+
+      - name: Verify clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Format check
+        id: fmt
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check
+        id: check
+        continue-on-error: true
+        run: cargo check --all-targets
+
+      - name: Test suite
+        id: test
+        continue-on-error: true
+        run: cargo test --all-targets
+
+      - name: Clippy check
+        id: clippy
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Dependency audit
+        id: audit
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          cargo install --locked cargo-audit
+          cargo audit
+
+      - name: Build release binary
+        id: release_build
+        continue-on-error: true
+        run: cargo build --release --locked
+
+      - name: Verify release binary
+        id: binary_verify
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/release/awh"
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            binary="target/release/awh.exe"
+          fi
+
+          test -f "$binary"
+          "$binary" --help > release-help.txt
+          "$binary" --version > release-version.txt
+
+          echo "Release binary verified: $binary"
+
+      - name: Verify external tooling is not a runtime dependency
+        id: boundary
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='(mini-swe-agent|swe-agent|swe-rex|swe-bench|swebench|swe-smith|swe_smith|codeclash|sb-cli|openhands)'
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo "Release boundary failed: external agent/benchmark tooling detected in AWH runtime manifests."
+            exit 1
+          fi
+          echo "Release boundary passed: AWH runtime remains independent of external evaluation tooling."
+
+      - name: Capture release metadata
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cargo metadata --format-version 1 > release-cargo-metadata.json 2> release-cargo-metadata.stderr
+          cargo tree > release-cargo-tree.txt 2>&1
+          git diff --check > release-diff-check.txt 2>&1
+          git status --short > release-status.txt 2>&1
+
+          {
+            echo "=== outcomes ==="
+            echo "fmt=${{ steps.fmt.outcome }}"
+            echo "check=${{ steps.check.outcome }}"
+            echo "test=${{ steps.test.outcome }}"
+            echo "clippy=${{ steps.clippy.outcome }}"
+            echo "audit=${{ steps.audit.outcome }}"
+            echo "release_build=${{ steps.release_build.outcome }}"
+            echo "binary_verify=${{ steps.binary_verify.outcome }}"
+            echo "boundary=${{ steps.boundary.outcome }}"
+            echo "=== git status ==="
+            cat release-status.txt
+          } > release-report.txt
+          cat release-report.txt
+
+      - name: Upload release validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-release-validation-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            release-context.txt
+            release-report.txt
+            release-help.txt
+            release-version.txt
+            release-cargo-metadata.json
+            release-cargo-metadata.stderr
+            release-cargo-tree.txt
+            release-diff-check.txt
+            release-status.txt
+            target/release/awh
+            target/release/awh.exe
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Enforce release validation
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.fmt.outcome }}" != "success" ||
+                "${{ steps.check.outcome }}" != "success" ||
+                "${{ steps.test.outcome }}" != "success" ||
+                "${{ steps.release_build.outcome }}" != "success" ||
+                "${{ steps.binary_verify.outcome }}" != "success" ||
+                "${{ steps.boundary.outcome }}" != "success" ]]; then
+            echo "Release validation failed. See uploaded artifacts."
+            exit 1
+          fi
+
+          if [[ "${{ runner.os }}" == "Linux" &&
+                ("${{ steps.clippy.outcome }}" != "success" ||
+                 "${{ steps.audit.outcome }}" != "success") ]]; then
+            echo "Linux release validation failed. See uploaded artifacts."
+            exit 1
+          fi
+
+      - name: Verify read-only repository state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "Release validation modified the repository checkout."
+            git status --short
+            exit 1
+          fi
