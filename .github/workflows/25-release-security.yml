@@ -1,0 +1,202 @@
+name: AWH Release Security Validation
+
+on:
+  pull_request:
+    branches: [rust]
+  workflow_dispatch:
+
+concurrency:
+  group: awh-release-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Security validation is CI-only. It is read-only and must never become an
+# AWH runtime dependency or publish/modify release state.
+permissions:
+  contents: read
+
+jobs:
+  release-security:
+    name: Release Security Validation (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Capture environment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            rustc --version || true
+            cargo --version || true
+          } | tee artifacts/environment.txt
+
+      - name: Verify repository is clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Required Rust formatting check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Required Rust build check
+        shell: bash
+        run: cargo check --all-targets
+
+      - name: Required Rust test suite
+        shell: bash
+        run: cargo test --all-targets
+
+      - name: Required Rust Clippy check
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build locked release
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Audit release package for security-sensitive files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifacts/package
+          mkdir -p artifacts/package
+          cargo package --locked --allow-dirty --no-verify
+          package=$(find target/package -maxdepth 1 -type f -name '*.crate' | head -n 1)
+          test -n "$package"
+          cp "$package" artifacts/package/
+          tar -tzf "$package" | tee artifacts/package/contents.txt
+
+          forbidden='(^|/)(\.env($|\.)|.*\.(pem|key|p12|pfx|jks)$|\.github/workflows/|id_rsa($|\.)|credentials($|\.)|secrets?($|\.))'
+          if tar -tzf "$package" | grep -Ei "$forbidden"; then
+            echo 'Release package contains potentially sensitive or CI-only material.'
+            exit 1
+          fi
+
+      - name: Scan tracked source for obvious secret material
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/security
+          rg -n --hidden --glob '!.git/**' --glob '!target/**' \
+            -e '-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----' \
+            -e 'gh[pousr]_[A-Za-z0-9_]{20,}' \
+            -e 'AIza[0-9A-Za-z_-]{20,}' \
+            -e 'AKIA[0-9A-Z]{16}' \
+            -e 'xox[baprs]-[A-Za-z0-9-]{20,}' \
+            . > artifacts/security/secret-pattern-scan.txt || true
+
+          if [ -s artifacts/security/secret-pattern-scan.txt ]; then
+            echo 'Potential hard-coded secret pattern detected.'
+            cat artifacts/security/secret-pattern-scan.txt
+            exit 1
+          fi
+
+      - name: Audit unsafe Rust usage
+        shell: bash
+        run: |
+          set -euo pipefail
+          rg -n --glob '*.rs' '\bunsafe\b' src > artifacts/security/unsafe-rust.txt || true
+          {
+            echo 'Unsafe Rust inventory:'
+            cat artifacts/security/unsafe-rust.txt 2>/dev/null || true
+          } > artifacts/security/unsafe-rust-report.txt
+
+      - name: Validate dependency lock integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > artifacts/security/cargo-metadata.json
+          cargo tree --locked --all-features > artifacts/security/cargo-tree.txt
+          cargo tree --locked --all-features --edges normal > artifacts/security/cargo-tree-normal.txt
+          sha256sum Cargo.toml Cargo.lock | tee artifacts/security/manifest-sha256.txt
+
+      - name: Check release runtime separation
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='swe-bench|swe-smith|codeclash|swe-rex|mini-swe-agent|swe-agent|sb-cli|openhands|prometheus|opentelemetry|opentelemetry-otlp|grafana|jaeger|datadog|sentry|honeycomb|newrelic|cargo-audit|cargo-deny|gitleaks|semgrep|trivy|cosign|sigstore'
+
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo 'External security/release/agent infrastructure appears in AWH runtime manifests.'
+            grep -Ein "$forbidden" Cargo.toml Cargo.lock || true
+            exit 1
+          fi
+
+          if grep -RniE "$forbidden" src 2>/dev/null; then
+            echo 'External CI/security/release infrastructure reference detected under src/.'
+            exit 1
+          fi
+
+          echo 'Security/release tooling remains external to the AWH runtime.' \
+            | tee artifacts/security/runtime-separation.txt
+
+      - name: Validate security-sensitive repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -Ei '(^|/)(\.env|.*\.(pem|key|p12|pfx|jks))$'; then
+            echo 'Tracked secret-bearing file detected.'
+            exit 1
+          fi
+          git diff --check | tee artifacts/security/git-diff-check.txt
+          git rev-parse HEAD | tee artifacts/security/source-commit.txt
+
+      - name: Record read-only security scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > artifacts/security/release-security-scope.txt <<'EOF'
+          AWH release security validation is read-only CI infrastructure.
+          It audits source, dependencies, package contents, and release artifacts.
+          It does not publish, tag, push, sign, or upload a release.
+          Security scanners and release tooling are not AWH runtime dependencies.
+          EOF
+
+      - name: Collect final diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git status --short > artifacts/final-git-status.txt
+          git diff --check > artifacts/final-diff-check.txt
+          git diff -- . > artifacts/final-tracked-diff.txt
+          cargo metadata --locked --format-version 1 > artifacts/final-cargo-metadata.json 2>&1
+          cargo tree --locked --all-features > artifacts/final-cargo-tree.txt 2>&1
+          sha256sum target/release/awh > artifacts/awh-release-sha256.txt 2>/dev/null || true
+
+      - name: Upload release security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-release-security-validation
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final read-only integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet -- .
+          echo 'Release security validation completed without modifying tracked AWH files.'
