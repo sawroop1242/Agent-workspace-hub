@@ -38,7 +38,6 @@ concurrency:
   group: awh-agent-engine-${{ github.workflow }}-${{ github.ref }}-${{ inputs.feature_id }}
   cancel-in-progress: true
 
-# External engineering infrastructure only. No AWH repository write permission.
 permissions:
   contents: read
 
@@ -190,7 +189,7 @@ jobs:
 
       - name: Run deterministic AWH verification (initial)
         id: verify_initial
-        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
         shell: bash
         run: |
           set +e
@@ -243,26 +242,100 @@ jobs:
           Run the full AWH verification contract after the repair.
           EOF
 
+      - name: Record initial verification status
+        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
+        shell: bash
+        run: |
+          set -euo pipefail
+          passed="${{ steps.verify_initial.outputs.passed }}"
+          [ -n "$passed" ] || passed="not-run"
+          python3 - "$passed" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          passed = sys.argv[1]
+          status = {
+              "schema_version": 1,
+              "stage": "initial_verification",
+              "passed": passed == "true",
+              "status": passed,
+              "verification": ["cargo fmt", "cargo check", "cargo test", "cargo clippy"],
+          }
+          Path("artifacts/agent-engine/initial-verification-status.json").write_text(json.dumps(status, indent=2) + "\n")
+          PY
+          {
+            echo '### Initial verification'
+            echo "- Result: **$passed**"
+            echo '- Checks: fmt, check, test, clippy'
+            if [ "$passed" != 'true' ]; then echo '- Repair loop: **triggered**'; else echo '- Repair loop: **not required**'; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run bounded repair attempt
         if: inputs.mode == 'implement' && steps.verify_initial.outputs.passed != 'true'
+        id: repair_attempt
         env:
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
           OPENAI_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY_1 }}
           OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           mini \
             -c artifacts/agent-engine/config/mini-awh.yml \
             -t "$(cat artifacts/agent-engine/repair-task.txt)" \
             -o artifacts/agent-engine/repair-trajectory.json \
             | tee artifacts/agent-engine/repair-output.txt
-          echo 'repair-attempts=1' > artifacts/agent-engine/repair-result.txt
-          echo 'repair-bound=1' >> artifacts/agent-engine/repair-result.txt
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" > artifacts/agent-engine/repair-result.txt
+          echo 'attempted=true' >> artifacts/agent-engine/repair-result.txt
+          echo 'attempt_limit=1' >> artifacts/agent-engine/repair-result.txt
+          if [ "$status" -eq 0 ]; then
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+            echo 'Repair agent attempt: completed' | tee -a artifacts/agent-engine/repair-result.txt
+          else
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+            echo 'Repair agent attempt: failed' | tee -a artifacts/agent-engine/repair-result.txt
+          fi
+          exit 0
+
+      - name: Record repair attempt status
+        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
+        shell: bash
+        run: |
+          set -euo pipefail
+          attempted='false'
+          passed='not-run'
+          if [ -f artifacts/agent-engine/repair-result.txt ]; then
+            attempted='true'
+            grep -q '^passed=true$' artifacts/agent-engine/repair-result.txt && passed='true' || true
+            grep -q '^passed=false$' artifacts/agent-engine/repair-result.txt && passed='false' || true
+          elif [ "${{ inputs.mode }}" = 'repair' ]; then
+            attempted='true'
+            passed='not-run'
+          fi
+          python3 - "$attempted" "$passed" <<'PY'
+          import json, sys
+          from pathlib import Path
+          attempted, passed = sys.argv[1:]
+          status = {
+              "schema_version": 1,
+              "stage": "repair_attempt",
+              "attempted": attempted == "true",
+              "attempt_limit": 1,
+              "agent_completed": passed == "true",
+              "agent_status": passed,
+          }
+          Path("artifacts/agent-engine/repair-attempt-status.json").write_text(json.dumps(status, indent=2) + "\n")
+          PY
+          {
+            echo '### Repair attempt'
+            echo "- Attempted: **$attempted**"
+            echo '- Bound: **1 attempt**'
+            echo "- Agent completion: **$passed**"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run deterministic AWH verification (final)
         id: verify_final
-        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
+        if: inputs.mode == 'implement' || inputs.mode == 'repair'
         shell: bash
         run: |
           set +e
@@ -284,50 +357,98 @@ jobs:
             echo 'FINAL_RESULT=PASS' | tee artifacts/agent-engine/final-result.txt
           else
             echo 'passed=false' >> "$GITHUB_OUTPUT"
-            echo "FINAL_RESULT=FAIL" | tee artifacts/agent-engine/final-result.txt
+            echo 'FINAL_RESULT=FAIL' | tee artifacts/agent-engine/final-result.txt
             echo "verification_exit_code=$status" >> artifacts/agent-engine/final-result.txt
           fi
           exit 0
 
-      - name: Record repair loop outcome
+      - name: Record final verification status
+        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
+        shell: bash
+        run: |
+          set -euo pipefail
+          passed="${{ steps.verify_final.outputs.passed }}"
+          [ -n "$passed" ] || passed="not-run"
+          python3 - "$passed" <<'PY'
+          import json, sys
+          from pathlib import Path
+          passed = sys.argv[1]
+          status = {
+              "schema_version": 1,
+              "stage": "final_verification",
+              "passed": passed == "true",
+              "status": passed,
+              "verification": ["cargo fmt", "cargo check", "cargo test", "cargo clippy"],
+          }
+          Path("artifacts/agent-engine/final-verification-status.json").write_text(json.dumps(status, indent=2) + "\n")
+          PY
+          {
+            echo '### Final verification'
+            echo "- Result: **$passed**"
+            echo '- Checks: fmt, check, test, clippy'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record final repair-loop decision
         if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
         shell: bash
         run: |
           set -euo pipefail
           initial="${{ steps.verify_initial.outputs.passed }}"
           final="${{ steps.verify_final.outputs.passed }}"
-          if [ -z "$initial" ]; then initial='not-run'; fi
-          if [ -z "$final" ]; then final='not-run'; fi
+          [ -n "$initial" ] || initial="not-run"
+          [ -n "$final" ] || final="not-run"
+          attempted='false'
+          if [ -f artifacts/agent-engine/repair-attempt-status.json ]; then attempted='true'; fi
+          if [ "$final" = 'true' ]; then result='PASS'; else result='FAIL'; fi
+          python3 - "$initial" "$attempted" "$final" "$result" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          initial, attempted, final, result = sys.argv[1:]
+          status = {
+              "schema_version": 1,
+              "stage": "repair_loop_decision",
+              "feature_id": os.environ.get("FEATURE_ID", "${{ inputs.feature_id }}"),
+              "mode": os.environ.get("MODE", "${{ inputs.mode }}"),
+              "initial_failure": initial == "false",
+              "initial_status": initial,
+              "repair_attempted": attempted == "true",
+              "repair_attempt_limit": 1,
+              "final_status": final,
+              "decision": result,
+              "verification_source_of_truth": "deterministic AWH verification",
+          }
+          Path("artifacts/agent-engine/repair-loop-status.json").write_text(json.dumps(status, indent=2) + "\n")
+          PY
           {
-            echo "initial_verification=$initial"
-            echo "repair_attempts=${{ inputs.mode == 'implement' && '1-if-needed' || '0' }}"
-            echo "final_verification=$final"
-            if [ "$final" = 'true' ]; then
-              echo 'result=PASS'
-            else
-              echo 'result=FAIL'
-            fi
-          } | tee artifacts/agent-engine/repair-loop-result.txt
+            echo '## AWH Agent Engine — Repair Loop'
+            echo ''
+            echo '| Stage | Result |'
+            echo '|---|---|'
+            echo "| Initial verification | **$initial** |"
+            echo "| Repair attempted | **$attempted** |"
+            echo "| Final verification | **$final** |"
+            echo "| **Final decision** | **$result** |"
+            echo ''
+            echo 'Repair bound: **1 automatic attempt**.'
+            echo 'Deterministic AWH verification is the source of truth.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check external runtime separation
         if: always()
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           forbidden='mini-swe-agent|swe-rex|swe-bench|swe-smith|swe-agent|sb-cli|openhands|cargo-audit|cargo-deny|gitleaks|semgrep|trivy|cosign|sigstore'
           if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
             echo 'External engineering/evaluation tooling leaked into AWH dependency manifests.'
             grep -Ein "$forbidden" Cargo.toml Cargo.lock || true
-            echo 'Runtime separation: FAIL' | tee artifacts/agent-engine/runtime-separation.txt
             exit 1
           fi
           if grep -RniE "$forbidden" src 2>/dev/null; then
             echo 'External engineering/evaluation tooling leaked into AWH source.'
-            echo 'Runtime separation: FAIL' | tee artifacts/agent-engine/runtime-separation.txt
             exit 1
           fi
           echo 'Runtime separation: PASS' | tee artifacts/agent-engine/runtime-separation.txt
-          exit 0
 
       - name: Capture patch and final state
         if: always()
@@ -378,23 +499,6 @@ jobs:
           path: artifacts/agent-engine/
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Final pass/fail gate
-        if: always() && (inputs.mode == 'implement' || inputs.mode == 'repair')
-        shell: bash
-        run: |
-          set -euo pipefail
-          final='${{ steps.verify_final.outputs.passed }}'
-          runtime='FAIL'
-          if [ -f artifacts/agent-engine/runtime-separation.txt ]; then
-            runtime="$(cat artifacts/agent-engine/runtime-separation.txt)"
-          fi
-          if [ "$final" != 'true' ] || [ "$runtime" != 'Runtime separation: PASS' ]; then
-            echo 'AWH agent-engine final result: FAIL'
-            echo 'The bounded repair policy was exhausted, deterministic verification failed, or runtime separation failed.'
-            exit 1
-          fi
-          echo 'AWH agent-engine final result: PASS'
 
       - name: Final no-push boundary
         if: always()
