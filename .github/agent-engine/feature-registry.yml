@@ -1,0 +1,119 @@
+version: 1
+product: agent-workspace-hub
+base_branch: rust
+source_of_truth:
+  roadmap: docs/PROJECT_ROADMAP.md
+  status: docs/PROJECT_ROADMAP_STATUS.md
+  verification: .github/agent/verification.md
+
+# External agent infrastructure must not become AWH runtime dependencies.
+runtime_boundary:
+  external_only:
+    - mini-swe-agent
+    - SWE-ReX
+    - SWE-bench
+    - SWE-smith
+
+features:
+  - id: workspace.agent-grade-editing
+    phase: 2
+    priority: P0
+    status: incomplete
+    description: Controlled line-wise and diff-based editing integrated with verification, snapshots, provenance and audit.
+    depends_on: [workspace.filesystem, snapshots.provenance]
+    interfaces: [mcp, cli]
+    verification: [rust, integration, security]
+
+  - id: git.first-class-worktrees
+    phase: 3
+    priority: P0
+    status: incomplete
+    description: AWH-managed isolated worktree lifecycle linked to agent, session, workspace and branch.
+    depends_on: [git.service, sessions.agent-management]
+    interfaces: [mcp, cli, tui]
+    verification: [rust, integration, cross-platform]
+
+  - id: capabilities.unified-enforcement
+    phase: 4
+    priority: P0
+    status: incomplete
+    description: One capability and policy decision path across filesystem, Git, process, network, MCP and secrets.
+    depends_on: [sessions.agent-management]
+    interfaces: [mcp, cli, control-api]
+    verification: [rust, security, integration]
+
+  - id: provenance.unified-runtime
+    phase: 5
+    priority: P1
+    status: incomplete
+    description: Connect agent/session/workspace/worktree/tool/capability/snapshot/Git/audit state into one provenance model.
+    depends_on: [snapshots.provenance, audit.observability, capabilities.unified-enforcement]
+    interfaces: [mcp, cli, tui, control-api]
+    verification: [rust, integration, security]
+
+  - id: tui.runtime-control-center
+    phase: 11
+    priority: P1
+    status: incomplete
+    description: Make the TUI a live control center over the unified AWH runtime state.
+    depends_on: [provenance.unified-runtime]
+    interfaces: [tui]
+    verification: [rust, integration]
+
+  - id: collaboration.multi-agent
+    phase: 12
+    priority: P2
+    status: incomplete
+    description: Agent handoff, ownership, conflict detection, isolated worktrees and merge events.
+    depends_on: [git.first-class-worktrees, provenance.unified-runtime]
+    interfaces: [mcp, cli, tui, control-api]
+    verification: [rust, integration, security]
+
+  - id: control-api.contract-hardening
+    phase: 13
+    priority: P2
+    status: incomplete
+    description: Stabilize Control API contracts, scoped authorization, domain APIs and event streaming.
+    depends_on: [capabilities.unified-enforcement, provenance.unified-runtime]
+    interfaces: [control-api]
+    verification: [rust, integration, security]
+
+  - id: remote.secure-operations
+    phase: 14
+    priority: P2
+    status: incomplete
+    description: Complete secure remote workspace/session operations, synchronization, recovery and audit/control experience.
+    depends_on: [control-api.contract-hardening, provenance.unified-runtime]
+    interfaces: [control-api, mcp, tui]
+    verification: [rust, integration, security, cross-platform]
+
+  - id: ecosystem.client-verification
+    phase: 15
+    priority: P2
+    status: incomplete
+    description: Verify interoperability with external coding agents and MCP clients without making them runtime dependencies.
+    depends_on: [capabilities.unified-enforcement, control-api.contract-hardening]
+    interfaces: [mcp]
+    verification: [integration, compatibility]
+
+  - id: advanced.sandbox-adapters
+    phase: 16
+    priority: P2
+    status: incomplete
+    description: Demand-driven Docker/WASM/platform sandbox adapters, advanced secrets, remote execution and enterprise controls.
+    depends_on: [capabilities.unified-enforcement, remote.secure-operations]
+    interfaces: [mcp, cli, control-api]
+    verification: [security, integration, cross-platform]
+
+# The agent must never reinterpret benchmark results as product requirements.
+evaluation:
+  deterministic_gate:
+    - cargo fmt --all -- --check
+    - cargo check --all-targets
+    - cargo test --all-targets
+    - cargo clippy --all-targets --all-features -- -D warnings
+  optional_security:
+    - cargo audit
+  external:
+    - SWE-bench
+    - SWE-smith
