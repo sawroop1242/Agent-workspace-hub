@@ -64,7 +64,7 @@ issue:
   github_issue: 22
   title: "<current title>"
   issue_state: "OPEN"              # OPEN | CLOSED
-  tracking_state: "OPEN"           # see state enum below
+  tracking_state: "OPEN"
 
 implementation:
   status: "NOT_STARTED"             # NOT_STARTED | PARTIAL | IMPLEMENTED | IMPLEMENTED_UNVALIDATED | VERIFIED
@@ -93,7 +93,7 @@ verification:
   manual_verification: []
 
 pull_request:
-  status: "NONE"                   # NONE | OPEN | DRAFT | CHANGES_REQUESTED | APPROVED | MERGED | CLOSED_NOT_MERGED
+  status: "NONE"
   number: null
   title: null
   head_branch: null
@@ -112,7 +112,7 @@ relationships:
   blocked_by: []
 
 blockers:
-  status: "NONE"                   # NONE | BLOCKED
+  status: "NONE"
   items: []
 
 next_implementation_unit:
@@ -158,7 +158,7 @@ Meaning:
 - `VERIFIED` — acceptance criteria and required verification evidence are satisfied.
 - `MERGED` — verified implementation is integrated into the tracked branch with merge evidence.
 - `BLOCKED` — progress cannot safely continue because a concrete blocker exists.
-- `SUPERSEDED` — issue no longer represents the current implementation path; record the replacement/evidence in `notes`.
+- `SUPERSEDED` — issue no longer represents the current implementation path.
 
 Important distinctions:
 
@@ -173,7 +173,32 @@ issue closed    != proof that current branch still satisfies it
 
 ---
 
-# 5. Implementation commit tracking
+# 5. Current AWE-001 through AWE-008 status
+
+The following is the **current tracking snapshot**, not a permanent truth. It records the GitHub issue state known at the time this prompt was updated and must be revalidated during every tracking cycle.
+
+| Issue | GitHub Issue | Issue State | Implementation Status | Verification Status | Blockers | Next Implementation Unit |
+|---|---:|---|---|---|---|---|
+| AWE-001 | #22 | **CLOSED** | **IMPLEMENTED** | **VERIFIED / reconcile against current branch** | None recorded | No — complete; continue dependency graph |
+| AWE-002 | #23 | **CLOSED** | **IMPLEMENTED** | **VERIFIED / reconcile against current branch** | None recorded | No — complete; continue dependency graph |
+| AWE-003 | #24 | **CLOSED** | **IMPLEMENTED** | **VERIFIED / reconcile against current branch** | None recorded | No — complete; continue dependency graph |
+| AWE-004 | #25 | **CLOSED** | **IMPLEMENTED** | **VERIFIED / reconcile against current branch** | None recorded | No — complete; continue dependency graph |
+| AWE-005 | #26 | **CLOSED** | **IMPLEMENTED** | **VERIFIED / reconcile against current branch** | None recorded | No — complete; continue dependency graph |
+| AWE-006 | #27 | **CLOSED** | **IMPLEMENTED** | **VERIFIED / reconcile against current branch** | None recorded | No — complete; continue dependency graph |
+| AWE-007 | #28 | **OPEN** | **OPEN / remaining implementation** | **NOT VERIFIED** | None recorded; issue remains actionable | **YES — AWE-007 stale-state/edit conflict detection** |
+| AWE-008 | #29 | **CLOSED** | **IMPLEMENTED** | **VERIFIED / reconcile against current branch** | None recorded | No — complete; continue dependency graph |
+
+### Current sequencing interpretation
+
+AWE-007 is the **active unresolved implementation unit** in the AWE-001..AWE-008 range. GitHub currently reports #28 as open, while #22, #23, #25, #26, #27, and #29 are closed; AWE-003/#24 is also tracked as closed. fileciteturn314file0L3-L7 fileciteturn315file0L3-L7 fileciteturn317file0L3-L7 fileciteturn318file0L3-L7 fileciteturn319file0L3-L7 fileciteturn320file0L3-L7 fileciteturn321file0L3-L7
+
+AWE-007 depends on AWE-002 and AWE-004, with AWE-006 required to preserve the invariant during commit/rollback. Its core invariant is `expected_state != current_state → conflict → zero mutation`. fileciteturn320file0L6-L7
+
+**Do not infer that AWE-008 being closed makes AWE-007 complete.** Issue state and implementation state remain separate tracking dimensions.
+
+---
+
+# 6. Implementation commit tracking
 
 Once implementation exists, record:
 
@@ -192,7 +217,7 @@ If multiple commits form the implementation, record the complete relevant commit
 
 ---
 
-# 6. Acceptance-criteria tracking
+# 7. Acceptance-criteria tracking
 
 Every issue record must separate:
 
@@ -213,20 +238,11 @@ Never mark an issue `VERIFIED` while required acceptance criteria remain unresol
 
 ---
 
-# 7. Test tracking
+# 8. Test tracking
 
 Tests are tracked independently from CI.
 
-Record:
-
-```text
-exact command
-relevant test target
-passed tests
-failed tests
-skipped tests and reason
-platform/environment limitation
-```
+Record exact commands, relevant targets, passed tests, failed tests, skipped tests and reasons, and platform/environment limitations.
 
 A successful test command proves only what that command actually exercised.
 
@@ -234,7 +250,7 @@ For implementation work, missing or failing required behavioral tests prevents `
 
 ---
 
-# 8. PR tracking
+# 9. PR tracking
 
 Track the PR independently from implementation state:
 
@@ -267,7 +283,7 @@ Never infer implementation completion merely from PR creation or approval.
 
 ---
 
-# 9. CI tracking
+# 10. CI tracking
 
 CI is separate from local tests.
 
@@ -286,7 +302,7 @@ If CI fails because of infrastructure, record the failure and documented cause r
 
 ---
 
-# 10. Merge tracking
+# 11. Merge tracking
 
 Merge is an explicit tracking dimension:
 
@@ -303,7 +319,7 @@ A feature is `MERGED` only when the implementation is present on the tracked bra
 
 ---
 
-# 11. Dependency schema
+# 12. Dependency schema
 
 Every issue must record:
 
@@ -314,33 +330,13 @@ blocking_dependencies: []
 blocked_by: []
 ```
 
-Dependencies can be:
-
-- another AWE issue;
-- a security prerequisite;
-- an architecture prerequisite;
-- a required source/API contract;
-- an explicitly documented external capability.
-
-Example:
-
-```yaml
-dependencies:
-  - "AWE-002"
-  - "AWE-003"
-satisfied_dependencies:
-  - "AWE-002"
-blocking_dependencies: 
-  - "AWE-003"
-blocked_by:
-  - "AWE-003"
-```
+Dependencies can be another AWE issue, a security prerequisite, an architecture prerequisite, a required source/API contract, or an explicitly documented external capability.
 
 Do not mark a dependency satisfied merely because its GitHub issue is closed. Verify the implementation evidence required by the dependent issue.
 
 ---
 
-# 12. Blocker schema
+# 13. Blocker schema
 
 Every blocker must be concrete and actionable:
 
@@ -349,7 +345,7 @@ blockers:
   status: "BLOCKED"
   items:
     - id: "BLOCKER-001"
-      type: "DEPENDENCY"          # DEPENDENCY | CODE | TEST | CI | PR | ENVIRONMENT | SECURITY | ARCHITECTURE | UNKNOWN
+      type: "DEPENDENCY"
       description: "<precise blocker>"
       evidence: "<issue/commit/PR/test/CI reference>"
       blocking_since: "<date or commit>"
@@ -362,41 +358,28 @@ A blocker is cleared only when its resolution condition is demonstrated by curre
 
 ---
 
-# 13. Next implementation unit schema
+# 14. Next implementation unit schema
 
 The tracker MUST identify the next actionable AWE implementation unit whenever one exists:
 
 ```yaml
 next_implementation_unit:
-  id: "AWE-004"
-  description: "<smallest coherent remaining implementation scope>"
-  reason: "AWE-002 and AWE-003 are verified and AWE-004 remains unresolved."
+  id: "AWE-007"
+  description: "Implement stale-state and edit conflict detection."
+  reason: "AWE-007/#28 is the unresolved issue in the AWE-001..AWE-008 sequence; its declared dependencies are already closed."
   prerequisites:
     - "AWE-002"
-    - "AWE-003"
+    - "AWE-004"
+    - "AWE-006"
 ```
 
-The next unit must be:
+The next unit must be unresolved, dependency-ready, backed by a current issue/prompt or explicit repository requirement, and small enough to implement and verify coherently.
 
-1. unresolved;
-2. dependency-ready;
-3. backed by a current issue/prompt or explicit repository requirement;
-4. small enough to implement and verify coherently;
-5. selected from current repository evidence rather than stale roadmap assumptions.
-
-If no safe next unit exists:
-
-```yaml
-next_implementation_unit:
-  id: null
-  description: null
-  reason: "No dependency-ready unresolved AWE implementation unit exists."
-  prerequisites: []
-```
+If no safe next unit exists, use `id: null` and explicitly explain why.
 
 ---
 
-# 14. Current AWE dependency model
+# 15. Current AWE dependency model
 
 The known implementation ordering is:
 
@@ -446,100 +429,27 @@ AWE-019 is roadmap/status/strategic analysis and must never become an umbrella i
 
 ---
 
-# 15. Sequential tracking procedure
+# 16. Sequential tracking procedure
 
 For every tracking cycle:
 
-### Step 1 — Inspect current repository state
-
-Record:
-
-```text
-tracked branch
-HEAD SHA
-current relevant commits
-current tests
-current documentation
-```
-
-### Step 2 — Inspect GitHub state
-
-For `AWE-001..AWE-019`, record:
-
-```text
-issue state
-acceptance criteria
-open/closed PRs
-review state
-CI/check state
-merge state
-```
-
-### Step 3 — Reconcile implementation
-
-For each issue compare:
-
-```text
-issue
-→ prompt
-→ acceptance criteria
-→ source
-→ tests
-→ implementation commit
-→ PR
-→ CI
-→ merge
-```
-
-### Step 4 — Populate every schema dimension
-
-Every field must be:
-
-- populated with evidence;
-- explicitly `null`/empty because it does not exist; or
-- `UNKNOWN` when evidence cannot be obtained.
-
-Never silently omit a status dimension.
-
-### Step 5 — Recalculate dependencies
-
-Mark each dependency as satisfied, blocking, or informational using current evidence.
-
-### Step 6 — Recalculate blockers
-
-Do not leave stale blockers after their resolution condition is satisfied.
-
-### Step 7 — Recalculate next implementation unit
-
-Select the earliest dependency-ready unresolved AWE implementation unit. If the earliest candidate is blocked, select another only when the dependency graph permits independent progress.
-
-### Step 8 — Update after material events
-
-Material events include:
-
-```text
-implementation commit
-new test evidence
-CI completion
-PR creation
-review decision
-PR update
-merge
-issue closure/reopening
-blocker resolution
-new dependency discovery
-```
+1. Inspect the tracked branch and HEAD.
+2. Inspect GitHub state for AWE-001..AWE-019.
+3. Reconcile each issue against prompt, acceptance criteria, source, tests, implementation commits, PRs, CI, and merge state.
+4. Populate every schema dimension; use `null`, empty, or `UNKNOWN` when evidence is unavailable.
+5. Recalculate dependencies and blockers.
+6. Recalculate the next implementation unit.
+7. Update the record after implementation commits, test evidence, CI completion, PR creation/update/review, merge, issue closure/reopening, blocker resolution, or dependency discovery.
 
 ---
 
-# 16. False-completion prevention
+# 17. False-completion prevention
 
 Never mark an AWE issue complete because:
 
 - its prompt exists;
 - an agent says `done`;
-- a PR was opened;
-- a PR was approved;
+- a PR was opened or approved;
 - a commit exists without verification;
 - tests were added but not run;
 - one local test passed while required acceptance criteria remain untested;
@@ -551,18 +461,9 @@ Completion must be backed by current evidence.
 
 ---
 
-# 17. Stale-tracking prevention
+# 18. Stale-tracking prevention
 
-Do not permanently encode claims such as:
-
-```text
-0/19 complete
-AWE-001 is open
-AWE-002 is next
-AWE-019 means all implementation is complete
-```
-
-unless they are freshly verified.
+Do not permanently encode claims such as `0/19 complete`, `AWE-001 is open`, or `AWE-002 is next` unless freshly verified.
 
 The tracker must be rerunnable after commits, merges, issue changes, CI changes, dependency changes, architecture changes, or discovery of pre-existing implementations.
 
@@ -570,7 +471,7 @@ Historical status may be retained only when explicitly labeled historical.
 
 ---
 
-# 18. Final tracking report
+# 19. Final tracking report
 
 A tracking cycle should produce:
 
@@ -606,16 +507,9 @@ The table is a reporting view. The canonical source is the complete per-issue tr
 
 ---
 
-# 19. Separation from development-agent orchestration
+# 20. Separation from development-agent orchestration
 
-This document does **not** define:
-
-- OpenHands Agent 1/2/3 behavior;
-- planner/worker/reviewer prompts;
-- model/provider selection;
-- autonomous agent loops;
-- GitHub Actions implementation details;
-- AWH runtime agent behavior.
+This document does **not** define OpenHands Agent 1/2/3 behavior, planner/worker/reviewer prompts, model/provider selection, autonomous agent loops, GitHub Actions implementation details, or AWH runtime agent behavior.
 
 Its only development-automation responsibility is to expose accurate AWE implementation state that another system may consume.
 
@@ -637,7 +531,7 @@ These are separate concerns.
 
 ---
 
-# 20. Hard rules
+# 21. Hard rules
 
 1. **Track evidence, not intentions.**
 2. **Separate issue state from implementation state.**
@@ -657,7 +551,7 @@ These are separate concerns.
 
 ---
 
-# 21. Definition of a complete tracking record
+# 22. Definition of a complete tracking record
 
 A complete record means the current state is accurately documented, not necessarily that the issue is complete.
 
