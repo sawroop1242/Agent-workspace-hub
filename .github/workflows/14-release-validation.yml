@@ -1,0 +1,156 @@
+name: AWH Release Validation
+
+on:
+  pull_request:
+    branches: [rust]
+  workflow_dispatch:
+
+concurrency:
+  group: awh-release-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Release validation is external CI infrastructure. It must not publish,
+# tag, push, or become a dependency of the AWH runtime.
+permissions:
+  contents: read
+
+jobs:
+  release-validation:
+    name: Release Validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Capture release environment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts
+          {
+            echo '# AWH release validation environment'
+            echo "OS=${RUNNER_OS}"
+            echo "ARCH=${RUNNER_ARCH}"
+            echo "REF=${GITHUB_REF}"
+            echo "SHA=${GITHUB_SHA}"
+            rustc --version || true
+            cargo --version || true
+          } | tee artifacts/environment.txt
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify repository is clean before validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Required Rust formatting check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Required Rust build check
+        shell: bash
+        run: cargo check --all-targets
+
+      - name: Required Rust test suite
+        shell: bash
+        run: cargo test --all-targets
+
+      - name: Required Rust Clippy check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Validate locked release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+
+      - name: Validate AWH release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=./target/release/awh
+          test -x "$binary"
+          "$binary" --version | tee artifacts/awh-version.txt
+          "$binary" --help > artifacts/awh-help.txt
+          "$binary" status | tee artifacts/awh-status.txt
+          test -s artifacts/awh-version.txt
+          test -s artifacts/awh-help.txt
+          test -s artifacts/awh-status.txt
+
+      - name: Validate package metadata and lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 > artifacts/cargo-metadata.json
+          cargo tree --all-features > artifacts/cargo-tree.txt
+          cargo package --allow-dirty --no-verify --list > artifacts/package-files.txt
+
+      - name: Verify runtime dependency separation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -Eiq '(swe-bench|swe-smith|codeclash|swe-rex|mini-swe-agent|swe-agent|sb-cli|openhands)' Cargo.toml Cargo.lock; then
+            echo 'Forbidden external agent/benchmark dependency detected in AWH runtime manifests.'
+            exit 1
+          fi
+          # Release validation must not publish, tag, push, or alter tracked files.
+          git diff --quiet -- .
+
+      - name: Collect release diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git status --short > artifacts/git-status.txt
+          git diff --check > artifacts/diff-check.txt
+          git diff -- . > artifacts/tracked-diff.txt
+          find target/release -maxdepth 2 -type f -name 'awh*' -printf '%p %s bytes\n' \
+            > artifacts/release-binaries.txt 2>/dev/null || true
+          du -sh target/release 2>/dev/null > artifacts/release-directory-size.txt || true
+
+      - name: Upload release artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-release-validation-${{ runner.os }}-${{ runner.arch }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final read-only integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet -- .
+          echo 'Release validation completed without modifying tracked AWH files.'
+
+  release-gate:
+    name: Release Validation Gate
+    if: always()
+    needs: [release-validation]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Enforce platform matrix result
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.release-validation.result }}" != "success" ]]; then
+            echo 'One or more AWH release validations failed.'
+            exit 1
+          fi
+          echo 'All AWH release validations passed.'
