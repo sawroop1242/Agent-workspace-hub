@@ -1,0 +1,167 @@
+name: AWH Observability Validation
+
+on:
+  pull_request:
+    branches: [rust]
+  workflow_dispatch:
+
+concurrency:
+  group: awh-observability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Observability validation is external CI infrastructure. It is read-only and
+# must never become an AWH runtime dependency or modify repository state.
+permissions:
+  contents: read
+
+jobs:
+  observability:
+    name: Observability Validation (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Capture observability environment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts
+          {
+            echo '# AWH observability validation environment'
+            echo "OS=${RUNNER_OS}"
+            echo "ARCH=${RUNNER_ARCH}"
+            echo "REF=${GITHUB_REF}"
+            echo "SHA=${GITHUB_SHA}"
+            rustc --version || true
+            cargo --version || true
+          } | tee artifacts/environment.txt
+
+      - name: Verify repository is clean before validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Required Rust formatting check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Required Rust build check
+        shell: bash
+        run: cargo check --all-targets
+
+      - name: Required Rust test suite
+        shell: bash
+        run: cargo test --all-targets
+
+      - name: Required Rust Clippy check
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Validate locked release build
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Validate AWH runtime observability surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/awh --version | tee artifacts/awh-version.txt
+          ./target/release/awh --help > artifacts/awh-help.txt
+          ./target/release/awh status | tee artifacts/awh-status.txt
+
+          # Record observable source/configuration surfaces without modifying
+          # AWH runtime state.
+          rg -n --glob '*.rs' \
+            '(tracing|tracing_subscriber|log::|println!|eprintln!|stderr|stdout|error!|warn!|info!|debug!|trace!)' \
+            src tests 2>/dev/null > artifacts/observability-source-inventory.txt || true
+
+      - name: Validate observability documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > artifacts/observability-documents.txt
+          for file in docs/development.md docs/security.md docs/error.md docs/PROJECT_CONTEXT.md; do
+            if [[ ! -f "$file" ]]; then
+              echo "Required observability/context document missing: $file"
+              exit 1
+            fi
+            printf '%s\n' "$file" >> artifacts/observability-documents.txt
+          done
+
+          rg -ni '(log|logging|tracing|observability|error|diagnostic|telemetry)' \
+            docs/development.md docs/security.md docs/error.md docs/PROJECT_CONTEXT.md \
+            > artifacts/observability-doc-references.txt || true
+
+      - name: Validate dependency and runtime boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 > artifacts/cargo-metadata.json
+          cargo tree --all-features > artifacts/cargo-tree.txt
+
+          # CI/observability helpers remain external tooling and are forbidden
+          # from entering the AWH runtime dependency graph.
+          forbidden='prometheus|opentelemetry|opentelemetry-otlp|grafana|jaeger|datadog|sentry|honeycomb|newrelic|swe-bench|swe-smith|codeclash|swe-rex|mini-swe-agent|swe-agent|sb-cli|openhands|gitleaks|semgrep|trivy'
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo 'External observability/CI tooling detected in AWH runtime manifests.'
+            grep -Ein "$forbidden" Cargo.toml Cargo.lock || true
+            exit 1
+          fi
+
+      - name: Validate diagnostics are not leaking secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > artifacts/diagnostic-secret-scan.txt
+          rg -n --hidden \
+            --glob '!target/**' \
+            --glob '!.git/**' \
+            --glob '!*.lock' \
+            '(BEGIN (RSA|OPENSSH|EC|DSA|PRIVATE) KEY|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})' \
+            artifacts/ > artifacts/diagnostic-secret-scan.txt || true
+          if [[ -s artifacts/diagnostic-secret-scan.txt ]]; then
+            echo 'Potential secret material detected in collected diagnostics.'
+            cat artifacts/diagnostic-secret-scan.txt
+            exit 1
+          fi
+
+      - name: Collect observability diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git status --short > artifacts/git-status.txt
+          git diff --check > artifacts/diff-check.txt
+          git diff -- . > artifacts/tracked-diff.txt
+          cargo metadata --format-version 1 > artifacts/cargo-metadata-final.json 2>&1
+          cargo tree --all-features > artifacts/cargo-tree-final.txt 2>&1
+          find target -maxdepth 3 -type f -name 'awh*' -printf '%p %s bytes\n' \
+            > artifacts/runtime-artifacts.txt 2>/dev/null || true
+
+      - name: Upload observability artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-observability-validation
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final read-only integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet -- .
+          echo 'Observability validation completed without modifying tracked AWH files.'
