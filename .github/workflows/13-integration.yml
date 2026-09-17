@@ -1,0 +1,161 @@
+name: AWH Integration Validation
+
+on:
+  pull_request:
+    branches: [rust]
+  workflow_dispatch:
+
+concurrency:
+  group: awh-integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Integration validation is external CI infrastructure. It must never become
+# an AWH runtime dependency or modify the repository under test.
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Capture integration environment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts
+          {
+            echo '# AWH integration environment'
+            echo "OS=${RUNNER_OS}"
+            echo "ARCH=${RUNNER_ARCH}"
+            echo "REF=${GITHUB_REF}"
+            echo "SHA=${GITHUB_SHA}"
+            rustc --version || true
+            cargo --version || true
+          } | tee artifacts/environment.txt
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify repository is clean before validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Required Rust formatting check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Required Rust build check
+        shell: bash
+        run: cargo check --all-targets
+
+      - name: Required Rust test suite
+        shell: bash
+        run: cargo test --all-targets
+
+      - name: Required Rust Clippy check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build AWH CLI
+        shell: bash
+        run: cargo build --locked
+
+      - name: CLI integration smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=./target/debug/awh
+          "$binary" --version | tee artifacts/awh-version.txt
+          "$binary" --help > artifacts/awh-help.txt
+          "$binary" status | tee artifacts/awh-status.txt
+          test -s artifacts/awh-version.txt
+          test -s artifacts/awh-help.txt
+          test -s artifacts/awh-status.txt
+
+      - name: MCP stdio integration test
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"github-actions-integration","version":"1.0"}}}' \
+            | ./target/debug/awh mcp serve > artifacts/mcp-initialize.txt
+          test -s artifacts/mcp-initialize.txt
+          grep -q 'agent-workspace-hub' artifacts/mcp-initialize.txt
+
+      - name: Workspace and filesystem integration checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exercise the public CLI surface without changing tracked repository files.
+          ./target/debug/awh --help >/dev/null
+          ./target/debug/awh status >/dev/null
+          cargo metadata --format-version 1 > artifacts/cargo-metadata.json
+          cargo tree --all-features > artifacts/cargo-tree.txt
+
+      - name: Runtime dependency separation check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -Eiq '(swe-bench|swe-smith|codeclash|swe-rex|mini-swe-agent|swe-agent|sb-cli|openhands)' Cargo.toml Cargo.lock; then
+            echo 'Forbidden external agent/benchmark dependency detected in AWH runtime manifests.'
+            exit 1
+          fi
+          git diff --quiet -- .
+
+      - name: Collect integration diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git status --short > artifacts/git-status.txt
+          git diff --check > artifacts/diff-check.txt
+          git diff -- . > artifacts/tracked-diff.txt
+          find target -maxdepth 3 -type f -name 'awh*' -print > artifacts/target-binaries.txt 2>/dev/null || true
+
+      - name: Upload integration artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-integration-${{ runner.os }}-${{ runner.arch }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final read-only integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet -- .
+          echo 'Integration validation completed without modifying tracked AWH files.'
+
+  integration-gate:
+    name: Integration Gate
+    if: always()
+    needs: [integration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Enforce matrix result
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.integration.result }}" != "success" ]]; then
+            echo 'One or more AWH integration platform validations failed.'
+            exit 1
+          fi
+          echo 'All AWH integration platform validations passed.'
