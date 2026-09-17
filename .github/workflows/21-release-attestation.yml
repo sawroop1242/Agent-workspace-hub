@@ -1,0 +1,198 @@
+name: AWH Release Attestation Validation
+
+on:
+  pull_request:
+    branches: [rust]
+  workflow_dispatch:
+
+concurrency:
+  group: awh-release-attestation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Attestation validation is CI-only. This workflow records and verifies
+# release provenance; it does not publish, sign, tag, push, or alter AWH.
+permissions:
+  contents: read
+
+jobs:
+  release-attestation:
+    name: Release Attestation Validation (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Capture attestation environment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts
+          {
+            echo '# AWH release attestation validation environment'
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            rustc --version || true
+            cargo --version || true
+          } | tee artifacts/environment.txt
+
+      - name: Verify repository is clean before validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Required Rust formatting check
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Required Rust build check
+        shell: bash
+        run: cargo check --all-targets
+
+      - name: Required Rust test suite
+        shell: bash
+        run: cargo test --all-targets
+
+      - name: Required Rust Clippy check
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build locked release artifact
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Validate release binary identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/awh
+          target/release/awh --version | tee artifacts/awh-version.txt
+          target/release/awh --help > artifacts/awh-help.txt
+          target/release/awh status > artifacts/awh-status.txt
+          sha256sum target/release/awh | tee artifacts/awh-release-sha256.txt
+
+      - name: Generate release provenance record
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# AWH release provenance'
+            echo "commit=$(git rev-parse HEAD)"
+            echo "ref=${GITHUB_REF}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "target=$(rustc -vV | awk -F': ' '/host:/ {print $2}')"
+          } | tee artifacts/release-provenance.txt
+
+          git rev-parse HEAD > artifacts/source-commit.txt
+          git show --format=fuller --no-patch HEAD > artifacts/source-commit-details.txt
+          git status --short > artifacts/source-status.txt
+          git diff --check > artifacts/source-diff-check.txt
+          sha256sum Cargo.toml Cargo.lock > artifacts/manifest-sha256.txt
+
+      - name: Validate locked dependency and package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > artifacts/cargo-metadata.json
+          cargo tree --locked --all-features > artifacts/cargo-tree.txt
+          cargo package --locked --allow-dirty --no-verify > artifacts/cargo-package.log
+
+      - name: Verify release package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_file="$(find target/package -maxdepth 1 -type f -name '*.crate' -print -quit)"
+          test -n "$package_file"
+          sha256sum "$package_file" | tee artifacts/package-sha256.txt
+          tar -tzf "$package_file" > artifacts/package-contents.txt
+
+          # The package must not contain CI-only infrastructure or credentials.
+          if grep -Eiq '(^|/)(\.github/workflows|\.env|.*\.(pem|key|p12|pfx))' artifacts/package-contents.txt; then
+            echo 'Release package contains forbidden CI/credential material.'
+            grep -Ein '(^|/)(\.github/workflows|\.env|.*\.(pem|key|p12|pfx))' artifacts/package-contents.txt || true
+            exit 1
+          fi
+
+      - name: Enforce external tooling separation
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These are CI-only tools and must never become AWH runtime or release dependencies.
+          forbidden='swe-bench|swe-smith|codeclash|swe-rex|mini-swe-agent|swe-agent|sb-cli|openhands|prometheus|opentelemetry|opentelemetry-otlp|grafana|jaeger|datadog|sentry|honeycomb|newrelic|cargo-audit|cargo-deny|gitleaks|semgrep|trivy|cosign|sigstore'
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo 'Forbidden CI-only tooling detected in AWH runtime manifests.'
+            grep -Ein "$forbidden" Cargo.toml Cargo.lock || true
+            exit 1
+          fi
+
+          if grep -RniE "$forbidden" src 2>/dev/null; then
+            echo 'Forbidden CI-only tooling reference detected under src/. '
+            exit 1
+          fi
+
+          if grep -Eiq "$forbidden" artifacts/cargo-tree.txt artifacts/cargo-metadata.json; then
+            echo 'Forbidden CI-only tooling detected in resolved release metadata.'
+            exit 1
+          fi
+
+      - name: Record attestation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > artifacts/attestation-scope.txt <<'EOF'
+          AWH release attestation validation is read-only CI infrastructure.
+
+          It validates source identity, locked dependencies, Rust checks, release
+          binary identity, package contents, and provenance metadata.
+
+          It does not publish releases, create tags, push commits, sign artifacts,
+          upload attestations to an external service, or add attestation/signing
+          dependencies to the AWH runtime.
+          EOF
+
+      - name: Collect final diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git status --short > artifacts/final-git-status.txt
+          git diff --check > artifacts/final-diff-check.txt
+          git diff -- . > artifacts/final-tracked-diff.txt
+          cargo metadata --locked --format-version 1 > artifacts/final-cargo-metadata.json 2>&1
+          cargo tree --locked --all-features > artifacts/final-cargo-tree.txt 2>&1
+
+      - name: Upload release attestation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-release-attestation-validation
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Final read-only integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet -- .
+          echo 'Release attestation validation completed without modifying tracked AWH files.'
