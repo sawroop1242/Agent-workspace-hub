@@ -54,3 +54,40 @@ jobs:
       # (unmaintained/yanked transitive crates) are surfaced but non-blocking.
       - run: cargo install --locked cargo-audit
       - run: cargo audit
+  ai-review:
+    name: Deep AI Code Review (GLM-5.3 via NVIDIA NIM)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [fmt, clippy, audit]
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      # Step 1: Load the custom prompt file into the environment
+      - name: Load Custom Review Prompt
+        id: load-prompt
+        run: |
+          # Read file content and safely escape it for GitHub Actions Environment Multiline Strings
+          EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          echo "CUSTOM_PROMPT<<$EOF" >> $GITHUB_ENV
+          cat .github/agent/prompts/review.md >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "$EOF" >> $GITHUB_ENV
+
+      # Step 2: Feed the custom prompt string into Junie
+      - name: Run Junie Code Review
+        uses: JetBrains/junie-github-action@v1.7.11
+        with:
+          openai_api_key: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
+          model: "glm-5.3"
+          # Dynamically inject the custom prompt loaded from your repository file
+          prompt: ${{ env.CUSTOM_PROMPT }}
+        env:
+          JUNIE_OPENAI_BASE_URL: "https://integrate.api.nvidia.com/v1
+"
