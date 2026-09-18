@@ -58,7 +58,7 @@ jobs:
     name: Deep AI Code Review (GLM-5.3 via NVIDIA NIM)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    needs: [fmt, clippy, audit]
+    needs: [fmt]
     permissions:
       contents: read
       pull-requests: write
