@@ -89,5 +89,4 @@ jobs:
           # Dynamically inject the custom prompt loaded from your repository file
           prompt: ${{ env.CUSTOM_PROMPT }}
         env:
-          JUNIE_OPENAI_BASE_URL: "https://integrate.api.nvidia.com/v1
-"
+          JUNIE_OPENAI_BASE_URL: "https://integrate.api.nvidia.com/v1"
