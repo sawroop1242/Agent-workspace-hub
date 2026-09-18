@@ -21,6 +21,7 @@ use crate::mcp::{
     BUILTIN_TOOL_TRUST_ID, MAX_TRACKED_TOOLS,
 };
 use crate::mcp::{permissions, tool_broker::RESOURCE_SCOPED_TOOLS, tool_registry};
+use crate::services::edit::{EditOperation, EditService, EditTransaction};
 use crate::services::git::GitService;
 use crate::services::terminal::TerminalService;
 use anyhow::{bail, Result};
@@ -420,6 +421,9 @@ pub struct McpDispatcher {
     context_engine: Option<Arc<ContextEngine>>,
     github: Option<Arc<GithubProvider>>,
     providers: Arc<RwLock<ProviderRegistry>>,
+    /// Canonical edit service powering `filesystem.*` mutation tools
+    /// (AWE-009).
+    edit_service: Arc<EditService>,
     /// Observer-only lifecycle hooks (see [`McpHooks`]).
     hooks: Arc<McpHooks>,
     /// Bounded per-tool call metrics (observability, never a gate).
@@ -582,6 +586,7 @@ impl McpDispatcher {
             workspace: Arc::new(WorkspaceMcp::new(project_root.clone())?),
             memory: Arc::new(MemoryMcp::new(project_root.clone())?),
             tasks: Arc::new(TasksMcp::new(project_root.clone())?),
+            edit_service: Arc::new(EditService::new(project_root.clone())),
             connectors: Arc::new(ConnectorsMcp::new(project_root)?),
             context_engine,
             github,
@@ -1578,6 +1583,128 @@ impl McpDispatcher {
                 let path = strval(&arguments, "path")?;
                 audit_allow("workspace_delete", &path, "");
                 json!({"deleted": self.workspace.delete_file(&path)?})
+            }
+            // ---- filesystem.* editing tools (AWE-009) ----
+            "filesystem.replace" => {
+                self.authorize_tool("filesystem.replace", &arguments)?;
+                let path = strval(&arguments, "path")?;
+                let old = strval(&arguments, "old")?;
+                let new = strval(&arguments, "new")?;
+                audit_allow("workspace_edit", "replace", &path);
+                let mut tx = EditTransaction::single(EditOperation::Replace {
+                    path: path.clone(),
+                    old,
+                    new,
+                    occurrence: arguments
+                        .get("occurrence")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as usize),
+                });
+                serde_json::to_value(self.edit_service.replace(tx)?)?
+            }
+            "filesystem.insert" => {
+                self.authorize_tool("filesystem.insert", &arguments)?;
+                let path = strval(&arguments, "path")?;
+                let line = arguments
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("missing or non-integer 'line' argument"))?
+                    as usize;
+                let content = strval(&arguments, "content")?;
+                audit_allow("workspace_edit", "insert", &path);
+                let tx = EditTransaction::single(EditOperation::Insert {
+                    path: path.clone(),
+                    line,
+                    content,
+                });
+                serde_json::to_value(self.edit_service.insert(tx)?)?
+            }
+            "filesystem.delete_range" => {
+                self.authorize_tool("filesystem.delete_range", &arguments)?;
+                let path = strval(&arguments, "path")?;
+                let start_line = arguments
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("missing or non-integer 'start_line' argument")
+                    })? as usize;
+                let end_line = arguments
+                    .get("end_line")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("missing or non-integer 'end_line' argument"))?
+                    as usize;
+                audit_allow("workspace_edit", "delete_range", &path);
+                let tx = EditTransaction::single(EditOperation::DeleteRange {
+                    path: path.clone(),
+                    start_line,
+                    end_line,
+                });
+                serde_json::to_value(self.edit_service.delete_range(tx)?)?
+            }
+            "filesystem.apply_diff" => {
+                self.authorize_tool("filesystem.apply_diff", &arguments)?;
+                let diff = strval(&arguments, "diff")?;
+                audit_allow("workspace_edit", "apply_diff", "");
+                let tx = EditTransaction::single(EditOperation::ApplyDiff { diff });
+                serde_json::to_value(self.edit_service.patch(tx)?)?
+            }
+            "filesystem.patch" => {
+                self.authorize_tool("filesystem.patch", &arguments)?;
+                let ops_array = arguments
+                    .get("operations")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("missing or non-array 'operations' argument"))?;
+                let mut ops = Vec::new();
+                for (idx, op) in ops_array.iter().enumerate() {
+                    let op_path = strval(op, "path")?;
+                    let op_obj = op.as_object().ok_or_else(|| {
+                        anyhow::anyhow!("operation at index {idx} must be an object")
+                    })?;
+
+                    if let (Some(old), Some(new)) = (
+                        op.get("old").and_then(Value::as_str),
+                        op.get("new").and_then(Value::as_str),
+                    ) {
+                        // Replace operation
+                        let occurrence = op
+                            .get("occurrence")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize);
+                        ops.push(EditOperation::Replace {
+                            path: op_path.clone(),
+                            old: old.to_owned(),
+                            new: new.to_owned(),
+                            occurrence,
+                        });
+                    } else if let (Some(line), Some(content)) = (
+                        op.get("line").and_then(Value::as_u64),
+                        op.get("content").and_then(Value::as_str),
+                    ) {
+                        // Insert operation
+                        ops.push(EditOperation::Insert {
+                            path: op_path.clone(),
+                            line: line as usize,
+                            content: content.to_owned(),
+                        });
+                    } else if let (Some(start_line), Some(end_line)) = (
+                        op.get("start_line").and_then(Value::as_u64),
+                        op.get("end_line").and_then(Value::as_u64),
+                    ) {
+                        // DeleteRange operation
+                        ops.push(EditOperation::DeleteRange {
+                            path: op_path.clone(),
+                            start_line: start_line as usize,
+                            end_line: end_line as usize,
+                        });
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "operation at index {idx} does not match any known operation type"
+                        ));
+                    }
+                }
+                audit_allow("workspace_edit", "patch", "");
+                let tx = EditTransaction::new(ops);
+                serde_json::to_value(self.edit_service.patch(tx)?)?
             }
             "memory.store" => {
                 self.authorize_tool("memory.store", &arguments)?;
