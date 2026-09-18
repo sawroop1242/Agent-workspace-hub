@@ -1657,7 +1657,7 @@ impl McpDispatcher {
                 let mut ops = Vec::new();
                 for (idx, op) in ops_array.iter().enumerate() {
                     let op_path = strval(op, "path")?;
-                    let op_obj = op.as_object().ok_or_else(|| {
+                    op.as_object().ok_or_else(|| {
                         anyhow::anyhow!("operation at index {idx} must be an object")
                     })?;
 
