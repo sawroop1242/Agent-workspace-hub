@@ -51,6 +51,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "DIAG: dirty paths before verify step:"
+          git status --porcelain -uall || true
+          echo "DIAG: end of status output"
           test -z "$(git status --porcelain)"
 
       - name: Required Rust formatting check
