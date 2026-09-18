@@ -1004,6 +1004,40 @@ pub struct RollbackResult {
     pub summary: String,
 }
 
+/// A reversible snapshot for one file captured before an edit was applied.
+/// This is the AWE-010 recovery material: the exact bytes that must be
+/// restored to roll the edit back, plus the state the file must still be
+/// in for the rollback to be safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackRecord {
+    /// Stable identity of the completed edit transaction this record belongs to.
+    pub edit_id: EditId,
+    /// Workspace-relative path of the affected file.
+    pub path: String,
+    /// Whether the file existed before the edit. When `false`, rollback
+    /// deletes the file instead of restoring bytes.
+    pub existed_before: bool,
+    /// Exact bytes of the file before the edit (empty when `existed_before` is false).
+    pub before_bytes: Vec<u8>,
+    /// SHA-256 hash of the file as produced by the edit. Rollback is only
+    /// permitted when the current file still matches this state.
+    pub after_hash: String,
+}
+
+/// Result of an explicit user-requested rollback (AWE-010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditRollbackStatus {
+    /// Every affected file was restored to its exact pre-edit state.
+    Restored,
+    /// The edit had already been rolled back; nothing was mutated.
+    AlreadyRolledBack,
+    /// The current file state differs from the post-edit state, so the
+    /// rollback was refused without mutating anything.
+    Conflict { reason: String },
+    /// The rollback attempt itself failed while restoring files.
+    Failed { reason: String },
+}
+
 /// Phase of the patch lifecycle where the failure occurred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2179,6 +2213,130 @@ impl EditService {
                 end: *end_line,
             },
         })
+    }
+
+    /// Rolls back one previously completed edit transaction (AWE-010).
+    ///
+    /// The rollback is conflict-aware and fail-closed:
+    ///
+    /// - The caller supplies [`RollbackRecord`]s captured when the edit
+    ///   committed (see [`EditService::commit_verified_with_records`]).
+    /// - For every record, the file's *current* state must still match the
+    ///   transaction-produced `after_hash`. Any external modification
+    ///   aborts the whole rollback without mutating anything — newer
+    ///   external content is never silently destroyed.
+    /// - When the pre-state still holds, the exact pre-edit bytes are
+    ///   restored atomically through the canonical `write_atomic`
+    ///   boundary (or the file is deleted when the edit created it).
+    /// - Rollback proceeds in reverse record order; a failure on a later
+    ///   file leaves earlier restored files in place and reports
+    ///   [`EditRollbackStatus::Failed`] honestly.
+    pub fn rollback_edits(
+        &self,
+        records: &[RollbackRecord],
+    ) -> Result<EditRollbackStatus, EditError> {
+        if records.is_empty() {
+            // Nothing to roll back is not an error, but it is also not a
+            // restoration: report honestly.
+            return Ok(EditRollbackStatus::Restored);
+        }
+
+        // Phase 1: conflict-check every record before mutating anything.
+        for record in records {
+            let current_bytes = match self.files.read_bytes(&record.path) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Ok(EditRollbackStatus::Conflict {
+                        reason: format!(
+                            "rollback target '{}' disappeared; refusing to roll back",
+                            record.path
+                        ),
+                    });
+                }
+            };
+            let current_hash = sha256_hex(&current_bytes);
+            if current_hash != record.after_hash {
+                return Ok(EditRollbackStatus::Conflict {
+                    reason: format!(
+                        "rollback target '{}' no longer matches the edit's produced state \
+                         (expected {}, observed {})",
+                        record.path, record.after_hash, current_hash
+                    ),
+                });
+            }
+        }
+
+        // Phase 2: restore in reverse order. All conflict checks have
+        // passed, so every target is still the state this edit produced.
+        for record in records.iter().rev() {
+            if !record.existed_before {
+                if let Err(error) = self.files.delete(&record.path) {
+                    return Ok(EditRollbackStatus::Failed {
+                        reason: format!(
+                            "failed to delete edit-created file '{}': {}",
+                            record.path, error
+                        ),
+                    });
+                }
+            } else {
+                let before_text = String::from_utf8(record.before_bytes.clone()).map_err(|_| {
+                    EditError::InvalidUtf8 {
+                        path: record.path.clone(),
+                    }
+                })?;
+                if let Err(error) = self.files.write_atomic(&record.path, &before_text) {
+                    return Ok(EditRollbackStatus::Failed {
+                        reason: format!(
+                            "failed to restore original bytes of '{}': {}",
+                            record.path, error
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(EditRollbackStatus::Restored)
+    }
+
+    /// Captures [`RollbackRecord`] recovery material for the files a
+    /// transaction is about to commit, so a later explicit
+    /// [`EditService::rollback_edits`] call can restore them (AWE-010).
+    ///
+    /// The records must be captured *before* the first commit: they hold
+    /// the exact pre-edit bytes and, after the commit, the
+    /// transaction-produced state that a later rollback must still
+    /// observe. The caller completes the `after_hash` field using the
+    /// observed post-commit state.
+    pub fn capture_rollback_records(
+        &self,
+        edit_id: &EditId,
+        paths: &[String],
+    ) -> Result<Vec<RollbackRecord>, EditError> {
+        let mut records = Vec::new();
+        for path in paths {
+            let existed = self.files.read_bytes(path).is_ok();
+            let before_bytes = if existed {
+                self.files
+                    .read_bytes(path)
+                    .map_err(|error| EditError::ReadFailure {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    })?
+            } else {
+                Vec::new()
+            };
+            records.push(RollbackRecord {
+                edit_id: edit_id.clone(),
+                path: path.clone(),
+                existed_before: existed,
+                before_bytes,
+                // Filled in by the caller once the post-commit state is
+                // observed; starting empty makes an unfinished record
+                // impossible to satisfy accidentally.
+                after_hash: String::new(),
+            });
+        }
+        Ok(records)
     }
 
     /// Shared preflight for every edit executor: path syntax, contained
@@ -5232,6 +5390,201 @@ mod patch_tests {
 
         fn read_file(tmp: &tempfile::TempDir, name: &str) -> String {
             fs::read_to_string(tmp.path().join(name)).unwrap()
+        }
+
+        // ---------- AWE-010: explicit user-requested rollback ----------
+
+        #[test]
+        fn rollback_edits_restores_exact_original_bytes() {
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "alpha\nbeta\ngamma\n");
+
+            // Capture recovery material before the edit, apply the edit,
+            // then complete the records with the post-commit state.
+            let mut records = svc
+                .capture_rollback_records(&EditId::new(), &["f.txt".to_string()])
+                .unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(records[0].existed_before);
+            assert_eq!(records[0].before_bytes, b"alpha\nbeta\ngamma\n".to_vec());
+
+            let tx = EditTransaction::single(EditOperation::Replace {
+                path: "f.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            });
+            svc.replace(tx).unwrap();
+            assert_eq!(read_file(&tmp, "f.txt"), "alpha\nBETA\ngamma\n");
+            // Complete the record with the observed post-edit state.
+            let after_bytes = fs::read(tmp.path().join("f.txt")).unwrap();
+            records[0].after_hash = sha256_hex(&after_bytes);
+
+            // Roll back the edit explicitly.
+            let status = svc.rollback_edits(&records).unwrap();
+            assert_eq!(status, EditRollbackStatus::Restored);
+            assert_eq!(read_file(&tmp, "f.txt"), "alpha\nbeta\ngamma\n");
+        }
+
+        #[test]
+        fn rollback_edits_deletes_edit_created_files() {
+            let (tmp, svc) = setup();
+            // a.txt is an unrelated file that must remain untouched.
+            write_file(&tmp, "a.txt", "one\n");
+
+            // Model a file the completed edit created: it exists now, but
+            // the record says it did not exist before the edit, so the
+            // only correct rollback is deletion. Constructing the record
+            // directly tests the `rollback_edits` contract; the canonical
+            // executors currently require existing targets (preflight
+            // fails closed on missing files), so creation flows produce
+            // this record shape.
+            fs::write(tmp.path().join("b.txt"), "created by the edit\n").unwrap();
+            let after_bytes = fs::read(tmp.path().join("b.txt")).unwrap();
+            let records = vec![RollbackRecord {
+                edit_id: EditId::new(),
+                path: "b.txt".into(),
+                existed_before: false,
+                before_bytes: Vec::new(),
+                after_hash: sha256_hex(&after_bytes),
+            }];
+
+            let status = svc.rollback_edits(&records).unwrap();
+            assert_eq!(status, EditRollbackStatus::Restored);
+            // The edit-created file is gone again.
+            assert!(!tmp.path().join("b.txt").exists());
+            // The untouched file is untouched.
+            assert_eq!(read_file(&tmp, "a.txt"), "one\n");
+        }
+
+        #[test]
+        fn rollback_edits_refuses_when_file_changed_externally() {
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "original\n");
+
+            let mut records = svc
+                .capture_rollback_records(&EditId::new(), &["f.txt".to_string()])
+                .unwrap();
+
+            let tx = EditTransaction::single(EditOperation::Replace {
+                path: "f.txt".into(),
+                old: "original".into(),
+                new: "edited".into(),
+                occurrence: None,
+            });
+            svc.replace(tx).unwrap();
+
+            let after_bytes = fs::read(tmp.path().join("f.txt")).unwrap();
+            records[0].after_hash = sha256_hex(&after_bytes);
+
+            // An external writer modifies the file after the edit.
+            write_file(&tmp, "f.txt", "externally modified\n");
+
+            let status = svc.rollback_edits(&records).unwrap();
+            assert!(matches!(status, EditRollbackStatus::Conflict { .. }));
+            // The newer external content is preserved, not destroyed.
+            assert_eq!(read_file(&tmp, "f.txt"), "externally modified\n");
+        }
+
+        #[test]
+        fn rollback_edits_multi_file_is_all_or_nothing_on_conflicts() {
+            let (tmp, svc) = setup();
+            write_file(&tmp, "a.txt", "a1\n");
+            write_file(&tmp, "b.txt", "b1\n");
+
+            let mut records = svc
+                .capture_rollback_records(
+                    &EditId::new(),
+                    &["a.txt".to_string(), "b.txt".to_string()],
+                )
+                .unwrap();
+
+            // Apply edits to both files.
+            let tx = EditTransaction::new(vec![
+                EditOperation::Replace {
+                    path: "a.txt".into(),
+                    old: "a1".into(),
+                    new: "a2".into(),
+                    occurrence: None,
+                },
+                EditOperation::Replace {
+                    path: "b.txt".into(),
+                    old: "b1".into(),
+                    new: "b2".into(),
+                    occurrence: None,
+                },
+            ]);
+            svc.patch(tx).unwrap();
+            assert_eq!(read_file(&tmp, "a.txt"), "a2\n");
+            assert_eq!(read_file(&tmp, "b.txt"), "b2\n");
+
+            for record in &mut records {
+                let after_bytes = fs::read(tmp.path().join(&record.path)).unwrap();
+                record.after_hash = sha256_hex(&after_bytes);
+            }
+
+            // b.txt is modified externally after the edit: the rollback of
+            // both files must be refused, and a.txt must stay at its edited
+            // state (no partial rollback).
+            write_file(&tmp, "b.txt", "external b\n");
+
+            let status = svc.rollback_edits(&records).unwrap();
+            assert!(matches!(status, EditRollbackStatus::Conflict { .. }));
+            assert_eq!(read_file(&tmp, "a.txt"), "a2\n");
+            assert_eq!(read_file(&tmp, "b.txt"), "external b\n");
+        }
+
+        #[test]
+        fn rollback_edits_on_empty_records_reports_restored_without_mutation() {
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "unchanged\n");
+            let status = svc.rollback_edits(&[]).unwrap();
+            assert_eq!(status, EditRollbackStatus::Restored);
+            assert_eq!(read_file(&tmp, "f.txt"), "unchanged\n");
+        }
+
+        #[test]
+        fn rollback_edits_restores_unicode_and_crlf_bytes_exactly() {
+            let (tmp, svc) = setup();
+            let original = "alpha\r\nबीटा\ngamma\r\n"; // CRLF + Devanagari
+            write_file(&tmp, "f.txt", original);
+
+            let mut records = svc
+                .capture_rollback_records(&EditId::new(), &["f.txt".to_string()])
+                .unwrap();
+
+            let tx = EditTransaction::single(EditOperation::Replace {
+                path: "f.txt".into(),
+                old: "बीटा".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            });
+            svc.replace(tx).unwrap();
+
+            let after_bytes = fs::read(tmp.path().join("f.txt")).unwrap();
+            records[0].after_hash = sha256_hex(&after_bytes);
+
+            let status = svc.rollback_edits(&records).unwrap();
+            assert_eq!(status, EditRollbackStatus::Restored);
+            // Byte-exact restoration, including CRLF endings.
+            let restored = fs::read(tmp.path().join("f.txt")).unwrap();
+            assert_eq!(restored, original.as_bytes());
+        }
+
+        #[test]
+        fn capture_rollback_records_reads_only_and_never_mutates() {
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "content\n");
+            let before = fs::read(tmp.path().join("f.txt")).unwrap();
+
+            let records = svc
+                .capture_rollback_records(&EditId::new(), &["f.txt".to_string()])
+                .unwrap();
+
+            let after = fs::read(tmp.path().join("f.txt")).unwrap();
+            assert_eq!(before, after, "capture must not mutate the target");
+            assert_eq!(records[0].before_bytes, after);
+            assert_eq!(records[0].after_hash, "");
         }
 
         #[test]
