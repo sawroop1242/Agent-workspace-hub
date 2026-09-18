@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod edit;
+pub use edit::{EditOperation, EditService, EditTransaction};
 pub mod files;
 pub mod git;
 pub mod projects;

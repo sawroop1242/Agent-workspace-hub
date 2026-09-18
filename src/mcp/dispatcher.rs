@@ -1591,7 +1591,7 @@ impl McpDispatcher {
                 let old = strval(&arguments, "old")?;
                 let new = strval(&arguments, "new")?;
                 audit_allow("workspace_edit", "replace", &path);
-                let mut tx = EditTransaction::single(EditOperation::Replace {
+                let tx = EditTransaction::single(EditOperation::Replace {
                     path: path.clone(),
                     old,
                     new,
