@@ -54,6 +54,7 @@ jobs:
       # (unmaintained/yanked transitive crates) are surfaced but non-blocking.
       - run: cargo install --locked cargo-audit
       - run: cargo audit
+
   ai-review:
     name: Deep AI Code Review (GLM-5.3 via NVIDIA NIM)
     runs-on: ubuntu-latest
@@ -67,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 
+          fetch-depth: 0
 
       # Step 1: Load the custom prompt file into the environment
       - name: Load Custom Review Prompt
@@ -80,13 +81,21 @@ jobs:
           echo "" >> $GITHUB_ENV
           echo "$EOF" >> $GITHUB_ENV
 
-      # Step 2: Feed the custom prompt string into Junie
+      # Step 2: Feed the custom prompt string into Junie.
+      #
+      # Junie's --model flag validates against its own fixed model roster
+      # (claude-*, gemini-*, gpt-*, grok-*) before ever making a network call --
+      # a raw provider-native model string like "z-ai/glm-5.3" is always
+      # rejected as "Invalid model", regardless of JUNIE_OPENAI_BASE_URL.
+      # Custom/BYOK models must instead be defined as a model profile under
+      # .junie/models/*.json (id, baseUrl including the full request path,
+      # apiType, apiKey referencing an env var), then selected by that
+      # profile's "id". See .junie/models/nvidia-glm.json and
+      # https://junie.jetbrains.com/docs/custom-llm-models.html.
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
         with:
           openai_api_key: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
-          model: "z-ai/glm-5.3"
+          model: "nvidia-glm-5.3"
           # Dynamically inject the custom prompt loaded from your repository file
           prompt: ${{ env.CUSTOM_PROMPT }}
-        env:
-          JUNIE_OPENAI_BASE_URL: "https://integrate.api.nvidia.com/v1"
