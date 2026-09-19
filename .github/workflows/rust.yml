@@ -96,6 +96,6 @@ jobs:
         uses: JetBrains/junie-github-action@v1.7.11
         with:
           openai_api_key: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
-          model: "nvidia-glm-5.3"
+          model: "z-ai/glm-5.3"
           # Dynamically inject the custom prompt loaded from your repository file
           prompt: ${{ env.CUSTOM_PROMPT }}
