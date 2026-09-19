@@ -123,3 +123,8 @@ See the existing MCP and security documentation for transport/authentication det
 | `docs/*.md` | Architecture, roadmap, security, implementation and status documentation |
 | `scripts/install.sh` | One-line Rust-binary installer |
 | `.github/workflows/*.yml` | CI and release pipelines |
+
+
+## OpenAI-compatible Junie review test
+
+This test commit verifies the FreeLLMAPI OpenAI-compatible routing configuration used by the Junie review workflow.
