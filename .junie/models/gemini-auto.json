@@ -1,8 +1,8 @@
 {
-  "id": "gemini-3.8-flash",
-  "displayName": "Gemini (OpenAI-compatible)",
-  "providerName": "Google Gemini",
-  "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+  "id": "auto",
+  "displayName": "FreeLLMAPI Auto Router",
+  "providerName": "FreeLLMAPI",
+  "baseUrl": "https://freellmapi-production-905c.up.railway.app/v1/chat/completions",
   "apiType": "OpenAICompletion",
-  "apiKey": "${GEMINI_API_KEY}"
+  "apiKey": "${FREELLMAPI_API_KEY}"
 }
