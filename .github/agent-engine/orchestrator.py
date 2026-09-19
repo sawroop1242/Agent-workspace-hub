@@ -3,7 +3,7 @@
 
 This is development infrastructure only; it is not an AWH runtime dependency.
 It reads the feature registry, processes one feature at a time, invokes
-mini-SWE-agent with an NVIDIA OpenAI-compatible endpoint, runs deterministic
+mini-SWE-agent with Google Gemini, runs deterministic
 AWH verification, permits exactly one repair attempt, and stores JSON state
 and evidence artifacts.
 """
@@ -31,8 +31,7 @@ REGISTRY = ROOT / ".github/agent-engine/feature-registry.yml"
 STATE_DIR = ROOT / ".github/agent-engine/state"
 ARTIFACT_DIR = ROOT / ".github/agent-engine/artifacts"
 MAX_REPAIR_ATTEMPTS = 1
-DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_NVIDIA_MODEL = "deepseek-ai/deepseek-v4-flash-0731"
+DEFAULT_GEMINI_MODEL = "gemini/gemini-2.5-flash"
 
 
 def utc_now() -> str:
@@ -58,17 +57,16 @@ def run(command: list[str], *, cwd: Path = ROOT, output_file: Path | None = None
     return process.returncode, output
 
 
-def load_nvidia_configuration() -> dict[str, str]:
-    api_key = os.environ.get("AWH_ROUTINE_NVIDIA_KEY") or os.environ.get("NVIDIA_API_KEY")
+def load_gemini_configuration() -> dict[str, str]:
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "NVIDIA credential is missing. Configure GitHub Actions secret "
-            "AWH_ROUTINE_NVIDIA_KEY."
+            "Gemini credential is missing. Configure GitHub Actions secret "
+            "GEMINI_API_KEY."
         )
     return {
         "api_key": api_key,
-        "base_url": os.environ.get("AWH_NVIDIA_BASE_URL", DEFAULT_NVIDIA_BASE_URL),
-        "model": os.environ.get("AWH_NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL),
+        "model": os.environ.get("AWH_GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
     }
 
 
@@ -179,7 +177,7 @@ coherent correction. Do not weaken tests to obtain a passing result.
 
 
 def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
-                          nvidia: dict[str, str], cost_limit: str,
+                          gemini: dict[str, str], cost_limit: str,
                           repair: bool = False) -> bool:
     task = build_agent_task(feature, repair=repair)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -187,17 +185,14 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
     output_file = artifact_dir / "mini-swe-agent-output.txt"
 
     agent_env = os.environ.copy()
-    # NVIDIA key is supplied only through the child process environment.
+    # Gemini key is supplied only through the child process environment.
     # It is never written to task text, command arguments, state, or artifacts.
-    agent_env["NVIDIA_API_KEY"] = nvidia["api_key"]
-    agent_env["OPENAI_API_KEY"] = nvidia["api_key"]
-    agent_env["OPENAI_BASE_URL"] = nvidia["base_url"]
-    agent_env["AWH_NVIDIA_BASE_URL"] = nvidia["base_url"]
-    agent_env["AWH_NVIDIA_MODEL"] = nvidia["model"]
+    agent_env["GEMINI_API_KEY"] = gemini["api_key"]
+    agent_env["AWH_GEMINI_MODEL"] = gemini["model"]
 
     command = [
         "mini",
-        "-m", nvidia["model"],
+        "-m", gemini["model"],
         "-t", task,
         "-y",
         "-l", cost_limit,
@@ -206,8 +201,7 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
     if os.environ.get("AWH_USE_SWEREX", "1") == "1":
         command.extend(["--environment-class", "swerex_docker"])
 
-    print(f"Invoking mini-SWE-agent: {nvidia['model']}")
-    print(f"NVIDIA base URL: {nvidia['base_url']}")
+    print(f"Invoking mini-SWE-agent with Gemini: {gemini['model']}")
     exit_code, _ = run(command, env=agent_env)
 
     save_json(artifact_dir / "agent-status.json", {
@@ -216,9 +210,9 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
         "feature_id": feature["id"],
         "completed": exit_code == 0,
         "exit_code": exit_code,
-        "model": nvidia["model"],
-        "base_url": nvidia["base_url"],
-        "credential": "AWH_ROUTINE_NVIDIA_KEY",
+        "model": gemini["model"],
+        "provider": "google-gemini",
+        "credential": "GEMINI_API_KEY",
         "credential_value_saved": False,
         "timestamp": utc_now(),
     })
@@ -260,7 +254,7 @@ def load_state() -> dict[str, Any]:
 
 
 def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
-                    nvidia: dict[str, str], cost_limit: str) -> bool:
+                    gemini: dict[str, str], cost_limit: str) -> bool:
     feature_id = feature["id"]
     artifact_dir = ARTIFACT_DIR / feature_id / str(int(time.time()))
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -274,17 +268,16 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
 
     save_json(artifact_dir / "feature.json", feature)
     save_json(artifact_dir / "model-config.json", {
-        "provider": "nvidia",
-        "model": nvidia["model"],
-        "base_url": nvidia["base_url"],
-        "credential": "AWH_ROUTINE_NVIDIA_KEY",
+        "provider": "google-gemini",
+        "model": gemini["model"],
+        "credential": "GEMINI_API_KEY",
         "credential_value_saved": False,
     })
 
     agent_ok = invoke_mini_swe_agent(
         feature,
         artifact_dir=artifact_dir / "initial-agent",
-        nvidia=nvidia,
+        gemini=gemini,
         cost_limit=cost_limit,
     )
 
@@ -342,17 +335,14 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
 def main() -> int:
     parser = argparse.ArgumentParser(description="AWH external Python agent orchestrator")
     parser.add_argument("--feature", help="Process a specific feature ID")
-    parser.add_argument("--model", help="Override NVIDIA model")
-    parser.add_argument("--base-url", help="Override NVIDIA OpenAI-compatible base URL")
+    parser.add_argument("--model", help="Override Google Gemini model")
     parser.add_argument("--cost-limit", default=os.environ.get("AWH_AGENT_COST_LIMIT", "3"))
     parser.add_argument("--once", action="store_true", help="Run only one feature")
     args = parser.parse_args()
 
-    nvidia = load_nvidia_configuration()
+    gemini = load_gemini_configuration()
     if args.model:
-        nvidia["model"] = args.model
-    if args.base_url:
-        nvidia["base_url"] = args.base_url
+        gemini["model"] = args.model
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -360,8 +350,7 @@ def main() -> int:
     features = get_features(registry)
     state = load_state()
 
-    print(f"AWH NVIDIA model: {nvidia['model']}")
-    print(f"AWH NVIDIA base URL: {nvidia['base_url']}")
+    print(f"AWH Gemini model: {gemini['model']}")
     print(f"Features: {len(features)} | Completed: {len(state.get('completed', []))}")
 
     while True:
