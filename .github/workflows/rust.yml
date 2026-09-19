@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolay/rust-toolchain@stable
         with:
           toolchain: stable
           components: clippy
@@ -50,13 +50,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      # Fails on actual RUSTSEC vulnerabilities; warning-level advisories
-      # (unmaintained/yanked transitive crates) are surfaced but non-blocking.
       - run: cargo install --locked cargo-audit
       - run: cargo audit
 
   ai-review:
-    name: Deep AI Code Review (Google Gemini)
+    name: Deep AI Code Review (FreeLLMAPI OpenAI-compatible)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: [fmt]
@@ -70,11 +68,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Step 1: Load the custom prompt file into the environment
       - name: Load Custom Review Prompt
         id: load-prompt
         run: |
-          # Read file content and safely escape it for GitHub Actions Environment Multiline Strings
           EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
           echo "CUSTOM_PROMPT<<$EOF" >> $GITHUB_ENV
           cat .github/agent/prompts/review.md >> $GITHUB_ENV

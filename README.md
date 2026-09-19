@@ -2,6 +2,17 @@
 
 ![AWH ](docs/image_1cebd533.png) 
 
+## Gemini review-agent test
+
+This line intentionally changes the README so the pull-request review workflow can be verified end-to-end. It has no runtime impact and should be removed after the review-agent test.
+
+## OpenAI-compatible FreeLLMAPI test
+
+This additional test change verifies that the review workflow can use the
+OpenAI Chat Completions API shape through the FreeLLMAPI router. The router
+uses the `auto` model route. The credential must be provided through the
+GitHub Actions secret `FREELLMAPI_API_KEY` and is not stored in the repository.
+
 ## Documentation
 
 - [Final architecture and roadmap](docs/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
@@ -96,8 +107,7 @@ Recommended new-agent startup:
 5. Use `connector.invoke` only when a configured connector is required by the active task.
 
 This loop makes context transfer explicit: the outgoing agent records decisions and
-progress, and the incoming agent starts from the persisted state instead of asking
-the user to repeat the project idea.
+progress, and the incoming agent starts from the persisted state instead of asking the user to repeat the project idea.
 
 ## MCP transports
 
