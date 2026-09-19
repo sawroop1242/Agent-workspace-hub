@@ -289,10 +289,7 @@ jobs:
         if: inputs.mode == 'implement' && steps.verify_initial.outputs.passed != 'true'
         id: repair_attempt
         env:
-          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
-          OPENAI_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         shell: bash
         run: |
           set +e
