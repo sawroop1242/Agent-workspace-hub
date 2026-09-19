@@ -1,0 +1,138 @@
+name: AWH NVIDIA NIM Bounded Feature Loop
+
+on:
+  workflow_dispatch:
+    inputs:
+      feature_id:
+        description: "Feature registry ID to process"
+        required: true
+        type: string
+      cost_limit:
+        description: >-
+          Per-mini-invocation cost cap in USD, passed to `mini -l`. This is
+          applied separately to the initial implementation attempt AND the
+          single bounded repair attempt, so actual max spend for one run is
+          up to 2x this value. Default is set high (effectively no
+          practical limit) per explicit request; the real backstop on a run
+          is the 180-minute job timeout below, not this number.
+        required: false
+        type: string
+        default: "1000000"
+
+concurrency:
+  group: awh-nvidia-nim-${{ inputs.feature_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-loop:
+    name: NVIDIA NIM / ${{ inputs.feature_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout AWH
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sanitize feature ID for artifact naming
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="${{ inputs.feature_id }}"
+          # Artifact names reject / : ? * " < > | and CR/LF. Replace anything
+          # outside a safe set with '-' so a mistyped or future feature_id
+          # can never break the upload step below.
+          safe="$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '-')"
+          if [[ -z "$safe" ]]; then
+            echo "::error::feature_id sanitizes to an empty string: '$raw'"
+            exit 1
+          fi
+          echo "SAFE_FEATURE_ID=$safe" >> "$GITHUB_ENV"
+          if [[ "$safe" != "$raw" ]]; then
+            echo "::warning::feature_id '$raw' contains characters unsafe for artifact names; using '$safe' for the artifact name only. The orchestrator still receives the original value."
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install external agent infrastructure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input --quiet 'mini-swe-agent[full]' swe-rex pyyaml
+          mini --version
+          python3 -c 'import swerex; print("SWE-ReX import: OK")'
+          python3 -c 'import yaml; print("PyYAML import: OK")'
+
+      - name: Validate NVIDIA NIM configuration
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_BASE_URL: ${{ secrets.NVIDIA_BASE_URL }}
+          NVIDIA_MODEL: ${{ secrets.NVIDIA_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$NVIDIA_API_KEY" || { echo "::error::NVIDIA_API_KEY is not configured"; exit 1; }
+          test -n "$NVIDIA_BASE_URL" || { echo "::error::NVIDIA_BASE_URL is not configured"; exit 1; }
+          test -n "$NVIDIA_MODEL" || { echo "::error::NVIDIA_MODEL is not configured"; exit 1; }
+          echo "NVIDIA NIM configuration is present."
+          echo "Base URL: $NVIDIA_BASE_URL"
+          echo "Model: $NVIDIA_MODEL"
+
+      - name: Run bounded autonomous feature loop
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_BASE_URL: ${{ secrets.NVIDIA_BASE_URL }}
+          NVIDIA_MODEL: ${{ secrets.NVIDIA_MODEL }}
+          AWH_AGENT_COST_LIMIT: ${{ inputs.cost_limit }}
+          AWH_USE_SWEREX: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The credential is scoped only to this step and is never passed
+          # through command-line arguments, task text, artifacts, or git state.
+          test -n "$NVIDIA_API_KEY"
+          test -n "$NVIDIA_BASE_URL"
+          test -n "$NVIDIA_MODEL"
+
+          # NOTE: --cost-limit is applied per mini invocation (implementation,
+          # then repair on failure), so real max spend for this run is up to
+          # 2x AWH_AGENT_COST_LIMIT. See the cost_limit input description.
+          python3 .github/agent-engine/orchestrator.py \
+            --feature "${{ inputs.feature_id }}" \
+            --model "$NVIDIA_MODEL" \
+            --base-url "$NVIDIA_BASE_URL" \
+            --cost-limit "$AWH_AGENT_COST_LIMIT" \
+            --once
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awh-nvidia-nim-${{ env.SAFE_FEATURE_ID }}-${{ github.run_id }}
+          path: .github/agent-engine/artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce runtime separation
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='mini-swe-agent|swe-rex|swe-bench|swe-smith|swe-agent|sb-cli|openhands'
+          if grep -Eiq "$forbidden" Cargo.toml Cargo.lock; then
+            echo "External agent tooling leaked into AWH runtime manifests."
+            exit 1
+          fi
+          if grep -RniE "$forbidden" src 2>/dev/null; then
+            echo "External agent tooling leaked into AWH source."
+            exit 1
+          fi
+          echo "Runtime separation: PASS"
