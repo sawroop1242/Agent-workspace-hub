@@ -1,5 +1,7 @@
 # Agent-workspace-hub
 
+- [AWH ](docs/image_1cebd533.png) 
+
 ## Documentation
 
 - [Final architecture and roadmap](docs/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
