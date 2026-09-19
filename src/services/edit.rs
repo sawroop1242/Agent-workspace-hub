@@ -647,6 +647,15 @@ pub enum EditError {
     /// did not delete the intended lines.
     #[error(transparent)]
     SemanticVerificationFailure(Box<SemanticVerificationFailurePayload>),
+    /// Authorization denied: the caller did not satisfy the
+    /// capability/policy boundary. This is a first-class verification
+    /// failure — never a silent fallback to weaker rules.
+    #[error("authorization denied for operation {action}: {reason}")]
+    AuthorizationDenied {
+        action: String,
+        reason: String,
+        denial: crate::services::authorization::DenialReason,
+    },
 }
 
 /// Payload of [`EditError::ExpectedStateConflict`].

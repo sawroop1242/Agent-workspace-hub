@@ -4,12 +4,22 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The three built-in tool names for which Phase 3 policy rules are
+/// The built-in tool names for which resource-scoped policy rules are
 /// supported. Any other `tool` value is rejected at rule-creation time.
-const SUPPORTED_POLICY_TOOLS: [&str; 3] = [
+///
+/// AWE-011 extends the original three-tool set with the canonical
+/// `filesystem.*` editing tools so a workspace-local DENY rule can narrow
+/// edit mutations exactly as it narrows `workspace.write_file`. The
+/// rollback tool is covered too: a rollback is a consequential mutation.
+const SUPPORTED_POLICY_TOOLS: [&str; 8] = [
     "workspace.write_file",
     "workspace.delete_file",
     "terminal.run",
+    "filesystem.replace",
+    "filesystem.insert",
+    "filesystem.delete_range",
+    "filesystem.patch",
+    "filesystem.apply_diff",
 ];
 
 /// Persistent workspace-local policy storage under `.agent/policy.json`.
@@ -131,6 +141,11 @@ impl PolicyStore {
                     path_prefix_matches(&rule.pattern, resource)
                 }
                 "terminal.run" => rule.pattern == resource,
+                "filesystem.replace"
+                | "filesystem.insert"
+                | "filesystem.delete_range"
+                | "filesystem.patch"
+                | "filesystem.apply_diff" => path_prefix_matches(&rule.pattern, resource),
                 _ => false,
             };
             if matched {
@@ -331,6 +346,59 @@ mod tests {
                 "tool {bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn filesystem_edit_tools_are_policy_supported() {
+        // AWE-011: the canonical filesystem edit tools must accept
+        // resource-scoped deny rules and match by path prefix.
+        let temp = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(temp.path());
+        for tool in [
+            "filesystem.replace",
+            "filesystem.insert",
+            "filesystem.delete_range",
+            "filesystem.patch",
+            "filesystem.apply_diff",
+        ] {
+            store
+                .add(&rule(&format!("deny-src-{tool}"), tool, "src/"))
+                .unwrap();
+            assert!(
+                store.matching(tool, "src/main.rs").unwrap().is_some(),
+                "{tool} must match a resource under the deny prefix"
+            );
+            assert!(
+                store.matching(tool, "docs/readme.md").unwrap().is_none(),
+                "{tool} must not match a resource outside the deny prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn path_prefix_is_component_scoped_not_string_prefix() {
+        // AWE-011 scope semantics: `src/foo` must NOT authorize/match
+        // `src/foobar` — the comparison is path-component based.
+        let temp = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(temp.path());
+        store
+            .add(&rule("r1", "filesystem.replace", "src/foo"))
+            .unwrap();
+        assert!(store
+            .matching("filesystem.replace", "src/foo")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .matching("filesystem.replace", "src/foo/a.rs")
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .matching("filesystem.replace", "src/foobar.rs")
+                .unwrap()
+                .is_none(),
+            "a scope of src/foo must not match src/foobar"
+        );
     }
 
     #[test]

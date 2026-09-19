@@ -4,6 +4,7 @@
 //! business logic.
 
 pub mod audit;
+pub mod authorization;
 pub mod edit;
 pub use edit::{EditOperation, EditService, EditTransaction};
 pub mod files;
