@@ -124,7 +124,10 @@ See the existing MCP and security documentation for transport/authentication det
 | `scripts/install.sh` | One-line Rust-binary installer |
 | `.github/workflows/*.yml` | CI and release pipelines |
 
-
 ## OpenAI-compatible Junie review test
 
 This test commit verifies the FreeLLMAPI OpenAI-compatible routing configuration used by the Junie review workflow.
+
+The review endpoint uses the OpenAI Chat Completions API shape with the `auto`
+model route. The API credential is supplied only through the GitHub Actions
+secret `FREELLMAPI_API_KEY`; no credential is stored in the repository.
