@@ -2,6 +2,10 @@
 
 ![AWH ](docs/image_1cebd533.png) 
 
+## Gemini review-agent test
+
+This line intentionally changes the README so the pull-request review workflow can be verified end-to-end. It has no runtime impact and should be removed after the review-agent test.
+
 ## Documentation
 
 - [Final architecture and roadmap](docs/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
