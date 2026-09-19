@@ -81,11 +81,13 @@ jobs:
           echo "" >> $GITHUB_ENV
           echo "$EOF" >> $GITHUB_ENV
 
-      # Step 2: Run Junie using Google Gemini through the supported BYOK provider.
+      # Step 2: Run Junie through the repository's OpenAI-compatible Gemini profile.
+      # The custom profile is selected explicitly; the provider/model endpoint is
+      # defined in .junie/models/gemini-auto.json.
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         with:
-          google_api_key: ${{ secrets.GEMINI_API_KEY }}
-          model: "gemini-pro"
-          # Dynamically inject the custom prompt loaded from your repository file
+          model: "custom:gemini-auto"
           prompt: ${{ env.CUSTOM_PROMPT }}
