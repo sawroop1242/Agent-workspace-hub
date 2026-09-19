@@ -87,7 +87,7 @@ jobs:
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         with:
           model: "custom:gemini-auto"
           prompt: ${{ env.CUSTOM_PROMPT }}
