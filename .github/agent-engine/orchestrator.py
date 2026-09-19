@@ -291,7 +291,7 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
         repair_ok = invoke_mini_swe_agent(
             feature,
             artifact_dir=artifact_dir / "repair-agent",
-            nvidia=nvidia,
+            gemini=gemini,
             cost_limit=cost_limit,
             repair=True,
         )
@@ -362,7 +362,7 @@ def main() -> int:
             return 0
 
         print(f"\n=== Processing {feature['id']} ===")
-        ok = process_feature(feature, state=state, nvidia=nvidia, cost_limit=args.cost_limit)
+        ok = process_feature(feature, state=state, gemini=gemini, cost_limit=args.cost_limit)
         if not ok:
             print("Feature failed deterministic verification; stopping.")
             return 1
