@@ -20,10 +20,10 @@ on:
         required: true
         type: string
       model:
-        description: "NVIDIA OpenAI-compatible model name used by the orchestrator"
+        description: "Google Gemini model name used by the orchestrator"
         required: false
         type: string
-        default: "deepseek-ai/deepseek-v4-flash"
+        default: "gemini/gemini-2.5-flash"
       cost_limit:
         description: "Maximum agent cost in USD; 0 disables the limit"
         required: false
@@ -110,21 +110,18 @@ jobs:
       - name: Run Python long-running orchestrator
         if: inputs.mode == 'orchestrate'
         env:
-          AWH_ROUTINE_NVIDIA_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          AWH_NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
-          AWH_NVIDIA_MODEL: ${{ inputs.model }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AWH_GEMINI_MODEL: ${{ inputs.model }}
           AWH_AGENT_COST_LIMIT: ${{ inputs.cost_limit }}
           AWH_USE_SWEREX: ${{ inputs.use_swerex }}
-          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$AWH_ROUTINE_NVIDIA_KEY"
-          test -n "$AWH_NVIDIA_MODEL"
+          test -n "$GEMINI_API_KEY"
+          test -n "$AWH_GEMINI_MODEL"
           python3 .github/agent-engine/orchestrator.py \
             --feature "${{ inputs.feature_id }}" \
-            --model "$AWH_NVIDIA_MODEL" \
+            --model "$AWH_GEMINI_MODEL" \
             --cost-limit "$AWH_AGENT_COST_LIMIT" \
             --once
 
@@ -141,10 +138,7 @@ jobs:
         if: inputs.mode == 'plan'
         env:
           MODEL_NAME: ${{ inputs.model }}
-          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          OPENAI_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
-          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -199,10 +193,7 @@ jobs:
       - name: Run implementation or repair agent
         if: inputs.mode == 'implement' || inputs.mode == 'repair'
         env:
-          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          NVIDIA_NIM_API_BASE: https://integrate.api.nvidia.com/v1
-          OPENAI_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
