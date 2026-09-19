@@ -1,0 +1,8 @@
+{
+  "id": "auto",
+  "displayName": "FreeLLMAPI Auto Router",
+  "providerName": "FreeLLMAPI",
+  "baseUrl": "https://freellmapi-production-905c.up.railway.app/v1/chat/completions",
+  "apiType": "OpenAICompletion",
+  "apiKey": "${FREELLMAPI_API_KEY}"
+}

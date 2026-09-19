@@ -1,6 +1,0 @@
-{
-  "id": "z-ai/glm-5.3",
-  "baseUrl": "https://integrate.api.nvidia.com/v1/chat/completions",
-  "apiType": "OpenAICompletion",
-  "apiKey": "${OPENAI_API_KEY}"
-}
