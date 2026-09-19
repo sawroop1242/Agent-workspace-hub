@@ -1,6 +1,6 @@
 # Agent-workspace-hub
 
-- [AWH ](docs/image_1cebd533.png) 
+![AWH ](docs/image_1cebd533.png) 
 
 ## Documentation
 
