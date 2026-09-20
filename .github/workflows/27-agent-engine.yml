@@ -147,7 +147,6 @@ jobs:
           FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
           ANTHROPIC_API_BASE: https://freellmapi-production-905c.up.railway.app/v1
-          OPENAI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
           MSWEA_COST_TRACKING: ignore_errors
         shell: bash
         run: |
