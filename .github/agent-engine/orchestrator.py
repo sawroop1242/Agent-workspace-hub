@@ -3,7 +3,7 @@
 
 This is development infrastructure only; it is not an AWH runtime dependency.
 It reads the feature registry, processes one feature at a time, invokes
-mini-SWE-agent with Google Gemini, runs deterministic
+mini-SWE-agent through FreeLLMAPI's Anthropic-compatible API, runs deterministic
 AWH verification, permits exactly one repair attempt, and stores JSON state
 and evidence artifacts.
 """
@@ -31,7 +31,8 @@ REGISTRY = ROOT / ".github/agent-engine/feature-registry.yml"
 STATE_DIR = ROOT / ".github/agent-engine/state"
 ARTIFACT_DIR = ROOT / ".github/agent-engine/artifacts"
 MAX_REPAIR_ATTEMPTS = 1
-DEFAULT_GEMINI_MODEL = "gemini/gemini-2.5-flash"
+DEFAULT_ANTHROPIC_MODEL = "anthropic/auto"
+DEFAULT_ANTHROPIC_API_BASE = "https://freellmapi-production-905c.up.railway.app/v1"
 
 
 def utc_now() -> str:
@@ -57,16 +58,17 @@ def run(command: list[str], *, cwd: Path = ROOT, output_file: Path | None = None
     return process.returncode, output
 
 
-def load_gemini_configuration() -> dict[str, str]:
-    api_key = os.environ.get("GEMINI_API_KEY")
+def load_anthropic_configuration() -> dict[str, str]:
+    api_key = os.environ.get("FREELLMAPI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "Gemini credential is missing. Configure GitHub Actions secret "
-            "GEMINI_API_KEY."
+            "FreeLLMAPI credential is missing. Configure the GitHub Actions "
+            "secret FREELLMAPI_API_KEY."
         )
     return {
         "api_key": api_key,
-        "model": os.environ.get("AWH_GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        "model": os.environ.get("AWH_ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
+        "api_base": os.environ.get("ANTHROPIC_API_BASE", DEFAULT_ANTHROPIC_API_BASE),
     }
 
 
@@ -177,7 +179,7 @@ coherent correction. Do not weaken tests to obtain a passing result.
 
 
 def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
-                          gemini: dict[str, str], cost_limit: str,
+                          anthropic: dict[str, str], cost_limit: str,
                           repair: bool = False) -> bool:
     task = build_agent_task(feature, repair=repair)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -185,14 +187,15 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
     output_file = artifact_dir / "mini-swe-agent-output.txt"
 
     agent_env = os.environ.copy()
-    # Gemini key is supplied only through the child process environment.
-    # It is never written to task text, command arguments, state, or artifacts.
-    agent_env["GEMINI_API_KEY"] = gemini["api_key"]
-    agent_env["AWH_GEMINI_MODEL"] = gemini["model"]
+    # FreeLLMAPI credential is supplied only through the child process
+    # environment. It is never written to task text, command arguments,
+    # state, or artifacts.
+    agent_env["ANTHROPIC_API_KEY"] = anthropic["api_key"]
+    agent_env["ANTHROPIC_API_BASE"] = anthropic["api_base"]
 
     command = [
         "mini",
-        "-m", gemini["model"],
+        "-m", anthropic["model"],
         "-t", task,
         "-y",
         "-l", cost_limit,
@@ -201,7 +204,7 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
     if os.environ.get("AWH_USE_SWEREX", "1") == "1":
         command.extend(["--environment-class", "swerex_docker"])
 
-    print(f"Invoking mini-SWE-agent with Gemini: {gemini['model']}")
+    print(f"Invoking mini-SWE-agent with FreeLLMAPI Anthropic: {anthropic['model']}")
     exit_code, _ = run(command, env=agent_env)
 
     save_json(artifact_dir / "agent-status.json", {
@@ -210,9 +213,10 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
         "feature_id": feature["id"],
         "completed": exit_code == 0,
         "exit_code": exit_code,
-        "model": gemini["model"],
-        "provider": "google-gemini",
-        "credential": "GEMINI_API_KEY",
+        "model": anthropic["model"],
+        "provider": "freellmapi-anthropic",
+        "api_base": anthropic["api_base"],
+        "credential": "FREELLMAPI_API_KEY",
         "credential_value_saved": False,
         "timestamp": utc_now(),
     })
@@ -254,7 +258,7 @@ def load_state() -> dict[str, Any]:
 
 
 def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
-                    gemini: dict[str, str], cost_limit: str) -> bool:
+                    anthropic: dict[str, str], cost_limit: str) -> bool:
     feature_id = feature["id"]
     artifact_dir = ARTIFACT_DIR / feature_id / str(int(time.time()))
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -268,16 +272,17 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
 
     save_json(artifact_dir / "feature.json", feature)
     save_json(artifact_dir / "model-config.json", {
-        "provider": "google-gemini",
-        "model": gemini["model"],
-        "credential": "GEMINI_API_KEY",
+        "provider": "freellmapi-anthropic",
+        "model": anthropic["model"],
+        "api_base": anthropic["api_base"],
+        "credential": "FREELLMAPI_API_KEY",
         "credential_value_saved": False,
     })
 
     agent_ok = invoke_mini_swe_agent(
         feature,
         artifact_dir=artifact_dir / "initial-agent",
-        gemini=gemini,
+        anthropic=anthropic,
         cost_limit=cost_limit,
     )
 
@@ -291,7 +296,7 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
         repair_ok = invoke_mini_swe_agent(
             feature,
             artifact_dir=artifact_dir / "repair-agent",
-            gemini=gemini,
+            anthropic=anthropic,
             cost_limit=cost_limit,
             repair=True,
         )
@@ -335,14 +340,14 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
 def main() -> int:
     parser = argparse.ArgumentParser(description="AWH external Python agent orchestrator")
     parser.add_argument("--feature", help="Process a specific feature ID")
-    parser.add_argument("--model", help="Override Google Gemini model")
+    parser.add_argument("--model", help="Override Anthropic-compatible model")
     parser.add_argument("--cost-limit", default=os.environ.get("AWH_AGENT_COST_LIMIT", "3"))
     parser.add_argument("--once", action="store_true", help="Run only one feature")
     args = parser.parse_args()
 
-    gemini = load_gemini_configuration()
+    anthropic = load_anthropic_configuration()
     if args.model:
-        gemini["model"] = args.model
+        anthropic["model"] = args.model
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -350,7 +355,7 @@ def main() -> int:
     features = get_features(registry)
     state = load_state()
 
-    print(f"AWH Gemini model: {gemini['model']}")
+    print(f"AWH FreeLLMAPI Anthropic model: {anthropic['model']}")
     print(f"Features: {len(features)} | Completed: {len(state.get('completed', []))}")
 
     while True:
@@ -362,7 +367,7 @@ def main() -> int:
             return 0
 
         print(f"\n=== Processing {feature['id']} ===")
-        ok = process_feature(feature, state=state, gemini=gemini, cost_limit=args.cost_limit)
+        ok = process_feature(feature, state=state, anthropic=anthropic, cost_limit=args.cost_limit)
         if not ok:
             print("Feature failed deterministic verification; stopping.")
             return 1
