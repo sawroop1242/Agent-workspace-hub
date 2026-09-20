@@ -26,14 +26,11 @@ jobs:
       max_iterations: ${{ fromJson(vars.OPENHANDS_MAX_ITER || '50') }}
       macro: ${{ vars.OPENHANDS_MACRO || '@openhands-agent' }}
       target_branch: ${{ vars.TARGET_BRANCH || 'rust' }}
-      pr_type: ${{ vars.OPENHANDS_PR_TYPE || 'draft' }}
       LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
-      LLM_API_VERSION: ${{ vars.LLM_API_VERSION || '' }}
       base_container_image: ${{ vars.OPENHANDS_BASE_CONTAINER_IMAGE || '' }}
       runner: ${{ vars.TARGET_RUNNER || 'ubuntu-latest' }}
     secrets:
-      LLM_MODEL: ${{ secrets.OPENHANDS_LLM_MODEL }}
       LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-      LLM_BASE_URL: ${{ secrets.OPENHANDS_LLM_BASE_URL }}
+      LLM_BASE_URL: https://integrate.api.nvidia.com/v1
       PAT_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
       PAT_USERNAME: ${{ vars.OPENHANDS_PAT_USERNAME }}
