@@ -1,0 +1,8 @@
+{
+  "id": "auto",
+  "displayName": "FreeLLMAPI Anthropic Auto",
+  "providerName": "FreeLLMAPI",
+  "baseUrl": "https://freellmapi-production-905c.up.railway.app/v1/messages",
+  "apiType": "Anthropic",
+  "apiKey": "${FREELLMAPI_API_KEY}"
+}
