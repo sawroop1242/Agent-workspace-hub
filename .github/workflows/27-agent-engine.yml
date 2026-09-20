@@ -19,11 +19,6 @@ on:
         description: "Feature registry ID, for example workspace.agent-grade-editing"
         required: true
         type: string
-      model:
-        description: "Anthropic-compatible model routed through FreeLLMAPI"
-        required: false
-        type: string
-        default: "anthropic/auto"
       cost_limit:
         description: "Maximum agent cost in USD; 0 disables the limit"
         required: false
@@ -153,6 +148,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
           ANTHROPIC_API_BASE: https://freellmapi-production-905c.up.railway.app/v1
           OPENAI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          MSWEA_COST_TRACKING: ignore_errors
         shell: bash
         run: |
           set -euo pipefail
