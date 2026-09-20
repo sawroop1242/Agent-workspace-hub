@@ -178,6 +178,62 @@ coherent correction. Do not weaken tests to obtain a passing result.
     return task.strip()
 
 
+def write_mini_config(path: Path, *, anthropic: dict[str, str],
+                      cost_limit: str) -> None:
+    """Write a v2-compatible mini-SWE-agent config for the AWH worker."""
+    use_swerex = os.environ.get("AWH_USE_SWEREX", "1") == "1"
+    environment: dict[str, Any] = {
+        "environment_class": "swerex_docker" if use_swerex else "docker",
+        "cwd": "/workspace",
+        "image": "rust:latest",
+        "timeout": 180,
+    }
+    if use_swerex:
+        environment["deployment_extra_kwargs"] = {
+            "docker_args": [
+                "--rm",
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--volume",
+                f"{ROOT}:/workspace",
+            ]
+        }
+    else:
+        environment["run_args"] = [
+            "--rm",
+            "--network",
+            "none",
+            "--cap-drop",
+            "ALL",
+            "--volume",
+            f"{ROOT}:/workspace",
+        ]
+
+    config = {
+        "model": {
+            "model_class": "litellm",
+            "model_name": anthropic["model"],
+            # FreeLLMAPI's router model is intentionally not in LiteLLM's
+            # public price catalog, so missing price metadata must not abort
+            # the executor. The hard execution bound remains step_limit.
+            "cost_tracking": "ignore_errors",
+            "model_kwargs": {
+                "api_base": anthropic["api_base"],
+            },
+        },
+        "agent": {
+            "step_limit": 100,
+            "cost_limit": float(cost_limit),
+            "mode": "yolo",
+            "confirm_exit": False,
+        },
+        "environment": environment,
+    }
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+
 def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
                           anthropic: dict[str, str], cost_limit: str,
                           repair: bool = False) -> bool:
@@ -185,24 +241,25 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
     artifact_dir.mkdir(parents=True, exist_ok=True)
     (artifact_dir / "agent-task.txt").write_text(task + "\n", encoding="utf-8")
     output_file = artifact_dir / "mini-swe-agent-output.txt"
+    config_file = artifact_dir / "mini-awh.yml"
+    write_mini_config(config_file, anthropic=anthropic, cost_limit=cost_limit)
 
     agent_env = os.environ.copy()
-    # FreeLLMAPI credential is supplied only through the child process
+    # FreeLLMAPI credential is supplied only through the parent process
     # environment. It is never written to task text, command arguments,
-    # state, or artifacts.
+    # state, or artifacts. The container only executes shell actions.
     agent_env["ANTHROPIC_API_KEY"] = anthropic["api_key"]
     agent_env["ANTHROPIC_API_BASE"] = anthropic["api_base"]
+    agent_env["MSWEA_MODEL_NAME"] = anthropic["model"]
+    agent_env["MSWEA_COST_TRACKING"] = "ignore_errors"
 
     command = [
         "mini",
-        "-m", anthropic["model"],
+        "-c", str(config_file),
         "-t", task,
         "-y",
-        "-l", cost_limit,
         "-o", str(output_file),
     ]
-    if os.environ.get("AWH_USE_SWEREX", "1") == "1":
-        command.extend(["--environment-class", "swerex_docker"])
 
     print(f"Invoking mini-SWE-agent with FreeLLMAPI Anthropic: {anthropic['model']}")
     exit_code, _ = run(command, env=agent_env)
@@ -217,6 +274,8 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
         "provider": "freellmapi-anthropic",
         "api_base": anthropic["api_base"],
         "credential": "FREELLMAPI_API_KEY",
+        "credential_value_saved": False,
+        "config": str(config_file.relative_to(ROOT)),
         "credential_value_saved": False,
         "timestamp": utc_now(),
     })
