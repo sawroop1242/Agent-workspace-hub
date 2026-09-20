@@ -35,11 +35,12 @@ on:
   issue_comment:
     types: [created]
 
-permissions:
-  contents: read
-
 jobs:
   call-openhands-resolver:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     # issue_comment fires on PR comments too - github.event.issue.pull_request
     # is only present when the comment is on a PR, so its absence confirms
     # this is a real issue comment, not a PR review comment.
