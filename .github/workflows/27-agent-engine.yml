@@ -202,7 +202,9 @@ jobs:
       - name: Run implementation or repair agent
         if: inputs.mode == 'implement' || inputs.mode == 'repair'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_BASE: https://freellmapi-production-905c.up.railway.app/v1
         shell: bash
         run: |
           set -euo pipefail
@@ -298,7 +300,9 @@ jobs:
         if: inputs.mode == 'implement' && steps.verify_initial.outputs.passed != 'true'
         id: repair_attempt
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_BASE: https://freellmapi-production-905c.up.railway.app/v1
         shell: bash
         run: |
           set +e
