@@ -20,10 +20,10 @@ on:
         required: true
         type: string
       model:
-        description: "Google Gemini model name used by the orchestrator"
+        description: "Anthropic-compatible model routed through FreeLLMAPI"
         required: false
         type: string
-        default: "gemini/gemini-2.5-flash"
+        default: "anthropic/auto"
       cost_limit:
         description: "Maximum agent cost in USD; 0 disables the limit"
         required: false
@@ -110,14 +110,20 @@ jobs:
       - name: Run Python long-running orchestrator
         if: inputs.mode == 'orchestrate'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # FreeLLMAPI provides the Anthropic-compatible /v1/messages endpoint.
+          # The orchestrator's existing provider interface is retained so the
+          # agent-engine flow remains unchanged; no Gemini secret is used.
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_BASE: https://freellmapi-production-905c.up.railway.app/v1
+          GEMINI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
           AWH_GEMINI_MODEL: ${{ inputs.model }}
           AWH_AGENT_COST_LIMIT: ${{ inputs.cost_limit }}
           AWH_USE_SWEREX: ${{ inputs.use_swerex }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$GEMINI_API_KEY"
+          test -n "$FREELLMAPI_API_KEY"
           test -n "$AWH_GEMINI_MODEL"
           python3 .github/agent-engine/orchestrator.py \
             --feature "${{ inputs.feature_id }}" \
@@ -138,7 +144,10 @@ jobs:
         if: inputs.mode == 'plan'
         env:
           MODEL_NAME: ${{ inputs.model }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ANTHROPIC_API_BASE: https://freellmapi-production-905c.up.railway.app/v1
+          OPENAI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
