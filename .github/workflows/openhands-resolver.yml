@@ -1,0 +1,69 @@
+name: OpenHands Issue Resolver
+
+# Label an issue "fix-me", or comment "@openhands-agent" on one, and this
+# calls All-Hands-AI/OpenHands's own reusable resolver workflow to attempt
+# an autonomous fix and open a PR against `rust`.
+#
+# Routed through NVIDIA NIM rather than the resolver's default
+# Anthropic/OpenAI recommendation - see the LLM_MODEL note below.
+#
+# Setup required before first use (see docs/README.md for AWH's other
+# secrets/vars conventions):
+#   Settings -> Secrets and variables -> Actions -> Secrets:
+#     OPENHANDS_PAT_TOKEN   - PAT with contents/issues/pull-requests/workflows
+#                             write scope. A PAT is required (not the ambient
+#                             GITHUB_TOKEN) because the resolver's own PR
+#                             needs to trigger downstream workflow runs.
+#     OPENHANDS_NVIDIA_KEY  - NVIDIA NIM API key (integrate.api.nvidia.com).
+#                             Deliberately a new, dedicated secret rather than
+#                             reusing AWH_AGENT2_NVIDIA_KEY_2/3 or
+#                             AWH_AGENT3_NVIDIA_KEY_1, since those are already
+#                             earmarked for the agent-engine and Junie jobs -
+#                             point it at the same NVIDIA account if you'd
+#                             rather not provision a separate key.
+#   Settings -> Secrets and variables -> Actions -> Variables (optional):
+#     OPENHANDS_PAT_USERNAME - GitHub username owning the PAT above.
+#                              Defaults to the token owner if unset.
+#     LLM_MODEL               - defaults to "openai/z-ai/glm-5.3" below.
+#   Settings -> Actions -> General -> Workflow permissions:
+#     "Read and write permissions", plus "Allow GitHub Actions to create
+#     and approve pull requests" - both required for the resolver's PR step.
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  call-openhands-resolver:
+    # issue_comment fires on PR comments too - github.event.issue.pull_request
+    # is only present when the comment is on a PR, so its absence confirms
+    # this is a real issue comment, not a PR review comment.
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'fix-me') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request == null &&
+       contains(github.event.comment.body, '@openhands-agent'))
+    uses: All-Hands-AI/OpenHands/.github/workflows/openhands-resolver.yml@main
+    with:
+      macro: ${{ vars.OPENHANDS_MACRO || '@openhands-agent' }}
+      max_iterations: ${{ fromJson(vars.OPENHANDS_MAX_ITER || '50') }}
+      target_branch: rust
+      # NVIDIA NIM's own catalog name for this model is "z-ai/glm-5.3" (same
+      # identifier used in .junie/models/nvidia-glm.json). The resolver runs
+      # on LiteLLM, which routes "openai/<model>" to whatever LLM_BASE_URL
+      # is set below - this is the generic OpenAI-compatible path. LiteLLM
+      # may also expose a dedicated "nvidia_nim/z-ai/glm-5.3" provider
+      # prefix; confirm against LiteLLM's current NVIDIA NIM provider docs
+      # before relying on this in an unattended run, and adjust the
+      # LLM_MODEL repo variable rather than this default if so.
+      LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
+    secrets:
+      PAT_TOKEN: ${{ secrets.OPENHANDS_PAT_TOKEN }}
+      PAT_USERNAME: ${{ vars.OPENHANDS_PAT_USERNAME }}
+      LLM_API_KEY: ${{ secrets.OPENHANDS_NVIDIA_KEY }}
+      LLM_BASE_URL: https://integrate.api.nvidia.com/v1
