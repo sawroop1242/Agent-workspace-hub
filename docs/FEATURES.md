@@ -12,6 +12,8 @@ External agents own reasoning, planning, model selection, and agent intelligence
 
 AWH is not an agent framework, generic model router, or general-purpose workflow engine.
 
+See `docs/roadmap/GROWTH_STRATEGY.md` for how this boundary translates into positioning and adoption sequencing.
+
 ## Final feature set
 
 ### Foundation and distribution
