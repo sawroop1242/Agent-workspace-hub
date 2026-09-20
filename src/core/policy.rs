@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// `filesystem.*` editing tools so a workspace-local DENY rule can narrow
 /// edit mutations exactly as it narrows `workspace.write_file`. The
 /// rollback tool is covered too: a rollback is a consequential mutation.
-const SUPPORTED_POLICY_TOOLS: [&str; 8] = [
+const SUPPORTED_POLICY_TOOLS: [&str; 9] = [
     "workspace.write_file",
     "workspace.delete_file",
     "terminal.run",
@@ -20,6 +20,7 @@ const SUPPORTED_POLICY_TOOLS: [&str; 8] = [
     "filesystem.delete_range",
     "filesystem.patch",
     "filesystem.apply_diff",
+    "filesystem.rollback",
 ];
 
 /// Persistent workspace-local policy storage under `.agent/policy.json`.
@@ -145,7 +146,8 @@ impl PolicyStore {
                 | "filesystem.insert"
                 | "filesystem.delete_range"
                 | "filesystem.patch"
-                | "filesystem.apply_diff" => path_prefix_matches(&rule.pattern, resource),
+                | "filesystem.apply_diff"
+                | "filesystem.rollback" => path_prefix_matches(&rule.pattern, resource),
                 _ => false,
             };
             if matched {
@@ -373,6 +375,38 @@ mod tests {
                 "{tool} must not match a resource outside the deny prefix"
             );
         }
+    }
+
+    #[test]
+    fn filesystem_rollback_is_policy_supported_and_path_scoped() {
+        // Regression test for the AWE-011 gap: `EditAction::Rollback`
+        // authorizes as tool "filesystem.rollback", but that tool was
+        // missing from SUPPORTED_POLICY_TOOLS, so a rollback mutation could
+        // never be denied by policy. Rollback is a consequential mutation
+        // and must be policy-deniable like every other edit operation.
+        let temp = tempfile::tempdir().unwrap();
+        let store = PolicyStore::new(temp.path());
+        store
+            .add(&rule("deny-rollback", "filesystem.rollback", "src/"))
+            .unwrap();
+        assert!(store
+            .matching("filesystem.rollback", "src/main.rs")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .matching("filesystem.rollback", "src/foo/bar.rs")
+            .unwrap()
+            .is_some());
+        // path-component boundary: "src/" must not match "srcx/.."
+        assert!(store
+            .matching("filesystem.rollback", "srcx/main.rs")
+            .unwrap()
+            .is_none());
+        // a rollback rule must not match unrelated edit tools
+        assert!(store
+            .matching("filesystem.replace", "src/main.rs")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

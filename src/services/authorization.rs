@@ -503,4 +503,40 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn rollback_obeys_policy_deny() {
+        // Regression coverage for the AWE-011 gap: rollback maps to the
+        // "filesystem.rollback" policy tool, which must be deniable by a
+        // workspace policy rule like every other consequential mutation.
+        let temp = tempfile::tempdir().unwrap();
+        write_grant_store(temp.path(), grant("g1", "agent-a", None, None));
+        write_policy(temp.path(), "deny-rb", "filesystem.rollback", "src/");
+        let auth = EditAuthorizer::new(temp.path().to_path_buf());
+        let denied = request(
+            EditAction::Rollback,
+            "src/main.rs",
+            principal(Some("agent-a")),
+        );
+        assert!(matches!(
+            auth.authorize(&denied),
+            AuthorizationDecision::Deny {
+                reason: DenialReason::PolicyDenied,
+                ..
+            }
+        ));
+        let allowed = request(
+            EditAction::Rollback,
+            "docs/readme.md",
+            principal(Some("agent-a")),
+        );
+        assert_eq!(auth.authorize(&allowed), AuthorizationDecision::Allow);
+    }
+
+    #[test]
+    fn rollback_tool_name_matches_policy_namespace() {
+        // Guards against a future drift between the authorization tool
+        // name and the policy store's supported tool table.
+        assert_eq!(EditAction::Rollback.tool_name(), "filesystem.rollback");
+    }
 }
