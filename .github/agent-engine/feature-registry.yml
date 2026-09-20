@@ -19,10 +19,40 @@ features:
     phase: 2
     priority: P0
     status: incomplete
-    description: Controlled line-wise and diff-based editing integrated with verification, snapshots, provenance and audit.
-    depends_on: [workspace.filesystem, snapshots.provenance]
+    description: Complete the AWE agent-grade editing pipeline from canonical edit transactions through safe mutation, atomic verification, snapshots, provenance, audit, rollback, CLI/MCP adapters and real-client acceptance.
+    issues:
+      - AWE-001
+      - AWE-002
+      - AWE-003
+      - AWE-004
+      - AWE-005
+      - AWE-006
+      - AWE-007
+      - AWE-008
+      - AWE-009
+      - AWE-010
+      - AWE-011
+      - AWE-012
+      - AWE-013
+      - AWE-014
+      - AWE-015
+      - AWE-016
+      - AWE-017
+      - AWE-018
+    acceptance_contract:
+      transaction: "validate -> expected-state/context check -> prepare -> snapshot -> apply -> verify -> provenance/audit -> result -> optional rollback"
+      safety_invariant: "invalid/conflict -> zero mutation"
+      rollback_invariant: "apply/edit -> verify -> rollback -> byte-identical original state"
+      multi_file_invariant: "preparation failure -> all files unchanged"
+      transport_invariant: "MCP and CLI use the same canonical edit service"
+      interoperability_gate: "real MCP clients must exercise read -> minimal edit -> verify -> conflict/rollback"
+    depends_on:
+      - workspace.filesystem
+      - snapshots.provenance
+      - audit.observability
+      - capabilities.unified-enforcement
     interfaces: [mcp, cli]
-    verification: [rust, integration, security]
+    verification: [rust, integration, security, compatibility]
 
   - id: git.first-class-worktrees
     phase: 3
