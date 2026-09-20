@@ -133,3 +133,10 @@ See the existing MCP and security documentation for transport/authentication det
 | `docs/*.md` | Architecture, roadmap, security, implementation and status documentation |
 | `scripts/install.sh` | One-line Rust-binary installer |
 | `.github/workflows/*.yml` | CI and release pipelines |
+
+
+
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=sawroop1242/agent-workspace-hub&type=date&logscale&legend=bottom-right)](https://www.star-history.com/?repos=sawroop1242%2Fagent-workspace-hub&type=date&logscale=&legend=bottom-right)
