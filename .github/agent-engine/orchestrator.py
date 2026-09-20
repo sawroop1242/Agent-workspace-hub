@@ -360,7 +360,7 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
 
     repair_attempted = False
     repair_ok = False
-    if not initial_passed:
+    if not agent_ok or not initial_passed:
         repair_attempted = True
         repair_ok = invoke_mini_swe_agent(
             feature,
@@ -373,8 +373,10 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
 
     if repair_attempted:
         final_passed, final_result = deterministic_verify(artifact_dir / "final")
+        final_passed = final_passed and repair_ok
     else:
-        final_passed, final_result = initial_passed, initial_result
+        final_passed = initial_passed and agent_ok
+        final_result = initial_result
 
     save_json(artifact_dir / "final-verification.json", final_result)
     write_patch_and_status(artifact_dir)
