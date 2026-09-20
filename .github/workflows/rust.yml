@@ -77,13 +77,14 @@ jobs:
           echo "" >> $GITHUB_ENV
           echo "$EOF" >> $GITHUB_ENV
 
-      # Step 2: Run Junie through the repository's OpenAI-compatible Gemini profile.
-      # The custom profile is selected explicitly; the provider/model endpoint is
-      # defined in .junie/models/gemini-auto.json.
+      # Junie's prepare step requires a supported BYOK input. The OpenAI BYOK
+      # slot is used only to satisfy that action-level requirement; the custom
+      # profile below routes the actual request to FreeLLMAPI.
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
         env:
           FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         with:
-          model: "custom:gemini-auto"
+          openai_api_key: ${{ secrets.FREELLMAPI_API_KEY }}
+          model: "custom:freellmapi-auto"
           prompt: ${{ env.CUSTOM_PROMPT }}
