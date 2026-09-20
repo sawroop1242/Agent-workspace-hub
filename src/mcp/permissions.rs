@@ -234,4 +234,100 @@ mod tests {
         assert!(!is_blocked_environment("HOME"));
         assert!(!is_blocked_environment("API_KEY"));
     }
+
+    #[test]
+    fn permission_as_str_and_display_agree_with_wire_labels() {
+        for (permission, label) in [
+            (Permission::Network, "network"),
+            (Permission::Filesystem, "filesystem"),
+            (Permission::Environment, "environment"),
+            (Permission::Process, "process"),
+            (Permission::Secrets, "secrets"),
+        ] {
+            assert_eq!(permission.as_str(), label);
+            assert_eq!(permission.to_string(), label);
+            // wire label round trips back through serde
+            let back: Permission = serde_json::from_str(&format!("{label:?}")).unwrap();
+            assert_eq!(back, permission);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_permissions() {
+        let perms = McpPermissions {
+            network: true,
+            process: true,
+            filesystem: vec!["/data".into()],
+            environment: vec!["API_KEY".into()],
+            secrets: vec!["API_KEY".into()],
+        };
+        assert!(perms.validate().is_ok());
+        // empty everything is also valid (grants nothing)
+        assert!(McpPermissions::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_filesystem_paths() {
+        let mut perms = McpPermissions {
+            filesystem: vec!["/ok".into(), "   ".into()],
+            ..McpPermissions::default()
+        };
+        assert!(perms.validate().is_err());
+        perms.filesystem = vec!["/ok".into()];
+        assert!(perms.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_and_blocked_environment_names() {
+        let mut perms = McpPermissions {
+            environment: vec!["1BAD".into()],
+            ..McpPermissions::default()
+        };
+        assert!(perms.validate().is_err());
+        perms = McpPermissions {
+            environment: vec!["LD_PRELOAD".into()],
+            ..McpPermissions::default()
+        };
+        assert!(perms.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_secret_without_matching_environment() {
+        // a secret must also appear in the environment list to be resolvable
+        let perms = McpPermissions {
+            environment: vec!["OTHER".into()],
+            secrets: vec!["API_KEY".into()],
+            ..McpPermissions::default()
+        };
+        assert!(perms.validate().is_err());
+        let fixed = McpPermissions {
+            environment: vec!["API_KEY".into()],
+            secrets: vec!["API_KEY".into()],
+            ..McpPermissions::default()
+        };
+        assert!(fixed.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_blocked_secret_names() {
+        let perms = McpPermissions {
+            environment: vec!["LD_PRELOAD".into(), "PATH".into()],
+            secrets: vec!["PATH".into()],
+            ..McpPermissions::default()
+        };
+        assert!(perms.validate().is_err());
+    }
+
+    #[test]
+    fn mcp_permissions_serde_defaults_missing_fields() {
+        // Approvals persisted without all fields still deserialize with
+        // fail-closed defaults (nothing granted).
+        let json = r#"{"network": true}"#;
+        let perms: McpPermissions = serde_json::from_str(json).unwrap();
+        assert!(perms.network);
+        assert!(!perms.process);
+        assert!(perms.filesystem.is_empty());
+        assert!(perms.environment.is_empty());
+        assert!(perms.secrets.is_empty());
+    }
 }

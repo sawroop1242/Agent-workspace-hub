@@ -83,3 +83,91 @@ impl ProjectSkillReferences {
         &self.path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry_with(temp: &tempfile::TempDir, names: &[&str]) -> GlobalSkillRegistry {
+        let registry = GlobalSkillRegistry::new(temp.path().join("global-skills"));
+        for name in names {
+            registry.create(name, "test skill").unwrap();
+        }
+        registry
+    }
+
+    #[test]
+    fn new_points_at_agent_skills_json() {
+        let refs = ProjectSkillReferences::new("/proj");
+        assert_eq!(refs.path(), Path::new("/proj/.agent/skills.json"));
+    }
+
+    #[test]
+    fn load_defaults_to_empty_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let refs = ProjectSkillReferences::new(temp.path());
+        assert!(refs.load().unwrap().skills.is_empty());
+    }
+
+    #[test]
+    fn add_requires_skill_installed_globally() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = registry_with(&temp, &[]);
+        let refs = ProjectSkillReferences::new(temp.path().join("proj"));
+        let error = refs.add("missing-skill", &registry).unwrap_err();
+        assert!(error.to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn add_persists_sorted_unique_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = registry_with(&temp, &["alpha", "beta"]);
+        let proj = temp.path().join("proj");
+        let refs = ProjectSkillReferences::new(&proj);
+        refs.add("beta", &registry).unwrap();
+        refs.add("alpha", &registry).unwrap();
+        refs.add("alpha", &registry).unwrap(); // duplicate add is a no-op
+
+        let loaded = refs.load().unwrap();
+        assert_eq!(loaded.skills, vec!["alpha", "beta"]);
+        assert!(refs.path().is_file());
+    }
+
+    #[test]
+    fn remove_reports_existence_and_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = registry_with(&temp, &["alpha"]);
+        let refs = ProjectSkillReferences::new(temp.path().join("proj"));
+        assert!(!refs.remove("alpha").unwrap()); // not referenced yet
+        refs.add("alpha", &registry).unwrap();
+        assert!(refs.remove("alpha").unwrap());
+        assert!(refs.load().unwrap().skills.is_empty());
+        assert!(!refs.remove("alpha").unwrap()); // already removed
+    }
+
+    #[test]
+    fn resolve_returns_installed_skills_in_reference_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = registry_with(&temp, &["alpha", "beta"]);
+        let refs = ProjectSkillReferences::new(temp.path().join("proj"));
+        refs.add("beta", &registry).unwrap();
+        refs.add("alpha", &registry).unwrap();
+        let resolved = refs.resolve(&registry).unwrap();
+        let names: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
+        // stored sorted, so resolution is deterministic
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn resolve_fails_when_referenced_skill_is_missing_globally() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = registry_with(&temp, &["alpha"]);
+        let proj = temp.path().join("proj");
+        let refs = ProjectSkillReferences::new(&proj);
+        refs.add("alpha", &registry).unwrap();
+        // simulate the skill being uninstalled after being referenced
+        fs::remove_dir_all(registry.skills_dir().join("alpha")).unwrap();
+        let error = refs.resolve(&registry).unwrap_err();
+        assert!(error.to_string().contains("missing global skill"));
+    }
+}

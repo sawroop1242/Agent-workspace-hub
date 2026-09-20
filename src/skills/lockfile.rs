@@ -58,3 +58,97 @@ impl LockfileStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn locked(name: &str, version: &str, source: &str) -> LockedSkill {
+        LockedSkill {
+            name: name.into(),
+            version: version.into(),
+            source: source.into(),
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn new_points_at_agent_skills_lock_json() {
+        let store = LockfileStore::new("/proj");
+        assert_eq!(store.path, PathBuf::from("/proj/.agent/skills.lock.json"));
+    }
+
+    #[test]
+    fn load_defaults_to_empty_v1_lockfile_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LockfileStore::new(temp.path());
+        let lock = store.load().unwrap();
+        assert_eq!(lock.version, 1);
+        assert!(lock.skills.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_round_trips_pinned_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LockfileStore::new(temp.path());
+        let lock = SkillLockfile {
+            version: 1,
+            skills: vec![
+                locked("alpha", "1.0.0", "registry"),
+                locked("beta", "2.0.0", "repo"),
+            ],
+        };
+        store.save(&lock).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.skills.len(), 2);
+        assert_eq!(loaded.skills[0].name, "alpha");
+        assert_eq!(loaded.skills[0].version, "1.0.0");
+        assert_eq!(loaded.skills[1].source, "repo");
+        assert_eq!(loaded.skills[1].sha256, None);
+    }
+
+    #[test]
+    fn save_creates_missing_parent_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LockfileStore::new(temp.path().join("deep/nested/project"));
+        store
+            .save(&SkillLockfile {
+                version: 1,
+                skills: vec![],
+            })
+            .unwrap();
+        assert!(temp
+            .path()
+            .join("deep/nested/project/.agent/skills.lock.json")
+            .is_file());
+    }
+
+    #[test]
+    fn load_fails_on_corrupt_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LockfileStore::new(temp.path());
+        fs::create_dir_all(temp.path().join(".agent")).unwrap();
+        fs::write(&store.path, "not json").unwrap();
+        assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn sha256_digest_is_round_tripped_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LockfileStore::new(temp.path());
+        let mut skill = locked("alpha", "1.0.0", "registry");
+        skill.sha256 = Some("a".repeat(64));
+        store
+            .save(&SkillLockfile {
+                version: 1,
+                skills: vec![skill],
+            })
+            .unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.skills[0].sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+    }
+}

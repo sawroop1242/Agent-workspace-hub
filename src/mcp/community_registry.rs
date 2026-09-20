@@ -144,10 +144,12 @@ fn manifest_to_config(m: &CommunityMcpManifest) -> Result<CustomMcpServerConfig>
         bail!("registry MCP must have id and name");
     }
     match m.transport {
-        McpTransport::Stdio if m.command.as_deref().unwrap_or("").is_empty() => {
+        // Trim consistently with the id/name checks above: a whitespace-only
+        // command or URL is just as unusable as a missing one.
+        McpTransport::Stdio if m.command.as_deref().unwrap_or("").trim().is_empty() => {
             bail!("stdio MCP '{}' is missing command", m.id)
         }
-        McpTransport::StreamableHttp if m.url.as_deref().unwrap_or("").is_empty() => {
+        McpTransport::StreamableHttp if m.url.as_deref().unwrap_or("").trim().is_empty() => {
             bail!("HTTP MCP '{}' is missing url", m.id)
         }
         _ => {}
@@ -169,4 +171,117 @@ fn manifest_to_config(m: &CommunityMcpManifest) -> Result<CustomMcpServerConfig>
 #[allow(dead_code)]
 fn _validate_json(_value: &Value) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(id: &str, transport: McpTransport) -> CommunityMcpManifest {
+        CommunityMcpManifest {
+            id: id.into(),
+            name: format!("{id} server"),
+            description: String::new(),
+            version: "1.0".into(),
+            author: String::new(),
+            transport,
+            command: None,
+            args: Vec::new(),
+            url: None,
+            env: Default::default(),
+            homepage: None,
+            repository: None,
+        }
+    }
+
+    #[test]
+    fn manifest_to_config_rejects_missing_id_or_name() {
+        let mut m = manifest("mcp-a", McpTransport::Stdio);
+        m.command = Some("run".into());
+        {
+            let mut bad = m.clone();
+            bad.id = "   ".into();
+            assert!(manifest_to_config(&bad).is_err());
+        }
+        {
+            let mut bad = m.clone();
+            bad.name = String::new();
+            assert!(manifest_to_config(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn manifest_to_config_rejects_stdio_without_command() {
+        let m = manifest("mcp-a", McpTransport::Stdio);
+        let error = manifest_to_config(&m).unwrap_err();
+        assert!(error.to_string().contains("missing command"));
+        // whitespace-only command is treated as missing
+        let mut m = m;
+        m.command = Some("   ".into());
+        assert!(manifest_to_config(&m).is_err());
+    }
+
+    #[test]
+    fn manifest_to_config_rejects_http_without_url() {
+        let m = manifest("mcp-a", McpTransport::StreamableHttp);
+        let error = manifest_to_config(&m).unwrap_err();
+        assert!(error.to_string().contains("missing url"));
+    }
+
+    #[test]
+    fn manifest_to_config_maps_stdio_manifest_to_enabled_config() {
+        let mut m = manifest("mcp-a", McpTransport::Stdio);
+        m.command = Some("node".into());
+        m.args = vec!["server.js".into()];
+        m.env.insert("API_KEY".into(), "value".into());
+
+        let config = manifest_to_config(&m).unwrap();
+        assert_eq!(config.id, "mcp-a");
+        assert_eq!(config.name, "mcp-a server");
+        assert!(matches!(config.transport, McpTransport::Stdio));
+        assert_eq!(config.command.as_deref(), Some("node"));
+        assert_eq!(config.args, vec!["server.js".to_string()]);
+        assert_eq!(config.env.get("API_KEY").map(String::as_str), Some("value"));
+        // community installs start enabled with no extra permissions
+        assert!(config.enabled);
+        assert_eq!(config.headers.len(), 0);
+        assert!(!config.permissions.network);
+        assert!(!config.permissions.process);
+    }
+
+    #[test]
+    fn manifest_to_config_maps_http_manifest_to_enabled_config() {
+        let mut m = manifest("mcp-b", McpTransport::StreamableHttp);
+        m.url = Some("https://example.com/mcp".into());
+
+        let config = manifest_to_config(&m).unwrap();
+        assert!(matches!(config.transport, McpTransport::StreamableHttp));
+        assert_eq!(config.url.as_deref(), Some("https://example.com/mcp"));
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn index_and_manifests_deserialize_from_json() {
+        let json = r#"{
+            "mcps": [
+                {
+                    "id": "mcp-a",
+                    "name": "A",
+                    "transport": "stdio",
+                    "command": "node",
+                    "args": [],
+                    "url": null,
+                    "env": {}
+                }
+            ]
+        }"#;
+        let index: CommunityRegistryIndex = serde_json::from_str(json).unwrap();
+        assert_eq!(index.mcps.len(), 1);
+        assert_eq!(index.mcps[0].id, "mcp-a");
+        // optional fields default rather than fail
+        assert_eq!(index.mcps[0].version, "");
+        assert_eq!(index.mcps[0].author, "");
+        assert_eq!(index.mcps[0].description, "");
+        assert!(index.mcps[0].homepage.is_none());
+    }
 }
