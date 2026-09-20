@@ -138,12 +138,21 @@ def deterministic_verify(artifact_dir: Path) -> tuple[bool, dict[str, Any]]:
     return passed_all, result
 
 
-def build_agent_task(feature: dict[str, Any], repair: bool = False) -> str:
+def build_agent_task(feature: dict[str, Any], repair: bool = False,
+                     repair_evidence: Path | None = None) -> str:
+    issue_contract = feature.get("issue_contract", {})
+    acceptance_contract = feature.get("acceptance_contract", {})
     task = f"""You are working on Agent Workspace Hub (AWH).
 
 Feature: {feature['id']}
 Priority: {feature.get('priority', 'unknown')}
-Objective: {feature.get('objective', '')}
+Description: {feature.get('description', '')}
+
+Deterministic acceptance contract:
+{yaml.safe_dump(acceptance_contract, sort_keys=False).strip()}
+
+Issue-level requirements and verification:
+{yaml.safe_dump(issue_contract, sort_keys=False).strip()}
 
 Read before modifying code:
 - docs/PROJECT_CONTEXT.md
@@ -169,11 +178,12 @@ Rules:
 7. Leave the branch ready for review.
 """
     if repair:
-        task += """
+        evidence = str(repair_evidence.relative_to(ROOT)) if repair_evidence else ".github/agent-engine/artifacts"
+        task += f"""
 
 This is the single allowed REPAIR attempt. Read the previous deterministic
-verification evidence, reproduce the actual failure, and make the smallest
-coherent correction. Do not weaken tests to obtain a passing result.
+verification evidence under {evidence}, reproduce the actual failure, and make
+the smallest coherent correction. Do not weaken tests to obtain a passing result.
 """
     return task.strip()
 
@@ -236,8 +246,9 @@ def write_mini_config(path: Path, *, anthropic: dict[str, str],
 
 def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
                           anthropic: dict[str, str], cost_limit: str,
-                          repair: bool = False) -> bool:
-    task = build_agent_task(feature, repair=repair)
+                          repair: bool = False,
+                          repair_evidence: Path | None = None) -> bool:
+    task = build_agent_task(feature, repair=repair, repair_evidence=repair_evidence)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     (artifact_dir / "agent-task.txt").write_text(task + "\n", encoding="utf-8")
     output_file = artifact_dir / "mini-swe-agent-output.txt"
@@ -276,7 +287,6 @@ def invoke_mini_swe_agent(feature: dict[str, Any], *, artifact_dir: Path,
         "credential": "FREELLMAPI_API_KEY",
         "credential_value_saved": False,
         "config": str(config_file.relative_to(ROOT)),
-        "credential_value_saved": False,
         "timestamp": utc_now(),
     })
     return exit_code == 0
@@ -358,6 +368,7 @@ def process_feature(feature: dict[str, Any], *, state: dict[str, Any],
             anthropic=anthropic,
             cost_limit=cost_limit,
             repair=True,
+            repair_evidence=artifact_dir / "initial",
         )
 
     if repair_attempted:
