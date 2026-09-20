@@ -11,4 +11,5 @@ pub mod files;
 pub mod git;
 pub mod projects;
 pub mod rate_limit;
+pub mod snapshot;
 pub mod terminal;
