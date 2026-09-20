@@ -114,3 +114,147 @@ pub enum PolicyDenialError {
         reason: Option<String>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_error_display_messages_are_distinct_and_stable() {
+        assert_eq!(
+            McpAuthorizationError::MissingId.to_string(),
+            "MCP id is required"
+        );
+        assert_eq!(
+            McpAuthorizationError::NoApproval {
+                id: "server-a".into()
+            }
+            .to_string(),
+            "MCP execution denied: no approval for server-a"
+        );
+        assert_eq!(
+            McpAuthorizationError::Mismatch {
+                id: "server-a".into()
+            }
+            .to_string(),
+            "MCP execution denied: trust, version, or permissions do not match approval for server-a"
+        );
+    }
+
+    #[test]
+    fn authorization_error_equality_distinguishes_variants() {
+        let no_approval = McpAuthorizationError::NoApproval {
+            id: "server-a".into(),
+        };
+        let mismatch = McpAuthorizationError::Mismatch {
+            id: "server-a".into(),
+        };
+        assert_ne!(no_approval, mismatch);
+        // each constructed value equals an identically-constructed value
+        assert_eq!(
+            no_approval,
+            McpAuthorizationError::NoApproval {
+                id: "server-a".into()
+            }
+        );
+    }
+
+    #[test]
+    fn builtin_tool_error_tool_returns_gated_tool_for_every_variant() {
+        let cases = [
+            (
+                "workspace.write_file",
+                BuiltinToolAuthorizationError::Unregistered {
+                    tool: "workspace.write_file".into(),
+                },
+            ),
+            (
+                "workspace.delete_file",
+                BuiltinToolAuthorizationError::StoreUnavailable {
+                    tool: "workspace.delete_file".into(),
+                },
+            ),
+            (
+                "terminal.run",
+                BuiltinToolAuthorizationError::AuthorizationRequired {
+                    tool: "terminal.run".into(),
+                    id: "awh-builtin-tools".into(),
+                },
+            ),
+            (
+                "workspace.read_file",
+                BuiltinToolAuthorizationError::PermissionDenied {
+                    tool: "workspace.read_file".into(),
+                    permission: Permission::Network,
+                    id: "awh-builtin-tools".into(),
+                },
+            ),
+            (
+                "filesystem.patch",
+                BuiltinToolAuthorizationError::TrustLevelDenied {
+                    tool: "filesystem.patch".into(),
+                    id: "awh-builtin-tools".into(),
+                },
+            ),
+        ];
+        for (expected, error) in &cases {
+            assert_eq!(error.tool(), *expected);
+        }
+    }
+
+    #[test]
+    fn builtin_permission_denied_error_is_eq_comparable() {
+        // `Permission` must participate in PartialEq so callers can match on
+        // the specific missing capability (SEC-001 fail-closed reporting).
+        let a = BuiltinToolAuthorizationError::PermissionDenied {
+            tool: "terminal.run".into(),
+            permission: Permission::Process,
+            id: "awh-builtin-tools".into(),
+        };
+        let b = BuiltinToolAuthorizationError::PermissionDenied {
+            tool: "terminal.run".into(),
+            permission: Permission::Process,
+            id: "awh-builtin-tools".into(),
+        };
+        assert_eq!(a, b);
+        let c = BuiltinToolAuthorizationError::PermissionDenied {
+            tool: "terminal.run".into(),
+            permission: Permission::Filesystem,
+            id: "awh-builtin-tools".into(),
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn policy_denial_display_includes_rule_and_optional_reason() {
+        let plain = PolicyDenialError::Denied {
+            tool: "workspace.write_file".into(),
+            rule_id: "deny-env".into(),
+            pattern: "src/env/".into(),
+            reason: None,
+        };
+        assert_eq!(
+            plain.to_string(),
+            "'workspace.write_file' denied by policy rule 'deny-env' matching 'src/env/'"
+        );
+        let explained = PolicyDenialError::Denied {
+            tool: "terminal.run".into(),
+            rule_id: "deny-rm".into(),
+            pattern: "rm".into(),
+            reason: Some("destructive command".into()),
+        };
+        assert_eq!(
+            explained.to_string(),
+            "'terminal.run' denied by policy rule 'deny-rm' matching 'rm': destructive command"
+        );
+        assert_eq!(
+            plain,
+            PolicyDenialError::Denied {
+                tool: "workspace.write_file".into(),
+                rule_id: "deny-env".into(),
+                pattern: "src/env/".into(),
+                reason: None,
+            }
+        );
+    }
+}

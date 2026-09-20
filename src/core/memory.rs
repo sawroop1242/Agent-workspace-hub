@@ -56,3 +56,95 @@ impl MemoryStore {
         Ok(entries)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(content: &str) -> MemoryEntry {
+        MemoryEntry {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn for_project_points_at_agent_memory_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_project(temp.path());
+        assert_eq!(store.path(), temp.path().join(".agent/memory.jsonl"));
+    }
+
+    #[test]
+    fn read_all_on_missing_file_is_empty_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_project(temp.path());
+        assert!(store.read_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_creates_parent_dirs_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_project(temp.path());
+        store.append(&entry("first")).unwrap();
+        store.append(&entry("second")).unwrap();
+        assert!(store.path().is_file());
+        let entries = store.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "first");
+        assert_eq!(entries[1].content, "second");
+        assert_eq!(entries[0].timestamp, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn append_is_one_jsonl_line_per_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_project(temp.path());
+        store.append(&entry("first")).unwrap();
+        store.append(&entry("second")).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            assert!(serde_json::from_str::<MemoryEntry>(line).is_ok());
+        }
+        // no trailing separator junk: the file ends after the last newline
+        assert!(raw.ends_with('\n'));
+    }
+
+    #[test]
+    fn read_all_skips_blank_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_project(temp.path());
+        fs::create_dir_all(temp.path().join(".agent")).unwrap();
+        let content = format!(
+            "{}\n\n   \n{}\n",
+            serde_json::to_string(&entry("first")).unwrap(),
+            serde_json::to_string(&entry("second")).unwrap()
+        );
+        fs::write(store.path(), content).unwrap();
+        let entries = store.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "first");
+        assert_eq!(entries[1].content, "second");
+    }
+
+    #[test]
+    fn read_all_fails_on_corrupt_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_project(temp.path());
+        fs::create_dir_all(temp.path().join(".agent")).unwrap();
+        fs::write(store.path(), "not json at all\n").unwrap();
+        assert!(store.read_all().is_err());
+    }
+
+    #[test]
+    fn memory_entry_serializes_with_expected_field_names() {
+        let e = entry("hello");
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["timestamp"], "2026-01-01T00:00:00Z");
+        assert_eq!(json["content"], "hello");
+        let back: MemoryEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back, e);
+    }
+}

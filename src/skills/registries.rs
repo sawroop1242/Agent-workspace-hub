@@ -33,11 +33,14 @@ impl RegistryStore {
 
     /// Adds a registry URL, returning whether it was newly added.
     pub fn add(&self, url: &str) -> Result<bool> {
+        // Trim before the duplicate check so `https://host/` and `https://host`
+        // are recognized as the same registry instead of being stored twice.
+        let url = url.trim_end_matches('/');
         let mut config = self.load()?;
         if config.registries.iter().any(|u| u == url) {
             return Ok(false);
         }
-        config.registries.push(url.trim_end_matches('/').to_owned());
+        config.registries.push(url.to_owned());
         config.registries.sort();
         self.save(&config)?;
         Ok(true)
@@ -62,5 +65,77 @@ impl RegistryStore {
         }
         fs::write(&self.path, serde_json::to_string_pretty(config)?)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_defaults_to_empty_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(temp.path());
+        assert!(store.load().unwrap().registries.is_empty());
+    }
+
+    #[test]
+    fn add_is_idempotent_and_sorts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(temp.path());
+        assert!(store.add("https://b.example.com").unwrap());
+        assert!(store.add("https://a.example.com").unwrap());
+        assert!(!store.add("https://a.example.com").unwrap()); // duplicate
+
+        let config = store.load().unwrap();
+        assert_eq!(
+            config.registries,
+            vec!["https://a.example.com", "https://b.example.com"]
+        );
+    }
+
+    #[test]
+    fn add_trims_trailing_slash_before_deduplicating() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(temp.path());
+        assert!(store.add("https://a.example.com").unwrap());
+        // the same URL with a trailing slash is the same registry
+        assert!(!store.add("https://a.example.com/").unwrap());
+        let config = store.load().unwrap();
+        assert_eq!(config.registries, vec!["https://a.example.com"]);
+    }
+
+    #[test]
+    fn remove_reports_existence_and_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(temp.path());
+        assert!(!store.remove("https://gone.example.com").unwrap());
+        store.add("https://gone.example.com").unwrap();
+        assert!(store.remove("https://gone.example.com").unwrap());
+        assert!(store.load().unwrap().registries.is_empty());
+    }
+
+    #[test]
+    fn remove_does_not_match_a_trailing_slash_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(temp.path());
+        store.add("https://a.example.com").unwrap();
+        // removal is exact-match: the slashed variant does not remove it
+        assert!(!store.remove("https://a.example.com/").unwrap());
+        assert_eq!(store.load().unwrap().registries.len(), 1);
+    }
+
+    #[test]
+    fn save_load_round_trips_and_creates_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RegistryStore::new(temp.path().join("nested/root"));
+        store
+            .save(&RegistryConfig {
+                registries: vec!["https://one.example.com".into()],
+            })
+            .unwrap();
+        assert!(temp.path().join("nested/root/registries.json").is_file());
+        let config = store.load().unwrap();
+        assert_eq!(config.registries, vec!["https://one.example.com"]);
     }
 }

@@ -41,3 +41,47 @@ impl ProjectStore {
         Ok(projects)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_returns_project_with_agent_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = ProjectStore::create(temp.path(), "alpha").unwrap();
+        assert_eq!(project.name, "alpha");
+        assert_eq!(project.path, temp.path().join("alpha"));
+        assert!(project.path.join(".agent").is_dir());
+    }
+
+    #[test]
+    fn exists_reflects_directory_presence() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!ProjectStore::exists(temp.path(), "alpha"));
+        ProjectStore::create(temp.path(), "alpha").unwrap();
+        assert!(ProjectStore::exists(temp.path(), "alpha"));
+    }
+
+    #[test]
+    fn list_on_missing_root_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("no-such-root");
+        assert!(ProjectStore::list(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_returns_only_projects_with_agent_dir_sorted_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        ProjectStore::create(temp.path(), "beta").unwrap();
+        ProjectStore::create(temp.path(), "alpha").unwrap();
+        // a plain directory without `.agent` is not a project
+        fs::create_dir_all(temp.path().join("not-a-project")).unwrap();
+        // a file (not a directory) is not a project either
+        fs::write(temp.path().join("some-file.txt"), "hi").unwrap();
+
+        let projects = ProjectStore::list(temp.path()).unwrap();
+        let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+}

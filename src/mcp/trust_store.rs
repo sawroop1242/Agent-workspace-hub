@@ -70,3 +70,123 @@ impl PersistentTrustStore {
         changed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::permissions::McpPermissions;
+
+    #[test]
+    fn new_creates_data_dir_and_defaults_to_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("trust-data");
+        assert!(!dir.exists());
+        let store = PersistentTrustStore::new(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert!(store.approvals.is_empty());
+    }
+
+    #[test]
+    fn save_then_new_round_trips_approvals() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("trust-data");
+        let mut store = PersistentTrustStore::new(&dir).unwrap();
+        store
+            .approve(
+                "server-a",
+                TrustLevel::Reviewed,
+                McpPermissions::default(),
+                "1.0",
+            )
+            .unwrap();
+        store.save(&dir).unwrap();
+
+        let reloaded = PersistentTrustStore::new(&dir).unwrap();
+        assert_eq!(reloaded.approvals.len(), 1);
+        assert_eq!(reloaded.approvals[0].id, "server-a");
+        assert_eq!(reloaded.approvals[0].level, TrustLevel::Reviewed);
+        assert_eq!(reloaded.approvals[0].approved_version, "1.0");
+    }
+
+    #[test]
+    fn approve_replaces_and_persists_single_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("trust-data");
+        let mut store = PersistentTrustStore::new(&dir).unwrap();
+        store
+            .approve(
+                "server-a",
+                TrustLevel::Reviewed,
+                McpPermissions::default(),
+                "1.0",
+            )
+            .unwrap();
+        store
+            .approve(
+                "server-a",
+                TrustLevel::Blocked,
+                McpPermissions::default(),
+                "2.0",
+            )
+            .unwrap();
+        store.save(&dir).unwrap();
+        let reloaded = PersistentTrustStore::new(&dir).unwrap();
+        assert_eq!(reloaded.approvals.len(), 1);
+        assert_eq!(reloaded.approvals[0].level, TrustLevel::Blocked);
+    }
+
+    #[test]
+    fn revoke_reports_existence_and_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("trust-data");
+        let mut store = PersistentTrustStore::new(&dir).unwrap();
+        store
+            .approve(
+                "server-a",
+                TrustLevel::Reviewed,
+                McpPermissions::default(),
+                "1.0",
+            )
+            .unwrap();
+        store.save(&dir).unwrap();
+        let mut reloaded = PersistentTrustStore::new(&dir).unwrap();
+        assert!(!reloaded.revoke("missing"));
+        assert!(reloaded.revoke("server-a"));
+        reloaded.save(&dir).unwrap();
+        assert!(PersistentTrustStore::new(&dir)
+            .unwrap()
+            .approvals
+            .is_empty());
+    }
+
+    #[test]
+    fn store_conversion_preserves_approvals() {
+        let mut memory = TrustStore::default();
+        memory
+            .approve(
+                "server-a",
+                TrustLevel::Trusted,
+                McpPermissions::default(),
+                "",
+            )
+            .unwrap();
+        let persistent = PersistentTrustStore::from_store(&memory);
+        assert_eq!(persistent.approvals.len(), 1);
+        let back = persistent.to_store();
+        assert_eq!(back.approvals.len(), 1);
+        assert_eq!(back.get("server-a").unwrap().level, TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn approve_rejects_invalid_permissions_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("trust-data");
+        let mut store = PersistentTrustStore::new(&dir).unwrap();
+        let mut bad = McpPermissions::default();
+        bad.environment.push("PATH".into()); // blocked env var
+        assert!(store
+            .approve("server-a", TrustLevel::Trusted, bad, "1.0")
+            .is_err());
+        assert!(store.approvals.is_empty());
+    }
+}

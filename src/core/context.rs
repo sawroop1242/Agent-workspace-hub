@@ -39,3 +39,48 @@ impl ContextStore {
             .with_context(|| format!("failed to write {}", self.path.display()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn for_project_points_at_agent_context_md() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ContextStore::for_project(temp.path());
+        assert_eq!(store.path(), temp.path().join(".agent/context.md"));
+    }
+
+    #[test]
+    fn read_on_missing_file_is_empty_string_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ContextStore::for_project(temp.path());
+        assert_eq!(store.read().unwrap(), "");
+    }
+
+    #[test]
+    fn write_creates_parent_dirs_and_read_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ContextStore::for_project(temp.path());
+        store.write("# Context\n\nSome notes.").unwrap();
+        assert!(store.path().is_file());
+        assert_eq!(store.read().unwrap(), "# Context\n\nSome notes.");
+    }
+
+    #[test]
+    fn write_overwrites_previous_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ContextStore::for_project(temp.path());
+        store.write("first version").unwrap();
+        store.write("second version").unwrap();
+        assert_eq!(store.read().unwrap(), "second version");
+    }
+
+    #[test]
+    fn write_empty_string_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ContextStore::for_project(temp.path());
+        store.write("").unwrap();
+        assert_eq!(store.read().unwrap(), "");
+    }
+}
