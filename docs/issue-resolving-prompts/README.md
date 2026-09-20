@@ -71,3 +71,19 @@ workspace. `docs/` is treated as a primary engineering context source, but claim
 must still be reconciled against current source code, tests, Git history, and CI.
 
 Do not place secrets, credentials, or private CI data in these prompts.
+
+## Trust-Wedge standalone prompts
+
+The Trust Wedge is split into independently implementable issues. These prompts intentionally do not require another Trust-Wedge issue to be merged first:
+
+- TW-001 — AWH initialization and runtime identity contracts
+- TW-002 — AgentProfile, AgentRegistry, AgentSession
+- TW-003 — Agent-specific MCP routing and capability/policy enforcement
+- TW-004 — EditService caller identity and authorization
+- TW-005 — Durable file snapshots and provenance
+- TW-006 — Conflict-aware rollback and recovery
+- TW-007 — Persistent structured audit
+- TW-008 — Complete Trust-Wedge acceptance suite
+- TW-TRUST-WEDGE-MASTER-PROMPT — common implementation rules
+
+Each TW prompt is a master implementation prompt: inspect current source first, reuse existing abstractions, implement only the stated scope, add executable tests, and never claim acceptance without evidence.
