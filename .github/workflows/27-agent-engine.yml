@@ -83,7 +83,7 @@ jobs:
           feature_id = os.environ["FEATURE_ID"]
           mode = os.environ["MODE"]
           registry = Path(".github/agent-engine/feature-registry.yml").read_text()
-          marker = re.search(rf"(?m)^  - id: {re.escape(feature_id)}\\s*$", registry)
+          marker = re.search(rf"(?m)^  - id: {re.escape(feature_id)}\s*$", registry)
           if not marker:
               raise SystemExit(f"Unknown feature_id: {feature_id}")
           start = marker.start()
