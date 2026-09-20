@@ -601,6 +601,8 @@ awh logs follow
 
 ## 11. Strategic Guardrails
 
+> Go-to-market sequencing that follows from these guardrails lives in `docs/roadmap/GROWTH_STRATEGY.md`.
+
 1. **Do not become an agent framework.** AWH provides runtime infrastructure; agents own reasoning and planning.
 2. **Do not become a generic workflow/DAG platform.** Add orchestration only when required by an AWH workflow.
 3. **Do not become a generic model router.** Provider/model selection remains above AWH.
@@ -610,3 +612,4 @@ awh logs follow
 7. **Validate complete workflows, not only unit tests.**
 8. **Coherence over feature count.** Later phases must not destabilize the core runtime.
 9. **Distribution is a product feature.** Cross-platform binaries, install/upgrade/uninstall, checksums, and completion are part of release quality.
+10. **Growth follows trust, not breadth.** Do not chase general-purpose, maximal-permission adoption patterns. AWH's addressable growth is being the governance layer for exactly that risk class, not replicating it. See `docs/roadmap/GROWTH_STRATEGY.md`.
