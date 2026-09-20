@@ -166,14 +166,11 @@ jobs:
       - name: Prepare SWE-ReX agent configuration
         if: inputs.mode == 'implement' || inputs.mode == 'repair'
         env:
-          MODEL_NAME: ${{ inputs.model }}
+          MODEL_NAME: anthropic/auto
+          USE_SWEREX: ${{ inputs.use_swerex }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "$MODEL_NAME" ]; then
-            echo 'A model is required for implement/repair mode.'
-            exit 1
-          fi
           mkdir -p artifacts/agent-engine/config
           cat > artifacts/agent-engine/config/mini-awh.yml <<EOF
           model:
@@ -188,10 +185,14 @@ jobs:
             mode: yolo
             confirm_exit: false
           environment:
-            environment_class: ${{ inputs.use_swerex && 'swerex_docker' || 'docker' }}
             cwd: /workspace
             image: rust:latest
             timeout: 180
+          EOF
+
+          if [ "$USE_SWEREX" = "true" ]; then
+            cat >> artifacts/agent-engine/config/mini-awh.yml <<EOF
+            environment_class: swerex_docker
             deployment_extra_kwargs:
               docker_args:
                 - "--rm"
@@ -202,6 +203,19 @@ jobs:
                 - "--volume"
                 - "${GITHUB_WORKSPACE}:/workspace"
           EOF
+          else
+            cat >> artifacts/agent-engine/config/mini-awh.yml <<EOF
+            environment_class: docker
+            run_args:
+              - "--rm"
+              - "--network"
+              - "none"
+              - "--cap-drop"
+              - "ALL"
+              - "--volume"
+              - "${GITHUB_WORKSPACE}:/workspace"
+          EOF
+          fi
           cat artifacts/agent-engine/config/mini-awh.yml
 
       - name: Run implementation or repair agent
