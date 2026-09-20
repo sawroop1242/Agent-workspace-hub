@@ -54,7 +54,7 @@ jobs:
       - run: cargo audit
 
   ai-review:
-    name: Deep AI Code Review (FreeLLMAPI OpenAI-compatible)
+    name: Deep AI Code Review (FreeLLMAPI Anthropic-compatible)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: [fmt]
@@ -77,14 +77,13 @@ jobs:
           echo "" >> $GITHUB_ENV
           echo "$EOF" >> $GITHUB_ENV
 
-      # Junie's prepare step requires a supported BYOK input. The OpenAI BYOK
-      # slot is used only to satisfy that action-level requirement; the custom
-      # profile below routes the actual request to FreeLLMAPI.
+      # Junie's prepare step requires a supported BYOK input. The Anthropic BYOK
+      # slot authenticates the custom Anthropic-compatible FreeLLMAPI profile.
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
         env:
           FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         with:
-          openai_api_key: ${{ secrets.FREELLMAPI_API_KEY }}
-          model: "custom:freellmapi-auto"
+          anthropic_api_key: ${{ secrets.FREELLMAPI_API_KEY }}
+          model: "custom:freellmapi-anthropic"
           prompt: ${{ env.CUSTOM_PROMPT }}
