@@ -83,6 +83,11 @@ jobs:
           feature_id = os.environ["FEATURE_ID"]
           mode = os.environ["MODE"]
           registry = Path(".github/agent-engine/feature-registry.yml").read_text()
+          feature_ids = re.findall(r"(?m)^  - id: (.+?)\s*$", registry)
+          print(f"Feature registry: {len(feature_ids)} feature(s) loaded")
+          print("Available feature IDs:")
+          for item in feature_ids:
+              print(f"  - {item}")
           marker = re.search(rf"(?m)^  - id: {re.escape(feature_id)}\s*$", registry)
           if not marker:
               raise SystemExit(f"Unknown feature_id: {feature_id}")
