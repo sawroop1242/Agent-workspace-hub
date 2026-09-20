@@ -63,7 +63,7 @@ jobs:
       # LLM_MODEL repo variable rather than this default if so.
       LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
     secrets:
-      PAT_TOKEN: ${{ secrets.OPENHANDS_PAT_TOKEN }}
+      PAT_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
       PAT_USERNAME: ${{ vars.OPENHANDS_PAT_USERNAME }}
-      LLM_API_KEY: ${{ secrets.OPENHANDS_NVIDIA_KEY }}
+      LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
       LLM_BASE_URL: https://integrate.api.nvidia.com/v1
