@@ -56,7 +56,7 @@ jobs:
   ai-review:
     name: Deep AI Code Review (FreeLLMAPI OpenAI-compatible)
     runs-on: ubuntu-latest
-    if: ${{ event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' }}
     needs: [fmt]
     permissions:
       contents: read
