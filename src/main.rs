@@ -28,6 +28,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize the current directory as an AWH workspace (idempotent).
+    Init {
+        /// Workspace root to initialize (defaults to the current directory).
+        #[arg(long, default_value = ".")]
+        path: String,
+    },
     Status,
     /// Interactive terminal UI.
     Tui {
@@ -375,6 +381,21 @@ fn main() -> Result<()> {
     let home = dirs::home_dir().context("could not determine home directory")?;
     let registry_store = RegistryStore::new(home.join(".agent-workspace-hub"));
     match cli.command {
+        Some(Command::Init { path }) => {
+            use agent_workspace_hub::services::init::{initialize_workspace, InitOutcome};
+            // initialize_workspace canonicalizes `path`; manifest.workspace_root
+            // is the resolved root that was actually initialized.
+            let outcome = initialize_workspace(std::path::Path::new(&path))?;
+            let manifest = outcome.manifest();
+            let label = match outcome {
+                InitOutcome::Created(_) => "initialized workspace",
+                InitOutcome::AlreadyInitialized(_) => "workspace already initialized",
+            };
+            println!(
+                "{label} {}\nworkspace id: {}",
+                manifest.workspace_root, manifest.workspace_id
+            );
+        }
         Some(Command::Status) => println!("Agent Workspace Hub — Rust\nstatus: bootstrap complete"),
         Some(Command::Tui {
             remote,
