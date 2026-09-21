@@ -123,7 +123,7 @@ jobs:
             docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md
             docs/ROADMAP_GAP_MATRIX.md
             docs/RECONCILED_ROADMAP_V2.md
-            docs/issue-resolving-prompts/README.md
+            docs/implementation-prompts/README.md
             .github/agent/system.md
             .github/agent/rules.md
             .github/agent/verification.md
