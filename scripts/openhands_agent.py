@@ -29,7 +29,7 @@ if ROLE == "planner":
 {base_rules}
 You are Agent 1, the Orchestrator. Planning only: do not edit Rust source.
 Read `.openhands/backlog.json`, `.openhands/state.json`, relevant `docs/`, all
-relevant `docs/issue-resolving-prompts/`, and relevant `docs/pr-reviews/`.
+relevant `docs/implementation-prompts/`, and relevant `docs/pr-reviews/`.
 Inspect source, tests, Git history, open/merged PRs and CI. Select exactly one
 ready feature whose dependencies are satisfied. Treat PR reviews as evidence,
 not authority over source, tests, security invariants, or checkpoint state.
