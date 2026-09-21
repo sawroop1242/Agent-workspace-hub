@@ -52,3 +52,39 @@ jobs:
           toolchain: stable
       - run: cargo install --locked cargo-audit
       - run: cargo audit
+
+  ai-review:
+    name: Deep AI Code Review (FreeLLMAPI OpenAI-compatible)
+    runs-on: ubuntu-latest
+    if: ${{ event_name == 'pull_request' }}
+    needs: [fmt]
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load Custom Review Prompt
+        id: load-prompt
+        run: |
+          EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          echo "CUSTOM_PROMPT<<$EOF" >> $GITHUB_ENV
+          cat .github/agent/prompts/review.md >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "$EOF" >> $GITHUB_ENV
+
+      # Junie's prepare step requires a supported BYOK input. The OpenAI BYOK
+      # slot is used only to satisfy that action-level requirement; the custom
+      # profile below routes the actual request to FreeLLMAPI.
+      - name: Run Junie Code Review
+        uses: JetBrains/junie-github-action@v1.7.11
+        env:
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+        with:
+          openai_api_key: ${{ secrets.FREELLMAPI_API_KEY }}
+          model: "custom:freellmapi-auto"
+          prompt: ${{ env.CUSTOM_PROMPT }}
