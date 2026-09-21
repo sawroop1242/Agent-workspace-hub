@@ -53,7 +53,7 @@ Before editing, inspect the following in this order as applicable:
 4. `docs/development.md`
 5. `docs/security.md`
 6. `docs/error.md`
-7. `docs/issue-resolving-prompts/README.md`
+7. `docs/implementation-prompts/README.md`
 8. The issue/task-specific documentation
 9. Relevant `src/` modules
 10. Relevant unit and integration tests
