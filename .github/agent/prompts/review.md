@@ -38,7 +38,7 @@ docs/PROJECT_ROADMAP_STATUS.md
 docs/development.md
 docs/security.md
 docs/error.md
-docs/issue-resolving-prompts/README.md
+docs/implementation-prompts/README.md
 ```
 
 Then inspect the relevant source, tests, configuration, workflows, and recent history.
