@@ -9,6 +9,7 @@ pub mod edit;
 pub use edit::{EditOperation, EditService, EditTransaction};
 pub mod files;
 pub mod git;
+pub mod init;
 pub mod projects;
 pub mod rate_limit;
 pub mod snapshot;

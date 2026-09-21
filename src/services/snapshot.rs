@@ -743,7 +743,7 @@ mod tests {
     fn recovery_view_rejects_corrupt_snapshot_linkage() {
         let temp = tempfile::tempdir().unwrap();
         let store = store_at(temp.path());
-        let manifest = store
+        let _manifest = store
             .create("edit-rv", &[("f.txt".to_string(), b"x\n".to_vec())], None)
             .unwrap();
         // Forge a provenance pointing at a non-existent snapshot id.

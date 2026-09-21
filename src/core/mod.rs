@@ -9,6 +9,8 @@ pub mod capability_grants;
 pub mod context;
 /// File helpers.
 pub mod files;
+/// Typed runtime identity contracts (TW-001).
+pub mod identity;
 /// Memory persistence.
 pub mod memory;
 /// Workspace policy rule persistence.
