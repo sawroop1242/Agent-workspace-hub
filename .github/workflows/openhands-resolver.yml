@@ -42,13 +42,14 @@ jobs:
 
       - name: Execute OpenHands Production Container
         run: |
-          # Executes using the official, universally accessible runtime production image
+          # Added the vital docker.sock volume mapping to enable sandboxed workspace creation
           docker run --rm \
             -e LLM_MODEL="${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}" \
             -e LLM_BASE_URL="https://nvidia.com" \
             -e LLM_API_KEY="${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}" \
             -e GITHUB_TOKEN="${{ secrets.AWH_AUTOMATION_TOKEN }}" \
             -e SANDBOX_USER_ID="${{ github.actor_id }}" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${{ github.workspace }}:/workspace" \
             ghcr.io/openhands/openhands:latest \
             python -m openhands.resolver.resolve_issue \
