@@ -64,32 +64,58 @@ jobs:
 
           echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
 
-      - name: Pull OpenHands image
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Checkout OpenHands source
+        shell: bash
         env:
-          OPENHANDS_IMAGE: ${{ vars.OPENHANDS_IMAGE || 'ghcr.io/openhands/openhands:1.8.0' }}
+          OPENHANDS_REF: ${{ vars.OPENHANDS_REF || 'main' }}
         run: |
           set -euo pipefail
 
-          echo "Pulling $OPENHANDS_IMAGE"
-          docker pull "$OPENHANDS_IMAGE"
+          rm -rf "$RUNNER_TEMP/OpenHands"
+
+          git clone --depth 1 --branch "$OPENHANDS_REF"             https://github.com/All-Hands-AI/OpenHands.git             "$RUNNER_TEMP/OpenHands"
+
+          cd "$RUNNER_TEMP/OpenHands"
+
+          echo "OpenHands source:"
+          git rev-parse HEAD
+
+      - name: Install OpenHands from source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install -e "$RUNNER_TEMP/OpenHands"
 
       - name: Verify OpenHands resolver
-        env:
-          OPENHANDS_IMAGE: ${{ vars.OPENHANDS_IMAGE || 'ghcr.io/openhands/openhands:1.8.0' }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking resolver module..."
+          python -c '
+          import openhands
+          import openhands.resolver.resolve_issue
 
-          docker run --rm \
-            "$OPENHANDS_IMAGE" \
-            python -c \
-            "import openhands.resolver.resolve_issue; print('OpenHands resolver: OK')"
+          print("OpenHands package:", openhands.__file__)
+          print("Resolver module:", openhands.resolver.resolve_issue.__file__)
+          print("OpenHands resolver: OK")
+          '
+
+      - name: Verify Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker version
+          docker info
 
       - name: Execute OpenHands resolver
         env:
-          OPENHANDS_IMAGE: ${{ vars.OPENHANDS_IMAGE || 'ghcr.io/openhands/openhands:1.8.0' }}
-
           REPOSITORY: ${{ github.repository }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
 
@@ -100,6 +126,7 @@ jobs:
           LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
           GITHUB_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
 
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -118,27 +145,14 @@ jobs:
             exit 1
           }
 
-          echo "Starting OpenHands resolver"
+          echo "=========================================="
+          echo "OpenHands Issue Resolver"
+          echo "=========================================="
           echo "Repository: $REPOSITORY"
-          echo "Issue: #$ISSUE_NUMBER"
-          echo "Model: $LLM_MODEL"
-          echo "Base URL: $LLM_BASE_URL"
+          echo "Issue:      #$ISSUE_NUMBER"
+          echo "Model:      $LLM_MODEL"
+          echo "Base URL:   $LLM_BASE_URL"
+          echo "Iterations: $MAX_ITERATIONS"
+          echo "=========================================="
 
-          docker run --rm \
-            --network host \
-            -e LLM_MODEL="$LLM_MODEL" \
-            -e LLM_BASE_URL="$LLM_BASE_URL" \
-            -e LLM_API_KEY="$LLM_API_KEY" \
-            -e GITHUB_TOKEN="$GITHUB_TOKEN" \
-            -e SANDBOX_USER_ID="${{ github.actor_id }}" \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$GITHUB_WORKSPACE:/workspace" \
-            -w /workspace \
-            "$OPENHANDS_IMAGE" \
-            python -m openhands.resolver.resolve_issue \
-              --repo "$REPOSITORY" \
-              --issue-number "$ISSUE_NUMBER" \
-              --issue-type issue \
-              --max-iterations "$MAX_ITERATIONS" \
-              --llm-model "$LLM_MODEL" \
-              --llm-api-key "$LLM_API_KEY"
+          python -m openhands.resolver.resolve_issue             --repo "$REPOSITORY"             --issue-number "$ISSUE_NUMBER"             --issue-type issue             --max-iterations "$MAX_ITERATIONS"             --llm-model "$LLM_MODEL"             --llm-api-key "$LLM_API_KEY"
