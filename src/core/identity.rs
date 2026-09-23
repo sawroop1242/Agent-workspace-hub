@@ -207,6 +207,11 @@ pub enum IdentityRelation {
     AgentActiveInWorkspace,
     /// The agent record exists in the workspace but is not active.
     AgentInactive,
+    /// The agent record exists but its profile is disabled (`enabled=false`).
+    /// Disabled is distinct from inactive (lifecycle) and from unknown — a
+    /// disabled profile is a deliberate operator decision and must never be
+    /// quietly treated as merely stopped (TW-002 §5).
+    AgentDisabled,
     /// No agent record exists for the referenced id in the workspace.
     UnknownAgent,
     /// The referenced workspace is not the workspace being operated on.
@@ -241,6 +246,9 @@ pub fn resolve_session_relation(
     else {
         return Ok(IdentityRelation::UnknownAgent);
     };
+    if !agent.enabled {
+        return Ok(IdentityRelation::AgentDisabled);
+    }
     if agent.status != crate::models::AgentStatus::Active {
         return Ok(IdentityRelation::AgentInactive);
     }
@@ -323,6 +331,7 @@ mod tests {
             name: "Writer".into(),
             role: "writer".into(),
             status: crate::models::AgentStatus::Created,
+            enabled: true,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         store.create(&created).unwrap();
@@ -358,6 +367,16 @@ mod tests {
         assert_eq!(
             resolve_session_relation(&root, &wrong).unwrap(),
             IdentityRelation::WrongWorkspace
+        );
+        // Disabled profile → its own relation, distinct from inactive/unknown.
+        store.set_enabled("writer", false).unwrap();
+        let disabled = SessionIdentity::new(
+            crate::core::identity::AgentId::new_checked("writer").unwrap(),
+            manifest.workspace_id.clone(),
+        );
+        assert_eq!(
+            resolve_session_relation(&root, &disabled).unwrap(),
+            IdentityRelation::AgentDisabled
         );
     }
 

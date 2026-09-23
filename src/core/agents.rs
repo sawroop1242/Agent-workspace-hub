@@ -3,10 +3,14 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Persistent agent identity storage under `.agent/agents` as per-agent JSON files.
+/// Persistent agent profile/identity storage under `.agent/agents` as
+/// per-agent JSON files.
 pub struct AgentStore {
     root: PathBuf,
 }
+
+/// Maximum accepted length for an agent id (bounded input, TW-002 §15).
+pub const MAX_AGENT_ID_LEN: usize = 64;
 
 impl AgentStore {
     /// Creates an `AgentStore` rooted at `root`.
@@ -33,8 +37,27 @@ impl AgentStore {
         Ok(())
     }
 
-    /// Returns the agent with the given `id`, or `None` if it does not exist.
+    /// Registers a new agent profile, failing if the id is already taken.
+    /// Unlike [`create`](Self::create) (a compatibility upsert), this is
+    /// the canonical registry operation: a duplicate identity is an error,
+    /// never a silent overwrite of another agent's record (TW-002 §5).
+    pub fn register(&self, agent: &Agent) -> Result<()> {
+        if self.get(&agent.id)?.is_some() {
+            return Err(anyhow::anyhow!(
+                "agent id already registered: {} (use a different id)",
+                agent.id
+            ));
+        }
+        self.create(agent)
+    }
+
+    /// Returns the agent with the given `id`, or `None` if it does not
+    /// exist. Unsafe ids fail closed as `None` — an id that cannot name a
+    /// store file can never escape `.agent/agents/` via a read (TW-002 §15).
     pub fn get(&self, id: &str) -> Result<Option<Agent>> {
+        if !is_safe_agent_id(id) {
+            return Ok(None);
+        }
         let path = self.agents_dir().join(format!("{}.json", id));
         if !path.exists() {
             return Ok(None);
@@ -72,15 +95,31 @@ impl AgentStore {
             .with_context(|| format!("failed to update status of agent {id}"))?;
         Ok(true)
     }
+
+    /// Updates an agent's `enabled` flag, returning `false` if the agent
+    /// does not exist. Disabling is the profile-level switch the runtime
+    /// consults before resolving any session for the agent (TW-002 §5).
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let Some(mut agent) = self.get(id)? else {
+            return Ok(false);
+        };
+        agent.enabled = enabled;
+        self.create(&agent)
+            .with_context(|| format!("failed to update enabled flag of agent {id}"))?;
+        Ok(true)
+    }
 }
 
-/// Returns whether `id` is safe to use as an agent filename (no path separators or traversal).
+/// Returns whether `id` is safe to use as an agent filename (no path
+/// separators, no traversal, bounded length, no control characters).
 pub fn is_safe_agent_id(id: &str) -> bool {
     !id.is_empty()
+        && id.len() <= MAX_AGENT_ID_LEN
         && id != "."
         && id != ".."
         && !id.contains('/')
         && !id.contains('\\')
+        && !id.chars().any(|c| c.is_control())
         && Path::new(id).file_name().and_then(|x| x.to_str()) == Some(id)
 }
 
@@ -94,8 +133,75 @@ mod tests {
             name: name.into(),
             role: role.into(),
             status: AgentStatus::Created,
+            enabled: true,
             created_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[test]
+    fn register_rejects_duplicate_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AgentStore::new(temp.path());
+        store.create(&agent("writer", "Writer", "writer")).unwrap();
+        let err = store
+            .register(&agent("writer", "Impostor", "writer"))
+            .unwrap_err();
+        assert!(err.to_string().contains("already registered"), "{err}");
+        // The original record was not overwritten.
+        let loaded = store.get("writer").unwrap().unwrap();
+        assert_eq!(loaded.name, "Writer");
+    }
+
+    #[test]
+    fn register_accepts_fresh_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AgentStore::new(temp.path());
+        store
+            .register(&agent("writer", "Writer", "writer"))
+            .unwrap();
+        assert!(store.get("writer").unwrap().is_some());
+    }
+
+    #[test]
+    fn get_fails_closed_on_unsafe_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AgentStore::new(temp.path());
+        store.create(&agent("writer", "Writer", "writer")).unwrap();
+        // Even with a crafted file outside the store, a traversal id must
+        // resolve to no agent rather than read outside `.agent/agents/`.
+        for bad in ["../workspace", "a/b", "..", "", "a\\b", "."] {
+            assert!(store.get(bad).unwrap().is_none(), "{bad:?} must be None");
+        }
+    }
+
+    #[test]
+    fn set_enabled_toggles_profile_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AgentStore::new(temp.path());
+        store.create(&agent("writer", "Writer", "writer")).unwrap();
+        assert!(store.set_enabled("writer", false).unwrap());
+        assert!(!store.get("writer").unwrap().unwrap().enabled);
+        assert!(store.set_enabled("writer", true).unwrap());
+        assert!(store.get("writer").unwrap().unwrap().enabled);
+        assert!(!store.set_enabled("ghost", false).unwrap());
+    }
+
+    #[test]
+    fn legacy_records_without_enabled_field_default_to_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".agent").join("agents");
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = r#"{
+            "id": "legacy",
+            "name": "Legacy Agent",
+            "role": "writer",
+            "status": "created",
+            "created_at": "2024-01-01T00:00:00Z"
+        }"#;
+        fs::write(dir.join("legacy.json"), legacy).unwrap();
+        let store = AgentStore::new(temp.path());
+        let loaded = store.get("legacy").unwrap().expect("legacy agent loads");
+        assert!(loaded.enabled, "legacy record must stay enabled");
     }
 
     #[test]

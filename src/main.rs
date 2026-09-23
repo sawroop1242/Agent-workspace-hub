@@ -1,4 +1,3 @@
-use agent_workspace_hub::core::agents::AgentStore;
 use agent_workspace_hub::core::capability_grants::CapabilityGrantStore;
 use agent_workspace_hub::core::policy::PolicyStore;
 use agent_workspace_hub::mcp::{
@@ -7,7 +6,8 @@ use agent_workspace_hub::mcp::{
     PersistentTrustStore, ProjectMcpReferences, ResourceLimits, StdioMcpServer, TlsConfig,
     TrustLevel, BUILTIN_TOOL_TRUST_ID,
 };
-use agent_workspace_hub::models::{Agent, AgentStatus, CapabilityGrant, PolicyRule};
+use agent_workspace_hub::models::{AgentStatus, CapabilityGrant, PolicyRule};
+use agent_workspace_hub::services::agent_runtime::AgentRuntimeService;
 use agent_workspace_hub::skills::{
     GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller,
 };
@@ -317,6 +317,91 @@ enum AgentCommand {
     Revoke {
         /// Grant id.
         grant_id: String,
+    },
+    /// Show an agent's profile (lifecycle + enabled + grants).
+    Show {
+        /// Agent id.
+        id: String,
+    },
+    /// Activate an agent (status: active).
+    Start {
+        /// Agent id(s) to activate.
+        ids: Vec<String>,
+        /// Activate every enabled agent instead of named ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Deactivate an agent (status: stopped).
+    Stop {
+        /// Agent id.
+        id: String,
+    },
+    /// Stop then start an agent.
+    Restart {
+        /// Agent id.
+        id: String,
+    },
+    /// Report the runtime status of agents and their sessions.
+    Status,
+    /// Enable or disable an agent profile (resolution fails closed while disabled).
+    Enable {
+        /// Agent id.
+        id: String,
+    },
+    Disable {
+        /// Agent id.
+        id: String,
+    },
+    /// Manage AWH runtime sessions for this workspace.
+    #[command(subcommand)]
+    Session(SessionCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Open a new runtime session for an active agent.
+    Open {
+        /// Agent id the session belongs to.
+        agent_id: String,
+    },
+    /// List sessions (optionally for one agent).
+    List {
+        /// Only list sessions of this agent.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Show one session.
+    Show {
+        /// Session id.
+        session_id: String,
+    },
+    /// Verify a claimed (agent, session) pair resolves to a usable caller.
+    Resolve {
+        /// Agent id claimed by the caller.
+        agent_id: String,
+        /// Session id presented by the caller.
+        session_id: String,
+    },
+    /// Pause an active session.
+    Pause {
+        /// Agent id that owns the session.
+        agent_id: String,
+        /// Session id.
+        session_id: String,
+    },
+    /// Resume a paused session.
+    Resume {
+        /// Agent id that owns the session.
+        agent_id: String,
+        /// Session id.
+        session_id: String,
+    },
+    /// Stop a session (terminal; a new session must be opened afterwards).
+    Stop {
+        /// Agent id that owns the session.
+        agent_id: String,
+        /// Session id.
+        session_id: String,
     },
 }
 
@@ -848,33 +933,29 @@ fn serve_control_api(host: String, port: u16, api_key_env: String) -> Result<()>
     Ok(())
 }
 
-/// Handles `awh agent create|list|inspect|grant|revoke`. Agents and their
-/// capability grants are plain persisted records in this phase: nothing here
-/// is consulted by tool execution — enforcement is a later phase.
+/// Handles `awh agent *`: registration, lifecycle, and runtime sessions.
+/// All logic is delegated to the shared [`AgentRuntimeService`] so the CLI
+/// cannot diverge from other surfaces (TW-002 §19). Capability grants remain
+/// recorded-but-not-enforced until the policy phase.
 fn handle_agent_cli(command: AgentCommand) -> Result<()> {
     // Agents are workspace-local: they live in the `.agent` directory of the
-    // project the command runs against.
+    // project the command runs against. All lifecycle logic lives in the
+    // shared AgentRuntimeService so every surface (CLI/MCP/TUI/API)
+    // behaves identically (TW-002 §19).
     let root = std::env::current_dir().context("could not determine workspace directory")?;
-    let agents = AgentStore::new(&root);
+    let runtime = AgentRuntimeService::new(&root);
     let grants = CapabilityGrantStore::new(&root);
 
     match command {
         AgentCommand::Create { id, name, role } => {
-            let agent = Agent {
-                id,
-                name,
-                role,
-                status: AgentStatus::Created,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            };
-            agents.create(&agent)?;
+            let agent = runtime.register_profile(&id, &name, &role)?;
             println!(
                 "created agent {} ({}) role: {} status: created",
                 agent.id, agent.name, agent.role
             );
         }
         AgentCommand::List => {
-            for agent in agents.list()? {
+            for agent in runtime.profiles()? {
                 println!(
                     "{} {} {} {}",
                     agent.id,
@@ -885,7 +966,7 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
             }
         }
         AgentCommand::Inspect { id } => {
-            let Some(agent) = agents.get(&id)? else {
+            let Some(agent) = runtime.profile(&id)? else {
                 bail!("agent not found: {id}");
             };
             println!(
@@ -896,27 +977,91 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
                 status_label(&agent.status),
                 agent.created_at
             );
-            let agent_grants = grants.list_for_agent(&id)?;
-            if agent_grants.is_empty() {
-                println!("grants: none");
-            } else {
-                println!("grants ({}):", agent_grants.len());
-                for grant in agent_grants {
-                    println!(
-                        "  {} {} scope: {}",
-                        grant.id,
-                        grant.permission.as_str(),
-                        grant.scope.as_deref().unwrap_or("unscoped")
-                    );
+            print_grants(&grants, &id)?;
+        }
+        AgentCommand::Show { id } => {
+            let agent = runtime
+                .profile(&id)?
+                .with_context(|| format!("agent not found: {id}"))?;
+            println!(
+                "id: {}\nname: {}\nrole: {}\nstatus: {}\nenabled: {}\ncreated: {}",
+                agent.id,
+                agent.name,
+                agent.role,
+                status_label(&agent.status),
+                if agent.enabled { "true" } else { "false" },
+                agent.created_at
+            );
+            print_grants(&grants, &id)?;
+        }
+        AgentCommand::Start { ids, all } => {
+            let targets: Vec<String> = if all {
+                let enabled: Vec<String> = runtime
+                    .profiles()?
+                    .into_iter()
+                    .filter(|a| a.enabled)
+                    .map(|a| a.id)
+                    .collect();
+                if enabled.is_empty() {
+                    println!("no enabled agents to start");
+                    return Ok(());
                 }
+                enabled
+            } else {
+                if ids.is_empty() {
+                    bail!("no agent id given (or use --all)");
+                }
+                ids
+            };
+            for id in targets {
+                let agent = runtime.start_agent(&id)?;
+                println!("started agent {} status: active", agent.id);
             }
+        }
+        AgentCommand::Stop { id } => {
+            let agent = runtime.stop_agent(&id)?;
+            println!("stopped agent {} status: stopped", agent.id);
+        }
+        AgentCommand::Restart { id } => {
+            let agent = runtime.restart_agent(&id)?;
+            println!("restarted agent {} status: active", agent.id);
+        }
+        AgentCommand::Status => {
+            let agents = runtime.profiles()?;
+            if agents.is_empty() {
+                println!("no agents registered");
+                return Ok(());
+            }
+            for agent in &agents {
+                let sessions = runtime.sessions_for(Some(&agent.id))?;
+                let usable = sessions.iter().filter(|s| s.status.is_usable()).count();
+                println!(
+                    "{} {} status: {} enabled: {} usable-sessions: {}",
+                    agent.id,
+                    agent.name,
+                    status_label(&agent.status),
+                    if agent.enabled { "true" } else { "false" },
+                    usable
+                );
+            }
+        }
+        AgentCommand::Enable { id } => {
+            let agent = runtime.set_profile_enabled(&id, true)?;
+            println!("enabled agent {}", agent.id);
+        }
+        AgentCommand::Disable { id } => {
+            let agent = runtime.set_profile_enabled(&id, false)?;
+            println!(
+                "disabled agent {} (sessions will no longer resolve)",
+                agent.id
+            );
         }
         AgentCommand::Grant {
             id,
             permission,
             scope,
         } => {
-            if agents.get(&id)?.is_none() {
+            if runtime.profile(&id)?.is_none() {
                 bail!("agent not found: {id}");
             }
             let permission = parse_permission(&permission)?;
@@ -941,6 +1086,120 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
             } else {
                 println!("grant not found: {grant_id}");
             }
+        }
+        AgentCommand::Session(command) => handle_session_cli(&runtime, command)?,
+    }
+    Ok(())
+}
+
+/// Shared grant rendering for `agent inspect` / `agent show`.
+fn print_grants(grants: &CapabilityGrantStore, id: &str) -> Result<()> {
+    let agent_grants = grants.list_for_agent(id)?;
+    if agent_grants.is_empty() {
+        println!("grants: none");
+    } else {
+        println!("grants ({}):", agent_grants.len());
+        for grant in agent_grants {
+            println!(
+                "  {} {} scope: {}",
+                grant.id,
+                grant.permission.as_str(),
+                grant.scope.as_deref().unwrap_or("unscoped")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Handles `awh agent session *`: the AWH-native runtime session surface.
+/// Thin handlers only — every operation is the canonical
+/// `AgentRuntimeService` operation (TW-002 §19: no duplicate lifecycle
+/// logic in CLI handlers).
+fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) -> Result<()> {
+    match command {
+        SessionCommand::Open { agent_id } => {
+            let session = runtime.open_session(&agent_id)?;
+            println!(
+                "opened session {} for agent {} status: active",
+                session.session_id, session.agent_id
+            );
+        }
+        SessionCommand::List { agent } => {
+            for session in runtime.sessions_for(agent.as_deref())? {
+                println!(
+                    "{} agent: {} status: {}",
+                    session.session_id,
+                    session.agent_id,
+                    session.status.label()
+                );
+            }
+        }
+        SessionCommand::Show { session_id } => {
+            let Some(session) = runtime
+                .sessions_for(None)?
+                .into_iter()
+                .find(|s| s.session_id == session_id)
+            else {
+                bail!("session not found: {session_id}");
+            };
+            println!(
+                "session: {}\nagent: {}\nworkspace: {}\nstatus: {}\ncreated: {}\nlast-activity: {}",
+                session.session_id,
+                session.agent_id,
+                session.workspace_id,
+                session.status.label(),
+                session.created_at,
+                session.last_activity_at
+            );
+        }
+        SessionCommand::Resolve {
+            agent_id,
+            session_id,
+        } => {
+            let caller = runtime.resolve_session(&agent_id, &session_id)?;
+            println!(
+                "resolved session {} agent: {} workspace: {} status: {}",
+                caller.session_id,
+                caller.agent_id,
+                caller.workspace_id,
+                caller.status.label()
+            );
+        }
+        SessionCommand::Pause {
+            agent_id,
+            session_id,
+        } => {
+            let session = runtime.transition_session(
+                &agent_id,
+                &session_id,
+                agent_workspace_hub::models::SessionStatus::Paused,
+            )?;
+            println!("paused session {} status: paused", session.session_id);
+        }
+        SessionCommand::Resume {
+            agent_id,
+            session_id,
+        } => {
+            let session = runtime.transition_session(
+                &agent_id,
+                &session_id,
+                agent_workspace_hub::models::SessionStatus::Active,
+            )?;
+            println!("resumed session {} status: active", session.session_id);
+        }
+        SessionCommand::Stop {
+            agent_id,
+            session_id,
+        } => {
+            let session = runtime.transition_session(
+                &agent_id,
+                &session_id,
+                agent_workspace_hub::models::SessionStatus::Stopped,
+            )?;
+            println!(
+                "stopped session {} (terminal — open a new session to continue)",
+                session.session_id
+            );
         }
     }
     Ok(())

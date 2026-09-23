@@ -145,20 +145,20 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
   approval/globs/hierarchy - out of scope. Tests: `tests/mcp_policy_gate.rs`
   (11, spawns real `awh` + real dispatcher).
 
-- **Phase 3 policy � workspace-local DENY-only rules (on top of PR #19's
+- **Phase 3 policy — workspace-local DENY-only rules (on top of PR #19's
   built-in gate)**: PR #19 routes every Medium/High built-in tool through
-  `authorize_builtin("aws.../workspace.*")` � a coarse, workspace-independent
+  `authorize_builtin("aws.../workspace.*")` — a coarse, workspace-independent
   category gate via `awh.builtin` (per-user-machine trust). This phase adds a
   SECOND, narrower check for exactly the three tools whose call carries a
   meaningful resource: `workspace.write_file` (`path`), `workspace.delete_file`
   (`path`), and `terminal.run` (`program`). New `PolicyStore`
   (`src/core/policy.rs`) persists ALL rules as a single JSON array at
-  `<workspace>/.agent/policy.json` � the ONE deliberate deviation from the
+  `<workspace>/.agent/policy.json` — the ONE deliberate deviation from the
   `AgentStore`/`CapabilityGrantStore` one-file-per-record pattern (single hot-
   path read via `matching()`). `matching(tool, resource)` returns the first
   rule for that exact tool whose pattern matches: forward-slash relative-path
   PREFIX for the two `workspace.*` tools, EXACT case-sensitive match for
-  `terminal.run` � no globs either way (v1 limitation, documented). New
+  `terminal.run` — no globs either way (v1 limitation, documented). New
   `src/models/policy_rule.rs` (`PolicyRule { id, tool, pattern, reason,
   created_at }`), `PolicyDenialError` in `src/mcp/error.rs`, JSON-RPC code
   `POLICY_DENIED_CODE = -32004` (after `BUILTIN_TOOL_DENIED_CODE = -32003`).
@@ -173,7 +173,7 @@ plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
   (std::env::current_dir(), auto id = `policy-` + tool+pattern SHA-256 prefix).
   Deny-only: zero rules = byte-identical to Phase 2 (`no_policy_rules_leaves_
   all_three_tools_working`). Fail closed on unreadable store (internal error,
-  not a false allow). No Allow rules/approval/globs/hierarchy � out of scope.
+  not a false allow). No Allow rules/approval/globs/hierarchy — out of scope.
   Tests: `tests/mcp_policy_gate.rs` (11, spawns real `awh` + real dispatcher).
 **PR #15 (mcp-protocol-hardening) — MCP protocol hardening round**: landed
 per-hook `catch_unwind` isolation in `McpHooks::fire` (panic recorded via
@@ -337,20 +337,20 @@ cheap-to-clone). Tool catalog 53 static.
   --secret NAME`. Names = RFC 7230 tokens, values control-char-free
   (CRLF injection rejected at config time), all values via
   `expand_secret_ref` (`${secret:NAME}` resolves only with BOTH secrets
-  AND environment permission � `McpPermissions::validate` requires
+  AND environment permission — `McpPermissions::validate` requires
   every secret to also be an allowed env name, so `--secret` grants the
   pair). Fail closed at registration, never send literal refs upstream.
   Gotchas: (1) test env-var manipulation needs globally-unique names
   (AWH_TEST_HEADER_SECRET) to survive parallel siblings;
-  (2) `unwrap_err()` needs Debug on the Ok type � use `match` for
+  (2) `unwrap_err()` needs Debug on the Ok type — use `match` for
   non-Debug clients; (3) a shell-exported COMPOSIO_API_KEY leaks into
   `cargo test` and makes dispatcher tests hit the live Composio backend
-  (401) � unset before testing; (4) repo-root `.agent/` is gitignored
+  (401) — unset before testing; (4) repo-root `.agent/` is gitignored
   (anchored `/.agent/` so `examples/mcp-interop/.agent` fixtures stay
   tracked) since `--header` can carry raw credentials in other setups;
   (5) Composio hosted MCP key only works on
   `connect.composio.dev/mcp` (x-consumer-api-key header), NOT on the
-  backend API the native `ComposioProvider` uses � register the hosted
+  backend API the native `ComposioProvider` uses — register the hosted
   endpoint as a custom server instead.
 - **Toolchain-reinstall trap**: rustup minimal profile lacks
   `cargo-fmt`/`cargo-clippy` shims until `rustup component add rustfmt
@@ -366,3 +366,5 @@ cheap-to-clone). Tool catalog 53 static.
 
 
 - **TW-001: awh init + runtime identity (issue #73, 2026-09)**: `awh init [--path DIR]` implemented in `src/services/init.rs` (service) + `src/main.rs` (CLI). Durable workspace manifest `.agent/workspace.json` = `{version, workspace_id, workspace_root, created_at}` (MANIFEST_VERSION=1). `initialize_workspace` is idempotent (AlreadyInitialized never rewrites; re-init preserves manifest bytes, agents, grants, policy rules). Fails closed: file-as-root, corrupt JSON, unsupported version, manifest recorded for another root (copied dir) are explicit errors and never reset state; corrupt policy.json blocks init. Uses StoreLock (manifest lock + separate policy-store lock) + NamedTempFile fsync/persist atomic writes. Typed IDs in `src/core/identity.rs`: WorkspaceId/AgentId/SessionId/TaskId/AuditEventId (macro-generated, `ws-`/`agent-`/`sess-`/`task-`/`audit-` prefixes, transparent serde, `new_checked` validation); SessionIdentity binds session->agent+workspace; `resolve_session_relation` returns UnknownAgent/AgentInactive/WrongWorkspace/ActiveInWorkspace (identity only, never authority). EditId/SnapshotId NOT duplicated. `load_workspace_manifest` is the reload entry point. Tests: tests/init_cli.rs (8 CLI/service tests incl. restart + foreign-manifest rejection), unit tests in identity.rs/init.rs; 982 tests total, all gates green. Gotchas: (1) tempdir `current_dir` must exist before spawning the awh binary in tests; (2) manifest stores the CANONICAL root so a copied .agent/ dir is detected as foreign; (3) don't canonicalize --path in main.rs - the service owns resolution.
+
+- **TW-002: agent runtime identity (AGENT-001, 2026-09)**: `AgentRuntimeService` (`src/services/agent_runtime.rs`) is the SINGLE shared boundary for agent profiles + AWH-native runtime sessions — every surface (CLI/MCP/TUI/API) must call it, never implement lifecycle logic locally. AgentProfile = existing `models::Agent` + `enabled: bool` (serde default true, so legacy JSON stays enabled); `AgentStore.register()` rejects duplicate ids (unlike `create()`, a compatibility upsert — keep both); `AgentStore.get()`/`SessionStore.get()` FAIL CLOSED (`Ok(None)`) on unsafe ids (traversal/separators/control chars, len caps `MAX_AGENT_ID_LEN`=64 / `MAX_ID_LEN`=128) — reads never escape `.agent/agents/` or `.agent/sessions/`; the id is the ONLY filesystem identifier, display names never touch paths. Sessions: `AgentSessionRecord` (`models/session.rs`) persisted one-JSON-per-session under `.agent/sessions/`, ids from `SessionId::new()` (`sess-` prefix), bound to the workspace manifest id at open; `session open` requires an initialized workspace (manifest binding) while `agent create` stays pre-init compatible. Lifecycle table in `core/sessions.rs` (`is_valid_transition`): Active<->Paused, anything->Stopped/Failed; Stopped/Failed are TERMINAL — never silently reactivated, open a new session. `resolve_session` re-validates EVERYTHING on every call (session exists, ownership vs claimed agent, usable status, workspace binding vs manifest, profile enabled+active via `IdentityRelation`, which now has `AgentDisabled` distinct from `AgentInactive`); identity resolution is never authority — capabilities/policy stay separate. `transition_session` resolves ownership FIRST, so a stopped session is rejected with "cannot be used" before the store table is consulted. CLI: `awh agent show/start [--all]/stop/restart/status/enable/disable` + `awh agent session open/list [--agent]/show/resolve/pause/resume/stop`; existing create/list/inspect/grant/revoke outputs preserved byte-identical. MCP protocol sessions (`SessionLifecycle`, mcp/dispatcher.rs) are transport-only and stay SEPARATE — no agent-specific MCP endpoint routing (Prompt 03 scope). Gotchas: (1) StoreLock is NOT reentrant — `transition()` holding a lock then calling `create()` (locks the same target) self-deadlocks to the 10s timeout; the store writes via lock-free internal `write_record()` under its own held lock — never nest StoreLocks on the same target; (2) create the sessions dir BEFORE `StoreLock::acquire` (lock-file creation ENOENTs on a missing parent); (3) serde error text for corrupt JSON varies — assert on stable substrings; (4) name/role are free text bounded 128/64 bytes. Tests: 12 service unit tests (incl. 8-thread parallel session creation: unique ids, no leakage, workspace-bound), store/identity unit tests, 9 e2e CLI tests in tests/agent_runtime_cli.rs; 1015 tests total, all gates green. Also repaired 9 pre-existing truncated em-dash bytes in this file (lone 0xd1) that made AGENTS.md invalid UTF-8.
