@@ -445,3 +445,63 @@ fn session_commands_on_uninitialized_workspace_fail_closed() {
     assert!(!ok, "open must fail without init");
     assert!(err.contains("not initialized"), "got: {err}");
 }
+
+#[test]
+fn agent_stop_leaves_session_retirable_via_cli() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+
+    run(root, &["init"]);
+    run(
+        root,
+        &["agent", "create", "writer", "Writer", "--role", "writer"],
+    );
+    run(root, &["agent", "start", "writer"]);
+    let (_, out, _) = run(root, &["agent", "session", "open", "writer"]);
+    let session_id = session_id_from(&out);
+
+    // Stopping the agent invalidates resolution but leaves the record
+    // retirable: `session stop` still works (terminal transitions do not
+    // require an active profile), and afterwards the record is terminal.
+    run(root, &["agent", "stop", "writer"]);
+    let (ok, _, err) = run(
+        root,
+        &["agent", "session", "resolve", "writer", &session_id],
+    );
+    assert!(!ok, "session must not resolve while agent is stopped");
+    assert!(err.contains("not active"), "got: {err}");
+
+    let (ok, out, err) = run(root, &["agent", "session", "stop", "writer", &session_id]);
+    assert!(ok, "session stop must work after agent stop: {err}");
+    assert!(out.contains("stopped session"), "got: {out}");
+    let (ok, out, _) = run(root, &["agent", "session", "show", &session_id]);
+    assert!(ok, "show failed");
+    assert!(out.contains("status: stopped"), "got: {out}");
+}
+
+#[test]
+fn start_all_conflicts_with_named_ids() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+
+    run(root, &["init"]);
+    run(
+        root,
+        &["agent", "create", "writer", "Writer", "--role", "writer"],
+    );
+
+    // `--all` and named ids are mutually exclusive: silently broadening
+    // the operator's intent to every agent must be a usage error.
+    let (ok, _, err) = run(root, &["agent", "start", "writer", "--all"]);
+    assert!(!ok, "ids + --all must be rejected: accepted silently");
+    assert!(
+        err.contains("cannot be used with"),
+        "clap conflict message expected: {err}"
+    );
+
+    // each form still works on its own
+    let (ok, _, err) = run(root, &["agent", "start", "writer"]);
+    assert!(ok, "named start failed: {err}");
+    let (ok, _, err) = run(root, &["agent", "start", "--all"]);
+    assert!(ok, "--all start failed: {err}");
+}

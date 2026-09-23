@@ -191,8 +191,8 @@ impl AgentRuntimeService {
         }
         if agent.status != AgentStatus::Active {
             bail!(
-                "agent {agent_id} is {} ; start it before opening a session",
-                crate::models::AgentStatus::label(&agent.status)
+                "agent {agent_id} is {}; start it before opening a session",
+                agent.status.label()
             );
         }
 
@@ -278,16 +278,43 @@ impl AgentRuntimeService {
 
     /// Applies a lifecycle transition to a session through the validated
     /// table (see [`SessionStore::transition`]). The agent's own claim on
-    /// the session is enforced first (no cross-agent stops, TW-002 §16).
+    /// the session is enforced first (no cross-agent stops, TW-002 §16):
+    /// ownership, session usability, and workspace binding are validated
+    /// through the same checks as [`resolve_session`](Self::resolve_session).
+    ///
+    /// An exception is made for *terminal* transitions (`Stopped`,
+    /// `Failed`): a stopped or disabled agent cannot *use* its sessions,
+    /// but it must still be able to *retire* them. Gating teardown on an
+    /// active profile would make terminal cleanup unreachable — the
+    /// records could never be stopped through the runtime after
+    /// `agent stop` / `agent disable` — so these transitions validate
+    /// ownership and binding only, not profile activity.
     pub fn transition_session(
         &self,
         agent_id: &str,
         session_id: &str,
         next: SessionStatus,
     ) -> Result<AgentSessionRecord> {
-        // The caller must legitimately own this session before its state
-        // may change; resolve also re-validates workspace + profile.
-        let _ = self.resolve_session(agent_id, session_id)?;
+        if next.is_usable() {
+            // A transition that *extends* use (resume) or a live-state
+            // change (pause) requires the full resolution contract.
+            let _ = self.resolve_session(agent_id, session_id)?;
+        } else {
+            // Terminal transition: ownership + binding still enforced,
+            // profile activity deliberately not.
+            let manifest = load_workspace_manifest(&self.root).context(
+                "cannot transition a session: workspace is not initialized (run `awh init` first)",
+            )?;
+            let Some(session) = self.sessions().get(session_id)? else {
+                bail!("session not found: {session_id}");
+            };
+            if session.agent_id != agent_id {
+                bail!("session {session_id} does not belong to agent {agent_id}");
+            }
+            if session.workspace_id != manifest.workspace_id.as_str() {
+                bail!("session {session_id} is bound to a different workspace");
+            }
+        }
         self.sessions()
             .transition(session_id, next)?
             .with_context(|| format!("session not found: {session_id}"))
@@ -298,13 +325,23 @@ impl AgentRuntimeService {
         self.sessions().list(agent_id)
     }
 
+    /// Returns one session by id (targeted lookup; no full-store scan).
+    /// Unsafe ids fail closed as `None`; a corrupt record is a loud error
+    /// naming the file.
+    pub fn session(&self, session_id: &str) -> Result<Option<AgentSessionRecord>> {
+        self.sessions().get(session_id)
+    }
+
     /// The workspace identity this service binds sessions to, if the
-    /// workspace is initialized.
+    /// workspace is initialized. A *missing* manifest is `None`; a
+    /// corrupt or unsupported manifest is an error, never silently
+    /// classified as "uninitialized".
     pub fn workspace_id(&self) -> Result<Option<WorkspaceId>> {
-        match load_workspace_manifest(&self.root) {
-            Ok(manifest) => Ok(Some(manifest.workspace_id)),
-            Err(_) => Ok(None),
+        let path = self.root.join(".agent").join("workspace.json");
+        if !path.exists() {
+            return Ok(None);
         }
+        Ok(Some(load_workspace_manifest(&self.root)?.workspace_id))
     }
 }
 
@@ -620,6 +657,7 @@ mod tests {
         let (_t, root) = init_root();
         let service = started_service(&root, "writer");
         let session = service.open_session("writer").unwrap();
+        let second = service.open_session("writer").unwrap();
 
         let path = root
             .join(".agent")
@@ -629,7 +667,84 @@ mod tests {
         let err = service
             .resolve_session("writer", &session.session_id)
             .unwrap_err();
-        assert!(err.to_string().contains("key must be a string"), "{err}");
+        // Targeted access fails loudly AND names the damaged file so an
+        // operator can inspect it (W3: distinguish corrupt from missing).
+        let chain = format!("{err:#}");
+        assert!(chain.contains("key must be a string"), "{chain}");
+        assert!(chain.contains("corrupt session record"), "{chain}");
+
+        // Listing stays usable workspace-wide: the intact record still
+        // lists while the damaged one is skipped (W3: one torn file must
+        // not brick `agent status` / `session list` / `session show`).
+        let listed = service.sessions_for(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, second.session_id);
+    }
+
+    #[test]
+    fn terminal_cleanup_reachable_after_agent_stop_or_disable() {
+        let (_t, root) = init_root();
+        let service = started_service(&root, "writer");
+        let session = service.open_session("writer").unwrap();
+
+        // Stopping (or disabling) the agent makes the session unusable...
+        service.stop_agent("writer").unwrap();
+        let err = service
+            .resolve_session("writer", &session.session_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("not active"), "{err}");
+
+        // ...but teardown remains reachable: a terminal transition still
+        // validates ownership + workspace binding without requiring an
+        // active profile (S1 review finding: cleanup must not become
+        // unreachable). No silent reactivation in the other direction.
+        let stopped = service
+            .transition_session("writer", &session.session_id, SessionStatus::Stopped)
+            .unwrap();
+        assert_eq!(stopped.status, SessionStatus::Stopped);
+        let err = service
+            .transition_session("writer", &session.session_id, SessionStatus::Active)
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be used"), "{err}");
+
+        // Ownership is still enforced for terminal transitions: another
+        // agent cannot retire a session it does not own.
+        service
+            .register_profile("reviewer", "Reviewer", "reviewer")
+            .unwrap();
+        service.start_agent("reviewer").unwrap();
+        let err = service
+            .transition_session("reviewer", &session.session_id, SessionStatus::Stopped)
+            .unwrap_err();
+        assert!(err.to_string().contains("does not belong"), "{err}");
+    }
+
+    #[test]
+    fn disabled_agent_can_still_retire_but_not_resume_sessions() {
+        let (_t, root) = init_root();
+        let service = started_service(&root, "writer");
+        let session = service.open_session("writer").unwrap();
+
+        // Pause while the agent is still enabled (a paused session is
+        // usable, so resolution proceeds past the status check).
+        service
+            .transition_session("writer", &session.session_id, SessionStatus::Paused)
+            .unwrap();
+
+        service.set_profile_enabled("writer", false).unwrap();
+
+        // Resume requires full resolution and now fails on the disabled
+        // profile — a disabled agent cannot resurrect a session.
+        let err = service
+            .transition_session("writer", &session.session_id, SessionStatus::Active)
+            .unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err}");
+
+        // Terminal teardown stays reachable despite the disabled profile.
+        let stopped = service
+            .transition_session("writer", &session.session_id, SessionStatus::Stopped)
+            .unwrap();
+        assert_eq!(stopped.status, SessionStatus::Stopped);
     }
 
     #[test]
@@ -640,5 +755,23 @@ mod tests {
         assert!(service.workspace_id().unwrap().is_none());
         crate::services::init::initialize_workspace(&root).unwrap();
         assert!(service.workspace_id().unwrap().is_some());
+    }
+
+    #[test]
+    fn workspace_id_distinguishes_missing_from_corrupt_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        let service = AgentRuntimeService::new(&root);
+
+        // Missing manifest: None (genuinely uninitialized).
+        assert!(service.workspace_id().unwrap().is_none());
+
+        // Corrupt manifest: a loud error, never silently "uninitialized"
+        // (S5 review finding: health checks must not misclassify).
+        let agent_dir = root.join(".agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("workspace.json"), "{ not json").unwrap();
+        let err = service.workspace_id().unwrap_err();
+        assert!(format!("{err:#}").contains("workspace manifest"), "{err:#}");
     }
 }

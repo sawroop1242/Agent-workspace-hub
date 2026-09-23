@@ -22,6 +22,22 @@ impl AgentStore {
         self.root.join(".agent").join("agents")
     }
 
+    fn record_path(&self, id: &str) -> PathBuf {
+        self.agents_dir().join(format!("{}.json", id))
+    }
+
+    /// Writes the agent record with a durability point before the rename
+    /// (matching the manifest/policy/session stores: tempfile + fsync +
+    /// rename under `StoreLock`).
+    fn write_record(&self, agent: &Agent) -> Result<()> {
+        let path = self.record_path(&agent.id);
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer_pretty(tmp.as_file_mut(), agent)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path)?;
+        Ok(())
+    }
+
     /// Creates (or overwrites) an agent, keyed by its `id`.
     pub fn create(&self, agent: &Agent) -> Result<()> {
         if !is_safe_agent_id(&agent.id) {
@@ -31,24 +47,46 @@ impl AgentStore {
             ));
         }
         fs::create_dir_all(self.agents_dir())?;
-        let path = self.agents_dir().join(format!("{}.json", agent.id));
-        let data = serde_json::to_string_pretty(agent)?;
-        fs::write(path, data)?;
-        Ok(())
+        let path = self.record_path(&agent.id);
+        let _lock = crate::mcp::store_lock::StoreLock::acquire(&path)?;
+        self.write_record(agent)
     }
 
     /// Registers a new agent profile, failing if the id is already taken.
     /// Unlike [`create`](Self::create) (a compatibility upsert), this is
     /// the canonical registry operation: a duplicate identity is an error,
     /// never a silent overwrite of another agent's record (TW-002 §5).
+    /// The check and the write run under one `StoreLock` on the record
+    /// path, so two concurrent registrations cannot both win (one gets
+    /// an explicit duplicate error).
     pub fn register(&self, agent: &Agent) -> Result<()> {
-        if self.get(&agent.id)?.is_some() {
+        if !is_safe_agent_id(&agent.id) {
+            return Err(anyhow::anyhow!(
+                "invalid agent id: {:?} (must not be empty or contain path separators)",
+                agent.id
+            ));
+        }
+        fs::create_dir_all(self.agents_dir())?;
+        let path = self.record_path(&agent.id);
+        let _lock = crate::mcp::store_lock::StoreLock::acquire(&path)?;
+        if self.get_locked(&path)?.is_some() {
             return Err(anyhow::anyhow!(
                 "agent id already registered: {} (use a different id)",
                 agent.id
             ));
         }
-        self.create(agent)
+        self.write_record(agent)
+    }
+
+    /// Unlocked-path record read used while a `StoreLock` on `path` is
+    /// already held by the caller (reads never need the lock; this exists
+    /// so `register` performs its duplicate check against the exact file
+    /// it is about to write).
+    fn get_locked(&self, path: &Path) -> Result<Option<Agent>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
     }
 
     /// Returns the agent with the given `id`, or `None` if it does not
@@ -160,6 +198,42 @@ mod tests {
             .register(&agent("writer", "Writer", "writer"))
             .unwrap();
         assert!(store.get("writer").unwrap().is_some());
+    }
+
+    #[test]
+    fn concurrent_registration_never_silently_overwrites() {
+        // The duplicate-identity guarantee must hold across processes, not
+        // just sequential calls: N threads racing `register` on the same
+        // id must yield exactly one winner; every loser gets an explicit
+        // duplicate error (never a silent overwrite of the winner's
+        // record).
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = Arc::new(temp.path().to_path_buf());
+
+        const THREADS: usize = 8;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = AgentStore::new(root.as_path());
+                store
+                    .register(&agent("writer", &format!("Writer {t}"), "writer"))
+                    .is_ok()
+            }));
+        }
+
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(winners, 1, "exactly one concurrent registrant may win");
+        let store = AgentStore::new(root.as_path());
+        let loaded = store.get("writer").unwrap().expect("winner persisted");
+        // The surviving record is the winner's, byte-intact.
+        assert_eq!(loaded.role, "writer");
+        assert!(loaded.name.starts_with("Writer "), "{}", loaded.name);
     }
 
     #[test]

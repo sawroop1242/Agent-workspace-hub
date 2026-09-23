@@ -127,7 +127,9 @@ impl SessionStore {
 
     /// Returns the session with the given id, or `None`. Unsafe ids fail
     /// closed as `None` (TW-002 §15: no path manipulation can read
-    /// outside `.agent/sessions/`).
+    /// outside `.agent/sessions/`). A present-but-unparseable record is a
+    /// loud error naming the file, so a damaged record is distinguishable
+    /// from a missing one.
     pub fn get(&self, session_id: &str) -> Result<Option<AgentSessionRecord>> {
         if !is_safe_session_id(session_id) {
             return Ok(None);
@@ -136,11 +138,22 @@ impl SessionStore {
         if !path.exists() {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+        Ok(Some(
+            serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read session record {}", path.display()))?,
+            )
+            .with_context(|| format!("corrupt session record {}", path.display()))?,
+        ))
     }
 
     /// Lists all sessions sorted by `session_id`, optionally filtered by
-    /// agent.
+    /// agent. Best-effort: a record that fails to parse is skipped rather
+    /// than failing the whole listing — session records are high-churn
+    /// runtime state, and one torn file must not brick `agent status`,
+    /// `session list`, or `session show` workspace-wide. Targeted access
+    /// ([`get`](Self::get)) still fails loudly with the file path so an
+    /// operator can inspect the damaged record.
     pub fn list(&self, agent_id: Option<&str>) -> Result<Vec<AgentSessionRecord>> {
         let dir = self.sessions_dir();
         if !dir.exists() {
@@ -153,7 +166,12 @@ impl SessionStore {
             if path.extension().and_then(|x| x.to_str()) != Some("json") {
                 continue;
             }
-            let session: AgentSessionRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(session) = serde_json::from_str::<AgentSessionRecord>(&content) else {
+                continue;
+            };
             if agent_id.map(|a| session.agent_id != a).unwrap_or(false) {
                 continue;
             }
@@ -199,6 +217,10 @@ pub fn is_safe_session_id(id: &str) -> bool {
 }
 
 /// Atomic content write: tempfile in the same directory, fsync, rename.
+/// The `sync_all` before the rename is the durability point — without it
+/// an OS crash can persist the directory entry before the file contents,
+/// leaving an empty or truncated record (this matches the manifest and
+/// policy stores' write discipline).
 fn atomic_write(target: &Path, data: &str) -> Result<()> {
     let parent = target
         .parent()
@@ -206,7 +228,7 @@ fn atomic_write(target: &Path, data: &str) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     use std::io::Write;
     tmp.write_all(data.as_bytes())?;
-    tmp.flush()?;
+    tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| e.error)?;
     Ok(())
 }

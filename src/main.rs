@@ -6,7 +6,7 @@ use agent_workspace_hub::mcp::{
     PersistentTrustStore, ProjectMcpReferences, ResourceLimits, StdioMcpServer, TlsConfig,
     TrustLevel, BUILTIN_TOOL_TRUST_ID,
 };
-use agent_workspace_hub::models::{AgentStatus, CapabilityGrant, PolicyRule};
+use agent_workspace_hub::models::{CapabilityGrant, PolicyRule};
 use agent_workspace_hub::services::agent_runtime::AgentRuntimeService;
 use agent_workspace_hub::skills::{
     GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller,
@@ -326,6 +326,7 @@ enum AgentCommand {
     /// Activate an agent (status: active).
     Start {
         /// Agent id(s) to activate.
+        #[arg(conflicts_with = "all")]
         ids: Vec<String>,
         /// Activate every enabled agent instead of named ones.
         #[arg(long)]
@@ -961,7 +962,7 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
                     agent.id,
                     agent.name,
                     agent.role,
-                    status_label(&agent.status)
+                    agent.status.label()
                 );
             }
         }
@@ -974,7 +975,7 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
                 agent.id,
                 agent.name,
                 agent.role,
-                status_label(&agent.status),
+                agent.status.label(),
                 agent.created_at
             );
             print_grants(&grants, &id)?;
@@ -988,7 +989,7 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
                 agent.id,
                 agent.name,
                 agent.role,
-                status_label(&agent.status),
+                agent.status.label(),
                 if agent.enabled { "true" } else { "false" },
                 agent.created_at
             );
@@ -1039,7 +1040,7 @@ fn handle_agent_cli(command: AgentCommand) -> Result<()> {
                     "{} {} status: {} enabled: {} usable-sessions: {}",
                     agent.id,
                     agent.name,
-                    status_label(&agent.status),
+                    agent.status.label(),
                     if agent.enabled { "true" } else { "false" },
                     usable
                 );
@@ -1135,11 +1136,7 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
             }
         }
         SessionCommand::Show { session_id } => {
-            let Some(session) = runtime
-                .sessions_for(None)?
-                .into_iter()
-                .find(|s| s.session_id == session_id)
-            else {
+            let Some(session) = runtime.session(&session_id)? else {
                 bail!("session not found: {session_id}");
             };
             println!(
@@ -1305,17 +1302,6 @@ fn parse_permission(value: &str) -> Result<Permission> {
         other => bail!(
             "invalid permission {other:?} — expected one of: network, filesystem, environment, process, secrets"
         ),
-    }
-}
-
-/// Human-readable agent status label matching the serde wire names.
-fn status_label(status: &AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Created => "created",
-        AgentStatus::Active => "active",
-        AgentStatus::Paused => "paused",
-        AgentStatus::Stopped => "stopped",
-        AgentStatus::Failed => "failed",
     }
 }
 

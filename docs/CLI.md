@@ -25,13 +25,24 @@ awh
 ├── doctor
 ├── config
 ├── agent
+│   ├── create
 │   ├── list
 │   ├── show
-│   ├── start
+│   ├── start [--all | ids]
 │   ├── stop
 │   ├── restart
 │   ├── run
-│   └── status
+│   ├── enable
+│   ├── disable
+│   ├── status
+│   └── session
+│       ├── open
+│       ├── list [--agent]
+│       ├── show
+│       ├── resolve
+│       ├── pause
+│       ├── resume
+│       └── stop
 ├── mcp
 │   ├── serve
 │   ├── list
@@ -189,24 +200,107 @@ Behavior:
 - fresh root: creates `.agent/workspace.json` (the durable workspace
   manifest: `version`, `workspace_id`, `workspace_root`, `created_at`) and
   initializes `.agent/policy.json` in its valid empty state; prints
-  `initialized workspace <canonical-root>` and `workspace id: ws-�`;
+  `initialized workspace <canonical-root>` and `workspace id: <workspace id>`;
 - already initialized: loads and reports the existing manifest unchanged
-  (`workspace already initialized �`, same workspace id). Re-init is
+  (`workspace already initialized —`, same workspace id). Re-init is
   idempotent: no new identity, no rewritten manifest, no reset of agents,
   grants, policy rules, or other persisted state;
 - no implicit authority: init never creates agent records, never activates
   an agent, and never grants capabilities. Activation and grants remain
-  explicit (`awh agent �`);
+  explicit (`awh agent —`);
 - fails closed: a root that is a file, a corrupt manifest, an unsupported
   manifest version, or a manifest recorded for a different root are
   structured errors (non-zero exit), and persisted bytes are left
-  untouched � never silently re-initialized;
+  untouched — never silently re-initialized;
 - concurrency: the manifest write is atomic (temp file + fsync + rename)
   and guarded by the same cross-process `StoreLock` mechanism as the other
   `.agent` stores, so two concurrent `awh init` invocations converge on one
   identity instead of racing;
 - the `--path` root is canonicalized before use, so `awh init --path ws`
   creates state only under `ws/` and never in the process CWD.
+
+## `awh agent` — agent runtime identity (TW-002)
+
+Registers and manages agent profiles and their AWH-native runtime
+sessions. Implemented on the `rust` branch (TW-002). Every surface (CLI,
+MCP, TUI, Control API) must use the shared `AgentRuntimeService` — the
+CLI handlers are thin; no duplicate lifecycle logic exists in the CLI.
+
+```text
+awh agent create <id> <name> --role <role>
+awh agent list
+awh agent show <id>
+awh agent start <ids> | --all      # ids and --all are mutually exclusive
+awh agent stop <id>
+awh agent restart <id>
+awh agent enable <id>
+awh agent disable <id>
+awh agent status
+
+awh agent session open <agent-id>
+awh agent session list [--agent <id>]
+awh agent session show <session-id>
+awh agent session resolve <agent-id> <session-id>
+awh agent session pause <agent-id> <session-id>
+awh agent session resume <agent-id> <session-id>
+awh agent session stop <agent-id> <session-id>
+```
+
+### Profile rules
+
+- `create` registers a fresh profile (id, name, role validated and
+  bounded; the profile carries no capabilities); a duplicate id is an
+  explicit error — a registry never overwrites an existing identity;
+- `start` activates a profile (`created|stopped|paused|failed → active`);
+  `--all` starts every *enabled* profile instead of named ones, and ids
+  plus `--all` in one invocation is a usage error (the operator's intent
+  must not be silently broadened). Disabled profiles fail closed: an
+  inactive or disabled agent never silently becomes active;
+- `stop`/`restart` are deliberate operator actions; `restart` is stop +
+  start and always results in an `active` profile. Stopping or disabling
+  an agent does not mutate or unload its session records — it only makes
+  session resolution fail closed;
+- `enable`/`disable` toggle the profile's resolution switch;
+- `status` reports per-agent lifecycle (`status:`, `enabled:`) and how
+  many of its sessions are currently usable (active or paused).
+
+### Session rules (TW-002 §7–§10)
+
+- a session is the AWH-native runtime identity. It is NOT the MCP
+  protocol session (transport lifecycle) and the two are never conflated;
+- `open` requires an initialized workspace and an enabled, active agent;
+  the session binds one agent to exactly one workspace. Session ids are
+  unique per open and globally named (`sess-<agent>-<workspace>-<unique>`);
+- `resolve` answers "which caller is this?" only — it never grants
+  capabilities and is never authorization. It re-validates everything on
+  every call: session exists, belongs to the claiming agent, is usable
+  (active or paused), is bound to the current workspace, and the agent
+  profile is still enabled and active. A persisted record is never
+  trusted merely because it exists;
+- lifecycle transitions go through the validated table:
+
+```text
+Active  → Paused, Stopped, Failed
+Paused  → Active (resume), Stopped, Failed
+Stopped → (terminal: no transitions)
+Failed  → (terminal: no transitions)
+```
+
+- `stopped` and `failed` are terminal: no pause, no resume, no resolve.
+  Reopening a stopped or failed caller requires opening a new session —
+  nothing is ever silently reactivated;
+- terminal transitions (`stop`, and `Failed` via the runtime) validate
+  ownership and workspace binding but do not require an active profile:
+  a stopped or disabled agent can still *retire* its sessions. Gating
+  teardown on an active profile would make cleanup unreachable after
+  `agent stop` / `agent disable`. Extending *use* (resume) still requires
+  the full resolution contract;
+- session records persist under `.agent/sessions/` as per-session JSON
+  (atomic tempfile + fsync + rename under the cross-process `StoreLock`),
+  for correlation and audit. Listing is best-effort: a record that fails
+  to parse is skipped so one torn file cannot brick `agent status`,
+  `session list`, or `session show` workspace-wide; targeted access
+  (`session show <id>`, resolve) fails loudly, naming the damaged file.
 
 ## Command-to-phase map
 
@@ -226,7 +320,8 @@ Behavior:
 | `memory *` | 7 | scoped memory store |
 | `skill *` | 8 | registry, policy, capabilities |
 | `agent *` | 1/4/9 | profile, registry, policy, server/session |
-| `session *` | 9 | agent + workspace + policy |
+| `agent session *` (TW-002 subset) | 9 | `AgentRuntimeService`, session store, workspace manifest |
+| `session *` (full) | 9 | agent + workspace + policy |
 | `task *` | 9 | session + agent ownership |
 | `audit *` / `logs *` | 10 | events/tracing |
 | `terminal *` | 10/16 | policy, capability, session, resource limits |
