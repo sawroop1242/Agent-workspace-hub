@@ -1,12 +1,16 @@
 name: OpenHands Issue Resolver
 
-# Trigger OpenHands' current reusable resolver for issues labeled "fix-me"
-# or issue comments containing "@openhands-agent".
 on:
   issues:
     types: [labeled]
   issue_comment:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'The issue number you want OpenHands to resolve'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,23 +18,49 @@ permissions:
   issues: write
 
 jobs:
-  call-openhands-resolver:
+  resolve-issue:
     if: >-
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' && github.event.label.name == 'fix-me') ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request == null &&
        contains(github.event.comment.body, '@openhands-agent'))
-    uses: OpenHands/openhands-aci/.github/workflows/openhands-resolver.yml@main
-    with:
-      max_iterations: ${{ fromJson(vars.OPENHANDS_MAX_ITER || '50') }}
-      macro: ${{ vars.OPENHANDS_MACRO || '@openhands-agent' }}
-      base_container_image: ${{ vars.OPENHANDS_BASE_CONTAINER_IMAGE || '' }}
-      target_branch: ${{ vars.TARGET_BRANCH || 'rust' }}
-      runner: ${{ vars.TARGET_RUNNER || 'ubuntu-latest' }}
-    secrets:
-      LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
-      LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-      LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-      PAT_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-      PAT_USERNAME: ${{ vars.OPENHANDS_PAT_USERNAME }}
-      
+    runs-on: ${{ vars.TARGET_RUNNER || 'ubuntu-latest' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OpenHands Resolver Platform
+        run: |
+          pip install openhands-resolver
+
+      - name: Execute Autonomous Issue Resolution
+        env:
+          # Required LLM Credentials and Configuration
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
+          LLM_BASE_URL: https://nvidia.com
+          LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          
+          # Target Workspace and Git Auth Details
+          GITHUB_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          ANYSCALE_API_KEY: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          SANDBOX_USER_ID: ${{ github.actor_id }}
+          
+          # Runtime Variables
+          MAX_ITERATIONS: ${{ fromJson(vars.OPENHANDS_MAX_ITER || '50') }}
+          TARGET_BRANCH: ${{ vars.TARGET_BRANCH || 'rust' }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number || github.event.issue.number }}
+        run: |
+          # Executes the Python entrypoint directly without calling an upstream workflow
+          python -m openhands_resolver.visualizer_or_patch \
+            --issue-number "$ISSUE_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --branch "$TARGET_BRANCH" \
+            --max-iter "$MAX_ITERATIONS"
+            
