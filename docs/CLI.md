@@ -270,7 +270,8 @@ awh agent session stop <agent-id> <session-id>
   protocol session (transport lifecycle) and the two are never conflated;
 - `open` requires an initialized workspace and an enabled, active agent;
   the session binds one agent to exactly one workspace. Session ids are
-  unique per open and globally named (`sess-<agent>-<workspace>-<unique>`);
+  unique per open (`sess-<nanos>-<pid>-<seq>`; the agent/workspace binding
+  lives in the session record, not the id);
 - `resolve` answers "which caller is this?" only — it never grants
   capabilities and is never authorization. It re-validates everything on
   every call: session exists, belongs to the claiming agent, is usable

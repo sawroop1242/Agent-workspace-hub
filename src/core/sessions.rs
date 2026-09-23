@@ -151,9 +151,11 @@ impl SessionStore {
     /// agent. Best-effort: a record that fails to parse is skipped rather
     /// than failing the whole listing — session records are high-churn
     /// runtime state, and one torn file must not brick `agent status`,
-    /// `session list`, or `session show` workspace-wide. Targeted access
-    /// ([`get`](Self::get)) still fails loudly with the file path so an
-    /// operator can inspect the damaged record.
+    /// `session list`, or `session show` workspace-wide. Every skip is
+    /// surfaced as a `tracing::warn!` naming the file, so the durability
+    /// failure stays operator-observable (the CLI writes tracing output
+    /// to stderr). Targeted access ([`get`](Self::get)) still fails
+    /// loudly with the file path so a damaged record can be inspected.
     pub fn list(&self, agent_id: Option<&str>) -> Result<Vec<AgentSessionRecord>> {
         let dir = self.sessions_dir();
         if !dir.exists() {
@@ -167,9 +169,11 @@ impl SessionStore {
                 continue;
             }
             let Ok(content) = fs::read_to_string(&path) else {
+                tracing::warn!(path = %path.display(), "skipping unreadable session record");
                 continue;
             };
             let Ok(session) = serde_json::from_str::<AgentSessionRecord>(&content) else {
+                tracing::warn!(path = %path.display(), "skipping corrupt session record");
                 continue;
             };
             if agent_id.map(|a| session.agent_id != a).unwrap_or(false) {

@@ -56,7 +56,10 @@ impl InitOutcome {
     }
 }
 
-fn manifest_path(root: &Path) -> PathBuf {
+/// The workspace manifest location for a workspace root: `.agent/workspace.json`.
+/// Public so other services reference one manifest location instead of
+/// re-hardcoding the path (the manifest is the shared workspace binding).
+pub fn manifest_path(root: &Path) -> PathBuf {
     root.join(".agent").join("workspace.json")
 }
 

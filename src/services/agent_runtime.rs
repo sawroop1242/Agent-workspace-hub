@@ -228,33 +228,19 @@ impl AgentRuntimeService {
     /// granted, no policy is consulted (TW-002 §11 — identity resolution
     /// is not authorization).
     pub fn resolve_session(&self, agent_id: &str, session_id: &str) -> Result<ResolvedCaller> {
-        let manifest = load_workspace_manifest(&self.root).context(
-            "cannot resolve a session: workspace is not initialized (run `awh init` first)",
-        )?;
-
-        let Some(session) = self.sessions().get(session_id)? else {
-            bail!("session not found: {session_id}");
-        };
-        if session.agent_id != agent_id {
-            // Substitution attack: the session belongs to another agent.
-            // Reject without revealing which agent it does belong to.
-            bail!("session {session_id} does not belong to agent {agent_id}");
-        }
+        let (session, workspace_id) = self.require_owned_session(agent_id, session_id)?;
         if !session.status.is_usable() {
             bail!(
                 "session {session_id} is {} and cannot be used (open a new session)",
                 session.status.label()
             );
         }
-        if session.workspace_id != manifest.workspace_id.as_str() {
-            bail!("session {session_id} is bound to a different workspace");
-        }
 
         // Full relation re-check through the existing identity layer.
         let identity = SessionIdentity::new_checked(
             SessionId::new_checked(session_id)?,
             AgentId::new_checked(agent_id.to_owned())?,
-            manifest.workspace_id.clone(),
+            workspace_id,
         )?;
         match resolve_session_relation(&self.root, &identity)? {
             IdentityRelation::AgentActiveInWorkspace => Ok(ResolvedCaller {
@@ -274,6 +260,38 @@ impl AgentRuntimeService {
                 bail!("session {session_id} is bound to a different workspace")
             }
         }
+    }
+
+    /// The shared ownership + workspace-binding validator (single source
+    /// of truth for the TW-002 §16 ownership rules): loads the session,
+    /// rejects cross-agent substitution, and enforces the workspace
+    /// binding against the manifest. Returns the validated record plus
+    /// the manifest's workspace id. Resolution
+    /// ([`resolve_session`](Self::resolve_session)) layers the
+    /// usability and profile re-checks on top; terminal transitions
+    /// ([`transition_session`](Self::transition_session)) call it alone
+    /// so teardown stays reachable when the profile is stopped or
+    /// disabled. Any new ownership/binding rule belongs *here*, so the
+    /// two paths can never drift apart.
+    fn require_owned_session(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Result<(AgentSessionRecord, WorkspaceId)> {
+        let manifest = load_workspace_manifest(&self.root)
+            .context("cannot use a session: workspace is not initialized (run `awh init` first)")?;
+        let Some(session) = self.sessions().get(session_id)? else {
+            bail!("session not found: {session_id}");
+        };
+        if session.agent_id != agent_id {
+            // Substitution attack: the session belongs to another agent.
+            // Reject without revealing which agent it does belong to.
+            bail!("session {session_id} does not belong to agent {agent_id}");
+        }
+        if session.workspace_id != manifest.workspace_id.as_str() {
+            bail!("session {session_id} is bound to a different workspace");
+        }
+        Ok((session, manifest.workspace_id))
     }
 
     /// Applies a lifecycle transition to a session through the validated
@@ -300,20 +318,9 @@ impl AgentRuntimeService {
             // change (pause) requires the full resolution contract.
             let _ = self.resolve_session(agent_id, session_id)?;
         } else {
-            // Terminal transition: ownership + binding still enforced,
-            // profile activity deliberately not.
-            let manifest = load_workspace_manifest(&self.root).context(
-                "cannot transition a session: workspace is not initialized (run `awh init` first)",
-            )?;
-            let Some(session) = self.sessions().get(session_id)? else {
-                bail!("session not found: {session_id}");
-            };
-            if session.agent_id != agent_id {
-                bail!("session {session_id} does not belong to agent {agent_id}");
-            }
-            if session.workspace_id != manifest.workspace_id.as_str() {
-                bail!("session {session_id} is bound to a different workspace");
-            }
+            // Terminal transition: ownership + binding still enforced via
+            // the shared validator, profile activity deliberately not.
+            self.require_owned_session(agent_id, session_id)?;
         }
         self.sessions()
             .transition(session_id, next)?
@@ -337,7 +344,7 @@ impl AgentRuntimeService {
     /// corrupt or unsupported manifest is an error, never silently
     /// classified as "uninitialized".
     pub fn workspace_id(&self) -> Result<Option<WorkspaceId>> {
-        let path = self.root.join(".agent").join("workspace.json");
+        let path = crate::services::init::manifest_path(&self.root);
         if !path.exists() {
             return Ok(None);
         }
