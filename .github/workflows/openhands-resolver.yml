@@ -21,8 +21,6 @@ permissions:
 
 jobs:
   resolve-issue:
-    name: Resolve GitHub Issue with OpenHands
-
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (
@@ -43,8 +41,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine issue number
-        id: parse_issue
+      - name: Resolve issue number
+        id: issue
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -60,24 +58,42 @@ jobs:
           fi
 
           if ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
-            echo "Invalid issue number: $ISSUE_NUMBER"
+            echo "::error::Invalid issue number: $ISSUE_NUMBER"
             exit 1
           fi
 
-          echo "num=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Docker
-        run: |
-          docker version
-          docker info
-
-      - name: Execute OpenHands Issue Resolver
+      - name: Pull OpenHands image
         env:
-          OPENHANDS_IMAGE: ghcr.io/openhands/openhands:latest
-          REPOSITORY: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ steps.parse_issue.outputs.num }}
+          OPENHANDS_IMAGE: ${{ vars.OPENHANDS_IMAGE || 'ghcr.io/openhands/openhands:1.8.0' }}
+        run: |
+          set -euo pipefail
 
-          LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm5' }}
+          echo "Pulling $OPENHANDS_IMAGE"
+          docker pull "$OPENHANDS_IMAGE"
+
+      - name: Verify OpenHands resolver
+        env:
+          OPENHANDS_IMAGE: ${{ vars.OPENHANDS_IMAGE || 'ghcr.io/openhands/openhands:1.8.0' }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking resolver module..."
+
+          docker run --rm \
+            "$OPENHANDS_IMAGE" \
+            python -c \
+            "import openhands.resolver.resolve_issue; print('OpenHands resolver: OK')"
+
+      - name: Execute OpenHands resolver
+        env:
+          OPENHANDS_IMAGE: ${{ vars.OPENHANDS_IMAGE || 'ghcr.io/openhands/openhands:1.8.0' }}
+
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
           LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://integrate.api.nvidia.com/v1' }}
           MAX_ITERATIONS: ${{ vars.OPENHANDS_MAX_ITER || '50' }}
 
@@ -87,15 +103,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "=========================================="
-          echo "OpenHands Issue Resolver"
-          echo "=========================================="
-          echo "Repository:     $REPOSITORY"
-          echo "Issue:          #$ISSUE_NUMBER"
-          echo "Model:          $LLM_MODEL"
-          echo "Base URL:       $LLM_BASE_URL"
-          echo "Max iterations: $MAX_ITERATIONS"
-          echo "=========================================="
+          test -n "$LLM_MODEL" || {
+            echo "::error::Repository variable LLM_MODEL is not configured"
+            exit 1
+          }
 
           test -n "$LLM_API_KEY" || {
             echo "::error::AWH_AGENT2_NVIDIA_KEY_1 is not configured"
@@ -106,6 +117,12 @@ jobs:
             echo "::error::AWH_AUTOMATION_TOKEN is not configured"
             exit 1
           }
+
+          echo "Starting OpenHands resolver"
+          echo "Repository: $REPOSITORY"
+          echo "Issue: #$ISSUE_NUMBER"
+          echo "Model: $LLM_MODEL"
+          echo "Base URL: $LLM_BASE_URL"
 
           docker run --rm \
             --network host \
