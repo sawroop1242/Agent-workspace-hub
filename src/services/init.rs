@@ -321,4 +321,66 @@ mod tests {
             "broken"
         );
     }
+
+    #[test]
+    fn manifest_with_invalid_workspace_id_is_rejected_without_mutation() {
+        // A structurally valid manifest whose workspace_id fails typed
+        // validation (traversal) must fail closed, never be adopted.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        initialize_workspace(&root).unwrap();
+        let path = manifest_path(root.canonicalize().unwrap().as_path());
+        let manifest = fs::read_to_string(&path).unwrap();
+        let poisoned = manifest
+            .split_once("\"workspace_id\": \"")
+            .map(|(prefix, rest)| {
+                let suffix = rest.split_once('"').map(|(_, s)| s).unwrap_or("");
+                format!("{prefix}\"workspace_id\": \"../evil\"{suffix}")
+            })
+            .unwrap();
+        assert_ne!(poisoned, manifest, "fixture must actually change the id");
+        fs::write(&path, poisoned.clone()).unwrap();
+        let err = initialize_workspace(&root).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid workspace id"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), poisoned);
+    }
+
+    #[test]
+    fn load_manifest_on_uninitialized_root_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let err = load_workspace_manifest(&root).unwrap_err();
+        assert!(format!("{err:#}").contains("not initialized"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("run `awh init` first"),
+            "{err:#}"
+        );
+        // A nonexistent root also fails closed (it cannot contain a manifest).
+        assert!(load_workspace_manifest(&temp.path().join("missing")).is_err());
+        // A later real init still succeeds — the failed load mutated nothing.
+        assert!(matches!(
+            initialize_workspace(&root).unwrap(),
+            InitOutcome::Created(_)
+        ));
+    }
+
+    #[test]
+    fn root_under_a_regular_file_is_rejected() {
+        // `file/sub` can never become a directory; init must fail with a
+        // deterministic error and leave no bootstrap state anywhere.
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let root = file.join("sub");
+        let err = initialize_workspace(&root).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to create workspace"),
+            "{err:#}"
+        );
+        assert!(!temp.path().join("sub").join(".agent").exists());
+    }
 }

@@ -13,6 +13,25 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace      # 359 tests as of Phase 10
 ```
 
+Sandbox note: fresh containers have NO Rust toolchain preinstalled -
+install with rustup (`curl https://sh.rustup.rs | sh -s -- -y`), then
+`source ~/.cargo/env`; `rustup component add clippy rustfmt` for gates.
+`cargo test --all-targets` takes >4 min here; run it in the background
+(`(cargo test --all-targets > log 2>&1 &)`) - foreground terminal is
+capped at ~1080s; full run is ~988 tests as of 2026-09.
+
+Prompt 01 (TW-001 init) verified COMPLETE: `src/services/init.rs` is the
+single bootstrap owner (no duplicates; grep `workspace.json` first).
+Contract: idempotent (byte-stable manifest), fail-closed on corrupt /
+unsupported-version / foreign-root / invalid-workspace-id manifests and
+corrupt `policy.json`, canonical-root binding, StoreLock-serialized +
+atomic-rename manifest creation. Tests: 11 in `services::init` unit tests,
+11 in `tests/init_cli.rs` (real compiled binary; 8-thread parallel race
+asserts exactly one Created + one canonical identity).
+`load_workspace_manifest` on a *nonexistent* root errors with
+"failed to resolve" (not "not initialized") - both fail closed; test the
+friendly message only against an existing-uninitialized dir.
+
 Git identity is NOT configured globally; commit with:
 `git -c user.name="openhands" -c user.email="openhands@all-hands.dev" commit ...`
 plus `Co-authored-by: openhands <openhands@all-hands.dev>` trailer.
