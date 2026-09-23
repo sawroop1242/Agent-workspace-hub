@@ -225,3 +225,105 @@ fn service_foreign_manifest_is_rejected_not_adopted() {
         "got: {err:#}"
     );
 }
+
+#[test]
+fn cli_init_rejects_unsupported_manifest_version() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    let (ok, _, err) = run(root, &["init"]);
+    assert!(ok, "{err}");
+    let path = manifest_path(root);
+    let bumped = fs::read_to_string(&path)
+        .unwrap()
+        .replace("\"version\": 1", "\"version\": 99");
+    fs::write(&path, bumped).unwrap();
+    let (ok, out, err) = run(root, &["init"]);
+    assert!(!ok, "init must fail on an unsupported version, got: {out}");
+    assert!(
+        err.contains("unsupported workspace manifest version"),
+        "got: {err}"
+    );
+    // Fail closed: the unsupported manifest is left untouched.
+    assert!(fs::read_to_string(&path)
+        .unwrap()
+        .contains("\"version\": 99"));
+}
+
+#[test]
+fn cli_init_rejects_foreign_manifest_with_nonzero_exit() {
+    let dir = tempdir().expect("tempdir");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    fs::create_dir_all(&a).unwrap();
+    let (ok, _, err) = run(&a, &["init"]);
+    assert!(ok, "{err}");
+    fs::create_dir_all(b.join(".agent")).unwrap();
+    fs::copy(manifest_path(&a), manifest_path(&b)).unwrap();
+    let (ok, out, err) = run(&b, &["init"]);
+    assert!(!ok, "init must fail on a foreign manifest, got: {out}");
+    assert!(err.contains("different root"), "got: {err}");
+    // The foreign manifest was not replaced by a fresh one.
+    assert_eq!(
+        fs::read_to_string(manifest_path(&b)).unwrap(),
+        fs::read_to_string(manifest_path(&a)).unwrap()
+    );
+}
+
+#[test]
+fn parallel_inits_produce_exactly_one_canonical_identity() {
+    // N threads hit initialize_workspace on the same fresh root at a
+    // barrier. The manifest StoreLock serializes the check-then-create
+    // cycle, so exactly one thread must observe Created and all others
+    // AlreadyInitialized — never two competing workspace identities and
+    // never an accepted torn manifest.
+    const THREADS: usize = 8;
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let root = root.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                initialize_workspace(&root).expect("every init attempt must succeed")
+            })
+        })
+        .collect();
+    let outcomes: Vec<InitOutcome> = handles
+        .into_iter()
+        .map(|h| h.join().expect("init thread panicked"))
+        .collect();
+
+    let created = outcomes
+        .iter()
+        .filter(|o| matches!(o, InitOutcome::Created(_)))
+        .count();
+    assert_eq!(created, 1, "exactly one init may create the identity");
+    let ids: std::collections::HashSet<_> = outcomes
+        .iter()
+        .map(|o| o.manifest().workspace_id.clone())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "all inits must agree on one canonical workspace identity"
+    );
+
+    // The accepted on-disk manifest is that identity, is valid, and is
+    // byte-stable under a further (sequential) re-init.
+    let manifest = load_workspace_manifest(&root).expect("manifest must be valid");
+    assert_eq!(manifest.workspace_id, *ids.iter().next().unwrap());
+    let bytes = fs::read(manifest_path(root.canonicalize().unwrap().as_path())).unwrap();
+    let again = initialize_workspace(&root).unwrap();
+    assert!(matches!(again, InitOutcome::AlreadyInitialized(_)));
+    assert_eq!(
+        fs::read(manifest_path(root.canonicalize().unwrap().as_path())).unwrap(),
+        bytes,
+        "re-init after the race must not rewrite the manifest"
+    );
+
+    // No lock residue from the race: the lock file is removed on drop.
+    assert!(!root.join(".agent/workspace.json.lock").exists());
+}
