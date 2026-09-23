@@ -2,7 +2,6 @@ name: OpenHands Issue Resolver
 
 # Trigger OpenHands' current reusable resolver for issues labeled "fix-me"
 # or issue comments containing "@openhands-agent".
-
 on:
   issues:
     types: [labeled]
@@ -21,16 +20,17 @@ jobs:
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request == null &&
        contains(github.event.comment.body, '@openhands-agent'))
-    uses: All-Hands-AI/OpenHands/.github/workflows/openhands-resolver.yml@main
+    uses: OpenHands/OpenHands/.github/workflows/openhands-resolver.yml@main
     with:
       max_iterations: ${{ fromJson(vars.OPENHANDS_MAX_ITER || '50') }}
       macro: ${{ vars.OPENHANDS_MACRO || '@openhands-agent' }}
-      LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
       base_container_image: ${{ vars.OPENHANDS_BASE_CONTAINER_IMAGE || '' }}
       target_branch: ${{ vars.TARGET_BRANCH || 'rust' }}
       runner: ${{ vars.TARGET_RUNNER || 'ubuntu-latest' }}
     secrets:
-      LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+      LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
       LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+      LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
       PAT_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
       PAT_USERNAME: ${{ vars.OPENHANDS_PAT_USERNAME }}
+      
