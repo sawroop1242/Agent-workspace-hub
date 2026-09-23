@@ -31,36 +31,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python environment
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install OpenHands Resolver Platform
+      - name: Setup Dynamic Issue Context
+        id: parse_issue
         run: |
-          pip install openhands-resolver
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "num=${{ github.event.inputs.issue_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "num=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Execute Autonomous Issue Resolution
-        env:
-          # Required LLM Credentials and Configuration
-          LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
-          LLM_BASE_URL: https://nvidia.com
-          LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-          
-          # Target Workspace and Git Auth Details
-          GITHUB_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-          ANYSCALE_API_KEY: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-          SANDBOX_USER_ID: ${{ github.actor_id }}
-          
-          # Runtime Variables
-          MAX_ITERATIONS: ${{ fromJson(vars.OPENHANDS_MAX_ITER || '50') }}
-          TARGET_BRANCH: ${{ vars.TARGET_BRANCH || 'rust' }}
-          ISSUE_NUMBER: ${{ github.event.inputs.issue_number || github.event.issue.number }}
+      - name: Pull and Execute OpenHands Resolver Container
         run: |
-          # Executes the Python entrypoint directly without calling an upstream workflow
-          python -m openhands_resolver.visualizer_or_patch \
-            --issue-number "$ISSUE_NUMBER" \
+          docker run --rm \
+            -e LLM_MODEL="${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}" \
+            -e LLM_BASE_URL="https://nvidia.com" \
+            -e LLM_API_KEY="${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}" \
+            -e GITHUB_TOKEN="${{ secrets.AWH_AUTOMATION_TOKEN }}" \
+            -e ANYSCALE_API_KEY="${{ secrets.AWH_AUTOMATION_TOKEN }}" \
+            -v "${{ github.workspace }}:/workspace" \
+            ghcr.io/openhands/openhands-resolver:latest \
+            --issue-number "${{ steps.parse_issue.outputs.num }}" \
             --repo "${{ github.repository }}" \
-            --branch "$TARGET_BRANCH" \
-            --max-iter "$MAX_ITERATIONS"
+            --branch "${{ vars.TARGET_BRANCH || 'rust' }}" \
+            --max-iter "${{ vars.OPENHANDS_MAX_ITER || '50' }}"
             
