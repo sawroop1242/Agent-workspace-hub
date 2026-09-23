@@ -73,4 +73,4 @@ cargo audit
 ## Master hardening prompt tracking
 
 The production-hardening work items (18.x phases) are recorded in commit
-messages and summarized in [`completeness-audit.md`](completeness-audit.md).
+messages and summarized in [`archive/completeness-audit.md`](archive/completeness-audit.md).

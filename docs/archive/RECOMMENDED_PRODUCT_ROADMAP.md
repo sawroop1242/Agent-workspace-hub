@@ -1,6 +1,6 @@
 # Recommended Product Roadmap (Historical Strategic Recommendation)
 
-> **Status: SUPERSEDED for implementation planning.** The canonical final architecture, feature set, CLI contract, dependency graph, and build order are now defined in [`docs/PROJECT_ROADMAP.md`](PROJECT_ROADMAP.md), [`docs/CLI.md`](CLI.md), and [`docs/FEATURES.md`](FEATURES.md).
+> **Status: SUPERSEDED for implementation planning.** The canonical final architecture, feature set, CLI contract, dependency graph, and build order are now defined in [`../roadmap/PROJECT_ROADMAP.md`](../roadmap/PROJECT_ROADMAP.md), [`../CLI.md`](../CLI.md), and [`../FEATURES.md`](../FEATURES.md).
 >
 > This document is retained for historical market/positioning context. Its earlier horizon sequencing is not the current build plan.
 

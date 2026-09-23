@@ -189,18 +189,18 @@ Behavior:
 - fresh root: creates `.agent/workspace.json` (the durable workspace
   manifest: `version`, `workspace_id`, `workspace_root`, `created_at`) and
   initializes `.agent/policy.json` in its valid empty state; prints
-  `initialized workspace <canonical-root>` and `workspace id: ws-…`;
+  `initialized workspace <canonical-root>` and `workspace id: <workspace id>`;
 - already initialized: loads and reports the existing manifest unchanged
-  (`workspace already initialized …`, same workspace id). Re-init is
+  (`workspace already initialized â€”`, same workspace id). Re-init is
   idempotent: no new identity, no rewritten manifest, no reset of agents,
   grants, policy rules, or other persisted state;
 - no implicit authority: init never creates agent records, never activates
   an agent, and never grants capabilities. Activation and grants remain
-  explicit (`awh agent …`);
+  explicit (`awh agent â€”`);
 - fails closed: a root that is a file, a corrupt manifest, an unsupported
   manifest version, or a manifest recorded for a different root are
   structured errors (non-zero exit), and persisted bytes are left
-  untouched — never silently re-initialized;
+  untouched â€” never silently re-initialized;
 - concurrency: the manifest write is atomic (temp file + fsync + rename)
   and guarded by the same cross-process `StoreLock` mechanism as the other
   `.agent` stores, so two concurrent `awh init` invocations converge on one

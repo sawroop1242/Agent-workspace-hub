@@ -104,9 +104,9 @@ jobs:
           required=(
             README.md
             docs/PROJECT_CONTEXT.md
-            docs/PROJECT_ROADMAP.md
-            docs/PROJECT_ROADMAP_STATUS.md
-            docs/PROJECT_STATUS.md
+            docs/roadmap/PROJECT_ROADMAP.md
+            docs/archive/PROJECT_ROADMAP_STATUS.md
+            docs/archive/PROJECT_STATUS.md
             docs/FEATURES.md
             docs/CLI.md
             docs/architecture.md
@@ -118,11 +118,11 @@ jobs:
             docs/testing.md
             docs/release.md
             docs/INSTALL.md
-            docs/completeness-audit.md
+            docs/archive/completeness-audit.md
             docs/error.md
-            docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md
-            docs/ROADMAP_GAP_MATRIX.md
-            docs/RECONCILED_ROADMAP_V2.md
+            docs/roadmap/ROADMAP_AGENT_PROFILES_POLICY_MCP.md
+            docs/archive/ROADMAP_GAP_MATRIX.md
+            docs/roadmap/STATUS.md
             docs/implementation-prompts/README.md
             .github/agent/system.md
             .github/agent/rules.md
