@@ -1,4 +1,4 @@
-name: OpenHands Issue Resolver
+name: Codex Issue Resolver
 
 on:
   issues:
@@ -10,14 +10,14 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: "The issue number you want OpenHands to resolve"
+        description: "The issue number you want Codex to resolve"
         required: true
         type: string
 
 permissions:
   contents: write
   pull-requests: write
-  issues: write
+  issues: read
 
 jobs:
   resolve-issue:
@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -48,6 +48,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DISPATCH_ISSUE: ${{ inputs.issue_number }}
           EVENT_ISSUE: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -62,71 +63,60 @@ jobs:
             exit 1
           fi
 
-          echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body,url)"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+          {
+            echo "number=$ISSUE_NUMBER"
+            echo "title<<CODEX_ISSUE_TITLE"
+            printf '%s\n' "$ISSUE_JSON" | jq -r '.title'
+            echo "CODEX_ISSUE_TITLE"
+            echo "body<<CODEX_ISSUE_BODY"
+            printf '%s\n' "$ISSUE_JSON" | jq -r '.body'
+            echo "CODEX_ISSUE_BODY"
+            echo "url=$(printf '%s\n' "$ISSUE_JSON" | jq -r '.url')"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout OpenHands source
+      - name: Resolve Codex Responses endpoint
+        id: endpoint
         shell: bash
         env:
-          OPENHANDS_REF: ${{ vars.OPENHANDS_REF || 'main' }}
+          CODEX_RESPONSES_API_ENDPOINT: ${{ vars.CODEX_RESPONSES_API_ENDPOINT }}
+          CODEX_BASE_URL: ${{ vars.CODEX_BASE_URL }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
         run: |
           set -euo pipefail
 
-          rm -rf "$RUNNER_TEMP/OpenHands"
+          # CODEX_RESPONSES_API_ENDPOINT wins and may already include /responses.
+          # Otherwise CODEX_BASE_URL/LLM_BASE_URL is treated as a /v1-style base URL.
+          BASE_URL="$CODEX_BASE_URL"
+          if [ -z "$BASE_URL" ]; then
+            BASE_URL="$LLM_BASE_URL"
+          fi
+          if [ -z "$BASE_URL" ]; then
+            BASE_URL="https://api.openai.com/v1"
+          fi
 
-          git clone --depth 1 --branch "$OPENHANDS_REF"             https://github.com/All-Hands-AI/OpenHands.git             "$RUNNER_TEMP/OpenHands"
+          if [ -n "$CODEX_RESPONSES_API_ENDPOINT" ]; then
+            ENDPOINT="$CODEX_RESPONSES_API_ENDPOINT"
+          else
+            BASE_URL="${BASE_URL%/}"
+            case "$BASE_URL" in
+              */responses)
+                ENDPOINT="$BASE_URL"
+                ;;
+              *)
+                ENDPOINT="$BASE_URL/responses"
+                ;;
+            esac
+          fi
 
-          cd "$RUNNER_TEMP/OpenHands"
+          echo "url=$ENDPOINT" >> "$GITHUB_OUTPUT"
 
-          echo "OpenHands source:"
-          git rev-parse HEAD
-
-      - name: Install OpenHands from source
+      - name: Validate Codex configuration
         shell: bash
-        run: |
-          set -euo pipefail
-
-          python -m pip install --upgrade pip
-          python -m pip install -e "$RUNNER_TEMP/OpenHands"
-
-      - name: Verify OpenHands resolver
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python -c '
-          import openhands
-          import openhands.resolver.resolve_issue
-
-          print("OpenHands package:", openhands.__file__)
-          print("Resolver module:", openhands.resolver.resolve_issue.__file__)
-          print("OpenHands resolver: OK")
-          '
-
-      - name: Verify Docker
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker version
-          docker info
-
-      - name: Execute OpenHands resolver
         env:
-          REPOSITORY: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
-
           LLM_MODEL: ${{ vars.LLM_MODEL }}
-          LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://integrate.api.nvidia.com/v1' }}
-          MAX_ITERATIONS: ${{ vars.OPENHANDS_MAX_ITER || '50' }}
-
-          LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-          GITHUB_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
-
-        shell: bash
+          CODEX_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
         run: |
           set -euo pipefail
 
@@ -135,24 +125,116 @@ jobs:
             exit 1
           }
 
-          test -n "$LLM_API_KEY" || {
+          test -n "$CODEX_API_KEY" || {
             echo "::error::AWH_AGENT2_NVIDIA_KEY_1 is not configured"
             exit 1
           }
 
-          test -n "$GITHUB_TOKEN" || {
-            echo "::error::AWH_AUTOMATION_TOKEN is not configured"
-            exit 1
-          }
+      - name: Run Codex
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          responses-api-endpoint: ${{ steps.endpoint.outputs.url }}
+          model: ${{ vars.LLM_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT || 'high' }}
+          permission-profile: ":workspace"
+          prompt: |
+            You are the coding agent for Agent Workspace Hub (AWH).
 
-          echo "=========================================="
-          echo "OpenHands Issue Resolver"
-          echo "=========================================="
-          echo "Repository: $REPOSITORY"
-          echo "Issue:      #$ISSUE_NUMBER"
-          echo "Model:      $LLM_MODEL"
-          echo "Base URL:   $LLM_BASE_URL"
-          echo "Iterations: $MAX_ITERATIONS"
-          echo "=========================================="
+            Repository: ${{ github.repository }}
+            Target branch: rust
+            Issue: #${{ steps.issue.outputs.number }}
+            Issue URL: ${{ steps.issue.outputs.url }}
 
-          python -m openhands.resolver.resolve_issue             --repo "$REPOSITORY"             --issue-number "$ISSUE_NUMBER"             --issue-type issue             --max-iterations "$MAX_ITERATIONS"             --llm-model "$LLM_MODEL"             --llm-api-key "$LLM_API_KEY"
+            Issue title:
+            ${{ steps.issue.outputs.title }}
+
+            Issue body:
+            ---
+            ${{ steps.issue.outputs.body }}
+            ---
+
+            Your task:
+            1. Read the repository architecture and relevant documentation before editing.
+            2. Understand the issue and identify the root cause.
+            3. Implement the smallest correct production-quality fix.
+            4. Preserve existing AWH architecture and Rust conventions.
+            5. Do not modify unrelated files.
+            6. Add or update focused tests for the change.
+            7. Run cargo fmt --all -- --check.
+            8. Run the relevant cargo tests, and run cargo test when practical.
+            9. Review the final diff for accidental or unrelated changes.
+            10. Do NOT create a branch, commit, push, or pull request. The workflow will handle Git operations after you finish.
+
+            If the issue is ambiguous, do not invent requirements. Make only changes that are supported by the repository and issue context.
+            Leave the working tree containing the completed fix and tests.
+
+      - name: Create branch, commit, and push
+        id: git
+        shell: bash
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes were produced by Codex."
+            gh issue comment "$ISSUE_NUMBER"               --repo "$GITHUB_REPOSITORY"               --body "Codex completed the run but produced no working-tree changes. No pull request was created."
+            exit 0
+          fi
+
+          BRANCH="codex/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+
+          git switch -c "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git diff --cached --check
+
+          git commit -m "fix: resolve issue #${ISSUE_NUMBER}"
+          git push --set-upstream origin "$BRANCH"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request
+        if: steps.git.outputs.branch != ''
+        shell: bash
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          BRANCH: ${{ steps.git.outputs.branch }}
+          CODEX_SUMMARY: ${{ steps.codex.outputs.final-message }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PR_BODY_FILE="$(mktemp)"
+          trap 'rm -f "$PR_BODY_FILE"' EXIT
+
+          cat > "$PR_BODY_FILE" <<EOF
+          ## Summary
+
+          Codex implemented the requested fix for #${ISSUE_NUMBER}.
+
+          ## Issue
+
+          ${ISSUE_TITLE}
+
+          ## Verification
+
+          Codex was instructed to run:
+          - cargo fmt --all -- --check
+          - relevant cargo tests
+          - cargo test when practical
+
+          ## Codex final message
+
+          ${CODEX_SUMMARY}
+
+          Fixes #${ISSUE_NUMBER}
+          EOF
+
+          gh pr create             --repo "$GITHUB_REPOSITORY"             --base rust             --head "$BRANCH"             --title "fix: resolve issue #${ISSUE_NUMBER}"             --body-file "$PR_BODY_FILE"
