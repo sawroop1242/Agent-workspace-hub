@@ -42,7 +42,6 @@ jobs:
 
       - name: Execute OpenHands Production Container
         run: |
-          # Added the vital docker.sock volume mapping to enable sandboxed workspace creation
           docker run --rm \
             -e LLM_MODEL="${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}" \
             -e LLM_BASE_URL="https://nvidia.com" \
@@ -52,7 +51,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${{ github.workspace }}:/workspace" \
             ghcr.io/openhands/openhands:latest \
-            python -m openhands.resolver.resolve_issue \
+            python -m openhands_resolver.resolve_issue \
             --repo "${{ github.repository }}" \
             --issue-number "${{ steps.parse_issue.outputs.num }}" \
             --issue-type "issue" \
