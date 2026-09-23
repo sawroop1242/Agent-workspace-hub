@@ -31,6 +31,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Setup Dynamic Issue Context
         id: parse_issue
         run: |
@@ -40,18 +45,27 @@ jobs:
             echo "num=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Pull and Execute OpenHands Resolver Container
+      - name: Install OpenHands Core Utilities
         run: |
-          docker run --rm \
-            -e LLM_MODEL="${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}" \
-            -e LLM_BASE_URL="https://nvidia.com" \
-            -e LLM_API_KEY="${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}" \
-            -e GITHUB_TOKEN="${{ secrets.AWH_AUTOMATION_TOKEN }}" \
-            -e ANYSCALE_API_KEY="${{ secrets.AWH_AUTOMATION_TOKEN }}" \
-            -v "${{ github.workspace }}:/workspace" \
-            ghcr.io/openhands/openhands-resolver:latest \
-            --issue-number "${{ steps.parse_issue.outputs.num }}" \
+          # Installs the complete openhands environment to resolve missing 'e2b' sub-packages
+          pip install openhands-ai
+
+      - name: Run OpenHands Resolver Engine
+        env:
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'openai/z-ai/glm-5.3' }}
+          LLM_BASE_URL: https://nvidia.com
+          LLM_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          GITHUB_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          SANDBOX_USER_ID: ${{ github.actor_id }}
+          MAX_ITERATIONS: ${{ fromJson(vars.OPENHANDS_MAX_ITER || '50') }}
+          TARGET_BRANCH: ${{ vars.TARGET_BRANCH || 'rust' }}
+        run: |
+          # Executes using the official consolidated repository execution entrypoint
+          python -m openhands.resolver.resolve_issue \
             --repo "${{ github.repository }}" \
-            --branch "${{ vars.TARGET_BRANCH || 'rust' }}" \
-            --max-iter "${{ vars.OPENHANDS_MAX_ITER || '50' }}"
+            --issue-number "${{ steps.parse_issue.outputs.num }}" \
+            --issue-type "issue" \
+            --max-iterations "$MAX_ITERATIONS" \
+            --llm-model "$LLM_MODEL" \
+            --llm-api-key "$LLM_API_KEY"
             
