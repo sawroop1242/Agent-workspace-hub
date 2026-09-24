@@ -184,11 +184,10 @@ jobs:
           Leave the working tree containing the completed implementation and tests.
           EOF
 
-          timeout 35m opencode run \
+          cd "$GITHUB_WORKSPACE"\n\n          timeout 35m opencode run \
             --standalone \
             --model freellmapi/auto \
             --auto \
-            --dir "$GITHUB_WORKSPACE" \
             "$(cat /tmp/opencode-prompt.md)" \
             2>&1 | tee /tmp/opencode-output.log
 
