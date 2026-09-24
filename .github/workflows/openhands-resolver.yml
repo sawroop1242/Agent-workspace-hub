@@ -146,7 +146,27 @@ jobs:
           OUTPUT_FILE="$(mktemp)"
           trap 'rm -f "$PROMPT_FILE" "$OUTPUT_FILE"' EXIT
 
-          # Write static prompt text without expanding issue content.
+          echo "::group::OpenCode diagnostics"
+          printf 'runner=%s\n' "$RUNNER_NAME"
+          printf 'workspace=%q\n' "$GITHUB_WORKSPACE"
+          printf 'repository=%q\n' "$GITHUB_REPOSITORY"
+          printf 'event=%q\n' "$GITHUB_EVENT_NAME"
+          printf 'run_id=%q\n' "$GITHUB_RUN_ID"
+          printf 'issue_number=%q\n' "$ISSUE_NUMBER"
+          printf 'issue_title_length=%s\n' "${#ISSUE_TITLE}"
+          printf 'issue_body_length=%s\n' "${#ISSUE_BODY}"
+          printf 'issue_url=%q\n' "$ISSUE_URL"
+          printf 'freellmapi_key_set=%s\n' "$([ -n "$FREELLMAPI_API_KEY" ] && echo true || echo false)"
+          printf 'freellmapi_key_length=%s\n' "${#FREELLMAPI_API_KEY}"
+          printf 'node=%s\n' "$(node --version)"
+          printf 'npm=%s\n' "$(npm --version)"
+          printf 'opencode=%s\n' "$(opencode --version)"
+          printf 'working_directory=%q\n' "$PWD"
+          git rev-parse --show-toplevel
+          git rev-parse --abbrev-ref HEAD
+          echo "::endgroup::"
+
+          # Write static prompt text without shell expansion.
           cat > "$PROMPT_FILE" <<'OPENCODE_PROMPT'
           You are the coding agent for Agent Workspace Hub (AWH).
 
@@ -189,9 +209,7 @@ jobs:
           Leave the working tree containing the completed implementation and tests.
           OPENCODE_PROMPT
 
-          # Replace placeholders using printf so issue content is never parsed
-          # as shell syntax. The issue can safely contain $, backticks, quotes,
-          # newlines, command substitutions, or other shell metacharacters.
+          # Substitute untrusted issue content after the heredoc has been parsed.
           python3 - "$PROMPT_FILE" "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" "$ISSUE_URL" "$ISSUE_TITLE" "$ISSUE_BODY" <<'PY'
           import pathlib
           import sys
@@ -210,20 +228,46 @@ jobs:
           pathlib.Path(path).write_text(text)
           PY
 
-          # The installed OpenCode version previously rejected --dir.
-          # Change directory explicitly and quote the path.
           cd -- "$GITHUB_WORKSPACE"
 
-          # Keep the prompt as exactly one argv element.
+          echo "::group::OpenCode invocation"
+          printf 'cwd=%q\n' "$PWD"
+          printf 'prompt_file=%q\n' "$PROMPT_FILE"
+          printf 'prompt_bytes=%s\n' "$(wc -c < "$PROMPT_FILE")"
+          printf 'prompt_lines=%s\n' "$(wc -l < "$PROMPT_FILE")"
+          printf 'command=%q ' timeout 35m opencode run --standalone --model freellmapi/auto --auto
+          printf '<prompt-file-content>\n'
+          echo "::endgroup::"
+
+          # Keep OpenCode's output visible while preserving the exact exit
+          # status of timeout/OpenCode via PIPESTATUS. No secret-bearing
+          # environment values are printed.
           set +e
           timeout 35m opencode run \
             --standalone \
             --model 'freellmapi/auto' \
             --auto \
             "$(cat "$PROMPT_FILE")" \
-            > >(tee "$OUTPUT_FILE") 2>&1
-          OPENCODE_STATUS=$?
+            2>&1 | tee "$OUTPUT_FILE"
+          PIPE_STATUS=("${PIPESTATUS[@]}")
           set -e
+
+          OPENCODE_STATUS="${PIPE_STATUS[0]:-125}"
+          TEE_STATUS="${PIPE_STATUS[1]:-125}"
+
+          echo "::group::OpenCode exit diagnostics"
+          printf 'opencode_pipeline_status=%s\n' "$OPENCODE_STATUS"
+          printf 'tee_status=%s\n' "$TEE_STATUS"
+          if [ "$OPENCODE_STATUS" -eq 124 ]; then
+            echo 'result=timeout'
+          elif [ "$OPENCODE_STATUS" -eq 0 ]; then
+            echo 'result=success'
+          else
+            echo 'result=failure'
+          fi
+          printf 'output_bytes=%s\n' "$(wc -c < "$OUTPUT_FILE")"
+          printf 'output_lines=%s\n' "$(wc -l < "$OUTPUT_FILE")"
+          echo "::endgroup::"
 
           {
             echo "summary<<OPENCODE_FINAL_MESSAGE"
@@ -231,8 +275,13 @@ jobs:
             echo "OPENCODE_FINAL_MESSAGE"
           } >> "$GITHUB_OUTPUT"
 
+          if [ "$TEE_STATUS" -ne 0 ]; then
+            echo "::error::tee failed with status $TEE_STATUS"
+            exit "$TEE_STATUS"
+          fi
+
           if [ "$OPENCODE_STATUS" -ne 0 ]; then
-            echo "::error::OpenCode exited with status $OPENCODE_STATUS"
+            echo "::error::OpenCode/timeout exited with status $OPENCODE_STATUS"
             exit "$OPENCODE_STATUS"
           fi
 
