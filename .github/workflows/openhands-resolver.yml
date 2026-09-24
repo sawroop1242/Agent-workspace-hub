@@ -76,47 +76,11 @@ jobs:
             echo "url=$(printf '%s\n' "$ISSUE_JSON" | jq -r '.url')"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Resolve Codex Responses endpoint
-        id: endpoint
-        shell: bash
-        env:
-          CODEX_RESPONSES_API_ENDPOINT: ${{ vars.CODEX_RESPONSES_API_ENDPOINT }}
-          CODEX_BASE_URL: ${{ vars.CODEX_BASE_URL }}
-          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
-        run: |
-          set -euo pipefail
-
-          # CODEX_RESPONSES_API_ENDPOINT wins and may already include /responses.
-          # Otherwise CODEX_BASE_URL/LLM_BASE_URL is treated as a /v1-style base URL.
-          BASE_URL="$CODEX_BASE_URL"
-          if [ -z "$BASE_URL" ]; then
-            BASE_URL="$LLM_BASE_URL"
-          fi
-          if [ -z "$BASE_URL" ]; then
-            BASE_URL="https://api.openai.com/v1"
-          fi
-
-          if [ -n "$CODEX_RESPONSES_API_ENDPOINT" ]; then
-            ENDPOINT="$CODEX_RESPONSES_API_ENDPOINT"
-          else
-            BASE_URL="${BASE_URL%/}"
-            case "$BASE_URL" in
-              */responses)
-                ENDPOINT="$BASE_URL"
-                ;;
-              *)
-                ENDPOINT="$BASE_URL/responses"
-                ;;
-            esac
-          fi
-
-          echo "url=$ENDPOINT" >> "$GITHUB_OUTPUT"
-
       - name: Validate Codex configuration
         shell: bash
         env:
           LLM_MODEL: ${{ vars.LLM_MODEL }}
-          CODEX_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          CODEX_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -134,8 +98,8 @@ jobs:
         id: codex
         uses: openai/codex-action@v1
         with:
-          openai-api-key: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-          responses-api-endpoint: ${{ steps.endpoint.outputs.url }}
+          openai-api-key: ${{ secrets.FREELLMAPI_API_KEY }}
+          responses-api-endpoint: "https://freellmapi-production-905c.up.railway.app/v1/responses"
           model: ${{ vars.LLM_MODEL }}
           effort: ${{ vars.CODEX_EFFORT || 'high' }}
           permission-profile: ":workspace"
