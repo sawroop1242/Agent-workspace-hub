@@ -79,7 +79,7 @@ jobs:
       - name: Validate Codex configuration
         shell: bash
         env:
-          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_MODEL: "auto"
           CODEX_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         run: |
           set -euo pipefail
