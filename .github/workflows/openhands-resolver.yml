@@ -1,4 +1,4 @@
-name: Codex Issue Resolver
+name: OpenCode Issue Resolver
 
 on:
   issues:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: "The issue number you want Codex to resolve"
+        description: "The issue number you want OpenCode to resolve"
         required: true
         type: string
 
@@ -34,6 +34,8 @@ jobs:
       )
 
     runs-on: ${{ vars.TARGET_RUNNER || 'ubuntu-latest' }}
+
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -63,76 +65,138 @@ jobs:
             exit 1
           fi
 
-          ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body,url)"
+          ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json title,body,url)"
 
           {
             echo "number=$ISSUE_NUMBER"
-            echo "title<<CODEX_ISSUE_TITLE"
+
+            echo "title<<OPENCODE_ISSUE_TITLE"
             printf '%s\n' "$ISSUE_JSON" | jq -r '.title'
-            echo "CODEX_ISSUE_TITLE"
-            echo "body<<CODEX_ISSUE_BODY"
+            echo "OPENCODE_ISSUE_TITLE"
+
+            echo "body<<OPENCODE_ISSUE_BODY"
             printf '%s\n' "$ISSUE_JSON" | jq -r '.body'
-            echo "CODEX_ISSUE_BODY"
+            echo "OPENCODE_ISSUE_BODY"
+
             echo "url=$(printf '%s\n' "$ISSUE_JSON" | jq -r '.url')"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Validate Codex configuration
+      - name: Validate OpenCode configuration
         shell: bash
         env:
-          LLM_MODEL: "auto"
-          CODEX_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         run: |
           set -euo pipefail
 
-          test -n "$LLM_MODEL" || {
-            echo "::error::Repository variable LLM_MODEL is not configured"
+          test -n "$FREELLMAPI_API_KEY" || {
+            echo "::error::FREELLMAPI_API_KEY GitHub Actions secret is not configured"
             exit 1
           }
 
-          test -n "$CODEX_API_KEY" || {
-            echo "::error::AWH_AGENT2_NVIDIA_KEY_1 is not configured"
-            exit 1
+      - name: Install OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm install --global @opencode/cli
+
+          opencode --version
+
+      - name: Configure OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/opencode.json" <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "freellmapi": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "FreeLLMAPI",
+                "options": {
+                  "baseURL": "https://freellmapi-production-905c.up.railway.app/v1",
+                  "apiKey": "{env:FREELLMAPI_API_KEY}"
+                },
+                "models": {
+                  "auto": {
+                    "name": "auto"
+                  }
+                }
+              }
+            }
           }
+          EOF
 
-      - name: Run Codex
-        id: codex
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.FREELLMAPI_API_KEY }}
-          responses-api-endpoint: "https://freellmapi-production-905c.up.railway.app/v1/responses"
-          model: auto
-          effort: ${{ vars.CODEX_EFFORT || 'high' }}
-          permission-profile: ":workspace"
-          prompt: |
-            You are the coding agent for Agent Workspace Hub (AWH).
+      - name: Run OpenCode
+        id: opencode
+        shell: bash
+        env:
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
+          ISSUE_URL: ${{ steps.issue.outputs.url }}
+        run: |
+          set -euo pipefail
 
-            Repository: ${{ github.repository }}
-            Target branch: rust
-            Issue: #${{ steps.issue.outputs.number }}
-            Issue URL: ${{ steps.issue.outputs.url }}
+          cat > /tmp/opencode-prompt.md <<EOF
+          You are the coding agent for Agent Workspace Hub (AWH).
 
-            Issue title:
-            ${{ steps.issue.outputs.title }}
+          Repository: ${GITHUB_REPOSITORY}
+          Target branch: rust
+          Issue: #${ISSUE_NUMBER}
+          Issue URL: ${ISSUE_URL}
 
-            Issue body:
-            ---
-            ${{ steps.issue.outputs.body }}
-            ---
+          Issue title:
+          ${ISSUE_TITLE}
 
-            Your task:
-            1. Read the repository architecture and relevant documentation before editing.
-            2. Understand the issue and identify the root cause.
-            3. Implement the smallest correct production-quality fix.
-            4. Preserve existing AWH architecture and Rust conventions.
-            5. Do not modify unrelated files.
-            6. Add or update focused tests for the change.
-            7. Run cargo fmt --all -- --check.
-            8. Run the relevant cargo tests, and run cargo test when practical.
-            9. Review the final diff for accidental or unrelated changes.
-            10. Do NOT create a branch, commit, push, or pull request. The workflow will handle Git operations after you finish.
+          Issue body:
+          ---
+          ${ISSUE_BODY}
+          ---
 
-            If the issue is ambiguous, do not invent requirements. Make only changes that are supported by the repository and issue context.
-            Leave the working tree containing the completed fix and tests.
+          Your task:
+
+          1. Read the repository architecture and relevant documentation before editing.
+          2. Understand the issue and identify the actual root cause.
+          3. Implement the smallest correct production-quality fix.
+          4. Preserve the existing AWH architecture and Rust conventions.
+          5. Do not modify unrelated files.
+          6. Add or update focused tests for the change.
+          7. Run cargo fmt --all -- --check.
+          8. Run the relevant cargo tests.
+          9. Run cargo test when practical.
+          10. Review the final git diff for accidental or unrelated changes.
+          11. Do NOT create a branch.
+          12. Do NOT commit.
+          13. Do NOT push.
+          14. Do NOT create a pull request.
+
+          The surrounding GitHub Actions workflow will handle branch creation,
+          commit, push, and pull-request creation after you finish.
+
+          If the issue is ambiguous, do not invent requirements.
+          Make only changes supported by the issue and repository context.
+
+          Leave the working tree containing the completed implementation and tests.
+          EOF
+
+          timeout 35m opencode run \
+            --standalone \
+            --model freellmapi/auto \
+            --auto \
+            --dir "$GITHUB_WORKSPACE" \
+            "$(cat /tmp/opencode-prompt.md)" \
+            2>&1 | tee /tmp/opencode-output.log
+
+          {
+            echo "summary<<OPENCODE_FINAL_MESSAGE"
+            tail -n 120 /tmp/opencode-output.log
+            echo "OPENCODE_FINAL_MESSAGE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create branch, commit, and push
         id: git
@@ -144,21 +208,28 @@ jobs:
           set -euo pipefail
 
           if git diff --quiet && git diff --cached --quiet; then
-            echo "No changes were produced by Codex."
-            gh issue comment "$ISSUE_NUMBER"               --repo "$GITHUB_REPOSITORY"               --body "Codex completed the run but produced no working-tree changes. No pull request was created."
+            echo "No changes were produced by OpenCode."
+
+            gh issue comment "$ISSUE_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "OpenCode completed the run but produced no working-tree changes. No pull request was created."
+
             exit 0
           fi
 
-          BRANCH="codex/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          BRANCH="opencode/issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
 
           git switch -c "$BRANCH"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -A
+
           git diff --cached --check
 
           git commit -m "fix: resolve issue #${ISSUE_NUMBER}"
+
           git push --set-upstream origin "$BRANCH"
 
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
@@ -170,7 +241,7 @@ jobs:
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
           BRANCH: ${{ steps.git.outputs.branch }}
-          CODEX_SUMMARY: ${{ steps.codex.outputs.final-message }}
+          OPENCODE_SUMMARY: ${{ steps.opencode.outputs.summary }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -181,7 +252,7 @@ jobs:
           cat > "$PR_BODY_FILE" <<EOF
           ## Summary
 
-          Codex implemented the requested fix for #${ISSUE_NUMBER}.
+          OpenCode implemented the requested fix for #${ISSUE_NUMBER}.
 
           ## Issue
 
@@ -189,16 +260,22 @@ jobs:
 
           ## Verification
 
-          Codex was instructed to run:
+          OpenCode was instructed to run:
+
           - cargo fmt --all -- --check
           - relevant cargo tests
           - cargo test when practical
 
-          ## Codex final message
+          ## OpenCode output
 
-          ${CODEX_SUMMARY}
+          ${OPENCODE_SUMMARY}
 
           Fixes #${ISSUE_NUMBER}
           EOF
 
-          gh pr create             --repo "$GITHUB_REPOSITORY"             --base rust             --head "$BRANCH"             --title "fix: resolve issue #${ISSUE_NUMBER}"             --body-file "$PR_BODY_FILE"
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base rust \
+            --head "$BRANCH" \
+            --title "fix: resolve issue #${ISSUE_NUMBER}" \
+            --body-file "$PR_BODY_FILE"
