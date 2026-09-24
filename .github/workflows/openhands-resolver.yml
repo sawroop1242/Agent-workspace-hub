@@ -141,6 +141,66 @@ jobs:
           echo 'config_json=valid'
           echo "::endgroup::"
 
+      - name: Smoke test OpenCode provider
+        shell: bash
+        env:
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          SMOKE_RAW="$(mktemp)"
+          SMOKE_SAFE="$(mktemp)"
+          trap 'rm -f "$SMOKE_RAW" "$SMOKE_SAFE"' EXIT
+
+          cd -- "$GITHUB_WORKSPACE"
+
+          echo "::group::OpenCode provider smoke test"
+          echo 'request=non-destructive provider connectivity/model response check'
+          echo 'provider=freellmapi'
+          echo 'model=freellmapi/auto'
+          echo 'prompt=Reply with exactly OK. Do not call tools, inspect files, or modify anything.'
+          echo 'timeout=90 seconds'
+          echo "::endgroup::"
+
+          set +e
+          timeout 90s opencode --log-level DEBUG --print-logs --pure run \
+            --standalone \
+            --model 'freellmapi/auto' \
+            --auto \
+            'Reply with exactly OK. Do not call tools, inspect files, or modify anything.' \
+            > "$SMOKE_RAW" 2>&1
+          SMOKE_STATUS=$?
+          set -e
+
+          python3 - "$SMOKE_RAW" "$SMOKE_SAFE" "$FREELLMAPI_API_KEY" <<'PY'
+          import pathlib
+          import sys
+
+          raw_path, safe_path, secret = sys.argv[1:]
+          text = pathlib.Path(raw_path).read_text(errors="replace")
+          if secret:
+              text = text.replace(secret, "[REDACTED]")
+          pathlib.Path(safe_path).write_text(text)
+          PY
+
+          echo "::group::OpenCode provider smoke-test diagnostics"
+          printf 'exit_status=%s\n' "$SMOKE_STATUS"
+          if [ "$SMOKE_STATUS" -eq 124 ]; then
+            echo 'timeout_status=timed_out'
+          else
+            echo 'timeout_status=not_timed_out'
+          fi
+          printf 'output_bytes=%s\n' "$(wc -c < "$SMOKE_SAFE")"
+          echo 'last_100_lines='
+          tail -n 100 "$SMOKE_SAFE"
+          echo "::endgroup::"
+
+          if [ "$SMOKE_STATUS" -ne 0 ]; then
+            echo "::error::OpenCode freellmapi/auto smoke test failed with status $SMOKE_STATUS"
+            echo "::error::Provider/API diagnostics are shown above with the API key redacted."
+            exit "$SMOKE_STATUS"
+          fi
+
       - name: Run OpenCode
         id: opencode
         shell: bash
