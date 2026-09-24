@@ -409,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // assertions depend on planting a symlink; Windows skips this test
     fn symlink_escape_is_rejected() {
         let outer = tempfile::tempdir().unwrap();
         let inner = tempfile::tempdir().unwrap();
@@ -418,18 +419,10 @@ mod tests {
         let svc = FilesService::new(inner.path().to_path_buf());
         // Symlink pointing outside the project root.
         let link = inner.path().join("leak.txt");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&secret, &link).unwrap();
-        #[cfg(windows)]
-        {
-            let _ = &link; // symlink creation needs privileges on Windows
-        }
 
-        #[cfg(unix)]
-        {
-            assert!(svc.read("leak.txt").is_err());
-            assert!(svc.write("leak.txt", "poison").is_err());
-        }
+        assert!(svc.read("leak.txt").is_err());
+        assert!(svc.write("leak.txt", "poison").is_err());
     }
 
     #[test]

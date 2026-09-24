@@ -26,7 +26,7 @@ See [`roadmap/`](roadmap/) — the canonical forward-looking architecture (`PROJ
 
 ## Feature work items
 
-See [`issue-resolving-prompts/`](issue-resolving-prompts/) — individual, self-contained implementation specs (AWE-*, SEC-*, ARCH-*, FS-*, GIT-*, AGENT-*), one file per feature. See that folder's own `README.md` for the Agent 1/2/3 reading contract.
+See [`implementation-prompts/`](implementation-prompts/) — individual, self-contained implementation specs (one file per feature), consolidated from the former AWE-*, SEC-*, ARCH-*, FS-*, GIT-*, AGENT-* issue-resolving prompts. See that folder's own `README.md` for the consolidation map and reading contract.
 
 ## Historical record
 

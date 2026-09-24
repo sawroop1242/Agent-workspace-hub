@@ -15,12 +15,11 @@ GitHub Actions secret `FREELLMAPI_API_KEY` and is not stored in the repository.
 
 ## Documentation
 
-- [Final architecture and roadmap](docs/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
-- [Autonomous pipeline](docs/pipeline/autonomous-pipeline.md) — checkpoint-driven dispatcher, planner, builder, reviewer, fix loop, and recovery architecture inspired by open-source autonomous development pipelines
+- [Final architecture and roadmap](docs/roadmap/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
 - [Final CLI reference](docs/CLI.md) — complete target command tree, phase mapping, dependencies, security ordering, and validation rules
 - [Architecture](docs/architecture.md) — existing implementation architecture and request flow
 - [Features](docs/FEATURES.md) — final target feature contract
-- [Agent Profiles roadmap](docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) — TOML configuration, per-agent MCP routes, CLI lifecycle, policy integration and multi-agent sequencing
+- [Agent Profiles roadmap](docs/roadmap/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) — TOML configuration, per-agent MCP routes, CLI lifecycle, policy integration and multi-agent sequencing
 - [Security policy and threat model](docs/security.md)
 - [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
 - [MCP integration](docs/mcp.md) — transports, tools, and interoperability evidence
@@ -29,9 +28,9 @@ GitHub Actions secret `FREELLMAPI_API_KEY` and is not stored in the repository.
 - [Development guide](docs/development.md) — conventions, commands, PR process
 - [Testing guide](docs/testing.md) — suite map and regression policy
 - [Release engineering](docs/release.md) — artifacts, checksums, CI-gated process
-- [Completeness audit](docs/completeness-audit.md) — honest per-subsystem status
+- [Completeness audit](docs/archive/completeness-audit.md) — honest per-subsystem status
 - [Installation and upgrade guide](docs/INSTALL.md)
-- [Project status and implementation guide](docs/PROJECT_STATUS.md)
+- [Project status and implementation guide](docs/archive/PROJECT_STATUS.md)
 - [Community MCP registry](docs/community-mcp-registry.md)
 
 ## One-line install
@@ -88,7 +87,7 @@ awh agent status
 
 Starting only Claude means only Claude's configured routes are active; Qwen/OpenCode are not merely denied tools, their agent-specific routes are inactive. URL namespaces identify the profile but are not authorization: requests still pass through the canonical capability/policy engine.
 
-See [docs/FEATURES.md](docs/FEATURES.md), [docs/CLI.md](docs/CLI.md), and [docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md](docs/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) for the full design and sequencing.
+See [docs/FEATURES.md](docs/FEATURES.md), [docs/CLI.md](docs/CLI.md), and [docs/roadmap/ROADMAP_AGENT_PROFILES_POLICY_MCP.md](docs/roadmap/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) for the full design and sequencing.
 
 ## Agent handoff workflow
 

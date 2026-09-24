@@ -5093,15 +5093,14 @@ mod line_edit_tests {
     }
 
     #[test]
+    #[cfg(unix)] // assertions depend on planting a symlink; Windows skips this test
     fn insert_symlink_escape_is_rejected_by_the_containment_boundary() {
         let (tmp, svc) = setup();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("real.txt"), "target\n").unwrap();
         write_file(&tmp, "f.txt", "inside\n");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path().join("real.txt"), tmp.path().join("link.txt"))
             .unwrap();
-        #[cfg(unix)]
         {
             let err = svc.insert(insert_tx("link.txt", 1, "x")).unwrap_err();
             assert!(

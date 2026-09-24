@@ -571,11 +571,10 @@ async fn restrictive_record_denies_terminal_run_without_running_the_process() {
         "must name the permission: {message}"
     );
     // BEFORE the process ran.
-    #[cfg(unix)]
-    let exists = marker.exists();
-    #[cfg(windows)]
-    let exists = root.join("ran-marker.txt").exists();
-    assert!(!exists, "denied terminal.run must not run the process");
+    assert!(
+        !marker.exists(),
+        "denied terminal.run must not run the process"
+    );
     assert!(audited("deny", "builtin_tool_denied", "terminal.run"));
 }
 
