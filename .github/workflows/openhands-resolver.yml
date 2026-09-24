@@ -100,7 +100,7 @@ jobs:
         with:
           openai-api-key: ${{ secrets.FREELLMAPI_API_KEY }}
           responses-api-endpoint: "https://freellmapi-production-905c.up.railway.app/v1/responses"
-          model: ${{ vars.LLM_MODEL }}
+          model: auto
           effort: ${{ vars.CODEX_EFFORT || 'high' }}
           permission-profile: ":workspace"
           prompt: |
