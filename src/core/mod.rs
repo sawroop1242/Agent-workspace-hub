@@ -17,6 +17,8 @@ pub mod memory;
 pub mod policy;
 /// Project persistence.
 pub mod project;
+/// Runtime session persistence (TW-002).
+pub mod sessions;
 /// Task persistence.
 pub mod tasks;
 /// Workspace root resolution.

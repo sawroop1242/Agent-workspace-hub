@@ -3,6 +3,7 @@
 //! services call core stores and domain engines. No interface duplicates
 //! business logic.
 
+pub mod agent_runtime;
 pub mod audit;
 pub mod authorization;
 pub mod edit;

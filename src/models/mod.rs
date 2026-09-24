@@ -13,6 +13,8 @@ pub mod memory;
 pub mod policy_rule;
 /// Project models.
 pub mod project;
+/// Session models (TW-002 runtime sessions).
+pub mod session;
 /// Task models.
 pub mod task;
 
@@ -21,4 +23,5 @@ pub use capability_grant::CapabilityGrant;
 pub use memory::MemoryEntry;
 pub use policy_rule::PolicyRule;
 pub use project::Project;
+pub use session::{AgentSessionRecord, SessionStatus};
 pub use task::{Task, TaskStatus};
