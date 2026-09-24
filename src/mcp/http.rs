@@ -264,6 +264,14 @@ pub fn build_router(state: AppState, config: &HttpServerConfig) -> Router {
     let protected = Router::new()
         .route("/sse", get(sse_handler))
         .route("/mcp", post(mcp_handler))
+        // Agent-scoped variants bound to the workspace's canonical agent
+        // store (TW-003): the path segment is a routing selector — never
+        // authorization. Transport authentication + rate limiting below
+        // still apply first, and the handlers re-verify the session↔agent
+        // binding on every request, so a session never migrates between
+        // agent boundaries.
+        .route("/{agent}/sse", get(agent_sse_handler))
+        .route("/{agent}/mcp", post(agent_mcp_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             rate_limit_guard,
@@ -388,6 +396,65 @@ async fn rate_limit_guard(
 
 /// `GET /sse` — establishes an isolated SSE session and streams events.
 async fn sse_handler(State(state): State<AppState>) -> Response {
+    sse_handler_impl(state, None, "/mcp").await
+}
+
+/// `GET /{agent}/sse` (TW-003). The route segment is a *routing selector
+/// only*: it is resolved through the canonical agent store before any
+/// session is created. Unknown, inactive, or malformed ids never produce a
+/// session at all — the route rejects before allocation, transport errors
+/// remain the generic ones from the shared middleware.
+async fn agent_sse_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+) -> Response {
+    let root = state.dispatcher.project_root();
+    let caller = match crate::mcp::agent_route::resolve_route_agent(&root, &agent) {
+        Ok((caller, _)) => caller,
+        Err(error) => {
+            crate::mcp::audit_deny("agent_route_resolve", error.reason_code(), &agent);
+            return (
+                route_error_status(&error),
+                Json(json!({
+                    "error": error.reason_code(),
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let endpoint = format!("/{agent}/mcp");
+    sse_handler_impl(state, Some(caller), &endpoint).await
+}
+
+/// Maps a route-resolution failure to the HTTP status for the client.
+fn route_error_status(error: &crate::mcp::agent_route::RouteError) -> StatusCode {
+    use crate::mcp::agent_route::RouteError;
+    match error {
+        RouteError::InvalidAgentId => StatusCode::BAD_REQUEST,
+        RouteError::UnknownAgent => StatusCode::NOT_FOUND,
+        RouteError::AgentInactive => StatusCode::FORBIDDEN,
+        // Binding mismatches and unknown sessions are indistinguishable to
+        // the caller — both mean "no session for this context" without
+        // disclosing whether a session exists on another route.
+        RouteError::SessionAgentMismatch
+        | RouteError::SessionWorkspaceMismatch
+        | RouteError::UnknownSession => StatusCode::NOT_FOUND,
+    }
+}
+
+/// Shared SSE-session establishment, shared between the global `/sse`
+/// route (no agent binding) and the agent-scoped `/{agent}/sse` route
+/// (binding = the resolved route context). `endpoint_path` is the path the
+/// client is told to POST subsequent messages to — on the agent-scoped
+/// route it includes the agent segment so every following message flows
+/// through `agent_mcp_handler`, which re-resolves the route + binding
+/// before dispatch.
+async fn sse_handler_impl(
+    state: AppState,
+    caller: Option<crate::mcp::agent_route::CallerContext>,
+    endpoint_path: &str,
+) -> Response {
     if state.sessions.len().await >= state.max_sessions {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -396,7 +463,15 @@ async fn sse_handler(State(state): State<AppState>) -> Response {
             .into_response();
     }
 
-    let session = state.sessions.create("/mcp").await;
+    let session = match caller {
+        Some(caller) => {
+            state
+                .sessions
+                .create_with_binding(endpoint_path, &caller)
+                .await
+        }
+        None => state.sessions.create(endpoint_path).await,
+    };
     let session_id = session.id.clone();
     let receiver = session.subscribe();
 
@@ -466,6 +541,70 @@ async fn mcp_handler(
     Query(query): Query<McpQuery>,
     body: axum::body::Bytes,
 ) -> Response {
+    mcp_handler_impl(state, headers, query, body).await
+}
+
+/// `POST /{agent}/mcp` (TW-003): the agent-scoped counterpart of
+/// [`mcp_handler`]. The handler runs the exact same body/session/dispatch
+/// pipeline, with two differences:
+///
+/// 1. the route segment is resolved against the agent store *first* — a
+///    request that names an unknown, inactive, or malformed agent never
+///    reaches the dispatcher, so a non-active agent cannot drive
+///    consequential tools even through a valid session id,
+/// 2. the presented session's stored binding must equal the route's agent
+///    and workspace context, else the request is rejected without dispatch.
+///
+/// This is what makes `/{agent}/mcp` a *binding* on an existing session,
+/// not merely an alternate URL onto the same open session.
+async fn agent_mcp_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<McpQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    let root = state.dispatcher.project_root();
+    let caller = match crate::mcp::agent_route::resolve_route_agent(&root, &agent) {
+        Ok((caller, _)) => caller,
+        Err(error) => {
+            crate::mcp::audit_deny("agent_route_resolve", error.reason_code(), &agent);
+            return (
+                route_error_status(&error),
+                Json(json!({
+                    "error": error.reason_code(),
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    mcp_handler_impl_scoped(state, headers, query, body, Some(&caller)).await
+}
+
+/// Shared body of the two `POST /mcp` handlers (legacy unscoped); agent
+/// scope goes through [`mcp_handler_impl_scoped`] instead.
+async fn mcp_handler_impl(
+    state: AppState,
+    headers: HeaderMap,
+    query: McpQuery,
+    body: axum::body::Bytes,
+) -> Response {
+    mcp_handler_impl_scoped(state, headers, query, body, None).await
+}
+
+/// Common implementation: validates the body, resolves the session id, then
+/// — when the request was made through an agent-scoped route — re-resolves
+/// the caller against the session's immutable binding before dispatch.
+/// The dispatch itself sends the caller through the dispatcher so every
+/// tools/call is additionally gated by the caller's capability grants.
+async fn mcp_handler_impl_scoped(
+    state: AppState,
+    headers: HeaderMap,
+    query: McpQuery,
+    body: axum::body::Bytes,
+    caller: Option<&crate::mcp::agent_route::CallerContext>,
+) -> Response {
     let body = match std::str::from_utf8(&body) {
         Ok(s) => s.to_string(),
         Err(_) => {
@@ -496,6 +635,9 @@ async fn mcp_handler(
         Some(id) => match state.sessions.get(&id).await {
             Some(s) => s,
             None => {
+                // On the agent route, an unrecognised session id is
+                // indistinguishable from a binding mismatch: neither
+                // reveals any fact about sessions on other routes.
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "unknown session"})),
@@ -511,6 +653,26 @@ async fn mcp_handler(
                 .into_response();
         }
     };
+
+    // TW-003 binding guard: a session bound to agent A must never answer
+    // on agent B's route, and must never accept a mutated workspace. Both
+    // mismatches and missing bindings on a scoped route fail closed.
+    if let Some(caller) = caller {
+        let authorized = match &session.binding {
+            Some(binding) => {
+                crate::mcp::agent_route::verify_session_binding(binding, caller).is_ok()
+            }
+            None => false,
+        };
+        if !authorized {
+            crate::mcp::audit_deny("agent_session_binding", "mismatch", &session.id);
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "unknown session"})),
+            )
+                .into_response();
+        }
+    }
 
     let result = state
         .dispatcher

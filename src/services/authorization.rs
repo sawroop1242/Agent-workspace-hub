@@ -272,7 +272,7 @@ impl EditAuthorizer {
 /// Returns whether `scope` covers the given `resource` with path-component
 /// semantics (`src/foo` covers `src/foo` and `src/foo/bar.rs`, never
 /// `src/foobar`). This mirrors the policy store's prefix matcher.
-fn scope_covers(scope: &str, resource: &str) -> bool {
+pub(crate) fn scope_covers(scope: &str, resource: &str) -> bool {
     let scope = normalize_forward_slash(scope);
     let resource = normalize_forward_slash(resource);
     if scope.is_empty() {
@@ -304,7 +304,7 @@ fn normalize_forward_slash(path: &str) -> String {
 ///
 /// A malformed `expires_at` fails closed (treated as expired) so a
 /// malformed payload can never be unexpectedly permissive.
-fn grant_is_expired(grant: &CapabilityGrant) -> bool {
+pub(crate) fn grant_is_expired(grant: &CapabilityGrant) -> bool {
     let Some(expires) = &grant.expires_at else {
         return false; // Unset = never expires.
     };
