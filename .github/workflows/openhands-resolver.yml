@@ -142,20 +142,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          cat > /tmp/opencode-prompt.md <<EOF
+          PROMPT_FILE="$(mktemp)"
+          OUTPUT_FILE="$(mktemp)"
+          trap 'rm -f "$PROMPT_FILE" "$OUTPUT_FILE"' EXIT
+
+          # Write static prompt text without expanding issue content.
+          cat > "$PROMPT_FILE" <<'OPENCODE_PROMPT'
           You are the coding agent for Agent Workspace Hub (AWH).
 
-          Repository: ${GITHUB_REPOSITORY}
+          Repository: __REPOSITORY__
           Target branch: rust
-          Issue: #${ISSUE_NUMBER}
-          Issue URL: ${ISSUE_URL}
+          Issue: #__ISSUE_NUMBER__
+          Issue URL: __ISSUE_URL__
 
           Issue title:
-          ${ISSUE_TITLE}
+          __ISSUE_TITLE__
 
           Issue body:
           ---
-          ${ISSUE_BODY}
+          __ISSUE_BODY__
           ---
 
           Your task:
@@ -182,22 +187,54 @@ jobs:
           Make only changes supported by the issue and repository context.
 
           Leave the working tree containing the completed implementation and tests.
-          EOF
+          OPENCODE_PROMPT
 
-          cd "$GITHUB_WORKSPACE"
+          # Replace placeholders using printf so issue content is never parsed
+          # as shell syntax. The issue can safely contain $, backticks, quotes,
+          # newlines, command substitutions, or other shell metacharacters.
+          python3 - "$PROMPT_FILE" "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" "$ISSUE_URL" "$ISSUE_TITLE" "$ISSUE_BODY" <<'PY'
+          import pathlib
+          import sys
 
+          path, repository, number, url, title, body = sys.argv[1:]
+          text = pathlib.Path(path).read_text()
+          replacements = {
+              "__REPOSITORY__": repository,
+              "__ISSUE_NUMBER__": number,
+              "__ISSUE_URL__": url,
+              "__ISSUE_TITLE__": title,
+              "__ISSUE_BODY__": body,
+          }
+          for key, value in replacements.items():
+              text = text.replace(key, value)
+          pathlib.Path(path).write_text(text)
+          PY
+
+          # The installed OpenCode version previously rejected --dir.
+          # Change directory explicitly and quote the path.
+          cd -- "$GITHUB_WORKSPACE"
+
+          # Keep the prompt as exactly one argv element.
+          set +e
           timeout 35m opencode run \
             --standalone \
-            --model freellmapi/auto \
+            --model 'freellmapi/auto' \
             --auto \
-            "$(cat /tmp/opencode-prompt.md)" \
-            2>&1 | tee /tmp/opencode-output.log
+            "$(cat "$PROMPT_FILE")" \
+            > >(tee "$OUTPUT_FILE") 2>&1
+          OPENCODE_STATUS=$?
+          set -e
 
           {
             echo "summary<<OPENCODE_FINAL_MESSAGE"
-            tail -n 120 /tmp/opencode-output.log
+            tail -n 120 "$OUTPUT_FILE"
             echo "OPENCODE_FINAL_MESSAGE"
           } >> "$GITHUB_OUTPUT"
+
+          if [ "$OPENCODE_STATUS" -ne 0 ]; then
+            echo "::error::OpenCode exited with status $OPENCODE_STATUS"
+            exit "$OPENCODE_STATUS"
+          fi
 
       - name: Create branch, commit, and push
         id: git
