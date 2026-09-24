@@ -106,29 +106,40 @@ jobs:
 
       - name: Configure OpenCode
         shell: bash
+        env:
+          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         run: |
           set -euo pipefail
 
           cat > "$GITHUB_WORKSPACE/opencode.json" <<'EOF'
           {
             "$schema": "https://opencode.ai/config.json",
-            "provider": {
+            "providers": {
               "freellmapi": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "FreeLLMAPI",
-                "options": {
+                "package": "@opencode/ai/providers/openai-compatible",
+                "settings": {
                   "baseURL": "https://freellmapi-production-905c.up.railway.app/v1",
                   "apiKey": "{env:FREELLMAPI_API_KEY}"
                 },
                 "models": {
                   "auto": {
-                    "name": "auto"
+                    "modelID": "auto"
                   }
                 }
               }
             }
           }
           EOF
+
+          echo "::group::OpenCode configuration"
+          echo 'provider=freellmapi'
+          echo 'model=freellmapi/auto'
+          echo 'package=@opencode/ai/providers/openai-compatible'
+          echo 'baseURL=https://freellmapi-production-905c.up.railway.app/v1'
+          echo 'apiKey_source=FREELLMAPI_API_KEY (value redacted)'
+          jq empty "$GITHUB_WORKSPACE/opencode.json"
+          echo 'config_json=valid'
+          echo "::endgroup::"
 
       - name: Run OpenCode
         id: opencode
