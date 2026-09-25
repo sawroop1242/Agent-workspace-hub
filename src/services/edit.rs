@@ -960,6 +960,16 @@ pub enum PatchStatus {
     PartiallyCommitted,
     /// Verification failed after committing one or more files.
     VerificationFailed,
+    /// A commit failed and the transaction did not complete.
+    /// `fully_restored` reports whether the in-transaction rollback
+    /// returned every already-committed file to its pre-transaction
+    /// bytes; when false, some target may still hold transaction-
+    /// produced content (bounded to `committed_paths`).
+    ///
+    /// Reported honestly even when the rollback fully restored the
+    /// workspace: a failed transaction must never surface as
+    /// [`PatchStatus::Committed`].
+    CommitFailed { fully_restored: bool },
 }
 
 /// Structured failure information for a failed patch transaction.
@@ -1248,55 +1258,86 @@ pub(crate) fn apply_hunks_to_content(
     hunks: &[ParsedHunk],
     path: &str,
 ) -> Result<String, EditError> {
-    let mut file_lines: Vec<String> = if content.is_empty() {
+    // Exact-byte line model: every logical line keeps its own terminator
+    // ("\r\n", "\n", or "" for a final line without a trailing newline).
+    // Rebuilding from (text, terminator) pairs instead of `join("\n")`
+    // preserves CRLF files byte-for-byte — a diff application must never
+    // normalize line endings (AWE-005 §11).
+    let mut file_lines: Vec<(String, &str)> = if content.is_empty() {
         Vec::new()
     } else {
-        content.lines().map(|s| s.to_owned()).collect()
+        let mut lines = Vec::new();
+        for chunk in content.split_inclusive('\n') {
+            if let Some(text) = chunk.strip_suffix("\r\n") {
+                lines.push((text.to_owned(), "\r\n"));
+            } else if let Some(text) = chunk.strip_suffix('\n') {
+                lines.push((text.to_owned(), "\n"));
+            } else {
+                lines.push((chunk.to_owned(), ""));
+            }
+        }
+        lines
     };
-    let _has_trailing_newline = content.ends_with('\n');
 
-    // Sort hunks descending by old_start so applying them doesn't shift earlier line numbers
-    let mut sorted_hunks: Vec<&ParsedHunk> = hunks.iter().collect();
-    sorted_hunks.sort_by_key(|a| std::cmp::Reverse(a.old_start));
+    // Apply hunks in descending source order so earlier line numbers stay
+    // stable; the ORIGINAL hunk number (its position in the caller's
+    // diff) is preserved for mismatch reporting.
+    let mut sorted_hunks: Vec<(usize, &ParsedHunk)> = hunks.iter().enumerate().collect();
+    sorted_hunks.sort_by_key(|(orig, hunk)| (std::cmp::Reverse(hunk.old_start), *orig));
 
-    for (hunk_idx, hunk) in sorted_hunks.iter().enumerate() {
+    for (orig_hunk, hunk) in sorted_hunks {
         let target_idx = if hunk.old_start == 0 {
             0
         } else {
             hunk.old_start - 1
         };
 
-        // Validate context + deletions match file lines
+        // Validate context + deletions match the file's line text exactly.
         let mut file_cursor = target_idx;
         for line in &hunk.lines {
             match line {
                 HunkLine::Context(expected) | HunkLine::Del(expected) => {
-                    if file_cursor >= file_lines.len() || file_lines[file_cursor] != *expected {
+                    if file_cursor >= file_lines.len() || file_lines[file_cursor].0 != *expected {
                         return Err(EditError::HunkContextMismatch {
                             path: path.to_owned(),
-                            hunk: hunk_idx + 1,
+                            hunk: orig_hunk + 1,
                         });
                     }
-                    if matches!(line, HunkLine::Context(_) | HunkLine::Del(_)) {
-                        file_cursor += 1;
-                    }
+                    file_cursor += 1;
                 }
                 HunkLine::Add(_) => {}
             }
         }
 
-        // Apply hunk modifications
-        let mut new_hunk_lines = Vec::new();
+        // Apply hunk modifications. Compose the replacement segment in
+        // hunk order: context lines keep their OWN original terminator
+        // (they map 1:1 onto the replaced span, in order); added lines
+        // adopt the anchor terminator — the first original line of the
+        // replaced span, or the file's first-line style for a pure-add
+        // hunk — so new content follows the file's own convention.
+        let anchor_terminator = if target_idx < file_lines.len() {
+            file_lines[target_idx].1
+        } else {
+            file_lines.first().map(|(_, t)| *t).unwrap_or("\n")
+        };
+        let mut composed: Vec<(String, &str)> = Vec::new();
+        let mut orig_pos = target_idx;
         for line in &hunk.lines {
             match line {
                 HunkLine::Context(text) => {
-                    new_hunk_lines.push(text.clone());
+                    let term = if orig_pos < file_lines.len() {
+                        file_lines[orig_pos].1
+                    } else {
+                        anchor_terminator
+                    };
+                    composed.push((text.clone(), term));
+                    orig_pos += 1;
                 }
                 HunkLine::Del(_) => {
-                    // skip deleted line
+                    orig_pos += 1;
                 }
                 HunkLine::Add(text) => {
-                    new_hunk_lines.push(text.clone());
+                    composed.push((text.clone(), anchor_terminator));
                 }
             }
         }
@@ -1307,24 +1348,39 @@ pub(crate) fn apply_hunks_to_content(
             .filter(|l| matches!(l, HunkLine::Context(_) | HunkLine::Del(_)))
             .count();
         if target_idx + remove_count <= file_lines.len() {
-            file_lines.splice(target_idx..target_idx + remove_count, new_hunk_lines);
+            file_lines.splice(target_idx..target_idx + remove_count, composed);
         } else {
             return Err(EditError::HunkContextMismatch {
                 path: path.to_owned(),
-                hunk: hunk_idx + 1,
+                hunk: orig_hunk + 1,
             });
         }
     }
 
-    if file_lines.is_empty() {
-        Ok("".into())
-    } else {
-        let mut result = file_lines.join("\n");
-        if content.ends_with('\n') {
-            result.push('\n');
+    // Rebuild byte-exact content. A final line without a trailing newline
+    // keeps that state; the last line's own terminator decides — a diff
+    // application must never silently add or strip a final newline
+    // (AWE-005 §11). One deterministic repair: if the original file ended
+    // with a newline but the last surviving/added line ended up without
+    // one (e.g. the original final line was deleted), restore the
+    // original final terminator so file shape is not silently changed.
+    if content.ends_with('\n') {
+        if let Some(last) = file_lines.last_mut() {
+            if last.1.is_empty() {
+                last.1 = if content.ends_with("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+            }
         }
-        Ok(result)
     }
+    let mut result = String::with_capacity(content.len());
+    for (text, term) in &file_lines {
+        result.push_str(text);
+        result.push_str(term);
+    }
+    Ok(result)
 }
 
 /// Internal preparation record for one file during a multi-operation patch.
@@ -1334,6 +1390,10 @@ struct PrepareFile {
     original_bytes: Vec<u8>,
     original_existed: bool,
     prepared_content: String,
+    /// Transaction index of the first operation driving this file (the
+    /// result's operation_index; a file prepared from several composed
+    /// operations reports its first driver, in transaction order).
+    first_operation_index: Option<usize>,
 }
 
 fn validate_patch_operation(op: &EditOperation) -> Result<(), String> {
@@ -1616,6 +1676,10 @@ impl EditService {
         let tx_id_str = tx_id.0.clone();
 
         // Phase 1: grouping — deterministic path ordering (sorted, no HashMap).
+        // Each entry keeps the operation's ORIGINAL transaction index so
+        // expected states pair with their own operation (the model's
+        // cardinality contract), never with whichever file happens to be
+        // next, and never silently broadcast.
         let mut affected: Vec<(String, Vec<(usize, EditOperation)>)> = Vec::new();
         for (idx, op) in transaction.operations.into_iter().enumerate() {
             match op {
@@ -1662,6 +1726,17 @@ impl EditService {
         }
         affected.sort_by(|a, b| a.0.cmp(&b.0));
 
+        // Expected states pair with operations by transaction index (an
+        // empty collection means "no preconditions", per the model;
+        // otherwise validate_shape guarantees expected.len() == operations.len()).
+        let expected_for_op = |idx: usize| -> Option<&ExpectedState> {
+            if transaction.expected.is_empty() {
+                None
+            } else {
+                transaction.expected.get(idx)
+            }
+        };
+
         // Phase 1b: validate every operation individually before touching any file.
         for (path, ops) in &affected {
             for (idx, op) in ops {
@@ -1677,7 +1752,7 @@ impl EditService {
 
         // Phase 2: prepare every affected file in memory.
         let mut plan: Vec<PrepareFile> = Vec::new();
-        for (file_idx, (path, ops)) in affected.iter().enumerate() {
+        for (path, ops) in affected.iter() {
             let before_file = self.files.read_bytes(path).map_err(|error| {
                 if is_not_found(&error) {
                     EditError::FileNotFound { path: path.clone() }
@@ -1693,48 +1768,54 @@ impl EditService {
                 .to_owned();
             let before = FileState::from_content(path, &content);
 
-            // Validate expected-state for this file (uses matching
-            // expected state by file index, or first).
-            let file_expected = transaction
-                .expected
-                .get(file_idx)
-                .cloned()
-                .or_else(|| transaction.expected.first().cloned());
-            if let Some(expected) = file_expected.as_ref() {
-                // If expected state has no preconditions set (all None), skip check.
-                if expected.hash.is_some()
-                    || expected.context.is_some()
-                    || expected.size.is_some()
-                    || expected.line_count.is_some()
+            // Expected-state validation is per OPERATION: every operation
+            // targeting this file has its own preconditions evaluated
+            // against the file's ORIGINAL observed state — the state the
+            // caller described, before any operation of this transaction
+            // composes. One expected state is never broadcast across
+            // operations, and a file's later operations are validated even
+            // when an earlier one already passed. First failure wins,
+            // in transaction order.
+            for (idx, _op) in ops {
+                let Some(expected) = expected_for_op(*idx) else {
+                    continue;
+                };
+                // No preconditions set (all absent) means nothing to check.
+                if expected.hash.is_none()
+                    && expected.context.is_none()
+                    && expected.size.is_none()
+                    && expected.line_count.is_none()
                 {
-                    match before.check(expected) {
-                        StateMatch::Matched => {}
-                        StateMatch::Conflicted { component } => {
-                            return Err(EditError::PatchPreparationFailure {
-                                transaction_id: tx_id_str.clone(),
-                                path: Some(path.clone()),
-                                reason: format!(
-                                    "expected-state conflict on {}: {} mismatch",
-                                    path, component
-                                ),
-                            });
-                        }
-                        StateMatch::Malformed { .. } => {
-                            return Err(EditError::InvalidHash(
-                                expected.hash.clone().unwrap_or_default(),
-                            ));
-                        }
-                        StateMatch::ContextPending => {}
+                    continue;
+                }
+                match before.check(expected) {
+                    StateMatch::Matched => {}
+                    StateMatch::Conflicted { component } => {
+                        return Err(EditError::PatchPreparationFailure {
+                            transaction_id: tx_id_str.clone(),
+                            path: Some(path.clone()),
+                            reason: format!(
+                                "expected-state conflict on {}: {} mismatch",
+                                path, component
+                            ),
+                        });
                     }
+                    StateMatch::Malformed { .. } => {
+                        return Err(EditError::InvalidHash(
+                            expected.hash.clone().unwrap_or_default(),
+                        ));
+                    }
+                    StateMatch::ContextPending => {}
                 }
             }
 
             // Apply every operation for this file in transaction order,
-            // mutating in-memory content only.
+            // mutating in-memory content only. Each operation's context
+            // precondition anchors against ITS OWN expected state.
             let mut current = content;
             for (idx, op) in ops {
                 current =
-                    apply_normalized_operation(path, *idx, op, &current, file_expected.as_ref())?;
+                    apply_normalized_operation(path, *idx, op, &current, expected_for_op(*idx))?;
             }
 
             let _after = FileState::from_content(path, &current);
@@ -1744,6 +1825,7 @@ impl EditService {
                 original_bytes: before_file,
                 original_existed: true,
                 prepared_content: current,
+                first_operation_index: ops.first().map(|(idx, _)| *idx),
             });
         }
 
@@ -1759,13 +1841,15 @@ impl EditService {
                     steps.push(PatchStepResult {
                         transaction_id: tx_id.clone(),
                         path: file.path.clone(),
-                        operation_index: 0,
+                        // The transaction index of the first operation that
+                        // drove this file (never a fabricated 0).
+                        operation_index: file.first_operation_index.unwrap_or(0),
                         status: PatchStepStatus::Committed,
                         before: file.before.clone(),
                         after: after.clone(),
                         operation: PatchOperation {
                             path: file.path.clone(),
-                            operation_index: 0,
+                            operation_index: file.first_operation_index.unwrap_or(0),
                             operation: NormalizedOperation::InsertLine {
                                 boundary: 0,
                                 content: String::new(),
@@ -1791,12 +1875,15 @@ impl EditService {
                 transaction_id: tx_id.clone(),
                 committed_paths: committed_paths.clone(),
             };
+            // Honest terminal status: the transaction did NOT commit. A
+            // commit or verification failure must never be reported as
+            // `Committed` — even when the rollback happened to restore
+            // everything — and `fully_restored` says whether the
+            // workspace was returned to its pre-transaction state.
             return Ok(PatchResult {
                 transaction_id: tx_id,
-                status: if rollback.conflict_free {
-                    PatchStatus::Committed
-                } else {
-                    PatchStatus::VerificationFailed
+                status: PatchStatus::CommitFailed {
+                    fully_restored: rollback.fully_restored,
                 },
                 steps,
                 committed_paths,
@@ -5377,6 +5464,219 @@ mod patch_tests {
         assert_eq!(read_file(&tmp, "invalid.txt"), "wrong content\n");
     }
 
+    /// Prompt 05: expected states pair with OPERATIONS by transaction
+    /// index — never by file index, never broadcast. A stale hash
+    /// attached to operation 1 (targeting b.txt) must NOT be checked
+    /// against a.txt just because a.txt sorts first.
+    #[test]
+    fn expected_states_pair_with_operations_not_files() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "a.txt", "alpha\n");
+        write_file(&tmp, "b.txt", "beta\n");
+
+        let mut tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "b.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            },
+            EditOperation::Replace {
+                path: "a.txt".into(),
+                old: "alpha".into(),
+                new: "ALPHA".into(),
+                occurrence: None,
+            },
+        ]);
+        // Operation 0 (b.txt): correct precondition.
+        tx.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"beta\n")),
+            ..Default::default()
+        });
+        // Operation 1 (a.txt): a STALE hash. Under the old per-FILE
+        // pairing, a.txt (sorted first, file index 0) was checked against
+        // expected[0] (the b.txt hash) — wrong file, wrong precondition —
+        // and b.txt against expected[1]. Both mispairings could pass or
+        // fail spuriously. Per-operation pairing must reject on the
+        // a.txt operation's own stale hash.
+        tx.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"stale content\n")),
+            ..Default::default()
+        });
+
+        let err = svc.patch(tx).unwrap_err();
+        assert!(
+            matches!(err, EditError::PatchPreparationFailure { .. }),
+            "stale expected state on operation 1 must reject the transaction"
+        );
+        assert!(err.to_string().contains("a.txt"));
+        // Zero mutation on rejected preparation.
+        assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+        assert_eq!(read_file(&tmp, "b.txt"), "beta\n");
+    }
+
+    /// The complementary positive case: per-operation pairing with all
+    /// correct preconditions commits every file.
+    #[test]
+    fn per_operation_expected_states_all_correct_commits() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "a.txt", "alpha\n");
+        write_file(&tmp, "b.txt", "beta\n");
+
+        let mut tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "b.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            },
+            EditOperation::Replace {
+                path: "a.txt".into(),
+                old: "alpha".into(),
+                new: "ALPHA".into(),
+                occurrence: None,
+            },
+        ]);
+        tx.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"beta\n")),
+            ..Default::default()
+        });
+        tx.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"alpha\n")),
+            ..Default::default()
+        });
+
+        let result = svc.patch(tx).unwrap();
+        assert_eq!(result.status, PatchStatus::Committed);
+        assert_eq!(read_file(&tmp, "a.txt"), "ALPHA\n");
+        assert_eq!(read_file(&tmp, "b.txt"), "BETA\n");
+        // Result ordering is deterministic (path-sorted steps).
+        assert_eq!(result.steps[0].path, "a.txt");
+        assert_eq!(result.steps[1].path, "b.txt");
+        // operation_index is the operation's transaction index, not a
+        // fabricated 0: a.txt was driven by operation 1.
+        assert_eq!(result.steps[0].operation_index, 1);
+        assert_eq!(result.steps[1].operation_index, 0);
+    }
+
+    /// Multiple operations on ONE file: each operation's own expected
+    /// state is evaluated against the file's original observed state —
+    /// a second operation with a stale precondition must reject even
+    /// though the first operation already matched.
+    #[test]
+    fn same_file_operations_each_check_their_own_expected_state() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "one\ntwo\n");
+
+        let mut tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "f.txt".into(),
+                old: "one".into(),
+                new: "ONE".into(),
+                occurrence: None,
+            },
+            EditOperation::Replace {
+                path: "f.txt".into(),
+                old: "two".into(),
+                new: "TWO".into(),
+                occurrence: None,
+            },
+        ]);
+        tx.expected.push(ExpectedState::default());
+        tx.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"stale\n")),
+            ..Default::default()
+        });
+
+        let err = svc.patch(tx).unwrap_err();
+        assert!(matches!(err, EditError::PatchPreparationFailure { .. }));
+        assert_eq!(read_file(&tmp, "f.txt"), "one\ntwo\n");
+    }
+
+    /// A preparation failure on one path rejects the whole transaction
+    /// with a structured error naming the failing path, and mutates
+    /// nothing (a path whose parent is a regular file cannot be read).
+    #[test]
+    fn preparation_failure_on_unreadable_path_names_the_path() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "a.txt", "alpha\n");
+        write_file(&tmp, "blocker", "not a directory\n");
+
+        let tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "a.txt".into(),
+                old: "alpha".into(),
+                new: "ALPHA".into(),
+                occurrence: None,
+            },
+            EditOperation::Insert {
+                path: "blocker/child.txt".into(),
+                line: 0,
+                content: "x".into(),
+            },
+        ]);
+
+        let err = svc.patch(tx).unwrap_err();
+        assert!(
+            err.to_string().contains("blocker/child.txt"),
+            "failure must name the unreadable path: {err}"
+        );
+        assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+    }
+
+    /// A COMMIT failure (write_atomic failing after every operation
+    /// prepared) is reported honestly as `CommitFailed` — never
+    /// `Committed`, even when nothing was committed and there was
+    /// nothing to roll back. Deterministic on unix by making the target
+    /// directory read-only: reads still succeed (preparation passes),
+    /// the atomic write cannot stage its temp file.
+    #[cfg(unix)]
+    #[test]
+    fn commit_failure_reports_commit_failed_not_committed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, svc) = setup();
+        write_file(&tmp, "a.txt", "alpha\n");
+        write_file(&tmp, "b.txt", "beta\n");
+        // Read-only directory: preparation reads succeed, commit write fails.
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+
+        let tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "a.txt".into(),
+                old: "alpha".into(),
+                new: "ALPHA".into(),
+                occurrence: None,
+            },
+            EditOperation::Replace {
+                path: "b.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            },
+        ]);
+
+        let result = svc.patch(tx).expect("commit failure is a PatchResult");
+        assert_eq!(
+            result.status,
+            PatchStatus::CommitFailed {
+                fully_restored: true
+            },
+            "commit failure must never surface as Committed"
+        );
+        assert!(result.failure.is_some());
+        assert_eq!(result.committed_paths.len(), 0);
+        assert_eq!(result.steps.len(), 0, "no step committed");
+
+        // Restore permissions for cleanup + verify zero mutation.
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+        assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+        assert_eq!(read_file(&tmp, "b.txt"), "beta\n");
+    }
+
     // ---------------------------------------------------------------------------
     // AWE-006: atomic and rollback-safe edit tests.
     // ---------------------------------------------------------------------------
@@ -5904,6 +6204,132 @@ mod patch_tests {
             assert!(matches!(err, EditError::PatchPreparationFailure { .. }));
 
             assert_eq!(read_file(&tmp, "f.txt"), "current content\n");
+        }
+
+        #[test]
+        fn apply_diff_to_crlf_file_preserves_crlf_byte_for_byte() {
+            // AWE-005 §11: a diff application must never normalize line
+            // endings. Before the prompt-05 fix this converted a CRLF
+            // file entirely to LF.
+            let (tmp, svc) = setup();
+            let original = "alpha\r\nbeta\r\ngamma\r\n";
+            write_file(&tmp, "f.txt", original);
+
+            let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -2 +2 @@\n-beta\n+BETA\n";
+            let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+
+            let result = svc.patch(tx).unwrap();
+            assert_eq!(result.status, PatchStatus::Committed);
+            // The untouched CRLF lines are byte-identical, the replaced
+            // line keeps its CRLF terminator, and no LF creeps in.
+            assert_eq!(read_file(&tmp, "f.txt"), "alpha\r\nBETA\r\ngamma\r\n");
+        }
+
+        #[test]
+        fn apply_diff_added_lines_inherit_the_files_own_terminator_style() {
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "one\r\ntwo\r\n");
+
+            let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n one\n+mid\n two\n";
+            let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+
+            svc.patch(tx).unwrap();
+            assert_eq!(read_file(&tmp, "f.txt"), "one\r\nmid\r\ntwo\r\n");
+        }
+
+        #[test]
+        fn apply_diff_to_lf_file_is_unchanged_byte_for_byte() {
+            // The CRLF fix must not disturb LF behavior: an LF file with
+            // and without a final newline round-trips exactly.
+            let (tmp, svc) = setup();
+            write_file(&tmp, "a.txt", "x\ny\n");
+            let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+X\n";
+            svc.patch(EditTransaction::single(EditOperation::ApplyDiff {
+                diff: diff.into(),
+            }))
+            .unwrap();
+            assert_eq!(read_file(&tmp, "a.txt"), "X\ny\n");
+
+            write_file(&tmp, "b.txt", "x\ny");
+            let diff_b = "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+X\n";
+            svc.patch(EditTransaction::single(EditOperation::ApplyDiff {
+                diff: diff_b.into(),
+            }))
+            .unwrap();
+            // No trailing newline is silently added.
+            assert_eq!(read_file(&tmp, "b.txt"), "X\ny");
+        }
+
+        #[test]
+        fn apply_diff_deleting_last_line_restores_final_terminator_shape() {
+            // When the final line is deleted, the new final line must end
+            // with the file's terminator — the file's shape must not
+            // silently change.
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "keep\ndrop\n");
+
+            let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1 @@\n keep\n-drop\n";
+            svc.patch(EditTransaction::single(EditOperation::ApplyDiff {
+                diff: diff.into(),
+            }))
+            .unwrap();
+            assert_eq!(read_file(&tmp, "f.txt"), "keep\n");
+        }
+
+        #[test]
+        fn apply_diff_reports_the_original_hunk_number_on_mismatch() {
+            // Hunks are applied in descending source order, but a
+            // mismatch must reference the hunk number AS WRITTEN in the
+            // caller's diff.
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "aaa\nbbb\nccc\n");
+
+            // Second hunk mismatches ("zzz" is not in the file); the
+            // error must name hunk 2, not the application order.
+            let diff =
+                "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-aaa\n+AAA\n@@ -3 +3 @@\n-zzz\n+CCC\n";
+            let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+
+            let err = svc.patch(tx).unwrap_err();
+            assert!(matches!(
+                err,
+                EditError::HunkContextMismatch { hunk: 2, .. }
+            ));
+            // Nothing was mutated by the failed preparation.
+            assert_eq!(read_file(&tmp, "f.txt"), "aaa\nbbb\nccc\n");
+        }
+
+        #[test]
+        fn apply_diff_with_unicode_devanagari_and_emoji_preserves_bytes() {
+            let (tmp, svc) = setup();
+            let original = "नमस्ते line 🌍\nsecond ✅\n";
+            write_file(&tmp, "f.txt", original);
+
+            let diff = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-नमस्ते line 🌍\n+नमस्ते दुनिया 🌏\n";
+            let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+
+            svc.patch(tx).unwrap();
+            assert_eq!(read_file(&tmp, "f.txt"), "नमस्ते दुनिया 🌏\nsecond ✅\n");
+        }
+
+        #[test]
+        fn apply_diff_rejects_traversal_and_absolute_paths_in_headers() {
+            let (tmp, svc) = setup();
+            write_file(&tmp, "f.txt", "ok\n");
+
+            for bad in [
+                "--- a/f.txt\n+++ b/../escape.txt\n@@ -1 +1 @@\n-ok\n+X\n",
+                "--- a/f.txt\n+++ /abs/path.txt\n@@ -1 +1 @@\n-ok\n+X\n",
+            ] {
+                let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: bad.into() });
+                assert!(
+                    matches!(svc.patch(tx), Err(EditError::InvalidPath(_))),
+                    "diff header {bad:?} must be rejected"
+                );
+            }
+            // No mutation, no escape file created.
+            assert_eq!(read_file(&tmp, "f.txt"), "ok\n");
+            assert!(!tmp.path().join("escape.txt").exists());
         }
     }
 }
