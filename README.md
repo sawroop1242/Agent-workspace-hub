@@ -1,39 +1,21 @@
-# Agent-workspace-hub
+# Agent Workspace Hub
 
-![AWH ](docs/image_1cebd533.png) 
+> An AI-native workspace runtime (Rust) that hands durable project state between AI agents via MCP.
 
-## Gemini review-agent test
+![AWH logo](docs/image_1cebd533.png)
 
-This line intentionally changes the README so the pull-request review workflow can be verified end-to-end. It has no runtime impact and should be removed after the review-agent test.
+## At a glance
 
-## OpenAI-compatible FreeLLMAPI test
+- **MCP server** — 53 core tools (65 with the GitHub provider) exposed over stdio and HTTPS + SSE.
+- **Durable handoff** — project state (context, memory, tasks, skills) persists in `.agent/`, so a fresh agent can resume work without a new bootstrap prompt.
+- **Agent profiles** — named profiles with policy-routed, namespaced routes (`/claude/mcp`, `/qwen/sse`, …); authorization stays in a single capability/policy engine.
+- **Security-first** — fail-closed policy gates, token authentication, path-traversal rejection, and a bounded audit ring.
 
-This additional test change verifies that the review workflow can use the
-OpenAI Chat Completions API shape through the FreeLLMAPI router. The router
-uses the `auto` model route. The credential must be provided through the
-GitHub Actions secret `FREELLMAPI_API_KEY` and is not stored in the repository.
+Ready to try it? Jump to the [Quickstart](#quickstart), or browse the full [Documentation](#documentation) index.
 
-## Documentation
+## Quickstart
 
-- [Final architecture and roadmap](docs/roadmap/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
-- [Final CLI reference](docs/CLI.md) — complete target command tree, phase mapping, dependencies, security ordering, and validation rules
-- [Architecture](docs/architecture.md) — existing implementation architecture and request flow
-- [Features](docs/FEATURES.md) — final target feature contract
-- [Agent Profiles roadmap](docs/roadmap/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) — TOML configuration, per-agent MCP routes, CLI lifecycle, policy integration and multi-agent sequencing
-- [Security policy and threat model](docs/security.md)
-- [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
-- [MCP integration](docs/mcp.md) — transports, tools, and interoperability evidence
-- [Composio integration guide](docs/composio.md) — add Composio's hosted MCP, connect apps, invoke tools, gotchas
-- [Configuration](docs/configuration.md) — every `AWH_*` variable and precedence
-- [Development guide](docs/development.md) — conventions, commands, PR process
-- [Testing guide](docs/testing.md) — suite map and regression policy
-- [Release engineering](docs/release.md) — artifacts, checksums, CI-gated process
-- [Completeness audit](docs/archive/completeness-audit.md) — honest per-subsystem status
-- [Installation and upgrade guide](docs/INSTALL.md)
-- [Project status and implementation guide](docs/archive/PROJECT_STATUS.md)
-- [Community MCP registry](docs/community-mcp-registry.md)
-
-## One-line install
+### One-line install
 
 Install Agent Workspace Hub with one command (downloads a prebuilt Rust binary
 for your OS/architecture):
@@ -57,6 +39,18 @@ curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/mai
 The installer requires `curl`; source installs additionally require `cargo`.
 Prebuilt binaries target Linux (x86_64, aarch64), macOS (x86_64, aarch64), and
 Windows (x86_64), falling back to a `cargo build` when no matching asset exists.
+
+### First run
+
+Initialize a workspace, then serve MCP over stdio for a local agent:
+
+```bash
+mkdir my-project && cd my-project
+awh init
+awh mcp serve
+```
+
+See the [Installation and upgrade guide](docs/INSTALL.md) for upgrading, and the [Configuration reference](docs/configuration.md) for every `AWH_*` environment variable.
 
 ## Agent Profiles & Policy-Routed MCP
 
@@ -117,7 +111,7 @@ Agent Workspace Hub exposes its MCP tools over two transports:
 | stdio (default) | `awh mcp serve` | Local agents on the same host |
 | HTTPS + SSE (remote) | `awh mcp serve --transport sse` | Remote agents |
 
-See the existing MCP and security documentation for transport/authentication details. The final agent-profile architecture adds namespaced routes on top of the shared MCP runtime.
+See the [MCP integration guide](docs/mcp.md) and [security documentation](docs/security.md) for transport/authentication details. The final agent-profile architecture adds namespaced routes on top of the shared MCP runtime.
 
 ## Repository layout
 
@@ -133,9 +127,46 @@ See the existing MCP and security documentation for transport/authentication det
 | `scripts/install.sh` | One-line Rust-binary installer |
 | `.github/workflows/*.yml` | CI and release pipelines |
 
+## Documentation
 
+- [Final architecture and roadmap](docs/roadmap/PROJECT_ROADMAP.md) — canonical product boundary, architecture, phases, dependencies, CLI contract, build order, and acceptance workflow
+- [Final CLI reference](docs/CLI.md) — complete target command tree, phase mapping, dependencies, security ordering, and validation rules
+- [Architecture](docs/architecture.md) — existing implementation architecture and request flow
+- [Features](docs/FEATURES.md) — final target feature contract
+- [Agent Profiles roadmap](docs/roadmap/ROADMAP_AGENT_PROFILES_POLICY_MCP.md) — TOML configuration, per-agent MCP routes, CLI lifecycle, policy integration and multi-agent sequencing
+- [Security policy and threat model](docs/security.md)
+- [Detailed threat model](docs/threat-model.md) — 10 threats with mitigations and tests
+- [MCP integration](docs/mcp.md) — transports, tools, and interoperability evidence
+- [Composio integration guide](docs/composio.md) — add Composio's hosted MCP, connect apps, invoke tools, gotchas
+- [Configuration](docs/configuration.md) — every `AWH_*` variable and precedence
+- [Development guide](docs/development.md) — conventions, commands, PR process
+- [Testing guide](docs/testing.md) — suite map and regression policy
+- [Release engineering](docs/release.md) — artifacts, checksums, CI-gated process
+- [Completeness audit](docs/archive/completeness-audit.md) — honest per-subsystem status
+- [Installation and upgrade guide](docs/INSTALL.md)
+- [Project status and implementation guide](docs/archive/PROJECT_STATUS.md)
+- [Community MCP registry](docs/community-mcp-registry.md)
 
+## License
+
+Agent Workspace Hub is released under the [MIT License](LICENSE).
 
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/chart?repos=sawroop1242/agent-workspace-hub&type=date&logscale&legend=bottom-right)](https://www.star-history.com/?repos=sawroop1242%2Fagent-workspace-hub&type=date&logscale=&legend=bottom-right)
+
+<details>
+<summary><b>Workflow test notes</b> (internal — not product documentation)</summary>
+
+### Gemini review-agent test
+
+This line intentionally changes the README so the pull-request review workflow can be verified end-to-end. It has no runtime impact and should be removed after the review-agent test.
+
+### OpenAI-compatible FreeLLMAPI test
+
+This additional test change verifies that the review workflow can use the
+OpenAI Chat Completions API shape through the FreeLLMAPI router. The router
+uses the `auto` model route. The credential must be provided through the
+GitHub Actions secret `FREELLMAPI_API_KEY` and is not stored in the repository.
+
+</details>
