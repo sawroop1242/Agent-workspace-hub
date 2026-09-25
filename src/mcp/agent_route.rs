@@ -14,14 +14,14 @@
 //! * a malformed or unsafe agent id (empty, `.`/`..`, separators, control
 //!   characters, over-length input),
 //! * an unknown agent,
-//! * an agent not active in this workspace,
+//! * an agent disabled or not active in this workspace (the canonical
+//!   TW-002 relation semantics),
 //! * a session key that does not match the resolved route context.
 
 use crate::core::agents::{is_safe_agent_id, AgentStore};
-use crate::core::identity::{AgentId, SessionId, SessionIdentity, WorkspaceId};
-
-/// The maximum length of an agent id accepted on the route path.
-const MAX_AGENT_ID_LEN: usize = 128;
+use crate::core::identity::{
+    resolve_session_relation, AgentId, IdentityRelation, SessionId, SessionIdentity, WorkspaceId,
+};
 
 /// Reason a `/​{agent}` route or session-binding verification failed.
 ///
@@ -36,7 +36,8 @@ pub enum RouteError {
     /// No agent record exists for the id in this workspace.
     #[error("unknown agent")]
     UnknownAgent,
-    /// The agent record exists but is not active in this workspace.
+    /// The agent record exists but is disabled or not active in this
+    /// workspace.
     #[error("agent inactive or disabled")]
     AgentInactive,
     /// The session id presented does not match the agent context.
@@ -93,45 +94,78 @@ impl CallerContext {
     }
 }
 
-/// Validates the raw route path segment and resolvies the canonical agent
+/// Validates the raw route path segment and resolves the canonical agent
 /// record for the workspace whose `.agent` directory `root` contains.
 ///
 /// This is the single authoritative route-resolution entry point for both
 /// `/{agent}/sse` and `/{agent}/mcp`: it never accepts a client-supplied
 /// workspace, treats the segment purely as a lookup key against the agent
-/// store, and fails closed (agent must exist *and* have status `active`).
-/// The returned [`CallerContext`] carries the workspace id of the resolved
-/// workspace so downstream binding checks never re-derive identity from the
-/// raw request.
+/// store, and fails closed (agent must exist, be enabled, *and* be active
+/// in this workspace). The activation/enabled/workspace semantics are the
+/// canonical ones owned by [`resolve_session_relation`]
+/// (TW-002) — this function is a thin transport adapter over them, not a
+/// second authority. The returned [`CallerContext`] carries the workspace
+/// id of the resolved workspace so downstream binding checks never
+/// re-derive identity from the raw request.
 pub fn resolve_route_agent(
     root: &std::path::Path,
     segment: &str,
 ) -> Result<(CallerContext, crate::models::Agent), RouteError> {
-    if segment.is_empty()
-        || segment.len() > MAX_AGENT_ID_LEN
-        || !segment.chars().all(|c| !c.is_control())
-        || !is_safe_agent_id(segment)
-    {
+    // Structural validation first (is_safe_agent_id enforces the canonical
+    // MAX_AGENT_ID_LEN, separators, control chars, `.`/`..`, traversal).
+    if !is_safe_agent_id(segment) {
         return Err(RouteError::InvalidAgentId);
     }
 
     let store = AgentStore::new(root);
-    let agent = store.get(segment).map_err(|_| RouteError::InvalidAgentId)?;
-    let Some(agent) = agent else {
+    let Some(agent) = store.get(segment).map_err(|_| RouteError::InvalidAgentId)? else {
         return Err(RouteError::UnknownAgent);
     };
-    if agent.status != crate::models::AgentStatus::Active {
-        return Err(RouteError::AgentInactive);
-    }
 
+    // The canonical activation check (TW-002): disabled and non-active
+    // agents fail closed with the workspace's own relation semantics, so
+    // this module can never accept an agent the runtime service would
+    // reject. Disabled and inactive map to the same route-level response
+    // (they both mean "this route may not serve callers"), but the audit
+    // log records the exact relation.
     let workspace = crate::services::init::load_workspace_manifest(root)
         .map_err(|_| RouteError::InvalidAgentId)?;
+    let identity = SessionIdentity::new(
+        AgentId::new_checked(agent.id.clone()).map_err(|_| RouteError::InvalidAgentId)?,
+        workspace.workspace_id.clone(),
+    );
+    match resolve_session_relation(root, &identity).map_err(|_| RouteError::UnknownAgent)? {
+        IdentityRelation::AgentActiveInWorkspace => {}
+        relation => {
+            audit_deny_route_relation(segment, &relation);
+            return Err(RouteError::AgentInactive);
+        }
+    }
+
     let caller = CallerContext {
-        agent_id: AgentId::new_checked(agent.id.clone()).map_err(|_| RouteError::InvalidAgentId)?,
-        workspace_id: workspace.workspace_id.clone(),
+        agent_id: identity.agent_id().clone(),
+        workspace_id: identity.workspace_id().clone(),
         session_id: None,
     };
     Ok((caller, agent))
+}
+
+/// Records the exact relation that closed a route resolution. Only the
+/// relation name reaches the audit log — never agent metadata or request
+/// payloads.
+fn audit_deny_route_relation(segment: &str, relation: &IdentityRelation) {
+    crate::mcp::audit_deny("agent_route_resolve", relation_name(relation), segment);
+}
+
+/// Stable audit name for an identity relation.
+fn relation_name(relation: &IdentityRelation) -> &'static str {
+    match relation {
+        IdentityRelation::AgentActiveInWorkspace => "agent_active",
+        IdentityRelation::AgentDisabled => "agent_disabled",
+        IdentityRelation::AgentInactive => "agent_inactive",
+        IdentityRelation::UnknownAgent => "unknown_agent",
+        IdentityRelation::WrongWorkspace => "wrong_workspace",
+    }
 }
 
 /// Verifies that an existing SSE-session binding matches the caller context
@@ -161,6 +195,7 @@ mod tests {
             name: id.to_string(),
             role: "writer".to_string(),
             status: AgentStatus::Active,
+            enabled: true,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         store.create(&agent).unwrap();
@@ -200,11 +235,36 @@ mod tests {
             name: "idle".to_string(),
             role: "writer".to_string(),
             status: AgentStatus::Created,
+            enabled: true,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         store.create(&agent).unwrap();
         assert_eq!(
             resolve_route_agent(root, "idle").unwrap_err(),
+            RouteError::AgentInactive
+        );
+    }
+
+    /// TW-002 added `enabled` as a deliberate operator kill-switch that is
+    /// distinct from lifecycle state: a disabled profile must never serve
+    /// callers, even while its status remains `Active`.
+    #[test]
+    fn rejects_disabled_agent_even_when_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        crate::services::init::initialize_workspace(root).unwrap();
+        let store = AgentStore::new(root);
+        let agent = Agent {
+            id: "off".to_string(),
+            name: "off".to_string(),
+            role: "writer".to_string(),
+            status: AgentStatus::Active,
+            enabled: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.create(&agent).unwrap();
+        assert_eq!(
+            resolve_route_agent(root, "off").unwrap_err(),
             RouteError::AgentInactive
         );
     }
@@ -221,6 +281,9 @@ mod tests {
             "a/b",
             "a\\b",
             "a\0b",
+            // Over the canonical MAX_AGENT_ID_LEN (64): both a slightly
+            // over-long id and an obviously absurd one.
+            "x".repeat(65).as_str(),
             "x".repeat(129).as_str(),
         ] {
             assert!(

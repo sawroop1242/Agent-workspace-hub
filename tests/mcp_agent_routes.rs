@@ -63,6 +63,7 @@ impl Workspace {
                     name: id.into(),
                     role: "test".into(),
                     status,
+                    enabled: true,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 })
                 .expect("create agent");
@@ -286,6 +287,34 @@ async fn non_active_agent_route_rejects_with_forbidden() {
             status
         );
     }
+}
+
+/// TW-002's `enabled=false` is a deliberate operator kill-switch: the
+/// agent's status can still be `Active` on disk, but the profile must
+/// never serve callers. The route must reject it exactly like a
+/// non-active agent (prompt §27 "disabled agent"), with no session
+/// allocated.
+#[tokio::test]
+async fn disabled_agent_route_rejects_before_creating_session() {
+    let ws = Workspace::new([("alpha", AgentStatus::Active)]);
+    // Flip the profile off through the canonical store, exactly as an
+    // operator would (`awh agent disable`).
+    agent_workspace_hub::core::agents::AgentStore::new(&ws.root)
+        .set_enabled("alpha", false)
+        .expect("disable agent");
+    let (router, state) = harness(&ws).await;
+
+    let (status, body) = send(router, "GET", "/alpha/sse", String::new(), Some(API_KEY)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["error"], "agent_inactive",
+        "disabled agents fail closed with the route's inactive code"
+    );
+    assert!(
+        state.sessions.is_empty().await,
+        "no session must be allocated for a disabled agent"
+    );
 }
 
 /// A session created for agent A presented on agent B's route is
@@ -562,6 +591,130 @@ async fn expired_grant_denies_tools_call() {
         value["error"]["code"], -32005,
         "expired grant never authorizes: {value}"
     );
+}
+
+/// The positive path: an agent holding a valid, unexpired, in-scope grant
+/// actually *succeeds* — the capability gate must not over-deny. This
+/// also pins the layering: the capability gate passes and the SEC-001
+/// trust floor independently allows this Medium-risk built-in (no trust
+/// record → no restriction for Medium), so the tool runs and mutates
+/// the workspace.
+#[tokio::test]
+async fn authorized_tool_succeeds_for_bound_caller() {
+    let ws = Workspace::new([("alpha", AgentStatus::Active)]);
+    ws.grant("g-fs", "alpha", Permission::Filesystem, Some("src"), None);
+    let (_router, state) = harness(&ws).await;
+    let (session, mut rx) = initialized_bound_session(&state, &ws, "alpha").await;
+
+    let value = dispatch_on(
+        &state,
+        &session,
+        &mut rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace.write_file",
+                "arguments": {"path": "src/ok.txt", "content": "capability-gated write"},
+            },
+        }),
+    )
+    .await;
+    // The MCP result envelope wraps the tool's JSON as a text content
+    // block — unwrap it to assert the tool's own payload.
+    let payload: Value = {
+        let text = value["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result is a text content block");
+        serde_json::from_str(text).expect("tool payload is JSON")
+    };
+    assert_eq!(payload["written"], json!(true), "{value}");
+
+    // The write really happened on disk — the tool did not merely report
+    // success.
+    let written = tokio::fs::read_to_string(ws.root.join("src/ok.txt"))
+        .await
+        .expect("file exists");
+    assert_eq!(written, "capability-gated write");
+}
+
+/// Prompt §24 concurrency: two agents hold independent sessions over
+/// their own routes simultaneously, each dispatch is authorized against
+/// exactly its own agent's grants, and neither can see or use the
+/// other's session. Both dispatched calls run concurrently and settle
+/// independently.
+#[tokio::test]
+async fn concurrent_agents_keep_independent_sessions_and_decisions() {
+    let ws = Workspace::new([
+        ("alpha", AgentStatus::Active),
+        ("beta", AgentStatus::Active),
+    ]);
+    // alpha may write under src/; beta holds no Filesystem grant at all.
+    ws.grant(
+        "g-alpha-fs",
+        "alpha",
+        Permission::Filesystem,
+        Some("src"),
+        None,
+    );
+    let (_router, state) = harness(&ws).await;
+
+    let (alpha_session, mut alpha_rx) = initialized_bound_session(&state, &ws, "alpha").await;
+    let (beta_session, mut beta_rx) = initialized_bound_session(&state, &ws, "beta").await;
+    assert_ne!(alpha_session.id, beta_session.id);
+    assert_ne!(
+        alpha_session.binding.as_ref().unwrap().agent_id,
+        beta_session.binding.as_ref().unwrap().agent_id
+    );
+
+    // Both calls in flight at the same time: alpha's succeeds, beta's is
+    // capability-denied. Each decision comes from the caller's own
+    // grants — never the other agent's.
+    let (alpha_outcome, beta_outcome) = tokio::join!(
+        dispatch_on(
+            &state,
+            &alpha_session,
+            &mut alpha_rx,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "workspace.write_file",
+                           "arguments": {"path": "src/alpha.txt", "content": "a"}},
+            })
+        ),
+        dispatch_on(
+            &state,
+            &beta_session,
+            &mut beta_rx,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "workspace.write_file",
+                           "arguments": {"path": "src/beta.txt", "content": "b"}},
+            })
+        ),
+    );
+    assert!(
+        alpha_outcome["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"written\":true"),
+        "{alpha_outcome}"
+    );
+    assert_eq!(
+        beta_outcome["error"]["code"], -32005,
+        "beta's call is denied by beta's own (missing) grants: {beta_outcome}"
+    );
+    assert!(
+        beta_outcome["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("beta"),
+        "denial names the resolved agent: {beta_outcome}"
+    );
+
+    // Isolation on disk: alpha's write landed, beta's never executed.
+    assert!(ws.root.join("src/alpha.txt").exists());
+    assert!(!ws.root.join("src/beta.txt").exists());
 }
 
 /// Policy denial overrides capability allowance: even with a valid
