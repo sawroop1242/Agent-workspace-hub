@@ -114,6 +114,13 @@ pub const BUILTIN_TOOL_DENIED_CODE: i64 = -32003;
 /// denial without parsing message strings.
 pub const POLICY_DENIED_CODE: i64 = -32004;
 
+/// Denial code for an agent-scoped call that fails the per-agent
+/// capability gate (TW-003). Distinct from [`BUILTIN_TOOL_DENIED_CODE`]
+/// (workspace-level trust gate) and [`POLICY_DENIED_CODE`] (workspace
+/// deny-rules) so clients and audit logs can distinguish which boundary
+/// rejected the call.
+pub const CAPABILITY_DENIED_CODE: i64 = -32005;
+
 /// The lifecycle state of one MCP session (the conceptual `NEW →
 /// INITIALIZING → READY → CLOSING/CLOSED/FAILED` machine, reduced to the
 /// states the transports actually drive).
@@ -154,6 +161,11 @@ pub struct SessionLifecycle {
     protocol_version: std::sync::Mutex<Option<String>>,
     /// Client-reported name/version from the initialize request.
     client_info: std::sync::Mutex<Option<Value>>,
+    /// Trusted agent/workspace identity bound at session establishment
+    /// (TW-003). `None` for the legacy global `/sse`+`stdio` paths and for
+    /// sessions that could not be bound; `Some` exactly when the session
+    /// was created by an agent-scoped route. Immutable after set.
+    caller: std::sync::Mutex<Option<crate::core::identity::SessionIdentity>>,
     /// Session creation and last-activity timestamps.
     created_at: std::sync::Mutex<Option<std::time::Instant>>,
     last_activity: std::sync::Mutex<Option<std::time::Instant>>,
@@ -220,6 +232,28 @@ impl SessionLifecycle {
     /// The transport-assigned session identity, when known.
     pub fn session_id(&self) -> Option<String> {
         self.session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Binds the trusted agent/workspace identity for this session
+    /// (TW-003). Call once, at session establishment, with the resolved
+    /// caller — the slot is never overwritten (subsequent calls are
+    /// no-ops), so a session can never be migrated to a different agent
+    /// context after creation.
+    pub fn set_caller(&self, caller: crate::core::identity::SessionIdentity) {
+        let mut slot = self.caller.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(caller);
+        }
+    }
+
+    /// The caller pinned at session establishment, if any. `None` means a
+    /// session outside any agent-scoped route (legacy global endpoint,
+    /// stdio transport) — the unscoped gate applies in that case.
+    pub fn caller(&self) -> Option<crate::core::identity::SessionIdentity> {
+        self.caller
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -728,6 +762,86 @@ impl McpDispatcher {
         Ok(())
     }
 
+    /// The workspace root this dispatcher serves (project root at
+    /// construction). Exposed for agent-route resolution (TW-003), which
+    /// resolves `/{agent}` path segments against the workspace's local
+    /// agent store — the workspace itself is never client-supplied.
+    pub fn project_root(&self) -> std::path::PathBuf {
+        self.workspace.root().to_path_buf()
+    }
+
+    /// TW-003: per-agent capability gate, applied *before* the existing
+    /// `awh.builtin` trust policy and the workspace deny-rules so the
+    /// shared SEC-001 floor still applies below. A bound caller means the
+    /// session came through an agent-scoped route (`/{agent}/mcp`).
+    ///
+    /// The check reads grants for exactly the resolved agent id (never
+    /// any other identity), requires every capability the tool declares,
+    /// and fails closed when the store is unreadable. Policy denial
+    /// still overrides capability allowance, because [`Self::authorize_tool`]
+    /// runs independently afterward.
+    fn authorize_caller_capability(
+        &self,
+        caller: &crate::core::identity::SessionIdentity,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<()> {
+        let Some(def) = tool_registry::registry_lookup(name) else {
+            // Unknown tool — the caller path also fails closed below when
+            // the operation arms run the existing deny-closed gates.
+            return Ok(());
+        };
+        if def.required_permissions.is_empty() {
+            // The tool has no declared capability surface — Fallthrough to
+            // the workspace-level trust/policy gates only.
+            return Ok(());
+        }
+        let grants = crate::core::capability_grants::CapabilityGrantStore::new(self.project_root())
+            .list_for_agent(caller.agent_id.as_str())
+            .map_err(|e| {
+                audit_deny("agent_capability_check", "store_unreadable", name);
+                DispatchError::internal(format!(
+                    "capability store unreadable for agent {}: {e}",
+                    caller.agent_id.as_str()
+                ))
+            })?;
+        let resource = strval(arguments, "path")
+            .or_else(|_| strval(arguments, "program"))
+            .unwrap_or_default();
+        for permission in def.required_permissions {
+            let covers = grants.iter().any(|grant| {
+                grant.permission == *permission
+                    && !crate::services::authorization::grant_is_expired(grant)
+                    && match &grant.scope {
+                        // Unscoped grants cover any resource.
+                        None => true,
+                        Some(scope) => {
+                            if resource.is_empty() {
+                                // Tool has no resource argument to scope
+                                // against — only an unscoped grant applies.
+                                false
+                            } else {
+                                crate::services::authorization::scope_covers(scope, &resource)
+                            }
+                        }
+                    }
+            });
+            if !covers {
+                audit_deny("agent_capability_denied", name, permission.as_str());
+                return Err(DispatchError::new(
+                    CAPABILITY_DENIED_CODE,
+                    format!(
+                        "agent {} is not authorized for tool {name}: missing capability {}",
+                        caller.agent_id.as_str(),
+                        permission.as_str()
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     /// The observer-only lifecycle hook registry for this dispatcher.
     ///
     /// Hooks observe events (`initialize` completed, tool calls, resource
@@ -788,7 +902,7 @@ impl McpDispatcher {
     /// hard errors, while *known* JSON-RPC failure modes (e.g. an unknown
     /// method) still return a well-formed error response.
     pub async fn dispatch_strict(&self, input: &str) -> Result<DispatchResult, DispatchError> {
-        self.dispatch_inner(input).await
+        self.dispatch_inner(input, None).await
     }
 
     /// Dispatches a message on behalf of a transport session, enforcing the
@@ -944,7 +1058,9 @@ impl McpDispatcher {
             }
         }
 
-        let result = self.dispatch_inner(input).await?;
+        let result = self
+            .dispatch_inner(input, lifecycle.caller().as_ref())
+            .await?;
         // The initialize exchange completed successfully: flip the session
         // to initialized and record what was negotiated. (A failure
         // response keeps the session uninitialized so the client can retry.)
@@ -994,7 +1110,11 @@ impl McpDispatcher {
         }
     }
 
-    async fn dispatch_inner(&self, input: &str) -> Result<DispatchResult, DispatchError> {
+    async fn dispatch_inner(
+        &self,
+        input: &str,
+        caller: Option<&crate::core::identity::SessionIdentity>,
+    ) -> Result<DispatchResult, DispatchError> {
         let req: RpcRequest = serde_json::from_str(input)
             .map_err(|e| DispatchError::parse(format!("invalid JSON: {e}")))?;
 
@@ -1025,11 +1145,11 @@ impl McpDispatcher {
             // MCP liveness probe: the protocol requires an empty response.
             "ping" => json!({}),
             "tools/list" => self
-                .tools_list_aggregated()
+                .tools_list_aggregated_for(caller)
                 .await
                 .map_err(to_dispatch_error)?,
             "tools/call" => {
-                let outcome = self.call_tool(&req.params).await;
+                let outcome = self.call_tool_for(&req.params, caller).await;
                 let name = req.params.get("name").and_then(Value::as_str);
                 if let Some(name) = name {
                     let ok = outcome.is_ok();
@@ -1139,7 +1259,16 @@ impl McpDispatcher {
         }))
     }
 
-    async fn tools_list_aggregated(&self) -> Result<Value> {
+    /// Builds the aggregated tools catalog, filtered for the caller when
+    /// the session is agent-bound (TW-003). Discovery filtering is a
+    /// *separate* layer from authorization: a tool hidden here — because
+    /// the agent holds no valid, unexpired grant covering its required
+    /// permissions — must still re-authorize before any direct call, which
+    /// [`Self::call_tool_for`] enforces.
+    async fn tools_list_aggregated_for(
+        &self,
+        caller: Option<&crate::core::identity::SessionIdentity>,
+    ) -> Result<Value> {
         let mut base = self
             .tools_list_static()
             .get("tools")
@@ -1194,6 +1323,46 @@ impl McpDispatcher {
                 // provider does not declare it and AWH must not guess.
             }
             base.push(entry);
+        }
+        // TW-003 discovery filter: when the session is bound to an agent,
+        // statically-registered tools the agent has no valid, unexpired
+        // grant for are omitted from the advertisement. Dynamic provider
+        // tools have no declared capability surface here, so they stay
+        // visible — their per-call authorization is enforced separately
+        // (provider-side + SEC-001 trust gate). Discovery filtering is NOT
+        // authorization: hidden tools still re-authorize on direct call.
+        if let Some(caller) = caller {
+            let store =
+                crate::core::capability_grants::CapabilityGrantStore::new(self.project_root());
+            match store.list_for_agent(caller.agent_id.as_str()) {
+                Ok(grants) => {
+                    base.retain(|tool| {
+                        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                            return false;
+                        };
+                        let Some(def) = tool_registry::registry_lookup(name) else {
+                            return true; // dynamic provider tool, filtered per-call
+                        };
+                        def.required_permissions.iter().all(|permission| {
+                            grants.iter().any(|grant| {
+                                grant.permission == *permission
+                                    && !crate::services::authorization::grant_is_expired(grant)
+                            })
+                        })
+                    });
+                }
+                Err(_) => {
+                    // Fail closed at *listing*: an unreadable grant store
+                    // yields an empty static catalog for this caller
+                    // (announce nothing we cannot authorize).
+                    base.retain(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .map(|name| tool_registry::registry_lookup(name).is_none())
+                            .unwrap_or(false)
+                    });
+                }
+            }
         }
         Ok(json!({"tools": base}))
     }
@@ -1425,7 +1594,11 @@ impl McpDispatcher {
         }))
     }
 
-    async fn call_tool(&self, params: &Value) -> Result<Value> {
+    async fn call_tool_for(
+        &self,
+        params: &Value,
+        caller: Option<&crate::core::identity::SessionIdentity>,
+    ) -> Result<Value> {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -1468,6 +1641,16 @@ impl McpDispatcher {
                 ))
                 .into());
             }
+        }
+
+        // TW-003 per-agent capability gate — the route-identity check the
+        // agent-scoped route advertised: the caller's resolved agent is
+        // checked against its grants record for exactly the capability the
+        // tool declares. Unscoped (legacy) sessions skip this and rely on
+        // the SEC-001 workspace trust floor alone; that floor runs in
+        // [`Self::authorize_tool`] regardless of binding.
+        if let Some(caller) = caller {
+            self.authorize_caller_capability(caller, name, &arguments)?;
         }
 
         // Audit every tool invocation by name only. Arguments are deliberately

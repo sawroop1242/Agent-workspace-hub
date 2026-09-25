@@ -6,6 +6,8 @@
 //! closed — if a protection cannot be applied, the operation is rejected.
 
 /// Structured security audit logging.
+pub mod agent_route;
+
 pub mod audit;
 /// Bearer-token authentication for the remote transport.
 pub mod auth;

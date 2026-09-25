@@ -41,6 +41,15 @@ pub struct Session {
     pub endpoint: String,
     /// Per-session MCP initialization lifecycle state.
     pub lifecycle: Arc<SessionLifecycle>,
+    /// The trusted agent/workspace identity this session is pinned to
+    /// (TW-003). `Some` only for sessions created via the agent-scoped
+    /// routes (`/{agent}/sse`); the legacy global `/sse` route leaves this
+    /// `None`, and the dispatcher treats it as a global-caller session
+    /// (existing behavior, no per-agent capability gate). A `Some` value is
+    /// immutable for the life of the session: subsequent messages over the
+    /// route are re-verified against it before the dispatcher sees them, so
+    /// a session created for agent A can never answer agent B's route.
+    pub binding: Option<crate::core::identity::SessionIdentity>,
     /// Broadcast sender for events destined to this session's SSE stream.
     tx: broadcast::Sender<SseEvent>,
 }
@@ -72,6 +81,27 @@ impl SessionRegistry {
 
     /// Creates a new isolated session with a fresh id and channel.
     pub async fn create(&self, endpoint_path: &str) -> Session {
+        self.create_inner(endpoint_path, None).await
+    }
+
+    /// Creates an agent-bound session (TW-003): the returned session is
+    /// pinned to `caller` + the fresh session id, and downstream handlers
+    /// must reject messages whose route context no longer matches the
+    /// binding. The session id is generated first so the stored
+    /// [`SessionIdentity`] names this very session.
+    pub async fn create_with_binding(
+        &self,
+        endpoint_path: &str,
+        caller: &crate::mcp::agent_route::CallerContext,
+    ) -> Session {
+        self.create_inner(endpoint_path, Some(caller)).await
+    }
+
+    async fn create_inner(
+        &self,
+        endpoint_path: &str,
+        caller: Option<&crate::mcp::agent_route::CallerContext>,
+    ) -> Session {
         let id = self.new_session_id();
         // Each session gets its own channel, so no cross-client message leakage.
         let (tx, _) = broadcast::channel(256);
@@ -79,10 +109,24 @@ impl SessionRegistry {
         let lifecycle = Arc::new(SessionLifecycle::default());
         lifecycle.set_session_id(id.clone());
         lifecycle.set_transport("sse");
+        // The just-generated random session id passes the shared id
+        // invariant by construction (hex chars only); fall back to an
+        // unbound session rather than bind a malformed identity. The
+        // binding is set on both the Session (route-level check before
+        // dispatch) and the lifecycle (dispatch-level capability gate).
+        let binding = caller.and_then(|c| {
+            crate::core::identity::SessionId::new_checked(id.clone())
+                .ok()
+                .map(|sid| c.to_session_identity(sid))
+        });
+        if let Some(binding) = &binding {
+            lifecycle.set_caller(binding.clone());
+        }
         let session = Session {
             id: id.clone(),
             endpoint,
             lifecycle,
+            binding,
             tx,
         };
         self.sessions.lock().await.insert(id, session.clone());
@@ -105,9 +149,15 @@ impl SessionRegistry {
         }
     }
 
-    /// Returns the number of active sessions (used by shutdown and limits).
+    /// Number of live sessions (rate/capacity checks).
     pub async fn len(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+
+    /// Snapshot of all live session ids (diagnostics/tests; order
+    /// unspecified).
+    pub async fn all_ids(&self) -> Vec<String> {
+        self.sessions.lock().await.keys().cloned().collect()
     }
 
     /// Returns whether no active sessions remain.
