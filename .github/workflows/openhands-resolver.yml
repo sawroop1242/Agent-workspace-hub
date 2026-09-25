@@ -86,7 +86,7 @@ jobs:
       - name: Validate OpenCode configuration
         shell: bash
         env:
-          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
         run: |
           set -euo pipefail
 
@@ -107,7 +107,7 @@ jobs:
       - name: Configure OpenCode
         shell: bash
         env:
-          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
         run: |
           set -euo pipefail
 
@@ -118,12 +118,12 @@ jobs:
               "freellmapi": {
                 "package": "@opencode/ai/providers/openai-compatible",
                 "settings": {
-                  "baseURL": "https://freellmapi-production-905c.up.railway.app/v1",
+                  "baseURL": "https://integrate.api.nvidia.com/v1/chat/completions",
                   "apiKey": "{env:FREELLMAPI_API_KEY}"
                 },
                 "models": {
                   "auto": {
-                    "modelID": "auto"
+                    "modelID": "z-ai/glm-5.3"
                   }
                 }
               }
@@ -144,7 +144,7 @@ jobs:
       - name: Smoke test OpenCode provider
         shell: bash
         env:
-          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
         run: |
           set -euo pipefail
 
@@ -205,7 +205,7 @@ jobs:
         id: opencode
         shell: bash
         env:
-          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.AWH_AGENT3_NVIDIA_KEY_1 }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
           ISSUE_BODY: ${{ steps.issue.outputs.body }}
