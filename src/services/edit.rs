@@ -1653,14 +1653,72 @@ fn apply_normalized_operation(
 /// steps 1–8 (and a failed commit in step 9) leaves the target unchanged.
 pub struct EditService {
     files: FilesService,
+    /// The canonical authorization boundary (AWE-011/TW-004). Held by the
+    /// service so the `*_as` entry points enforce the one authoritative
+    /// decision *inside* the mutation boundary — transports stay thin and
+    /// cannot re-decide what this layer denied.
+    authorizer: crate::services::authorization::EditAuthorizer,
 }
 
 impl EditService {
     /// Creates an edit service over one workspace root.
     pub fn new(project_root: impl Into<std::path::PathBuf>) -> Self {
+        let root: std::path::PathBuf = project_root.into();
         Self {
-            files: FilesService::new(project_root),
+            authorizer: crate::services::authorization::EditAuthorizer::new(root.clone()),
+            files: FilesService::new(root),
         }
+    }
+
+    /// Authorizes one action over every concrete affected resource
+    /// (§16 multi-file: all resources are authorized; the first denial
+    /// rejects the whole operation before any mutation). Returns the
+    /// structured [`EditError::AuthorizationDenied`] on Deny.
+    fn authorize_operation(
+        &self,
+        principal: &crate::services::authorization::AuthorizingPrincipal,
+        action: crate::services::authorization::EditAction,
+        resources: impl IntoIterator<Item = String>,
+        transaction_id: Option<String>,
+    ) -> Result<(), EditError> {
+        // Deduplicate deterministically (sorted, no HashMap) so the same
+        // transaction always authorizes the same resource set.
+        let unique: Vec<String> = {
+            let mut seen: Vec<String> = resources.into_iter().collect();
+            seen.sort();
+            seen.dedup();
+            seen
+        };
+        if unique.is_empty() {
+            return Err(EditError::AuthorizationDenied {
+                action: action.tool_name().to_owned(),
+                reason: "operation names no concrete workspace resource".to_owned(),
+                denial: crate::services::authorization::DenialReason::UnsupportedOperation,
+            });
+        }
+        for resource in unique {
+            let decision =
+                self.authorizer
+                    .authorize(&crate::services::authorization::AuthorizationRequest {
+                        action,
+                        principal: principal.clone(),
+                        resource: resource.clone(),
+                        transaction_id: transaction_id.clone(),
+                    });
+            if let crate::services::authorization::AuthorizationDecision::Deny {
+                reason,
+                detail,
+                ..
+            } = decision
+            {
+                return Err(EditError::AuthorizationDenied {
+                    action: action.tool_name().to_owned(),
+                    reason: format!("{detail} (resource {resource})"),
+                    denial: reason,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The canonical filesystem service backing this executor. Later
@@ -1668,6 +1726,134 @@ impl EditService {
     /// the same boundary rather than opening a second one.
     pub fn files(&self) -> &FilesService {
         &self.files
+    }
+
+    // -----------------------------------------------------------------
+    // Authorized entry points (AWE-011/TW-004). The `*_as` variants are
+    // the ONLY mutation path that carries a caller principal: they run
+    // the canonical authorization decision *before* any preflight read
+    // or mutation, so a denial costs zero filesystem work and leaves
+    // every target byte-identical. The plain methods remain the
+    // explicit trusted-operator surface (in-process application services,
+    // CLI, tests) — documented as such; no transport constructs an
+    // operator principal.
+    // -----------------------------------------------------------------
+
+    /// [`Self::replace`] under the canonical authorization boundary.
+    pub fn replace_as(
+        &self,
+        principal: &crate::services::authorization::AuthorizingPrincipal,
+        transaction: EditTransaction,
+    ) -> Result<EditResult, EditError> {
+        let resources = transaction
+            .operations
+            .iter()
+            .flat_map(|op| op.paths())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        self.authorize_operation(
+            principal,
+            crate::services::authorization::EditAction::Replace,
+            resources,
+            Some(transaction.id.to_string()),
+        )?;
+        self.replace(transaction)
+    }
+
+    /// [`Self::insert`] under the canonical authorization boundary.
+    pub fn insert_as(
+        &self,
+        principal: &crate::services::authorization::AuthorizingPrincipal,
+        transaction: EditTransaction,
+    ) -> Result<LineEditResult, EditError> {
+        let resources = transaction
+            .operations
+            .iter()
+            .flat_map(|op| op.paths())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        self.authorize_operation(
+            principal,
+            crate::services::authorization::EditAction::Insert,
+            resources,
+            Some(transaction.id.to_string()),
+        )?;
+        self.insert(transaction)
+    }
+
+    /// [`Self::delete_range`] under the canonical authorization boundary.
+    pub fn delete_range_as(
+        &self,
+        principal: &crate::services::authorization::AuthorizingPrincipal,
+        transaction: EditTransaction,
+    ) -> Result<LineEditResult, EditError> {
+        let resources = transaction
+            .operations
+            .iter()
+            .flat_map(|op| op.paths())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        self.authorize_operation(
+            principal,
+            crate::services::authorization::EditAction::DeleteRange,
+            resources,
+            Some(transaction.id.to_string()),
+        )?;
+        self.delete_range(transaction)
+    }
+
+    /// [`Self::patch`] under the canonical authorization boundary.
+    /// Every affected resource of the whole transaction is authorized
+    /// before the first byte is read for preparation (§16): one
+    /// unauthorized path denies the entire transaction.
+    pub fn patch_as(
+        &self,
+        principal: &crate::services::authorization::AuthorizingPrincipal,
+        transaction: EditTransaction,
+    ) -> Result<PatchResult, EditError> {
+        // Enumerate the concrete resources pre-mutation. ApplyDiff
+        // payloads name their targets in headers — parsing them now
+        // costs no mutation and rejects malformed diffs before any store
+        // is consulted.
+        let mut resources: Vec<String> = Vec::new();
+        for operation in &transaction.operations {
+            match operation {
+                EditOperation::ApplyDiff { diff } => {
+                    for file_diff in parse_unified_diff(diff)? {
+                        resources.push(file_diff.path);
+                    }
+                }
+                other => resources.extend(other.paths().into_iter().map(str::to_owned)),
+            }
+        }
+        self.authorize_operation(
+            principal,
+            crate::services::authorization::EditAction::Patch,
+            resources,
+            Some(transaction.id.to_string()),
+        )?;
+        self.patch(transaction)
+    }
+
+    /// [`Self::rollback_edits`] under the canonical authorization
+    /// boundary. Rollback is consequential mutation of equal weight
+    /// (§15/§37): every record's target path is authorized under the
+    /// `filesystem.rollback` action, and the edit's transaction id is
+    /// carried for correlation.
+    pub fn rollback_edits_as(
+        &self,
+        principal: &crate::services::authorization::AuthorizingPrincipal,
+        records: &[RollbackRecord],
+    ) -> Result<EditRollbackStatus, EditError> {
+        let resources = records.iter().map(|record| record.path.clone());
+        let transaction_id = records.first().map(|record| record.edit_id.to_string());
+        self.authorize_operation(
+            principal,
+            crate::services::authorization::EditAction::Rollback,
+            resources,
+            transaction_id,
+        )?;
+        self.rollback_edits(records)
     }
 
     /// Execute a multi-operation patch transaction.
@@ -7262,5 +7448,379 @@ mod atomic_write_tests {
             fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
             "previous"
         );
+    }
+}
+
+/// Prompt 07 (AWE-011/TW-004) mutation-boundary tests: the `*_as` entry
+/// points must enforce the canonical authorization decision *before* any
+/// read or mutation — a denial costs zero filesystem work and leaves
+/// every target byte-identical — and an Allow must reach the exact same
+/// executor semantics as the operator surface.
+#[cfg(test)]
+mod edit_authorization_boundary_tests {
+    use crate::services::authorization::{
+        AuthorizingPrincipal, DenialReason, EditAction, EditAuthorizer,
+    };
+    use crate::services::edit::{EditOperation, EditService, EditTransaction};
+    use chrono::Utc;
+    use std::fs;
+
+    fn setup() -> (tempfile::TempDir, EditService, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::services::init::initialize_workspace(tmp.path()).unwrap();
+        let workspace_id = crate::services::init::load_workspace_manifest(tmp.path())
+            .unwrap()
+            .workspace_id
+            .as_str()
+            .to_owned();
+        let svc = EditService::new(tmp.path().to_path_buf());
+        (tmp, svc, workspace_id)
+    }
+
+    fn register_agent(root: &std::path::Path, id: &str) {
+        crate::core::agents::AgentStore::new(root)
+            .create(&crate::models::Agent {
+                id: id.into(),
+                name: id.into(),
+                role: "test".into(),
+                status: crate::models::AgentStatus::Active,
+                enabled: true,
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+    }
+
+    fn grant_file(
+        root: &std::path::Path,
+        id: &str,
+        agent: &str,
+        scope: Option<&str>,
+        expires: Option<&str>,
+    ) {
+        let dir = root.join(".agent").join("capabilities");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&crate::models::CapabilityGrant {
+                id: id.into(),
+                agent_id: agent.into(),
+                permission: crate::mcp::permissions::Permission::Filesystem,
+                scope: scope.map(str::to_string),
+                granted_at: Utc::now().to_rfc3339(),
+                expires_at: expires.map(str::to_string),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn agent_principal(agent: &str, workspace_id: &str) -> AuthorizingPrincipal {
+        AuthorizingPrincipal::agent(agent, "session-1", workspace_id)
+    }
+
+    fn replace_tx(path: &str, old: &str, new: &str) -> EditTransaction {
+        EditTransaction::single(EditOperation::Replace {
+            path: path.into(),
+            old: old.into(),
+            new: new.into(),
+            occurrence: None,
+        })
+    }
+
+    fn write_file(tmp: &tempfile::TempDir, name: &str, content: &str) {
+        let path = tmp.path().join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn read_file(tmp: &tempfile::TempDir, name: &str) -> String {
+        fs::read_to_string(tmp.path().join(name)).unwrap()
+    }
+
+    fn assert_authorization_denied(error: crate::services::edit::EditError, reason: DenialReason) {
+        assert!(
+            matches!(
+                error,
+                crate::services::edit::EditError::AuthorizationDenied { denial, .. } if denial == reason
+            ),
+            "expected AuthorizationDenied({reason:?})",
+        );
+    }
+
+    /// §26: denial for replace leaves the target bytes unchanged, at
+    /// every denial reason — no grant, then an out-of-scope grant.
+    #[test]
+    fn denied_replace_leaves_target_unchanged() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "a.txt", "alpha\n");
+        register_agent(tmp.path(), "agent-a");
+
+        let err = svc
+            .replace_as(
+                &agent_principal("agent-a", &ws),
+                replace_tx("a.txt", "alpha", "ALPHA"),
+            )
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::MissingCapability);
+        assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+
+        grant_file(tmp.path(), "g1", "agent-a", Some("src"), None);
+        let err = svc
+            .replace_as(
+                &agent_principal("agent-a", &ws),
+                replace_tx("a.txt", "alpha", "ALPHA"),
+            )
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::MissingCapability);
+        assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+    }
+
+    /// §26: insert and delete_range denials (expired grant) leave the
+    /// target unchanged.
+    #[test]
+    fn denied_insert_and_delete_range_leave_targets_unchanged() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "f.txt", "one\ntwo\n");
+        register_agent(tmp.path(), "agent-a");
+        let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        grant_file(tmp.path(), "g1", "agent-a", None, Some(&past));
+
+        let insert_tx = EditTransaction::single(EditOperation::Insert {
+            path: "f.txt".into(),
+            line: 1,
+            content: "x".into(),
+        });
+        let err = svc
+            .insert_as(&agent_principal("agent-a", &ws), insert_tx)
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::ExpiredGrant);
+
+        let delete_tx = EditTransaction::single(EditOperation::DeleteRange {
+            path: "f.txt".into(),
+            start_line: 1,
+            end_line: 1,
+        });
+        let err = svc
+            .delete_range_as(&agent_principal("agent-a", &ws), delete_tx)
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::ExpiredGrant);
+        assert_eq!(read_file(&tmp, "f.txt"), "one\ntwo\n");
+    }
+
+    /// §16 multi-file: one out-of-scope path denies the WHOLE transaction
+    /// before any file is read or mutated — authorized files are not
+    /// partially committed.
+    #[test]
+    fn patch_as_denies_whole_transaction_when_one_resource_is_out_of_scope() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "a.txt", "alpha\n");
+        write_file(&tmp, "b.txt", "beta\n");
+        register_agent(tmp.path(), "agent-a");
+        grant_file(tmp.path(), "g1", "agent-a", Some("a.txt"), None);
+
+        let tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "a.txt".into(),
+                old: "alpha".into(),
+                new: "ALPHA".into(),
+                occurrence: None,
+            },
+            EditOperation::Replace {
+                path: "b.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            },
+        ]);
+        let err = svc
+            .patch_as(&agent_principal("agent-a", &ws), tx)
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::MissingCapability);
+        // BOTH files unchanged — including the authorized one.
+        assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+        assert_eq!(read_file(&tmp, "b.txt"), "beta\n");
+    }
+
+    /// §15/§37: rollback denial restores nothing.
+    #[test]
+    fn denied_rollback_restores_nothing() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "f.txt", "original\n");
+        register_agent(tmp.path(), "agent-a");
+
+        let edit_id = crate::services::edit::EditId::new();
+        let mut records = svc
+            .capture_rollback_records(&edit_id, &["f.txt".to_owned()])
+            .unwrap();
+        let result = svc
+            .replace(replace_tx("f.txt", "original", "edited"))
+            .unwrap();
+        records[0].after_hash = result.after.hash.clone();
+
+        let err = svc
+            .rollback_edits_as(&agent_principal("agent-a", &ws), &records)
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::MissingCapability);
+        assert_eq!(read_file(&tmp, "f.txt"), "edited\n");
+    }
+
+    /// §17 parity: for the same trusted caller, action, and resource, the
+    /// service-boundary decision equals the standalone authorizer's
+    /// decision. The service cannot reinterpret what the boundary
+    /// decided.
+    #[test]
+    fn service_boundary_decision_matches_the_canonical_authorizer() {
+        let (tmp, _svc, ws) = setup();
+        write_file(&tmp, "docs/x.md", "content\n");
+        register_agent(tmp.path(), "agent-a");
+        grant_file(tmp.path(), "g1", "agent-a", Some("docs"), None);
+
+        let authorizer = EditAuthorizer::new(tmp.path().to_path_buf());
+        for action in [
+            EditAction::Replace,
+            EditAction::Insert,
+            EditAction::DeleteRange,
+            EditAction::Patch,
+            EditAction::ApplyDiff,
+            EditAction::Rollback,
+        ] {
+            let allowed = crate::services::authorization::AuthorizationRequest {
+                action,
+                principal: agent_principal("agent-a", &ws),
+                resource: "docs/x.md".into(),
+                transaction_id: None,
+            };
+            assert!(
+                authorizer.authorize(&allowed).is_allowed(),
+                "{action:?} in-scope must allow"
+            );
+            let denied = crate::services::authorization::AuthorizationRequest {
+                action,
+                principal: agent_principal("agent-a", &ws),
+                resource: "outside/x.md".into(),
+                transaction_id: None,
+            };
+            match authorizer.authorize(&denied) {
+                crate::services::authorization::AuthorizationDecision::Deny { reason, .. } => {
+                    assert_eq!(reason, DenialReason::MissingCapability);
+                }
+                other => panic!("expected Deny for {action:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// §26 allow path: an authorized agent's mutation commits with the
+    /// exact operator-surface executor semantics (byte-exact, verified).
+    #[test]
+    fn authorized_agent_edit_commits_with_operator_equivalent_semantics() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "src/main.rs", "fn main() {}\n");
+        register_agent(tmp.path(), "agent-a");
+        grant_file(tmp.path(), "g1", "agent-a", Some("src"), None);
+
+        svc.replace_as(
+            &agent_principal("agent-a", &ws),
+            replace_tx("src/main.rs", "fn main() {}", "fn main() { edited(); }"),
+        )
+        .unwrap();
+        assert_eq!(read_file(&tmp, "src/main.rs"), "fn main() { edited(); }\n");
+    }
+
+    /// §37: an authorized rollback performs the actual restore — the
+    /// boundary must not block legitimate recovery.
+    #[test]
+    fn authorized_rollback_restores() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "f.txt", "original\n");
+        register_agent(tmp.path(), "agent-a");
+        grant_file(tmp.path(), "g1", "agent-a", None, None);
+
+        let edit_id = crate::services::edit::EditId::new();
+        let mut records = svc
+            .capture_rollback_records(&edit_id, &["f.txt".to_owned()])
+            .unwrap();
+        let result = svc
+            .replace(replace_tx("f.txt", "original", "edited"))
+            .unwrap();
+        records[0].after_hash = result.after.hash.clone();
+
+        let status = svc
+            .rollback_edits_as(&agent_principal("agent-a", &ws), &records)
+            .unwrap();
+        assert_eq!(status, crate::services::edit::EditRollbackStatus::Restored);
+        assert_eq!(read_file(&tmp, "f.txt"), "original\n");
+    }
+
+    /// §28/§31: the explicit Operator principal is the in-process
+    /// trusted surface and is policy-authorized.
+    #[test]
+    fn operator_principal_authorizes_like_the_plain_surface() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "f.txt", "v1\n");
+        svc.replace_as(
+            &AuthorizingPrincipal::operator(&ws),
+            replace_tx("f.txt", "v1", "v2"),
+        )
+        .expect("operator context is policy-authorized");
+        assert_eq!(read_file(&tmp, "f.txt"), "v2\n");
+    }
+
+    /// §16: an ApplyDiff payload's targets are authorized from the diff
+    /// headers pre-mutation; a diff naming an out-of-scope file denies
+    /// before any hunk is applied.
+    #[test]
+    fn patch_as_authorizes_apply_diff_targets_from_headers() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "a.txt", "x\n");
+        write_file(&tmp, "secret.txt", "s\n");
+        register_agent(tmp.path(), "agent-a");
+        grant_file(tmp.path(), "g1", "agent-a", Some("a.txt"), None);
+
+        let diff = concat!(
+            "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+X\n",
+            "--- a/secret.txt\n+++ b/secret.txt\n@@ -1 +1 @@\n-s\n+S\n"
+        );
+        let tx = EditTransaction::single(EditOperation::ApplyDiff { diff: diff.into() });
+        let err = svc
+            .patch_as(&agent_principal("agent-a", &ws), tx)
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::MissingCapability);
+        assert_eq!(read_file(&tmp, "a.txt"), "x\n");
+        assert_eq!(read_file(&tmp, "secret.txt"), "s\n");
+    }
+
+    /// §29: a policy deny hidden behind a valid capability is still
+    /// denied — policy precedence survives the service choke point.
+    #[test]
+    fn policy_deny_overrides_valid_capability_at_the_service_boundary() {
+        let (tmp, svc, ws) = setup();
+        write_file(&tmp, "src/secrets.rs", "key = \"...\"\n");
+        register_agent(tmp.path(), "agent-a");
+        grant_file(tmp.path(), "g1", "agent-a", Some("src"), None);
+        let dir = tmp.path().join(".agent");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("policy.json"),
+            serde_json::to_string_pretty(&[serde_json::json!({
+                "id": "deny-secrets",
+                "tool": "filesystem.replace",
+                "pattern": "src/secrets.rs",
+                "reason": null,
+                "created_at": "2026-01-01T00:00:00Z"
+            })])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = svc
+            .replace_as(
+                &agent_principal("agent-a", &ws),
+                replace_tx("src/secrets.rs", "key", "leaked"),
+            )
+            .unwrap_err();
+        assert_authorization_denied(err, DenialReason::PolicyDenied);
+        assert_eq!(read_file(&tmp, "src/secrets.rs"), "key = \"...\"\n");
     }
 }
