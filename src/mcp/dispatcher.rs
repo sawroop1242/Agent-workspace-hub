@@ -1653,6 +1653,21 @@ impl McpDispatcher {
             self.authorize_caller_capability(caller, name, &arguments)?;
         }
 
+        // AWE-011/TW-004: an agent-scoped session (bound caller from the
+        // trusted route/session resolution) also crosses the canonical
+        // EditAuthorizer boundary inside EditService via the `*_as` entry
+        // points — the same decision semantics at the service choke point,
+        // so a transport can never re-decide what the boundary denied.
+        // Sessions without an agent binding keep the established
+        // global-route contract (workspace trust/policy gates only).
+        let edit_principal = caller.map(|identity| {
+            crate::services::authorization::AuthorizingPrincipal::agent(
+                identity.agent_id.as_str(),
+                identity.session_id.as_str(),
+                identity.workspace_id.as_str(),
+            )
+        });
+
         // Audit every tool invocation by name only. Arguments are deliberately
         // never logged: they may contain file contents or secret material.
         audit_allow("tool_invoke", name, "tools/call");
@@ -1768,6 +1783,7 @@ impl McpDispatcher {
                 json!({"deleted": self.workspace.delete_file(&path)?})
             }
             // ---- filesystem.* editing tools (AWE-009) ----
+            // edit_principal is computed above (AWE-011/TW-004 wiring).
             "filesystem.replace" => {
                 self.authorize_tool("filesystem.replace", &arguments)?;
                 let path = strval(&arguments, "path")?;
@@ -1783,7 +1799,12 @@ impl McpDispatcher {
                         .and_then(Value::as_u64)
                         .map(|n| n as usize),
                 });
-                serde_json::to_value(self.edit_service.replace(tx)?)?
+                match &edit_principal {
+                    Some(principal) => {
+                        serde_json::to_value(self.edit_service.replace_as(principal, tx)?)?
+                    }
+                    None => serde_json::to_value(self.edit_service.replace(tx)?)?,
+                }
             }
             "filesystem.insert" => {
                 self.authorize_tool("filesystem.insert", &arguments)?;
@@ -1800,7 +1821,12 @@ impl McpDispatcher {
                     line,
                     content,
                 });
-                serde_json::to_value(self.edit_service.insert(tx)?)?
+                match &edit_principal {
+                    Some(principal) => {
+                        serde_json::to_value(self.edit_service.insert_as(principal, tx)?)?
+                    }
+                    None => serde_json::to_value(self.edit_service.insert(tx)?)?,
+                }
             }
             "filesystem.delete_range" => {
                 self.authorize_tool("filesystem.delete_range", &arguments)?;
@@ -1822,14 +1848,24 @@ impl McpDispatcher {
                     start_line,
                     end_line,
                 });
-                serde_json::to_value(self.edit_service.delete_range(tx)?)?
+                match &edit_principal {
+                    Some(principal) => {
+                        serde_json::to_value(self.edit_service.delete_range_as(principal, tx)?)?
+                    }
+                    None => serde_json::to_value(self.edit_service.delete_range(tx)?)?,
+                }
             }
             "filesystem.apply_diff" => {
                 self.authorize_tool("filesystem.apply_diff", &arguments)?;
                 let diff = strval(&arguments, "diff")?;
                 audit_allow("workspace_edit", "apply_diff", "");
                 let tx = EditTransaction::single(EditOperation::ApplyDiff { diff });
-                serde_json::to_value(self.edit_service.patch(tx)?)?
+                match &edit_principal {
+                    Some(principal) => {
+                        serde_json::to_value(self.edit_service.patch_as(principal, tx)?)?
+                    }
+                    None => serde_json::to_value(self.edit_service.patch(tx)?)?,
+                }
             }
             "filesystem.patch" => {
                 self.authorize_tool("filesystem.patch", &arguments)?;
@@ -1887,7 +1923,12 @@ impl McpDispatcher {
                 }
                 audit_allow("workspace_edit", "patch", "");
                 let tx = EditTransaction::new(ops);
-                serde_json::to_value(self.edit_service.patch(tx)?)?
+                match &edit_principal {
+                    Some(principal) => {
+                        serde_json::to_value(self.edit_service.patch_as(principal, tx)?)?
+                    }
+                    None => serde_json::to_value(self.edit_service.patch(tx)?)?,
+                }
             }
             "memory.store" => {
                 self.authorize_tool("memory.store", &arguments)?;
