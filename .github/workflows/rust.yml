@@ -82,9 +82,11 @@ jobs:
       # profile below routes the actual request to FreeLLMAPI.
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
-        env:
-          FREELLMAPI_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
         with:
-          openai_api_key: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1}}
-          model: "custom:nvidia-deepseek-ai/deepseek-v4.1-flash"
+          model: "deepseek-ai/deepseek-v4.1-flash"   # or whichever model you’re using
           prompt: ${{ env.CUSTOM_PROMPT }}
+
+        env:
+          JUNIE_API_KEY:  ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          JUNIE_BASE_URL: "https://integrate.api.nvidia.com/v1/chat/completions"
+       
