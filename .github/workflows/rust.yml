@@ -82,17 +82,16 @@ jobs:
           echo "" >> $GITHUB_ENV
           echo "$EOF" >> $GITHUB_ENV
 
-      # Junie's prepare step requires a supported BYOK input. The OpenAI BYOK
-      # slot is used only to satisfy that action-level requirement; the custom
-      # profile below routes the actual request to FreeLLMAPI.
+      # The NVIDIA NIM profile lives at .junie/models/freellmapi-auto.json
+      # ("custom:<filename-without-.json>"). That profile's apiKey field
+      # references ${AWH_AGENT2_NVIDIA_KEY_1}, so that exact env var name
+      # must be set here for Junie to resolve it.
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
         with:
-          model: "deepseek-ai/deepseek-v4.1-flash"   # or whichever model you’re using
+          model: "custom:freellmapi-auto"
           prompt: ${{ env.CUSTOM_PROMPT }}
           pr_number: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
 
         env:
-          openai_api_key:  ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-          openai_base_url: "https://integrate.api.nvidia.com/v1/chat/completions"
-       
+          AWH_AGENT2_NVIDIA_KEY_1: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
