@@ -1,8 +1,8 @@
 {
-  "id": "auto",
+  "id": "deepseek-ai/deepseek-v4.1-flash",
   "displayName": "FreeLLMAPI Auto Router",
-  "providerName": "FreeLLMAPI",
-  "baseUrl": "https://freellmapi-production-905c.up.railway.app/v1/chat/completions",
+  "providerName": "nvidia",
+  "baseUrl": "https://integrate.api.nvidia.com/v1/chat/completions",
   "apiType": "OpenAICompletion",
-  "apiKey": "${FREELLMAPI_API_KEY}"
+  "apiKey": "${AWH_AGENT2_NVIDIA_KEY_1}"
 }
