@@ -83,8 +83,8 @@ jobs:
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
         env:
-          FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
+          FREELLMAPI_API_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
         with:
-          openai_api_key: ${{ secrets.FREELLMAPI_API_KEY }}
+          openai_api_key: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1}}
           model: "custom:nvidia-deepseek-ai/deepseek-v4.1-flash"
           prompt: ${{ env.CUSTOM_PROMPT }}
