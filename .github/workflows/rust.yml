@@ -88,10 +88,14 @@ jobs:
       # must be set here for Junie to resolve it.
       - name: Run Junie Code Review
         uses: JetBrains/junie-github-action@v1.7.11
+        env:
+          AWH_AGENT2_NVIDIA_KEY_1: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+
         with:
           model: "custom:freellmapi-auto"
+          openai_api_key: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
           prompt: ${{ env.CUSTOM_PROMPT }}
           pr_number: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
 
-        env:
-          AWH_AGENT2_NVIDIA_KEY_1: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+       
+      
