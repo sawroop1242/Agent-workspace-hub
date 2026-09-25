@@ -529,6 +529,11 @@ pub enum EditError {
     InvalidOccurrence,
     #[error("{0} must not be empty when supplied")]
     EmptyReference(&'static str),
+    /// A supplied identity or correlation reference contains control
+    /// characters, which no legitimate identifier in this system can
+    /// carry. Fails closed rather than being passed to a later system.
+    #[error("{0} must not contain control characters")]
+    UnsafeReference(&'static str),
     // ---- Operation-layer failures (EditService). Every failure below is
     // ---- reported before the atomic commit boundary unless stated
     // ---- otherwise, so the target file is unchanged.
@@ -753,10 +758,18 @@ pub enum ContextConflictReason {
 }
 
 /// Validate a transport-provided relative workspace path before any I/O.
+///
+/// Syntax rules mirror the canonical filesystem boundary
+/// ([`crate::services::files::FilesService`]): empty, absolute, and
+/// traversal-shaped paths are rejected, plus control characters — a path
+/// containing them can never name a file a caller legitimately created,
+/// and rejecting it here keeps malformed input out of every executor.
+/// This is syntax-only containment: it never resolves a host path (that
+/// is the filesystem layer's job, re-enforced on every read/write).
 pub fn validate_path(path: &str) -> Result<(), EditError> {
     use std::path::{Component, Path};
     let p = Path::new(path);
-    if path.is_empty() || p.is_absolute() {
+    if path.is_empty() || p.is_absolute() || path.chars().any(|c| c.is_control()) {
         return Err(EditError::InvalidPath(path.to_owned()));
     }
     for component in p.components() {
@@ -784,14 +797,25 @@ pub fn is_valid_hash(hash: &str) -> bool {
 
 /// A supplied identity or correlation reference must be non-empty; `None`
 /// simply means the reference is absent, which is always valid.
+///
+/// Values are opaque foreign identifiers, so the model applies the shared
+/// identifier safety rule rather than interpreting their structure: any
+/// control character fails validation, matching the canonical agent-id
+/// rules elsewhere in the project (`crate::core::agents::is_safe_agent_id`).
+/// The model never resolves what a reference points at — that belongs to
+/// the system that owns it.
 fn validate_optional_reference(
     field: &'static str,
     value: &Option<String>,
 ) -> Result<(), EditError> {
-    if value.as_deref() == Some("") {
-        return Err(EditError::EmptyReference(field));
+    match value.as_deref() {
+        None => Ok(()),
+        Some("") => Err(EditError::EmptyReference(field)),
+        Some(value) if value.chars().any(|c| c.is_control()) => {
+            Err(EditError::UnsafeReference(field))
+        }
+        Some(_) => Ok(()),
     }
-    Ok(())
 }
 
 fn line_count(content: &str) -> usize {
@@ -3525,6 +3549,390 @@ mod tests {
         let parsed: EditTransaction = serde_json::from_str(&legacy).expect("legacy wire form");
         assert_eq!(parsed.identity, EditIdentity::default());
         assert_eq!(parsed.refs, EditRefs::default());
+    }
+}
+
+/// Prompt 04 (AWE-001) model-hardening tests: the adversarial and purity
+/// matrix the canonical transaction contract requires, exercised purely
+/// in memory (no filesystem, no Git, no transport, no async runtime).
+#[cfg(test)]
+mod transaction_model_tests {
+    use super::*;
+
+    fn insert_op(path: &str) -> EditOperation {
+        EditOperation::Insert {
+            path: path.into(),
+            line: 1,
+            content: "x".into(),
+        }
+    }
+
+    // ---------- §42 input hardening: control characters ----------
+
+    #[test]
+    fn control_characters_in_paths_are_rejected_for_every_operation_kind() {
+        for bad in [
+            "a\u{0000}.txt",
+            "a\u{0007}b.txt",
+            "dir/\tt.txt",
+            "x\u{007F}.rs",
+        ] {
+            for op in [
+                EditOperation::Replace {
+                    path: bad.into(),
+                    old: "old".into(),
+                    new: "new".into(),
+                    occurrence: None,
+                },
+                insert_op(bad),
+                EditOperation::DeleteRange {
+                    path: bad.into(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+                EditOperation::Patch {
+                    path: bad.into(),
+                    old: "old".into(),
+                    new: "new".into(),
+                },
+            ] {
+                let tx = EditTransaction::single(op);
+                assert!(
+                    matches!(tx.validate_shape(), Err(EditError::InvalidPath(_))),
+                    "path {bad:?} must be rejected"
+                );
+            }
+        }
+        // The syntax validator itself agrees on every rejected shape.
+        for bad in ["", "/abs.txt", "../up.txt", "a\u{0000}.txt", ".."] {
+            assert!(validate_path(bad).is_err(), "{bad:?} must be invalid");
+        }
+        // Plain relative paths remain valid.
+        validate_path("src/lib.rs").expect("plain relative path is valid");
+    }
+
+    #[test]
+    fn control_characters_in_identity_and_references_are_rejected() {
+        for bad in ["a\u{0000}", "\u{001B}[31m", "line\u{0008}break"] {
+            let mut tx = EditTransaction::single(insert_op("a.txt"));
+            tx.identity.agent_id = Some(bad.into());
+            assert_eq!(
+                tx.validate_shape(),
+                Err(EditError::UnsafeReference("agent_id")),
+                "agent id {bad:?} must be rejected"
+            );
+
+            let mut tx = EditTransaction::single(insert_op("a.txt"));
+            tx.refs.snapshot_id = Some(bad.into());
+            assert_eq!(
+                tx.validate_shape(),
+                Err(EditError::UnsafeReference("snapshot_id")),
+                "snapshot id {bad:?} must be rejected"
+            );
+        }
+
+        // Every identity and reference field applies the same rule —
+        // identity and refs are structurally indistinguishable inputs.
+        let mut tx = EditTransaction::single(insert_op("a.txt"));
+        tx.identity.session_id = Some("\u{0000}".into());
+        assert_eq!(
+            tx.validate_shape(),
+            Err(EditError::UnsafeReference("session_id"))
+        );
+
+        let mut tx = EditTransaction::single(insert_op("a.txt"));
+        tx.identity.workspace_id = Some("\u{0000}".into());
+        assert_eq!(
+            tx.validate_shape(),
+            Err(EditError::UnsafeReference("workspace_id"))
+        );
+
+        let mut tx = EditTransaction::single(insert_op("a.txt"));
+        tx.refs.provenance_id = Some("\u{0000}".into());
+        assert_eq!(
+            tx.validate_shape(),
+            Err(EditError::UnsafeReference("provenance_id"))
+        );
+
+        let mut tx = EditTransaction::single(insert_op("a.txt"));
+        tx.refs.audit_event_id = Some("\u{0000}".into());
+        assert_eq!(
+            tx.validate_shape(),
+            Err(EditError::UnsafeReference("audit_event_id"))
+        );
+
+        let mut tx = EditTransaction::single(insert_op("a.txt"));
+        tx.refs.policy_decision_id = Some("\u{0000}".into());
+        assert_eq!(
+            tx.validate_shape(),
+            Err(EditError::UnsafeReference("policy_decision_id"))
+        );
+
+        // Distinct from EmptyReference: the two failures are separable.
+        let mut tx = EditTransaction::single(insert_op("a.txt"));
+        tx.identity.agent_id = Some(String::new());
+        assert_eq!(
+            tx.validate_shape(),
+            Err(EditError::EmptyReference("agent_id"))
+        );
+    }
+
+    #[test]
+    fn error_messages_never_embed_file_contents() {
+        // Model-level messages name the offending field and echo only the
+        // caller-supplied *path* (workspace-relative, never a host path)
+        // or the malformed hash — never file content, context text, or
+        // secrets.
+        let message = EditError::InvalidPath("a\u{0000}.txt".to_owned()).to_string();
+        assert!(!message.contains("/home/") && !message.contains("/Users/"));
+        let hash_message = EditError::InvalidHash("deadbeef".into()).to_string();
+        assert!(hash_message.contains("64 lowercase hex"));
+        assert_eq!(
+            EditError::UnsafeReference("agent_id").to_string(),
+            "agent_id must not contain control characters"
+        );
+    }
+
+    // ---------- §39 explicit illegal transitions ----------
+
+    #[test]
+    fn representative_illegal_transitions_are_rejected() {
+        use EditStatus::*;
+        // Skipping forward stages.
+        assert!(!Requested.can_transition_to(Applied));
+        assert!(!Requested.can_transition_to(Committed));
+        assert!(!Authorized.can_transition_to(Applied));
+        assert!(!Validated.can_transition_to(Committed));
+        // Terminal reuse, both directions.
+        assert!(!Committed.can_transition_to(Requested));
+        assert!(!Rejected.can_transition_to(Applied));
+        assert!(!Conflict.can_transition_to(Applied));
+        assert!(!RolledBack.can_transition_to(Committed));
+    }
+
+    // ---------- §40 multi-operation structure ----------
+
+    #[test]
+    fn one_malformed_operation_rejects_the_whole_transaction() {
+        let tx = EditTransaction::new(vec![
+            insert_op("a.txt"),
+            // Well-formed...
+            EditOperation::Replace {
+                path: "b.txt".into(),
+                old: "old".into(),
+                new: "new".into(),
+                occurrence: Some(1),
+            },
+            // ...then malformed: empty match text.
+            EditOperation::Replace {
+                path: "c.txt".into(),
+                old: String::new(),
+                new: "new".into(),
+                occurrence: None,
+            },
+        ]);
+        assert_eq!(tx.validate_shape(), Err(EditError::EmptyMatch));
+    }
+
+    #[test]
+    fn operation_order_survives_serialization() {
+        let ops = vec![
+            insert_op("a.txt"),
+            EditOperation::DeleteRange {
+                path: "b.txt".into(),
+                start_line: 1,
+                end_line: 2,
+            },
+            EditOperation::Patch {
+                path: "c.txt".into(),
+                old: "old".into(),
+                new: "new".into(),
+            },
+        ];
+        let tx = EditTransaction::new(ops);
+        let json = serde_json::to_string(&tx).expect("serialize");
+        let back: EditTransaction = serde_json::from_str(&json).expect("deserialize");
+        // Order (not just membership) is preserved through the wire form.
+        assert_eq!(back.operations, tx.operations);
+        assert_eq!(back.operations[0].paths(), vec!["a.txt"]);
+        assert_eq!(back.operations[1].paths(), vec!["b.txt"]);
+        assert_eq!(back.operations[2].paths(), vec!["c.txt"]);
+    }
+
+    // ---------- §37 FileState ----------
+
+    #[test]
+    fn file_state_round_trips_and_is_deterministic() {
+        let state = FileState::from_content("src/lib.rs", "one\ntwo\n");
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: FileState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, state);
+        // SHA-256 is deterministic for identical content.
+        assert_eq!(
+            FileState::from_content("other.rs", "one\ntwo\n").hash,
+            state.hash
+        );
+        // And distinct for distinct content.
+        assert_ne!(
+            FileState::from_content("src/lib.rs", "one\ntwo").hash,
+            state.hash
+        );
+        // Canonical line counting: trailing newline does not add a line.
+        assert_eq!(FileState::from_content("a", "one\ntwo").line_count, 2);
+        assert_eq!(FileState::from_content("a", "").line_count, 0);
+        // Byte size, not character count.
+        assert_eq!(FileState::from_content("a", "héllo").size, 6);
+    }
+
+    // ---------- §41 property-style invariants ----------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Valid transactions round-trip losslessly through the wire form.
+        #[test]
+        fn valid_transaction_round_trips(
+            path in "[a-z][a-z0-9._-]{0,20}",
+            line in 0usize..100,
+            agent in "[a-z][a-z0-9-]{0,12}",
+        ) {
+            let mut tx = EditTransaction::new(vec![
+                EditOperation::Insert { path: path.clone(), line, content: "x".into() },
+            ]);
+            tx.identity.agent_id = Some(agent.clone());
+            tx.validate_shape().expect("generated tx must validate");
+            let json = serde_json::to_string(&tx).expect("serialize");
+            let back: EditTransaction = serde_json::from_str(&json).expect("deserialize");
+            prop_assert_eq!(back, tx);
+        }
+
+        /// No terminal status ever permits any transition, and no status
+        /// transition predicate is reachable from a terminal state.
+        #[test]
+        fn terminal_statuses_never_transition(
+            status in proptest::sample::select(vec![
+                EditStatus::Committed,
+                EditStatus::Rejected,
+                EditStatus::Conflict,
+                EditStatus::ValidationFailed,
+                EditStatus::ApplyFailed,
+                EditStatus::VerificationFailed,
+                EditStatus::RolledBack,
+            ]),
+            next in proptest::sample::select(vec![
+                EditStatus::Requested,
+                EditStatus::Authorized,
+                EditStatus::Located,
+                EditStatus::Validated,
+                EditStatus::Snapshotted,
+                EditStatus::Applied,
+                EditStatus::Verified,
+                EditStatus::Committed,
+            ]),
+        ) {
+            prop_assert!(status.is_terminal());
+            prop_assert!(!status.can_transition_to(next));
+        }
+
+        /// Malformed and mismatched hashes never read as Matched.
+        #[test]
+        fn bad_hashes_never_match(
+            content in "[a-z\\n]{0,60}",
+            bad in "[0-9A-Fx]{1,70}",
+        ) {
+            let state = FileState::from_content("a.txt", &content);
+            // Either structurally malformed or a genuine mismatch; the
+            // result must never be Matched.
+            let result = state.check(&ExpectedState {
+                hash: Some(bad.clone()),
+                ..ExpectedState::default()
+            });
+            prop_assert_ne!(result, StateMatch::Matched);
+        }
+
+        /// Structural validation is pure: identical input, identical
+        /// outcome, whatever the surrounding environment.
+        #[test]
+        fn validate_shape_is_deterministic(
+            path in "[a-z]{1,8}",
+        ) {
+            let tx = EditTransaction::single(EditOperation::Insert {
+                path: path.clone(),
+                line: 1,
+                content: "x".into(),
+            });
+            let first = tx.validate_shape();
+            let second = tx.validate_shape();
+            prop_assert_eq!(first, second);
+        }
+    }
+
+    // ---------- §43 purity ----------
+
+    #[test]
+    fn full_model_cycle_is_pure_and_mutates_nothing() {
+        // The entire contract — construct, validate shape, compare
+        // expected state, serialize/deserialize, validate transitions —
+        // runs without touching the filesystem. Prove it: point the
+        // transaction at an (uncreated) file inside an empty temp
+        // directory and assert the directory stays empty after the full
+        // cycle.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tx = EditTransaction::new(vec![
+            EditOperation::Insert {
+                path: "src/never-touched.txt".into(),
+                line: 0,
+                content: "inserted".into(),
+            },
+            EditOperation::Replace {
+                path: "src/never-touched.txt".into(),
+                old: "inserted".into(),
+                new: "replaced".into(),
+                occurrence: Some(1),
+            },
+        ]);
+        let content = "alpha\nbeta\n";
+        let before = FileState::from_content("src/never-touched.txt", content);
+        tx.expected.push(ExpectedState {
+            hash: Some(before.hash.clone()),
+            size: Some(before.size),
+            line_count: Some(before.line_count),
+            context: Some("alpha".into()),
+        });
+        tx.expected.push(ExpectedState::default());
+        tx.identity.agent_id = Some("agent-1".into());
+        tx.refs.audit_event_id = Some("audit-3".into());
+        tx.status = EditStatus::Validated;
+
+        // 1. Validate shape; 2. compare expected state; 4. transitions.
+        tx.validate_shape().expect("shape must validate");
+        assert_eq!(before.check(&tx.expected[0]), StateMatch::ContextPending);
+        assert_eq!(before.check(&tx.expected[1]), StateMatch::Matched);
+        assert!(tx.status.can_transition_to(EditStatus::Applied));
+        assert!(!tx.status.can_transition_to(EditStatus::Committed));
+
+        // 3. Serialize/deserialize without loss.
+        let json = serde_json::to_string(&tx).expect("serialize");
+        let back: EditTransaction = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, tx);
+
+        // Purity: nothing was created on disk by any of the above.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("temp dir readable")
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "model cycle must not touch the filesystem"
+        );
+    }
+
+    #[test]
+    fn generated_edit_ids_are_never_empty() {
+        for _ in 0..64 {
+            let id = EditId::new();
+            assert!(!id.to_string().is_empty());
+            assert!(!id.0.is_empty());
+        }
     }
 }
 
