@@ -93,6 +93,6 @@ jobs:
           pr_number: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
 
         env:
-          JUNIE_API_KEY:  ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-          JUNIE_BASE_URL: "https://integrate.api.nvidia.com/v1/chat/completions"
+          openai_api_key:  ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          openai_base_url: "https://integrate.api.nvidia.com/v1/chat/completions"
        
