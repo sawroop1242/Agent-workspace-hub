@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [rust]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull Request number to run AI review on'
+        required: true
+        type: string
 
 jobs:
   fmt:
@@ -56,7 +61,7 @@ jobs:
   ai-review:
     name: Deep AI Code Review (FreeLLMAPI OpenAI-compatible)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
     needs: [fmt]
     permissions:
       contents: read
@@ -85,6 +90,7 @@ jobs:
         with:
           model: "deepseek-ai/deepseek-v4.1-flash"   # or whichever model you’re using
           prompt: ${{ env.CUSTOM_PROMPT }}
+          pr_number: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
 
         env:
           JUNIE_API_KEY:  ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
