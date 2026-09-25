@@ -86,5 +86,5 @@ jobs:
           FREELLMAPI_API_KEY: ${{ secrets.FREELLMAPI_API_KEY }}
         with:
           openai_api_key: ${{ secrets.FREELLMAPI_API_KEY }}
-          model: "custom:freellmapi-auto"
+          model: "custom:nvidia-deepseek-ai/deepseek-v4.1-flash"
           prompt: ${{ env.CUSTOM_PROMPT }}
