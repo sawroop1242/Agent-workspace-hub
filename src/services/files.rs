@@ -137,25 +137,30 @@ impl FilesService {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("target has no parent directory"))?;
         fs::create_dir_all(parent)
-            .with_context(|| format!("create parent of {}", path.display()))?;
+            .with_context(|| format!("create parent directory of {relative:?}"))?;
         // Same-directory temp file: guarantees the rename stays on one
-        // filesystem, where it is atomic.
-        let mut temp = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("create temp file in {}", parent.display()))?;
+        // filesystem, where it is atomic. The raw tempfile error names
+        // the host temp path; it is replaced with a message that keeps
+        // host paths out of caller-visible errors (§20).
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+            anyhow::Error::msg(format!(
+                "stage temporary file for {relative:?}: {}",
+                sanitize_io_message(&error.to_string())
+            ))
+        })?;
         std::io::Write::write_all(&mut temp, content.as_bytes())
-            .with_context(|| format!("stage {}", path.display()))?;
-        std::io::Write::flush(&mut temp).with_context(|| format!("stage {}", path.display()))?;
+            .with_context(|| format!("stage {relative:?}"))?;
+        std::io::Write::flush(&mut temp).with_context(|| format!("stage {relative:?}"))?;
         temp.as_file()
             .sync_all()
-            .with_context(|| format!("sync {}", path.display()))?;
+            .with_context(|| format!("sync staged content for {relative:?}"))?;
         temp.persist(&path).map_err(|error| {
             // The temp file is returned on failure and dropped here,
-            // removing it; the target is untouched.
-            anyhow::Error::new(error.error).context(format!(
-                "commit {} (staged as {})",
-                path.display(),
-                error.file.path().display()
-            ))
+            // removing it; the target is untouched. The error names only
+            // the workspace-relative logical path — host and temp paths
+            // are deliberately kept out of messages that may reach callers.
+            anyhow::Error::new(error.error)
+                .context(format!("commit {relative:?} (target left unchanged)"))
         })?;
         // Best-effort directory fsync so the rename itself is durable.
         // Not portable to every platform/filesystem; a failure here never
@@ -333,6 +338,18 @@ pub enum PathKind {
 pub struct FileMeta {
     pub kind: PathKind,
     pub size: u64,
+}
+
+/// Strips host-filesystem path fragments from an OS error message so
+/// caller-visible errors never carry host or temp paths (§20): keeps the
+/// error kind/classification (`Permission denied (os error 13)`) and
+/// drops `at path "..."`-style suffixes that name concrete host paths.
+fn sanitize_io_message(message: &str) -> String {
+    if let Some(position) = message.find(" at path ") {
+        message[..position].to_owned()
+    } else {
+        message.to_owned()
+    }
 }
 
 /// Reads the first 8 KiB and declares the file binary when it contains

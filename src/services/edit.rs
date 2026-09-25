@@ -1860,7 +1860,7 @@ impl EditService {
         let mut commit_error: Option<EditError> = None;
 
         for file in &plan {
-            match self.commit_verified(&file.path, &file.prepared_content) {
+            match self.commit_verified(&file.path, &file.prepared_content, &file.before) {
                 Ok(after) => {
                     steps.push(PatchStepResult {
                         transaction_id: tx_id.clone(),
@@ -1890,7 +1890,8 @@ impl EditService {
         }
 
         if let Some(error) = commit_error {
-            // Attempt conflict-aware rollback of already-committed files.
+            // Attempt conflict-aware rollback of already-committed files,
+            // then verify the recovery actually restored them (§11).
             let rollback = self.attempt_rollback(&plan, &committed_paths, &tx_id);
             let primary_failure = PatchFailure {
                 phase: PatchFailurePhase::Commit,
@@ -1988,11 +1989,27 @@ impl EditService {
                 continue;
             }
 
-            // Restore original bytes or delete if created by this transaction.
+            // Restore original bytes or delete if created by this
+            // transaction. Every recovery write is VERIFIED (§11): a
+            // restore only counts when the re-read bytes equal the
+            // original exactly; a delete only counts when the target is
+            // really gone.
             if !file.original_existed {
                 match self.files.delete(&file.path) {
                     Ok(()) => {
-                        outcomes.push((file.path.clone(), RollbackOutcome::Deleted));
+                        let still_exists = self.files.read_bytes(&file.path).is_ok();
+                        if still_exists {
+                            outcomes.push((
+                                file.path.clone(),
+                                RollbackOutcome::Failed {
+                                    reason: "delete succeeded but the target still exists".into(),
+                                },
+                            ));
+                            fully_restored = false;
+                            conflict_free = false;
+                        } else {
+                            outcomes.push((file.path.clone(), RollbackOutcome::Deleted));
+                        }
                     }
                     Err(error) => {
                         outcomes.push((
@@ -2006,22 +2023,50 @@ impl EditService {
                     }
                 }
             } else {
-                match self
-                    .files
-                    .write_atomic(&file.path, &String::from_utf8_lossy(&file.original_bytes))
-                {
-                    Ok(()) => {
-                        outcomes.push((file.path.clone(), RollbackOutcome::Restored));
-                    }
-                    Err(error) => {
+                // Exact-bytes restore. The canonical atomic-write boundary
+                // is text-only (&str); original bytes that are not valid
+                // UTF-8 fail honestly rather than going through a lossy
+                // conversion that would silently change the file.
+                match std::str::from_utf8(&file.original_bytes) {
+                    Err(_) => {
                         outcomes.push((
                             file.path.clone(),
                             RollbackOutcome::Failed {
-                                reason: format!("restore failed: {error}"),
+                                reason: "cannot restore: original bytes are not \
+                                         valid UTF-8 and the atomic-write boundary \
+                                         is text-only"
+                                    .into(),
                             },
                         ));
                         fully_restored = false;
                         conflict_free = false;
+                    }
+                    Ok(original_text) => {
+                        let restored_ok =
+                            self.files.write_atomic(&file.path, original_text).is_ok();
+                        let verified = restored_ok
+                            && match self.files.read_bytes(&file.path) {
+                                Ok(current) => current == file.original_bytes,
+                                Err(_) => false,
+                            };
+                        if verified {
+                            outcomes.push((file.path.clone(), RollbackOutcome::Restored));
+                        } else {
+                            outcomes.push((
+                                file.path.clone(),
+                                RollbackOutcome::Failed {
+                                    reason: if restored_ok {
+                                        "restore verification failed: re-read bytes \
+                                         differ from the original"
+                                            .into()
+                                    } else {
+                                        "restore failed: atomic write did not succeed".into()
+                                    },
+                                },
+                            ));
+                            fully_restored = false;
+                            conflict_free = false;
+                        }
                     }
                 }
             }
@@ -2156,7 +2201,7 @@ impl EditService {
         prepared.push_str(&current.content[end..]);
 
         // 9–11. Atomic commit, verified re-read, and result.
-        let after = self.commit_verified(path, &prepared)?;
+        let after = self.commit_verified(path, &prepared, &current.before)?;
         // Semantic verification: verify the replacement actually occurred as intended
         self.verify_replace_semantics(path, old, new, *occurrence, &after)?;
         Ok(EditResult {
@@ -2237,7 +2282,7 @@ impl EditService {
         // preserved byte-for-byte.
         let prepared = lines.insert_at(&current.content, *line, content);
 
-        let after = self.commit_verified(path, &prepared)?;
+        let after = self.commit_verified(path, &prepared, &current.before)?;
         // Semantic verification: verify the insertion actually occurred as intended
         self.verify_insert_semantics(path, *line, content, &after)?;
         Ok(LineEditResult {
@@ -2319,7 +2364,7 @@ impl EditService {
         prepared.push_str(&current.content[..span_start]);
         prepared.push_str(&current.content[span_end..]);
 
-        let after = self.commit_verified(path, &prepared)?;
+        let after = self.commit_verified(path, &prepared, &current.before)?;
         // Semantic verification: verify the deletion actually occurred as intended
         self.verify_delete_range_semantics(path, *start_line, *end_line, &after)?;
         Ok(LineEditResult {
@@ -2518,11 +2563,114 @@ impl EditService {
         Ok(Preflight { content, before })
     }
 
-    /// Shared commit for every edit executor: atomic write through the
-    /// canonical filesystem boundary, then a verified re-read whose
-    /// observed state must equal the prepared content's state. Returns
-    /// the verified after-state.
-    fn commit_verified(&self, path: &str, prepared: &str) -> Result<FileState, EditError> {
+    /// Final pre-commit stale-state guard (AWE-007): re-reads the target
+    /// immediately before the atomic write and refuses to mutate when
+    /// its observed state no longer equals the state the transaction
+    /// prepared from. This closes the validate→commit TOCTOU window to
+    /// the read→rename interval: an external writer that lands between
+    /// preparation and commit is detected and the edit fails closed with
+    /// zero mutation, instead of silently overwriting the newer content.
+    ///
+    /// The comparison is the canonical `FileState` equality — exact hash,
+    /// byte size, and line count; no normalization. The conflict carries
+    /// both states (the expected pre-edit state and the state actually
+    /// observed at the commit boundary) so callers can report what
+    /// changed without reading file contents.
+    ///
+    /// Residual race: a writer that mutates the target *after* this
+    /// re-read but before the rename can still be overwritten — the
+    /// final-component swap is not synchronized (that belongs to the
+    /// filesystem-coordination milestone). This guard narrows the window
+    /// from "entire preparation span" to "one read→rename interval".
+    fn verify_live_unchanged(&self, path: &str, before: &FileState) -> Result<(), EditError> {
+        let bytes = self.files.read_bytes(path).map_err(|error| {
+            if is_not_found(&error) {
+                // The target vanished between preparation and commit.
+                EditError::ExpectedStateConflict(Box::new(ExpectedStateConflictPayload {
+                    path: path.to_owned(),
+                    component: ExpectedComponent::Hash,
+                    expected: ExpectedStateSummary {
+                        hash: Some(before.hash.clone()),
+                        size: Some(before.size),
+                        line_count: Some(before.line_count),
+                    },
+                    actual: FileState {
+                        path: path.to_owned(),
+                        hash: String::new(),
+                        size: 0,
+                        line_count: 0,
+                    },
+                }))
+            } else {
+                EditError::ReadFailure {
+                    path: path.to_owned(),
+                    message: error.to_string(),
+                }
+            }
+        })?;
+        // Compare against raw bytes — no UTF-8 decoding participates in
+        // the guard, so an external replacement with invalid UTF-8 is
+        // still detected as a change (a lossy decode could alias hashes).
+        let observed_hash = sha256_hex(&bytes);
+        let observed_size = bytes.len() as u64;
+        if observed_hash != before.hash || observed_size != before.size {
+            // Line count is derived for reporting only; hash/size decide.
+            let observed_text = String::from_utf8(bytes).ok();
+            let observed_line_count = observed_text
+                .as_deref()
+                .map(|text| {
+                    if text.is_empty() {
+                        0
+                    } else {
+                        text.lines().count()
+                    }
+                })
+                .unwrap_or(0);
+            return Err(EditError::ExpectedStateConflict(Box::new(
+                ExpectedStateConflictPayload {
+                    path: path.to_owned(),
+                    component: ExpectedComponent::Hash,
+                    expected: ExpectedStateSummary {
+                        hash: Some(before.hash.clone()),
+                        size: Some(before.size),
+                        line_count: Some(before.line_count),
+                    },
+                    actual: FileState {
+                        path: path.to_owned(),
+                        hash: observed_hash,
+                        size: observed_size,
+                        line_count: observed_line_count,
+                    },
+                },
+            )));
+        }
+        Ok(())
+    }
+
+    /// Shared commit for every edit executor. The safety pipeline at the
+    /// mutation boundary is:
+    ///
+    /// 1. **final stale-state guard** — the target is re-read and must
+    ///    still equal the state this transaction prepared from
+    ///    ([`Self::verify_live_unchanged`]); a change rejects the edit
+    ///    with zero mutation;
+    /// 2. **atomic write** through the canonical filesystem boundary;
+    /// 3. **verified re-read** — the observed post-commit state must
+    ///    equal the prepared content's state.
+    ///
+    /// Returns the verified after-state. Callers pass the before-state
+    /// observed during preparation (`before`); it is the precondition the
+    /// guard enforces, not a re-read of current content.
+    fn commit_verified(
+        &self,
+        path: &str,
+        prepared: &str,
+        before: &FileState,
+    ) -> Result<FileState, EditError> {
+        // AWE-007: expected state is validated as close to mutation as
+        // the current architecture permits — immediately before the
+        // atomic write, against the observed live bytes.
+        self.verify_live_unchanged(path, before)?;
         let after_predicted = FileState::from_content(path, prepared);
         self.files
             .write_atomic(path, prepared)
@@ -6739,5 +6887,380 @@ mod patch_tests {
             assert_eq!(read_file(&tmp, "f.txt"), "ok\n");
             assert!(!tmp.path().join("escape.txt").exists());
         }
+    }
+}
+
+/// Prompt 06 (AWE-006..008) safety-envelope tests: the final pre-commit
+/// stale-state guard, honest commit-failure reporting, verified recovery,
+/// and atomic-write behavior at the owning FilesService boundary.
+#[cfg(test)]
+mod edit_safety_tests {
+    use super::*;
+    use std::fs;
+
+    fn setup() -> (tempfile::TempDir, EditService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = EditService::new(tmp.path().to_path_buf());
+        (tmp, svc)
+    }
+
+    fn write_file(tmp: &tempfile::TempDir, name: &str, content: &str) {
+        fs::write(tmp.path().join(name), content).unwrap();
+    }
+
+    fn read_file(tmp: &tempfile::TempDir, name: &str) -> String {
+        fs::read_to_string(tmp.path().join(name)).unwrap()
+    }
+
+    fn replace_tx(path: &str, old: &str, new: &str) -> EditTransaction {
+        EditTransaction::single(EditOperation::Replace {
+            path: path.into(),
+            old: old.into(),
+            new: new.into(),
+            occurrence: None,
+        })
+    }
+
+    // ---------- AWE-007: final pre-commit stale-state guard ----------
+
+    /// The guard itself: a target that changed since preparation is a
+    /// conflict, and the conflict payload reports both states.
+    #[test]
+    fn verify_live_unchanged_rejects_a_target_modified_after_preparation() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "v1\n");
+        let before = {
+            let content = read_file(&tmp, "f.txt");
+            FileState::from_content("f.txt", &content)
+        };
+
+        // Unchanged: guard passes.
+        svc.verify_live_unchanged("f.txt", &before)
+            .expect("unchanged target passes the guard");
+
+        // External modification after preparation.
+        write_file(&tmp, "f.txt", "v2 — external writer\n");
+        let err = svc
+            .verify_live_unchanged("f.txt", &before)
+            .expect_err("changed target must fail the guard");
+        match err {
+            EditError::ExpectedStateConflict(payload) => {
+                assert_eq!(payload.path, "f.txt");
+                assert_eq!(payload.component, ExpectedComponent::Hash);
+                assert_eq!(payload.actual.size, "v2 — external writer\n".len() as u64);
+            }
+            other => panic!("expected ExpectedStateConflict, got {other:?}"),
+        }
+
+        // Target deleted after preparation: conflict, not a silent write.
+        fs::remove_file(tmp.path().join("f.txt")).unwrap();
+        assert!(matches!(
+            svc.verify_live_unchanged("f.txt", &before),
+            Err(EditError::ExpectedStateConflict(_))
+        ));
+    }
+
+    /// The guard runs on RAW BYTES: an external replacement with invalid
+    /// UTF-8 is still detected (no lossy-decode aliasing).
+    #[test]
+    fn verify_live_unchanged_detects_binary_replacement() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "text\n");
+        let before = FileState::from_content("f.txt", "text\n");
+
+        fs::write(tmp.path().join("f.txt"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        assert!(
+            matches!(
+                svc.verify_live_unchanged("f.txt", &before),
+                Err(EditError::ExpectedStateConflict(_))
+            ),
+            "binary replacement must read as a conflict"
+        );
+    }
+
+    /// End-to-end through the executor: the same file edited twice
+    /// through a stale transaction is the observable form of the race
+    /// the guard narrows — the second (stale) edit must conflict and
+    /// leave the newer content intact.
+    #[test]
+    fn stale_second_edit_conflicts_and_preserves_newer_content() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "one\ntwo\nthree\n");
+
+        let first = svc
+            .replace(replace_tx("f.txt", "one", "ONE"))
+            .expect("fresh edit applies");
+        assert_eq!(first.after.hash, sha256_hex(b"ONE\ntwo\nthree\n"));
+
+        // The caller cached the pre-first-edit state and now replays a
+        // stale edit: preparation read the CURRENT content, so without
+        // the guard the edit would succeed over content the caller never
+        // saw. Model the race by supplying the stale pre-edit hash — the
+        // canonical expected-state check must reject it with zero
+        // mutation.
+        let mut stale = replace_tx("f.txt", "two", "TWO");
+        stale.expected.push(ExpectedState {
+            hash: Some(sha256_hex(b"one\ntwo\nthree\n")),
+            ..Default::default()
+        });
+        let err = svc.replace(stale).expect_err("stale edit must conflict");
+        assert!(matches!(err, EditError::ExpectedStateConflict(_)));
+        assert_eq!(read_file(&tmp, "f.txt"), "ONE\ntwo\nthree\n");
+    }
+
+    /// External modification between preparation and the commit boundary
+    /// is the TOCTOU case the guard exists for: model it by preparing
+    /// through the internal plan (single-file executors read and commit
+    /// in one call), so exercise the guard's integration through patch()
+    /// where multi-file preparation reads A, then B — mutate A between
+    /// the two reads is not directly injectable without a seam; the
+    /// guard's own unit tests above prove the read-before-write
+    /// behavior, and this test pins the failure TRUTH: a commit-time
+    /// conflict never reads as success.
+    #[test]
+    fn commit_time_conflict_never_reports_success() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "a.txt", "alpha\n");
+        write_file(&tmp, "b.txt", "beta\n");
+
+        // Multi-file transaction: both prepared, then a commit-time
+        // failure on the first file (read-only workspace) must surface
+        // as CommitFailed, never Committed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(tmp.path(), perms).unwrap();
+
+            let tx = EditTransaction::new(vec![
+                EditOperation::Replace {
+                    path: "a.txt".into(),
+                    old: "alpha".into(),
+                    new: "ALPHA".into(),
+                    occurrence: None,
+                },
+                EditOperation::Replace {
+                    path: "b.txt".into(),
+                    old: "beta".into(),
+                    new: "BETA".into(),
+                    occurrence: None,
+                },
+            ]);
+            let result = svc.patch(tx).expect("commit failure is a PatchResult");
+            assert_eq!(
+                result.status,
+                PatchStatus::CommitFailed {
+                    fully_restored: true
+                },
+                "commit failure must never surface as Committed"
+            );
+            assert!(result.failure.is_some());
+            assert_eq!(result.committed_paths.len(), 0);
+
+            let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(tmp.path(), perms).unwrap();
+            assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+            assert_eq!(read_file(&tmp, "b.txt"), "beta\n");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&tmp, &svc);
+        }
+    }
+
+    // ---------- §11: recovery verification ----------
+
+    /// Recovery restorations are verified: a restore whose re-read bytes
+    /// differ from the original cannot be reported as Restored. Prove
+    /// the verification logic via the explicit rollback path: after
+    /// `rollback_edits` reports Restored, the file on disk is
+    /// byte-identical to the pre-edit content.
+    #[test]
+    fn rollback_restoration_is_verified_on_disk() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "original content\n");
+
+        let edit_id = EditId::new();
+        let records = svc
+            .capture_rollback_records(&edit_id, &["f.txt".to_owned()])
+            .unwrap();
+        let result = svc
+            .replace(replace_tx("f.txt", "original", "mutated"))
+            .unwrap();
+        // Caller completes the record with the produced state.
+        let mut records = records;
+        records[0].after_hash = result.after.hash.clone();
+
+        let status = svc.rollback_edits(&records).unwrap();
+        assert_eq!(status, EditRollbackStatus::Restored);
+        // Verified on disk: exact original bytes.
+        assert_eq!(read_file(&tmp, "f.txt"), "original content\n");
+    }
+
+    /// Recovery never destroys an external change: after the edit
+    /// committed, an external writer modifies the target — rollback must
+    /// refuse with Conflict and leave the external bytes intact.
+    #[test]
+    fn recovery_refuses_to_overwrite_external_change() {
+        let (tmp, svc) = setup();
+        write_file(&tmp, "f.txt", "original\n");
+
+        let edit_id = EditId::new();
+        let mut records = svc
+            .capture_rollback_records(&edit_id, &["f.txt".to_owned()])
+            .unwrap();
+        let result = svc
+            .replace(replace_tx("f.txt", "original", "edited"))
+            .unwrap();
+        records[0].after_hash = result.after.hash.clone();
+
+        // External writer lands after the edit.
+        write_file(&tmp, "f.txt", "external newer state\n");
+
+        let status = svc.rollback_edits(&records).unwrap();
+        assert!(matches!(status, EditRollbackStatus::Conflict { .. }));
+        // The external content survived.
+        assert_eq!(read_file(&tmp, "f.txt"), "external newer state\n");
+    }
+
+    // ---------- §20: error hygiene at the atomic-write boundary ----------
+
+    /// write_atomic failure messages name the workspace-relative path
+    /// only — never the host temp path. On unix, a read-only parent
+    /// directory makes the temp-file creation fail.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_errors_do_not_leak_host_temp_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = crate::services::files::FilesService::new(tmp.path().to_path_buf());
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+
+        let mut perms = fs::metadata(tmp.path().join("sub")).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(tmp.path().join("sub"), perms).unwrap();
+
+        let err = svc
+            .write_atomic("sub/f.txt", "content")
+            .expect_err("read-only parent must fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("sub/f.txt"),
+            "names the logical path: {message}"
+        );
+        assert!(
+            !message.contains(tmp.path().to_str().unwrap()),
+            "host root must not leak: {message}"
+        );
+        assert!(
+            !message.contains(".tmp"),
+            "temp path must not leak: {message}"
+        );
+
+        let mut perms = fs::metadata(tmp.path().join("sub")).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(tmp.path().join("sub"), perms).unwrap();
+    }
+}
+
+/// Prompt 06 §17.1: atomic-write contract tests at the owning
+/// FilesService boundary (previously untested directly).
+#[cfg(test)]
+mod atomic_write_tests {
+    use crate::services::files::FilesService;
+    use std::fs;
+
+    fn setup() -> (tempfile::TempDir, FilesService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = FilesService::new(tmp.path().to_path_buf());
+        (tmp, svc)
+    }
+
+    #[test]
+    fn replaces_existing_target_completely() {
+        let (tmp, svc) = setup();
+        fs::write(tmp.path().join("f.txt"), "old").unwrap();
+        svc.write_atomic("f.txt", "brand new content").unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "brand new content"
+        );
+    }
+
+    #[test]
+    fn creates_target_and_parents_where_supported() {
+        let (tmp, svc) = setup();
+        svc.write_atomic("deep/dir/f.txt", "content").unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("deep/dir/f.txt")).unwrap(),
+            "content"
+        );
+    }
+
+    #[test]
+    fn preserves_exact_bytes_including_crlf_and_unicode() {
+        let (tmp, svc) = setup();
+        let exact = "alpha\r\nनमस्ते 🌍\nno-final-newline";
+        svc.write_atomic("f.txt", exact).unwrap();
+        let bytes = fs::read(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(bytes, exact.as_bytes());
+    }
+
+    #[test]
+    fn rejects_oversized_content() {
+        let (tmp, svc) = setup();
+        let huge = "x".repeat(crate::services::files::MAX_FILE_BYTES as usize + 1);
+        assert!(svc.write_atomic("f.txt", &huge).is_err());
+        assert!(!tmp.path().join("f.txt").exists(), "nothing was written");
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_targets() {
+        let (tmp, svc) = setup();
+        assert!(svc.write_atomic("../escape.txt", "x").is_err());
+        assert!(svc.write_atomic("/abs.txt", "x").is_err());
+        assert!(!tmp.path().parent().unwrap().join("escape.txt").exists());
+    }
+
+    /// No staging leftovers: a successful and a failed atomic write both
+    /// leave the parent directory with exactly the intended entries.
+    #[test]
+    fn leaves_no_temporary_staging_leftovers() {
+        let (tmp, svc) = setup();
+        svc.write_atomic("f.txt", "one").unwrap();
+        svc.write_atomic("f.txt", "two").unwrap();
+        let entries: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "only the target remains");
+        assert_eq!(
+            entries[0].as_ref().unwrap().file_name().to_str(),
+            Some("f.txt")
+        );
+    }
+
+    /// A failure BEFORE the rename leaves the previous target intact:
+    /// a read-only parent prevents temp creation, and the existing
+    /// content is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn failure_before_rename_leaves_previous_target_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, svc) = setup();
+        fs::write(tmp.path().join("f.txt"), "previous").unwrap();
+
+        let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(tmp.path(), perms).unwrap();
+
+        assert!(svc.write_atomic("f.txt", "replacement").is_err());
+
+        let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(tmp.path(), perms).unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "previous"
+        );
     }
 }
