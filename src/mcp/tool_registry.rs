@@ -259,6 +259,53 @@ static REGISTRY: &[ToolDefinition] = &[
         Medium,
         []
     ),
+    // ---- filesystem.* (AWE-009 editing plane; Medium risk: every tool
+    // is a consequential workspace mutation, so the SEC-001 trust-gate
+    // policy path and the TW-003 capability gate both apply; the
+    // Filesystem permission is what capability grants must cover for
+    // agent-scoped callers.) ----
+    awh_tool!(
+        "filesystem.apply_diff",
+        "Apply a unified diff to workspace files",
+        "filesystem",
+        Medium,
+        [Filesystem]
+    ),
+    awh_tool!(
+        "filesystem.delete_range",
+        "Delete an inclusive range of lines from a workspace file",
+        "filesystem",
+        Medium,
+        [Filesystem]
+    ),
+    awh_tool!(
+        "filesystem.insert",
+        "Insert text at a line boundary in a workspace file",
+        "filesystem",
+        Medium,
+        [Filesystem]
+    ),
+    awh_tool!(
+        "filesystem.patch",
+        "Apply a multi-operation patch transaction to workspace files",
+        "filesystem",
+        Medium,
+        [Filesystem]
+    ),
+    awh_tool!(
+        "filesystem.replace",
+        "Replace an exact text match in a workspace file",
+        "filesystem",
+        Medium,
+        [Filesystem]
+    ),
+    awh_tool!(
+        "filesystem.rollback",
+        "Roll back one completed edit transaction by its exact id",
+        "filesystem",
+        Medium,
+        [Filesystem]
+    ),
     // ---- git.* ----
     awh_tool!(
         "git.branch",
