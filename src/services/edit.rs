@@ -2312,14 +2312,45 @@ impl EditService {
         action: &'static str,
         outcome: &EditRollbackStatus,
     ) {
-        let detail = match outcome {
-            EditRollbackStatus::Restored => "all pending targets restored and verified",
-            EditRollbackStatus::AlreadyRolledBack => "all targets already at pre-edit state",
-            EditRollbackStatus::Conflict { reason } | EditRollbackStatus::Failed { reason } => {
-                reason.as_str()
-            }
+        // AWE-013: the same correlated outcome vocabulary as the
+        // record-based rollback surface — kind from the outcome, the
+        // stable `filesystem.rollback` action, and the reason code the
+        // prompt-10 taxonomy defines (already-rolled-back/conflict/
+        // failure), so both rollback entry points emit identical,
+        // machine-filterable events.
+        let (kind, reason, detail) = match outcome {
+            EditRollbackStatus::Restored => (
+                "allow",
+                None,
+                "all pending targets restored and verified".to_owned(),
+            ),
+            EditRollbackStatus::AlreadyRolledBack => (
+                "allow",
+                Some("already_rolled_back".to_owned()),
+                "all targets already at pre-edit state".to_owned(),
+            ),
+            EditRollbackStatus::Conflict { reason } => (
+                "conflict",
+                Some("rollback_conflict".to_owned()),
+                reason.clone(),
+            ),
+            EditRollbackStatus::Failed { reason } => (
+                "failure",
+                Some("rollback_failed".to_owned()),
+                reason.clone(),
+            ),
         };
-        crate::services::audit::global().record("security", action, edit_id, detail);
+        let mut correlation =
+            crate::services::audit::AuditCorrelation::for_edit(edit_id.to_owned());
+        correlation.reason = reason;
+        crate::services::audit::record_outcome(
+            kind,
+            "filesystem.rollback",
+            edit_id,
+            &detail,
+            &correlation,
+        );
+        let _ = action; // retained in the signature for call-site clarity
     }
 
     /// Execute a multi-operation patch transaction.
@@ -2352,7 +2383,30 @@ impl EditService {
     /// and provenance with per-path produced-state hashes is recorded
     /// after the verified commit phase, so the multi-file edit can be
     /// rolled back later as one exact transaction.
+    /// This wrapper also emits the AWE-013 authoritative service-boundary
+    /// audit outcome (correlated to the exact edit id and the caller
+    /// identity) after the result is known; an audit failure never
+    /// rewrites the operation outcome.
     fn patch_with_identity(
+        &self,
+        identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
+        transaction: EditTransaction,
+    ) -> Result<PatchResult, EditError> {
+        // AWE-013: capture identity + edit correlation up front.
+        let edit_id = transaction.id.to_string();
+        let subject = transaction_paths(&transaction);
+        let result = self.patch_internal(identity, transaction);
+        audit_edit_outcome(
+            "filesystem.patch",
+            &subject,
+            &edit_id,
+            identity,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    fn patch_internal(
         &self,
         identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
         transaction: EditTransaction,
@@ -2804,7 +2858,90 @@ impl EditService {
             summary,
         }
     }
+}
 
+/// AWE-013: the outcome class + stable reason code of a final edit/rollback
+/// result, for the canonical durable audit record. The conflict class is
+/// exactly the stale-state/context family (nothing was mutated); every
+/// other failure is `failure`. Reason codes are machine-filterable and
+/// never carry file contents.
+fn edit_outcome(error: &EditError) -> (&'static str, String) {
+    let reason = match error {
+        EditError::ExpectedStateConflict(_) => "expected_state_conflict",
+        EditError::ContextConflict { .. } => "context_conflict",
+        EditError::HunkContextMismatch { .. } => "hunk_context_mismatch",
+        EditError::MatchNotFound { .. } => "match_not_found",
+        EditError::AmbiguousMatch { .. } => "ambiguous_match",
+        EditError::OccurrenceOutOfRange { .. } => "occurrence_out_of_range",
+        EditError::InsertBoundaryOutOfRange { .. } => "insert_boundary_out_of_range",
+        EditError::LineOutOfRange { .. } => "line_range_out_of_range",
+        EditError::EmptyFileDeletion { .. } => "empty_file_deletion",
+        EditError::FileNotFound { .. } => "target_not_found",
+        EditError::InvalidUtf8 { .. } => "target_not_utf8",
+        EditError::AuthorizationDenied { .. } => "authorization_denied",
+        EditError::ReadFailure { .. } | EditError::WriteFailure { .. } => "io_failure",
+        EditError::UnsupportedTransaction { .. } => "unsupported_transaction",
+        EditError::VerificationFailed(_) | EditError::SemanticVerificationFailure(_) => {
+            "verification_failed"
+        }
+        EditError::PatchValidationFailure { .. }
+        | EditError::PatchPreparationFailure { .. }
+        | EditError::PatchCommitFailure { .. } => "patch_preparation_failed",
+        _ => "edit_failed",
+    };
+    let kind = match error {
+        EditError::ExpectedStateConflict(_)
+        | EditError::ContextConflict { .. }
+        | EditError::HunkContextMismatch { .. } => "conflict",
+        _ => "failure",
+    };
+    (kind, reason.to_owned())
+}
+
+/// AWE-013: emits the ONE authoritative service-boundary outcome event
+/// for an edit/rollback operation, correlated to the exact edit id and
+/// the trusted caller identity (agent/session where present). Absent
+/// identity stays absent; the durable store stamps the workspace
+/// identity at append time. Best-effort: an audit failure never
+/// rewrites the operation outcome.
+fn audit_edit_outcome(
+    action: &str,
+    subject: &str,
+    edit_id: &str,
+    identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
+    error: Option<&EditError>,
+) {
+    let (kind, reason, detail) = match error {
+        None => ("allow", None, "operation succeeded".to_owned()),
+        Some(error) => {
+            let (kind, reason) = edit_outcome(error);
+            (kind, Some(reason), error.to_string())
+        }
+    };
+    let mut correlation = crate::services::audit::AuditCorrelation::for_edit(edit_id.to_owned());
+    correlation.reason = reason;
+    if let Some(principal) = identity {
+        correlation.agent_id = principal.agent_id.clone();
+        correlation.session_id = principal.session_id.clone();
+    }
+    crate::services::audit::record_outcome(kind, action, subject, &detail, &correlation);
+}
+
+/// The affected resource paths of a transaction in operation order,
+/// deduplicated (the audit store applies its own text bound).
+fn transaction_paths(transaction: &EditTransaction) -> String {
+    let mut paths: Vec<&str> = Vec::new();
+    for operation in &transaction.operations {
+        for path in operation.paths() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths.join("; ")
+}
+
+impl EditService {
     /// Executes one safe, contextual, conflict-aware replacement.
     ///
     /// Semantics (all deterministic, all enforced before mutation):
@@ -2840,7 +2977,30 @@ impl EditService {
     /// with zero mutation), and provenance with the produced-state
     /// hashes is recorded after the verified commit so the edit can be
     /// rolled back later by its exact id.
+    /// This wrapper also emits the AWE-013 authoritative service-boundary
+    /// audit outcome (correlated to the exact edit id and the caller
+    /// identity) after the result is known; an audit failure never
+    /// rewrites the operation outcome.
     fn replace_with_identity(
+        &self,
+        identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
+        transaction: EditTransaction,
+    ) -> Result<EditResult, EditError> {
+        // AWE-013: capture identity + edit correlation up front.
+        let edit_id = transaction.id.to_string();
+        let subject = transaction_paths(&transaction);
+        let result = self.replace_internal(identity, transaction);
+        audit_edit_outcome(
+            "filesystem.replace",
+            &subject,
+            &edit_id,
+            identity,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    fn replace_internal(
         &self,
         identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
         transaction: EditTransaction,
@@ -2997,7 +3157,30 @@ impl EditService {
     /// [`Self::insert`] with the durable AWE-010 recovery pipeline: the
     /// pre-edit state is captured before the commit, and provenance with
     /// the produced-state hash is recorded after the verified commit.
+    /// This wrapper also emits the AWE-013 authoritative service-boundary
+    /// audit outcome (correlated to the exact edit id and the caller
+    /// identity) after the result is known; an audit failure never
+    /// rewrites the operation outcome.
     fn insert_with_identity(
+        &self,
+        identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
+        transaction: EditTransaction,
+    ) -> Result<LineEditResult, EditError> {
+        // AWE-013: capture identity + edit correlation up front.
+        let edit_id = transaction.id.to_string();
+        let subject = transaction_paths(&transaction);
+        let result = self.insert_internal(identity, transaction);
+        audit_edit_outcome(
+            "filesystem.insert",
+            &subject,
+            &edit_id,
+            identity,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    fn insert_internal(
         &self,
         identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
         transaction: EditTransaction,
@@ -3106,7 +3289,30 @@ impl EditService {
     }
 
     /// [`Self::delete_range`] with the durable AWE-010 recovery pipeline.
+    /// This wrapper also emits the AWE-013 authoritative service-boundary
+    /// audit outcome (correlated to the exact edit id and the caller
+    /// identity) after the result is known; an audit failure never
+    /// rewrites the operation outcome.
     fn delete_range_with_identity(
+        &self,
+        identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
+        transaction: EditTransaction,
+    ) -> Result<LineEditResult, EditError> {
+        // AWE-013: capture identity + edit correlation up front.
+        let edit_id = transaction.id.to_string();
+        let subject = transaction_paths(&transaction);
+        let result = self.delete_range_internal(identity, transaction);
+        audit_edit_outcome(
+            "filesystem.delete_range",
+            &subject,
+            &edit_id,
+            identity,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    fn delete_range_internal(
         &self,
         identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
         transaction: EditTransaction,
@@ -3228,6 +3434,61 @@ impl EditService {
         if records.is_empty() {
             // Nothing to roll back is not an error, but it is also not a
             // restoration: report honestly.
+            return Ok(EditRollbackStatus::Restored);
+        }
+
+        let result = self.rollback_edits_inner(records);
+        // AWE-013: the ONE authoritative rollback outcome, correlated to
+        // the edit id of the records. Best-effort — an audit failure
+        // never rewrites the rollback outcome.
+        let edit_id = records[0].edit_id.to_string();
+        let subject = records
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect::<Vec<&str>>()
+            .join("; ");
+        let (kind, reason, detail) = match &result {
+            Ok(EditRollbackStatus::Restored) => {
+                ("allow", None, "rollback restored and verified".to_owned())
+            }
+            Ok(EditRollbackStatus::AlreadyRolledBack) => (
+                "allow",
+                Some("already_rolled_back".to_owned()),
+                "all targets already at pre-edit state".to_owned(),
+            ),
+            Ok(EditRollbackStatus::Conflict { reason }) => (
+                "conflict",
+                Some("rollback_conflict".to_owned()),
+                reason.clone(),
+            ),
+            Ok(EditRollbackStatus::Failed { reason }) => (
+                "failure",
+                Some("rollback_failed".to_owned()),
+                reason.clone(),
+            ),
+            Err(error) => {
+                let (kind, code) = edit_outcome(error);
+                (kind, Some(code), error.to_string())
+            }
+        };
+        let mut correlation =
+            crate::services::audit::AuditCorrelation::for_edit(edit_id.to_owned());
+        correlation.reason = reason;
+        crate::services::audit::record_outcome(
+            kind,
+            "filesystem.rollback",
+            &subject,
+            &detail,
+            &correlation,
+        );
+        result
+    }
+
+    fn rollback_edits_inner(
+        &self,
+        records: &[RollbackRecord],
+    ) -> Result<EditRollbackStatus, EditError> {
+        if records.is_empty() {
             return Ok(EditRollbackStatus::Restored);
         }
 

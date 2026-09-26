@@ -919,6 +919,9 @@ fn serve_control_api(host: String, port: u16, api_key_env: String) -> Result<()>
         .with_context(|| format!("control API requires a bearer token; set {api_key_env}"))?;
 
     let root = std::env::current_dir()?;
+    // AWE-013: the Control API audit reads (/audit, /logs) must serve
+    // durable history, so initialize the persistent store first.
+    agent_workspace_hub::services::audit::init_global(&root)?;
     let state = Arc::new(agent_workspace_hub::api::control::ControlState::new(
         &root, api_key,
     ));
@@ -1382,7 +1385,11 @@ fn handle_tunnel_cli(command: TunnelCommand) -> Result<()> {
 
 /// Runs the standard stdio MCP serve loop (the original `awh mcp serve` path).
 fn serve_stdio() -> Result<()> {
-    let server = StdioMcpServer::new(std::env::current_dir()?)?;
+    let root = std::env::current_dir()?;
+    // AWE-013: switch the canonical audit store to durable persistence
+    // before any request is served; buffered startup events replay in.
+    agent_workspace_hub::services::audit::init_global(&root)?;
+    let server = StdioMcpServer::new(root)?;
     agent_workspace_hub::mcp::audit_allow("server_start", "stdio", "mcp");
     use std::io::{self, BufRead, Write};
     for line in io::stdin().lock().lines() {
@@ -1452,16 +1459,21 @@ fn serve_sse(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        // AWE-013: switch the canonical audit store to durable
+        // persistence before any session is served; buffered startup
+        // events replay into the durable history.
+        let root = std::env::current_dir()?;
+        if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+            // Degraded mode is explicit: keep serving (the buffered
+            // store continues to record) and surface the condition.
+            tracing::error!(event = "audit_init_failed", error = %error);
+        }
         // Build the dispatcher on the runtime it will serve (no nested
         // runtime; see McpDispatcher::new_async).
-        let dispatcher = Arc::new(
-            McpDispatcher::new_async(std::env::current_dir()?)
-                .await
-                .map_err(|e| {
-                    tracing::error!("dispatcher construction failed: {e:#}");
-                    e
-                })?,
-        );
+        let dispatcher = Arc::new(McpDispatcher::new_async(root).await.map_err(|e| {
+            tracing::error!("dispatcher construction failed: {e:#}");
+            e
+        })?);
         agent_workspace_hub::mcp::http::serve(config, dispatcher).await
     })
 }

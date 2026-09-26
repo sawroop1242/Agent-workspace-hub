@@ -183,6 +183,24 @@ pub enum DenialReason {
     UnsupportedOperation,
 }
 
+impl DenialReason {
+    /// The stable snake_case reason code recorded in the durable audit
+    /// store (AWE-013): machine-readable, never a secret, identical for
+    /// MCP/CLI/API consumers.
+    pub fn to_audit_code(&self) -> &'static str {
+        match self {
+            DenialReason::MissingAgentIdentity => "missing_agent_identity",
+            DenialReason::UnknownAgent => "unknown_agent",
+            DenialReason::MissingCapability => "missing_capability",
+            DenialReason::ExpiredGrant => "expired_grant",
+            DenialReason::OutOfScope => "out_of_scope",
+            DenialReason::PolicyDenied => "policy_denied",
+            DenialReason::InfrastructureUnavailable => "infrastructure_unavailable",
+            DenialReason::UnsupportedOperation => "unsupported_operation",
+        }
+    }
+}
+
 /// The result of an authorization check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorizationDecision {
@@ -258,6 +276,38 @@ impl EditAuthorizer {
     ///   → Allow
     /// ```
     pub fn authorize(&self, request: &AuthorizationRequest) -> AuthorizationDecision {
+        let decision = self.authorize_inner(request);
+        // AWE-013/TW-007: authorization decisions are consequential
+        // security outcomes — denials (and only denials; allow-side
+        // accountability is recorded by the mutating service boundary
+        // once it observes the final operation outcome) are recorded in
+        // the canonical durable audit store with the stable reason code
+        // and safe identity correlation. Audit failure never rewrites
+        // the decision.
+        if let AuthorizationDecision::Deny { reason, detail } = &decision {
+            crate::services::audit::record_outcome(
+                "deny",
+                &format!("authorization.{}", request.action.tool_name()),
+                request
+                    .principal
+                    .agent_id
+                    .as_deref()
+                    .unwrap_or("unattributed"),
+                detail,
+                &crate::services::audit::AuditCorrelation {
+                    workspace_id: Some(request.principal.workspace_id.clone()),
+                    agent_id: request.principal.agent_id.clone(),
+                    session_id: request.principal.session_id.clone(),
+                    edit_id: request.transaction_id.clone(),
+                    snapshot_id: None,
+                    reason: Some(reason.to_audit_code().to_owned()),
+                },
+            );
+        }
+        decision
+    }
+
+    fn authorize_inner(&self, request: &AuthorizationRequest) -> AuthorizationDecision {
         // Step 1: caller context. An agent-scoped request must carry both
         // an agent identity and a session identity; absence of either is
         // an ambiguous caller and must never become Allow. Operator
