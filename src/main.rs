@@ -85,6 +85,15 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Agent-grade filesystem editing and recovery (AWE-014): thin
+    /// adapters over the canonical EditService — every mutation flows
+    /// through the authorization boundary, durable snapshots, provenance,
+    /// and correlated audit.
+    #[command(name = "fs")]
+    Fs {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::fs_edit::FsCommand,
+    },
     Tunnel {
         #[command(subcommand)]
         command: TunnelCommand,
@@ -603,6 +612,12 @@ fn main() -> Result<()> {
         },
         Some(Command::Agent { command }) => handle_agent_cli(command)?,
         Some(Command::Policy { command }) => handle_policy_cli(command)?,
+        Some(Command::Fs { command }) => {
+            // The fs family returns its own stable exit codes (AWE-014
+            // §23); propagate them as the process status.
+            let root = std::env::current_dir()?;
+            std::process::exit(agent_workspace_hub::cli::fs_edit::run(command, &root));
+        }
         Some(Command::Tunnel { command }) => handle_tunnel_cli(command)?,
         None => println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
     }
