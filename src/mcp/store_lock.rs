@@ -126,9 +126,16 @@ fn lock_path_for(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// A lock file is stale once it is older than [`STALE_LOCK_AGE`]. If its
-/// metadata can't be read at all, treat it as stale too rather than risk
-/// waiting forever on a file whose age we can't determine.
+/// A lock file is stale once it is *provably* older than
+/// [`STALE_LOCK_AGE`]. Unreadable metadata fails CLOSED (not stale):
+/// on Windows, transient sharing violations during concurrent
+/// create/delete churn on the lock path can make `fs::metadata` fail
+/// for a LIVE lock — treating that as stale would remove the live
+/// holder's lock and break mutual exclusion (observed as a lost
+/// update in CI). Waiting is safe: acquisition is bounded by
+/// [`ACQUIRE_TIMEOUT`], so an actually-abandoned lock whose age
+/// cannot be read fails the acquire with a structured error rather
+/// than wedging — and never silently excludes nobody.
 fn is_stale(lock_path: &Path) -> bool {
     fs::metadata(lock_path)
         .and_then(|m| m.modified())
@@ -138,7 +145,7 @@ fn is_stale(lock_path: &Path) -> bool {
                 .map(|age| age > STALE_LOCK_AGE)
                 .unwrap_or(false)
         })
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
