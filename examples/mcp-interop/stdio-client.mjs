@@ -4,12 +4,13 @@
 // workflow: connect -> initialize -> tools/list -> tools/call -> shutdown.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 const AWH = process.argv[2] ?? "/workspace/project/Agent-workspace-hub/target/release/awh";
 // Isolated HOME so the harness cannot pollute the operator's real
 // ~/.agent-workspace-hub (memory, trust store, skills).
 const HOME = "/tmp/awh-interop-home";
-import { mkdirSync } from "node:fs";
 mkdirSync(HOME, { recursive: true });
 
 function fail(step, err) {
@@ -121,6 +122,84 @@ try {
   } else {
     fail("unknown tool", e);
   }
+}
+
+// --- AWE-016: filesystem editing through the real SDK client -----------
+try {
+  // The canonical editing service edits EXISTING files, and the rollback
+  // tool's global-session contract needs the workspace identity — so
+  // prepare the scratch workspace before connecting.
+  execFileSync(AWH, ["init", "--path", HOME], { stdio: "ignore" });
+  writeFileSync(`${HOME}/interop-edit.txt`, "hello world\n");
+  console.log("PASS scratch workspace initialized for editing interop");
+
+  // tools/list must advertise the editing tools (AWE-009 discovery).
+  const editing = [
+    "filesystem.replace",
+    "filesystem.insert",
+    "filesystem.delete_range",
+    "filesystem.patch",
+    "filesystem.apply_diff",
+    "filesystem.rollback",
+  ].filter((n) => tools.some((t) => t.name === n));
+  if (editing.length !== 6) {
+    throw new Error(`editing tools missing from tools/list: ${editing.join(", ")}`);
+  }
+  console.log("PASS tools/list advertises all six filesystem.* editing tools");
+
+  // tools/call filesystem.replace → the canonical service mutates bytes.
+  const replace = await client.callTool({
+    name: "filesystem.replace",
+    arguments: { path: "interop-edit.txt", old: "hello", new: "HELLO" },
+  });
+  if (replace.isError) {
+    throw new Error(`filesystem.replace isError: ${JSON.stringify(replace).slice(0, 200)}`);
+  }
+  const payload = JSON.parse((replace.content ?? []).map((c) => c.text ?? "").join(""));
+  if (payload.status !== "committed") throw new Error(`unexpected status: ${payload.status}`);
+  console.log("PASS tools/call filesystem.replace committed (real edit id)");
+
+  // Read the mutated file back through MCP to prove the bytes changed.
+  const verify = await client.callTool({
+    name: "workspace.read_file",
+    arguments: { path: "interop-edit.txt" },
+  });
+  const seen = (verify.content ?? []).map((c) => c.text ?? "").join("");
+  if (!seen.includes("HELLO")) throw new Error("file did not change as reported");
+  console.log("PASS edited bytes visible through MCP after the replace");
+
+  // Malformed arguments → structured protocol error, no mutation.
+  const bad = await client
+    .callTool({ name: "filesystem.replace", arguments: { path: "interop-edit.txt" } })
+    .catch((e) => ({ thrown: e }));
+  const badOk =
+    (bad.thrown !== undefined) || (bad.isError === true);
+  if (!badOk) throw new Error("malformed edit was not rejected");
+  console.log("PASS malformed editing args rejected (protocol error / isError)");
+
+  // Rollback by the exact edit id → restores the pre-edit bytes.
+  const rollback = await client.callTool({
+    name: "filesystem.rollback",
+    arguments: { edit_id: payload.id },
+  });
+  if (rollback.isError) {
+    throw new Error(`filesystem.rollback isError: ${JSON.stringify(rollback).slice(0, 200)}`);
+  }
+  const rollbackPayload = JSON.parse(
+    (rollback.content ?? []).map((c) => c.text ?? "").join("")
+  );
+  if (rollbackPayload.status !== "restored") {
+    throw new Error(`rollback status: ${rollbackPayload.status}`);
+  }
+  const afterRollback = await client.callTool({
+    name: "workspace.read_file",
+    arguments: { path: "interop-edit.txt" },
+  });
+  const rolledText = (afterRollback.content ?? []).map((c) => c.text ?? "").join("");
+  if (rolledText.includes("HELLO")) throw new Error("rollback did not restore bytes");
+  console.log("PASS filesystem.rollback restored the pre-edit bytes via MCP");
+} catch (e) {
+  fail("filesystem editing interop", e);
 }
 
 // --- session lifecycle: clean shutdown ----------------------------------

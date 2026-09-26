@@ -1411,6 +1411,17 @@ impl McpDispatcher {
             {"name":"context.offload","description":"Soft-offload a context item (fully recoverable)","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id"]}},
             {"name":"context.restore","description":"Restore a soft-offloaded context item to active","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
         ]);
+        // AWE-009: the filesystem.* editing tools live in their own json!
+        // invocation — the merged catalog is split into two macro blocks
+        // to stay under serde_json's recursion limit.
+        let editing = json!([
+            {"name":"filesystem.apply_diff","description":"Apply a unified diff to workspace files; paths in diff headers stay workspace-relative and malformed diffs are rejected before any mutation","inputSchema":{"type":"object","properties":{"diff":{"type":"string"}},"required":["diff"]}},
+            {"name":"filesystem.delete_range","description":"Delete an inclusive one-based range of lines from a workspace file","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"number"},"end_line":{"type":"number"}},"required":["path","start_line","end_line"]}},
+            {"name":"filesystem.insert","description":"Insert text at a line boundary in a workspace file; line 0 inserts at the beginning, N inserts before logical line N","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"number"},"content":{"type":"string"}},"required":["path","line","content"]}},
+            {"name":"filesystem.patch","description":"Apply a multi-operation patch transaction; every operation prepares before any file is mutated","inputSchema":{"type":"object","properties":{"operations":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"occurrence":{"type":"number"},"line":{"type":"number"},"content":{"type":"string"},"start_line":{"type":"number"},"end_line":{"type":"number"}},"required":["path"]}}},"required":["operations"]}},
+            {"name":"filesystem.replace","description":"Replace an exact text match in a workspace file; without an occurrence the match must be unique","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"occurrence":{"type":"number"}},"required":["path","old","new"]}},
+            {"name":"filesystem.rollback","description":"Roll back one completed edit transaction by its exact edit id; refuses to overwrite any external change made after the edit","inputSchema":{"type":"object","properties":{"edit_id":{"type":"string"}},"required":["edit_id"]}}
+        ]);
         let extended = json!([
             {"name":"connector.composio_link","description":"Start a Composio OAuth link for a new connected account; open the returned redirect_url to finish authorizing, then register the resulting connected_account_id with connector.composio_register","inputSchema":{"type":"object","properties":{"auth_config_id":{"type":"string"},"user_id":{"type":"string"},"alias":{"type":"string"},"callback_url":{"type":"string"}},"required":["auth_config_id","user_id"]}},
             {"name":"connector.composio_accounts","description":"List Composio connected accounts visible to this API key, optionally filtered by user or toolkit","inputSchema":{"type":"object","properties":{"user_id":{"type":"string"},"toolkit":{"type":"string"}}}},
@@ -1433,6 +1444,9 @@ impl McpDispatcher {
         let mut tools = core;
         if let (Value::Array(core_arr), Value::Array(ext_arr)) = (&mut tools, &extended) {
             core_arr.extend(ext_arr.iter().cloned());
+        }
+        if let (Value::Array(core_arr), Value::Array(edit_arr)) = (&mut tools, &editing) {
+            core_arr.extend(edit_arr.iter().cloned());
         }
         // The github.* surface is a third macro invocation (the recursion
         // limit documented for the core/extended split binds here too) and is
@@ -1929,6 +1943,57 @@ impl McpDispatcher {
                     }
                     None => serde_json::to_value(self.edit_service.patch(tx)?)?,
                 }
+            }
+            "filesystem.rollback" => {
+                self.authorize_tool("filesystem.rollback", &arguments)?;
+                let edit_id = strval(&arguments, "edit_id")?;
+                audit_allow("workspace_edit", "rollback", &edit_id);
+                // The canonical by-id rollback requires an explicit
+                // principal for the authorization decision. An
+                // agent-scoped session uses its trusted binding; a
+                // global session uses the operator context of the
+                // documented global-route contract (workspace
+                // trust/policy gates only) — an uninitialized
+                // workspace fails closed, never fabricating authority.
+                let principal = match &edit_principal {
+                    Some(principal) => principal.clone(),
+                    None => {
+                        let root = self.project_root();
+                        let manifest = crate::services::init::load_workspace_manifest(&root)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "rollback requires an initialized workspace: {error}"
+                                )
+                            })?;
+                        crate::services::authorization::AuthorizingPrincipal::operator(
+                            manifest.workspace_id.as_str(),
+                        )
+                    }
+                };
+                let status = self.edit_service.rollback_edit(&principal, &edit_id)?;
+                json!({
+                    "status": match &status {
+                        crate::services::edit::EditRollbackStatus::Restored => "restored",
+                        crate::services::edit::EditRollbackStatus::AlreadyRolledBack => {
+                            "already_rolled_back"
+                        }
+                        crate::services::edit::EditRollbackStatus::Conflict { reason } => {
+                            let _ = reason;
+                            "conflict"
+                        }
+                        crate::services::edit::EditRollbackStatus::Failed { reason } => {
+                            let _ = reason;
+                            "failed"
+                        }
+                    },
+                    "detail": match &status {
+                        crate::services::edit::EditRollbackStatus::Conflict { reason }
+                        | crate::services::edit::EditRollbackStatus::Failed { reason } => {
+                            serde_json::Value::String(reason.clone())
+                        }
+                        _ => serde_json::Value::Null,
+                    },
+                })
             }
             "memory.store" => {
                 self.authorize_tool("memory.store", &arguments)?;
