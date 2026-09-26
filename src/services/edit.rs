@@ -1711,6 +1711,23 @@ fn snapshot_error_to_edit_error(
     }
 }
 
+/// The read-side mapping for recovery-material RESOLUTION: identical
+/// taxonomy except that a storage failure while *reading* recovery
+/// material is a read failure, never `WriteFailure` — a rollback that
+/// never wrote anything must not report one.
+fn snapshot_error_to_read_error(
+    edit_id: &str,
+    error: crate::services::snapshot::SnapshotError,
+) -> EditError {
+    match snapshot_error_to_edit_error(edit_id, error) {
+        EditError::WriteFailure { message, .. } => EditError::ReadFailure {
+            path: "recovery material".to_owned(),
+            message,
+        },
+        other => other,
+    }
+}
+
 /// The stable operation label recorded in provenance.
 fn operation_label(operation: &EditOperation) -> &'static str {
     match operation {
@@ -1945,12 +1962,11 @@ impl EditService {
     // -----------------------------------------------------------------
 
     /// Captures the exact pre-mutation state of `files` as a durable
-    /// snapshot for `edit_id`, before the edit's first commit. Missing
-    /// paths (files the edit is about to create) are recorded in the
-    /// returned pre-state map as `None` and tracked by the provenance
-    /// path set rather than the snapshot (the current snapshot API
-    /// stores existing-file bytes only; absence is derived at rollback
-    /// from provenance-path membership).
+    /// snapshot for `edit_id`, before the edit's first commit. Only the
+    /// files that existed pre-edit are snapshotted (the canonical
+    /// executors edit existing files); a file the edit creates simply
+    /// never appears in the manifest, and rollback later derives its
+    /// pre-edit absence from provenance-path membership.
     ///
     /// Snapshot failure fails the edit closed BEFORE mutation: a
     /// recovery-required edit may never proceed without complete,
@@ -2020,7 +2036,7 @@ impl EditService {
         let provenance = self
             .snapshots
             .provenance(edit_id)
-            .map_err(|error| snapshot_error_to_edit_error(edit_id, error))?;
+            .map_err(|error| snapshot_error_to_read_error(edit_id, error))?;
         // §C binding: the provenance record must name exactly this edit.
         if provenance.edit_id != edit_id {
             return Err(EditError::PatchPreparationFailure {
@@ -2029,10 +2045,27 @@ impl EditService {
                 reason: "provenance is bound to a different edit".into(),
             });
         }
+        // §C binding: when the recovery material records a workspace,
+        // it must be THIS workspace (the store is workspace-rooted, but
+        // the recorded binding is verified rather than assumed).
+        if let Some(recorded_workspace) = provenance.workspace_id.as_deref() {
+            let workspace = crate::services::init::load_workspace_manifest(self.files.root())
+                .map_err(|error| EditError::ReadFailure {
+                    path: "workspace manifest".to_owned(),
+                    message: error.to_string(),
+                })?;
+            if recorded_workspace != workspace.workspace_id.as_str() {
+                return Err(EditError::PatchPreparationFailure {
+                    transaction_id: edit_id.to_owned(),
+                    path: None,
+                    reason: "recovery material is bound to a different workspace".into(),
+                });
+            }
+        }
         let manifest = self
             .snapshots
             .load(&provenance.snapshot_id)
-            .map_err(|error| snapshot_error_to_edit_error(edit_id, error))?;
+            .map_err(|error| snapshot_error_to_read_error(edit_id, error))?;
         // §C binding: the snapshot must belong to exactly this edit.
         if manifest.edit_id != edit_id {
             return Err(EditError::PatchPreparationFailure {
@@ -2044,6 +2077,19 @@ impl EditService {
                     manifest.edit_id
                 ),
             });
+        }
+        // §C binding: every manifest entry must be covered by the
+        // provenance path set — a tampered material set must never
+        // smuggle recovery bytes past, or silently narrow, the recorded
+        // affected-resource set.
+        for entry in &manifest.entries {
+            if !provenance.paths.contains(&entry.path) {
+                return Err(EditError::PatchPreparationFailure {
+                    transaction_id: edit_id.to_owned(),
+                    path: Some(entry.path.clone()),
+                    reason: "snapshot entry is not covered by the provenance path set".into(),
+                });
+            }
         }
         if provenance.paths.is_empty() {
             return Err(EditError::PatchPreparationFailure {
@@ -2149,18 +2195,23 @@ impl EditService {
 
         // Preflight triage (Invariants D/E/K): every target must either
         // still match the transaction-produced state (rollback may
-        // proceed) or already match its pre-edit state (the whole edit
-        // is already rolled back → idempotent result). Anything else is
-        // an external change and a conflict.
-        let mut already_restored = 0;
-        for record in &records {
+        // restore it) or already match its pre-edit state (the target is
+        // already rolled back). Anything else is an external change and
+        // a conflict. The already-restored targets are PARTITIONED OUT of
+        // the restoration set: `rollback_edits`' produced-state guard
+        // would otherwise reject them, deadlocking a mixed-state retry
+        // (§19/§30) into a permanent Conflict instead of completing the
+        // remaining restorations.
+        let mut pending: Vec<RollbackRecord> = Vec::new();
+        for record in records {
             let current = self.files.read_bytes(&record.path);
             let (current_hash, exists) = match current {
                 Ok(bytes) => (sha256_hex(&bytes), true),
                 Err(_) => (String::new(), false),
             };
             if current_hash == record.after_hash {
-                continue; // still the produced state → restorable
+                pending.push(record); // still the produced state → restorable
+                continue;
             }
             // Already at pre-edit state? (Existing: bytes match the
             // snapshot bytes; created: absent.)
@@ -2170,10 +2221,9 @@ impl EditService {
                 !exists
             };
             if pre_state_matches {
-                already_restored += 1;
                 continue;
             }
-            return Ok(EditRollbackStatus::Conflict {
+            let conflict = EditRollbackStatus::Conflict {
                 reason: format!(
                     "rollback target '{}' no longer matches the edit's produced state \
                      (expected {}, observed {})",
@@ -2185,36 +2235,91 @@ impl EditService {
                         "absent".to_owned()
                     }
                 ),
-            });
+            };
+            self.correlate_rollback_outcome(edit_id, conflict.clone());
+            self.record_rollback_audit(edit_id, "rollback_conflict", &conflict);
+            return Ok(conflict);
         }
-        if already_restored == records.len() {
+        if pending.is_empty() {
             // §K: every target is already at its pre-edit state — the
             // repeat is a verified no-op, never a chance to overwrite
             // newer content.
-            return Ok(EditRollbackStatus::AlreadyRolledBack);
+            let no_op = EditRollbackStatus::AlreadyRolledBack;
+            self.correlate_rollback_outcome(edit_id, no_op.clone());
+            self.record_rollback_audit(edit_id, "rollback_noop", &no_op);
+            return Ok(no_op);
         }
 
-        // 13-14: commit the restoration and verify. `rollback_edits`
-        // re-checks the produced-state guard per file and restores in
-        // reverse record order.
-        let outcome = self.rollback_edits(&records)?;
+        // 13-14: commit the restoration of the STILL-PRODUCED targets
+        // and verify. `rollback_edits` re-checks the produced-state guard
+        // per file and restores in reverse record order; already-restored
+        // targets are skipped, so a retry after a partial restoration
+        // completes the remaining files without touching the ones back
+        // at their pre-edit state.
+        let outcome = self.rollback_edits(&pending)?;
 
-        // 16: correlate the outcome through the canonical provenance
-        // record (one record per edit id: the outcome reflects the
-        // latest observed state of this edit).
-        if let Ok(mut provenance) = self.snapshots.provenance(edit_id) {
-            let outcome_label = match &outcome {
-                EditRollbackStatus::Restored => "restored",
-                EditRollbackStatus::AlreadyRolledBack => "already-rolled-back",
-                EditRollbackStatus::Conflict { .. } => "conflict",
-                EditRollbackStatus::Failed { .. } => "failed",
-            };
-            provenance.outcome = crate::services::snapshot::ProvenanceOutcome::RolledBack {
-                reason: Some(outcome_label.to_owned()),
-            };
-            let _ = self.snapshots.record_provenance(&provenance);
-        }
+        // 16: correlate the observed outcome through the canonical
+        // provenance record (one record per edit id: the outcome
+        // reflects the latest observed state of this edit).
+        self.correlate_rollback_outcome(edit_id, outcome.clone());
+        self.record_rollback_audit(edit_id, "rollback_outcome", &outcome);
         Ok(outcome)
+    }
+
+    /// Records the observed rollback outcome in the canonical provenance
+    /// record (one record per edit id — the latest observed state).
+    /// Best-effort by contract (§25): a provenance failure never
+    /// rewrites the verified filesystem outcome, but it is logged so a
+    /// broken provenance store is never silent.
+    fn correlate_rollback_outcome(&self, edit_id: &str, outcome: EditRollbackStatus) {
+        let outcome_label = match &outcome {
+            EditRollbackStatus::Restored => "restored",
+            EditRollbackStatus::AlreadyRolledBack => "already-rolled-back",
+            EditRollbackStatus::Conflict { .. } => "conflict",
+            EditRollbackStatus::Failed { .. } => "failed",
+        };
+        match self.snapshots.provenance(edit_id) {
+            Ok(mut provenance) => {
+                provenance.outcome = crate::services::snapshot::ProvenanceOutcome::RolledBack {
+                    reason: Some(outcome_label.to_owned()),
+                };
+                if let Err(error) = self.snapshots.record_provenance(&provenance) {
+                    tracing::warn!(
+                        event = "rollback_provenance_failed",
+                        edit_id = edit_id,
+                        error = %error,
+                        "rollback outcome could not be recorded in provenance"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "rollback_provenance_unreadable",
+                    edit_id = edit_id,
+                    error = %error,
+                    "rollback outcome could not be correlated in provenance"
+                );
+            }
+        }
+    }
+
+    /// Emits the consequential rollback decision/outcome through the
+    /// existing shared audit boundary (§26): correlatable, redacted at
+    /// the choke point, never file contents or secrets.
+    fn record_rollback_audit(
+        &self,
+        edit_id: &str,
+        action: &'static str,
+        outcome: &EditRollbackStatus,
+    ) {
+        let detail = match outcome {
+            EditRollbackStatus::Restored => "all pending targets restored and verified",
+            EditRollbackStatus::AlreadyRolledBack => "all targets already at pre-edit state",
+            EditRollbackStatus::Conflict { reason } | EditRollbackStatus::Failed { reason } => {
+                reason.as_str()
+            }
+        };
+        crate::services::audit::global().record("security", action, edit_id, detail);
     }
 
     /// Execute a multi-operation patch transaction.
@@ -2260,9 +2365,11 @@ impl EditService {
         let tx_id = transaction.id.clone();
         let tx_id_str = tx_id.0.clone();
 
-        // AWE-010: keep the operation labels for the provenance record
-        // before the operations are grouped/consumed.
-        let original_operations: Vec<EditOperation> = transaction.operations.clone();
+        // AWE-010: keep only the operation LABELS for the provenance
+        // record (collecting them up front avoids cloning the whole
+        // operation payloads — ApplyDiff diffs can be large).
+        let operation_labels: Vec<&'static str> =
+            transaction.operations.iter().map(operation_label).collect();
 
         // Phase 1: grouping — deterministic path ordering (sorted, no HashMap).
         // Each entry keeps the operation's ORIGINAL transaction index so
@@ -2497,22 +2604,26 @@ impl EditService {
         // AWE-010: the whole transaction committed and verified —
         // record provenance with every produced-state hash so this
         // multi-file edit can be rolled back later as one exact
-        // transaction. Provenance failure is reported separately and
-        // never rewrites the committed filesystem outcome.
+        // transaction. Provenance failure never rewrites the committed
+        // filesystem outcome — it is logged so a broken provenance
+        // store is never silent.
         let paths: Vec<String> = after_hashes.iter().map(|(path, _)| path.clone()).collect();
-        let operations: Vec<String> = original_operations
-            .iter()
-            .map(operation_label)
-            .map(str::to_owned)
-            .collect();
-        let _ = self.record_edit_provenance(
+        let operations: Vec<String> = operation_labels.into_iter().map(str::to_owned).collect();
+        if let Err(error) = self.record_edit_provenance(
             &tx_id,
             &snapshot,
             after_hashes,
             operations,
             paths,
             identity,
-        );
+        ) {
+            tracing::warn!(
+                event = "edit_provenance_failed",
+                edit_id = %tx_id,
+                error = %error,
+                "committed edit could not record provenance; rollback by id is unavailable for it"
+            );
+        }
 
         Ok(PatchResult {
             transaction_id: tx_id,
@@ -2827,15 +2938,24 @@ impl EditService {
 
         // AWE-010: record provenance with the produced-state hash after
         // the verified commit. Provenance failure never rewrites the
-        // committed filesystem outcome — it surfaces separately.
-        let _ = self.record_edit_provenance(
+        // committed filesystem outcome — it is logged so a broken
+        // provenance store is never silent (a later exact-id rollback
+        // would report missing recovery material).
+        if let Err(error) = self.record_edit_provenance(
             &edit_id,
             &snapshot,
             vec![(path.clone(), after.hash.clone())],
             vec!["Replace".to_owned()],
             vec![path.clone()],
             identity,
-        );
+        ) {
+            tracing::warn!(
+                event = "edit_provenance_failed",
+                edit_id = %edit_id,
+                error = %error,
+                "committed edit could not record provenance; rollback by id is unavailable for it"
+            );
+        }
 
         Ok(EditResult {
             id: edit_id,
@@ -2936,15 +3056,24 @@ impl EditService {
         self.verify_insert_semantics(path, *line, content, &after)?;
 
         // AWE-010: provenance with the produced-state hash after the
-        // verified commit.
-        let _ = self.record_edit_provenance(
+        // verified commit. Provenance failure never rewrites the
+        // committed filesystem outcome — it is logged so a broken
+        // provenance store is never silent.
+        if let Err(error) = self.record_edit_provenance(
             &edit_id,
             &snapshot,
             vec![(path.clone(), after.hash.clone())],
             vec!["Insert".to_owned()],
             vec![path.clone()],
             identity,
-        );
+        ) {
+            tracing::warn!(
+                event = "edit_provenance_failed",
+                edit_id = %edit_id,
+                error = %error,
+                "committed edit could not record provenance; rollback by id is unavailable for it"
+            );
+        }
 
         Ok(LineEditResult {
             id: edit_id,
@@ -3044,15 +3173,24 @@ impl EditService {
         self.verify_delete_range_semantics(path, *start_line, *end_line, &after)?;
 
         // AWE-010: provenance with the produced-state hash after the
-        // verified commit.
-        let _ = self.record_edit_provenance(
+        // verified commit. Provenance failure never rewrites the
+        // committed filesystem outcome — it is logged so a broken
+        // provenance store is never silent.
+        if let Err(error) = self.record_edit_provenance(
             &edit_id,
             &snapshot,
             vec![(path.clone(), after.hash.clone())],
             vec!["DeleteRange".to_owned()],
             vec![path.clone()],
             identity,
-        );
+        ) {
+            tracing::warn!(
+                event = "edit_provenance_failed",
+                edit_id = %edit_id,
+                error = %error,
+                "committed edit could not record provenance; rollback by id is unavailable for it"
+            );
+        }
 
         Ok(LineEditResult {
             id: edit_id,
@@ -8843,5 +8981,139 @@ mod edit_authorization_boundary_tests {
             .unwrap_err();
         assert_authorization_denied(err, DenialReason::PolicyDenied);
         assert_eq!(read_file(&tmp, "src/secrets.rs"), "key = \"...\"\n");
+    }
+
+    /// §19/§30 mixed-state retry — the case the preflight partition
+    /// exists for: one target already back at its pre-edit state while
+    /// another is still at the produced state. The rollback must
+    /// complete the REMAINING restoration instead of deadlocking into a
+    /// permanent Conflict (the produced-state guard must not reject the
+    /// already-restored target), and must not touch the file already at
+    /// its pre-edit state.
+    #[test]
+    fn mixed_state_retry_completes_the_remaining_restoration() {
+        let (tmp, svc, ws) = setup();
+        let principal = AuthorizingPrincipal::operator(&ws);
+        write_file(&tmp, "a.txt", "alpha\n");
+        write_file(&tmp, "b.txt", "beta\n");
+        let tx = EditTransaction::new(vec![
+            EditOperation::Replace {
+                path: "a.txt".into(),
+                old: "alpha".into(),
+                new: "ALPHA".into(),
+                occurrence: None,
+            },
+            EditOperation::Replace {
+                path: "b.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            },
+        ]);
+        let result = svc.patch(tx).unwrap();
+
+        // Simulate a partial restoration: an external process already
+        // restored a.txt to its pre-edit state, while b.txt is still
+        // the produced state.
+        write_file(&tmp, "a.txt", "alpha\n");
+
+        let status = svc
+            .rollback_edit(&principal, &result.transaction_id.to_string())
+            .unwrap();
+        assert_eq!(
+            status,
+            crate::services::edit::EditRollbackStatus::Restored,
+            "a mixed-state retry must restore the remaining target, not conflict"
+        );
+        assert_eq!(read_file(&tmp, "a.txt"), "alpha\n");
+        assert_eq!(read_file(&tmp, "b.txt"), "beta\n");
+    }
+
+    /// §C/§33.1: recovery material bound to a different workspace is
+    /// rejected before any mutation.
+    #[test]
+    fn recovery_material_bound_to_another_workspace_is_rejected() {
+        let (tmp, svc, ws) = setup();
+        let principal = AuthorizingPrincipal::operator(&ws);
+        write_file(&tmp, "f.txt", "keep\n");
+        let edit_id = "edit-foreign-workspace";
+        let store = crate::services::snapshot::SnapshotStore::new(tmp.path().to_path_buf());
+        let manifest = store
+            .create(edit_id, &[("f.txt".into(), b"keep\n".to_vec())], None)
+            .unwrap();
+        store
+            .record_provenance(&crate::services::snapshot::ProvenanceRecord {
+                edit_id: edit_id.into(),
+                snapshot_id: manifest.id.clone(),
+                operations: vec!["Replace".into()],
+                paths: vec!["f.txt".into()],
+                agent_id: None,
+                session_id: None,
+                // A foreign workspace binding.
+                workspace_id: Some("ws-elsewhere".into()),
+                hash_edges: vec![(
+                    "f.txt".into(),
+                    crate::services::edit::sha256_hex(b"edited\n"),
+                )],
+                outcome: crate::services::snapshot::ProvenanceOutcome::Committed,
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let err = svc.rollback_edit(&principal, edit_id).unwrap_err();
+        assert!(
+            err.to_string().contains("bound to a different workspace"),
+            "foreign workspace binding must fail closed: {err}"
+        );
+        // Zero mutation.
+        assert_eq!(read_file(&tmp, "f.txt"), "keep\n");
+    }
+
+    /// §C: a manifest entry outside the provenance path set is rejected
+    /// before any mutation — tampered recovery material never smuggles
+    /// past the resource-set check.
+    #[test]
+    fn manifest_entry_outside_provenance_paths_fails_closed() {
+        let (tmp, svc, ws) = setup();
+        let principal = AuthorizingPrincipal::operator(&ws);
+        write_file(&tmp, "a.txt", "keep a\n");
+        let edit_id = "edit-path-set-tamper";
+        let store = crate::services::snapshot::SnapshotStore::new(tmp.path().to_path_buf());
+        // The snapshot covers BOTH files...
+        let manifest = store
+            .create(
+                edit_id,
+                &[
+                    ("a.txt".into(), b"keep a\n".to_vec()),
+                    ("b.txt".into(), b"keep b\n".to_vec()),
+                ],
+                None,
+            )
+            .unwrap();
+        // ...but the provenance names only a.txt.
+        store
+            .record_provenance(&crate::services::snapshot::ProvenanceRecord {
+                edit_id: edit_id.into(),
+                snapshot_id: manifest.id.clone(),
+                operations: vec!["Replace".into()],
+                paths: vec!["a.txt".into()],
+                agent_id: None,
+                session_id: None,
+                workspace_id: None,
+                hash_edges: vec![(
+                    "a.txt".into(),
+                    crate::services::edit::sha256_hex(b"edited a\n"),
+                )],
+                outcome: crate::services::snapshot::ProvenanceOutcome::Committed,
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let err = svc.rollback_edit(&principal, edit_id).unwrap_err();
+        assert!(
+            err.to_string().contains("provenance path set"),
+            "path-set mismatch must fail closed: {err}"
+        );
+        assert_eq!(read_file(&tmp, "a.txt"), "keep a\n");
     }
 }

@@ -342,8 +342,10 @@ impl SnapshotStore {
             self.contents_dir(),
             self.provenance_dir(),
         ] {
+            // The error message names the operation, never the host
+            // path: caller-visible errors must not leak absolute paths.
             fs::create_dir_all(&dir)
-                .map_err(|e| SnapshotError::Storage(format!("{}, {}", dir.display(), e)))?;
+                .map_err(|e| SnapshotError::Storage(format!("create snapshot state dir: {e}")))?;
         }
         Ok(())
     }
