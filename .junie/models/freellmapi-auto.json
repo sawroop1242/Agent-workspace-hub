@@ -4,5 +4,5 @@
   "providerName": "nvidia",
   "baseUrl": "https://integrate.api.nvidia.com/v1/chat/completions",
   "apiType": "OpenAICompletion",
-  "apiKey": "${AWH_AGENT2_NVIDIA_KEY_1}"
+  
 }
