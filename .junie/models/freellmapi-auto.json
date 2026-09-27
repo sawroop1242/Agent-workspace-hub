@@ -1,5 +1,5 @@
 {
-  "id": "deepseek-ai/deepseek-v4.1-flash",
+  "id ": "z-ai/glm-5.3",
   "displayName": "FreeLLMAPI Auto Router",
   "providerName": "nvidia",
   "baseUrl": "https://integrate.api.nvidia.com/v1/chat/completions",
