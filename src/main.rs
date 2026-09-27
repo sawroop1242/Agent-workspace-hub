@@ -80,6 +80,15 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Agent worktree isolation (GIT-001): managed Git worktrees bound
+    /// to one agent session — thin adapters over the canonical
+    /// WorktreeStore lifecycle (containment, ownership, reconciliation,
+    /// audit).
+    #[command(name = "worktree")]
+    Worktree {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::worktree::WorktreeCommand,
+    },
     /// Manage workspace-local DENY-only policy rules.
     Policy {
         #[command(subcommand)]
@@ -602,6 +611,12 @@ fn main() -> Result<()> {
             RegistryCommand::Search { query, url } => search_registry(&url, &query)?,
         },
         Some(Command::Agent { command }) => handle_agent_cli(command)?,
+        Some(Command::Worktree { command }) => {
+            // The worktree family returns its own stable exit codes
+            // (GIT-001 §19); propagate them as the process status.
+            let root = std::env::current_dir()?;
+            std::process::exit(agent_workspace_hub::cli::worktree::run(command, &root));
+        }
         Some(Command::Policy { command }) => handle_policy_cli(command)?,
         Some(Command::Tunnel { command }) => handle_tunnel_cli(command)?,
         None => println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
