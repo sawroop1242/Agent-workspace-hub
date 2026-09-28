@@ -59,9 +59,9 @@ jobs:
       - run: cargo audit
 
   ai-review:
-    name: Deep AI Code Review (FreeLLMAPI OpenAI-compatible)
+    name: PR-Agent NVIDIA NIM Review
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'pull_request' }}
     needs: [fmt]
     permissions:
       contents: read
@@ -69,33 +69,18 @@ jobs:
       issues: write
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Load Custom Review Prompt
-        id: load-prompt
-        run: |
-          EOF=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
-          echo "CUSTOM_PROMPT<<$EOF" >> $GITHUB_ENV
-          cat .github/agent/prompts/review.md >> $GITHUB_ENV
-          echo "" >> $GITHUB_ENV
-          echo "$EOF" >> $GITHUB_ENV
-
-      # The NVIDIA NIM profile lives at .junie/models/freellmapi-auto.json
-      # ("custom:<filename-without-.json>"). That profile's apiKey field
-      # references ${AWH_AGENT2_NVIDIA_KEY_1}, so that exact env var name
-      # must be set here for Junie to resolve it.
-      - name: Run Junie Code Review
-        uses: JetBrains/junie-github-action@v1.7.11
+      - name: PR-Agent review
+        uses: the-pr-agent/pr-agent@main
         env:
-          AWH_AGENT2_NVIDIA_KEY_1: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-
-        with:
-          model: "custom:freellmapi-auto"
-          openai_api_key: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-          prompt: ${{ env.CUSTOM_PROMPT }}
-          pr_number: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
-
-       
-      
+          GITHUB_TOKEN: ${{ github.token }}
+          OPENAI_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          OPENAI.API_BASE: "https://integrate.api.nvidia.com/v1"
+          config.model: "openai/z-ai/glm-5.3"
+          config.fallback_models: '["openai/z-ai/glm-5.3"]'
+          config.ai_timeout: "300"
+          config.custom_model_max_tokens: "128000"
+          config.verbosity_level: "1"
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "false"
+          github_action_config.auto_improve: "false"
+          github_action_config.pr_actions: '["opened", "reopened", "synchronize", "ready_for_review", "review_requested"]'
