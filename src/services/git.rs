@@ -281,6 +281,99 @@ impl GitService {
         self.run(&["branch", "-D", name]).await
     }
 
+    // ---- Worktree operations (GIT-001). All argv-structured; every
+    // ---- user-supplied value is passed after a `--`-style separator
+    // ---- or as an explicit option value, so no string can become a
+    // ---- Git option. The AWH worktree service owns the lifecycle;
+    // ---- these methods are only the canonical Git invocation boundary.
+
+    /// `git check-ref-format --allow-onelevel <ref>`: whether `ref` is a
+    /// valid ref/branch name under Git's own rules. Structured boolean
+    /// probe — the caller turns a refusal into a domain error.
+    pub async fn is_valid_ref(&self, name: &str) -> bool {
+        self.run_raw(&["check-ref-format", "--allow-onelevel", name])
+            .await
+            .map(|output| output.exit_code == Some(0))
+            .unwrap_or(false)
+    }
+
+    /// `git rev-parse HEAD`: the repository identity used by the AWH
+    /// worktree service (repository identity comes from Git, never from
+    /// directory names, §6).
+    pub async fn head_commit(&self) -> Result<String> {
+        let output = self.run(&["rev-parse", "HEAD"]).await?;
+        Ok(output.stdout.trim().to_owned())
+    }
+
+    /// `git worktree list --porcelain`: Git's native worktree metadata
+    /// (§27 — the worktree service uses this instead of scanning the
+    /// filesystem). Each entry is a `worktree <abs-path>` line followed
+    /// by its `HEAD`/`branch` attributes until a blank line.
+    pub async fn worktree_list(&self) -> Result<Vec<(String, Option<String>)>> {
+        let output = self.run(&["worktree", "list", "--porcelain"]).await?;
+        let mut entries = Vec::new();
+        let mut path: Option<String> = None;
+        for line in output.stdout.lines() {
+            if let Some(rest) = line.strip_prefix("worktree ") {
+                path = Some(rest.trim().to_owned());
+            } else if let (Some(p), Some(rest)) = (&path, line.strip_prefix("branch ")) {
+                entries.push((p.clone(), Some(rest.trim().to_owned())));
+                path = None;
+            } else if line.is_empty() {
+                if let Some(p) = path.take() {
+                    entries.push((p, None)); // detached HEAD
+                }
+            }
+        }
+        if let Some(p) = path.take() {
+            entries.push((p, None));
+        }
+        Ok(entries)
+    }
+
+    /// Creates a worktree at `path` (absolute or repo-relative) on a
+    /// NEW branch `branch` starting at `start_point`. Path and branch
+    /// are passed as explicit argv values after the pathspec form, so a
+    /// value beginning with `-` can never be re-interpreted as an
+    /// option (the branch is validated by the caller via
+    /// [`Self::is_valid_ref`], and `start_point` is resolved by Git
+    /// itself or validated upstream).
+    pub async fn worktree_add(
+        &self,
+        path: &Path,
+        branch: &str,
+        start_point: &str,
+    ) -> Result<GitOutput> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("worktree path is not valid UTF-8"))?;
+        self.run(&["worktree", "add", "-b", branch, "--", path_str, start_point])
+            .await
+    }
+
+    /// Removes a worktree WITHOUT discarding uncommitted changes (no
+    /// `--force`): Git refuses a dirty worktree, and the AWH service
+    /// surfaces that refusal instead of silently discarding user/agent
+    /// work (§13). The path is passed as an explicit argv value.
+    pub async fn worktree_remove(&self, path: &Path) -> Result<GitOutput> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("worktree path is not valid UTF-8"))?;
+        self.run(&["worktree", "remove", "--", path_str]).await
+    }
+
+    /// Deletes the branch created for a removed worktree. HIGH RISK
+    /// (`HighRiskGitOp::BranchDelete` semantics: explicit, never hidden
+    /// inside normal lifecycle), so it is a separate call the service
+    /// invokes only when its own contract explicitly permits branch
+    /// cleanup.
+    pub async fn delete_branch_quiet(&self, name: &str) -> Result<GitOutput> {
+        if name.is_empty() || name == "HEAD" {
+            bail!("refusing to delete invalid branch name");
+        }
+        self.run(&["branch", "-D", name]).await
+    }
+
     /// Force-pushes a branch. HIGH RISK.
     pub async fn force_push(&self, remote: &str, branch: &str) -> Result<GitOutput> {
         self.run(&["push", "--force-with-lease", remote, branch])
