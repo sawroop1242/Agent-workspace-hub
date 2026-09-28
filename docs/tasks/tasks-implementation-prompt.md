@@ -51,6 +51,118 @@ rg -n "TODO|FIXME|unimplemented!|todo!|panic!|unwrap\(|expect\("
 
 Record which existing contracts are reused, extended, adapted, or replaced and why. Missing prompt coverage is not evidence of missing Rust implementation.
 
+
+## Template refinement — repository-grounded contract
+
+### Existing-contract inventory
+
+| Existing contract | Location | Action | Reason |
+|---|---|---|---|
+| Minimal `Task` / `TaskStatus` model | `src/models/task.rs` | Converge/replace only after migration analysis | This is a smaller model than the richer MCP task model and must not remain a competing task authority |
+| File-per-task `TaskStore` | `src/core/tasks.rs` | Converge/deprecate as appropriate | Existing `.agent/tasks/*.json` store currently has overwrite semantics and a separate status model |
+| Rich `Task`, `TaskStatus`, `TaskPriority` | `src/mcp/tasks.rs` | Reuse/extend | Existing richer task lifecycle, bounded fields, atomic persistence, and locking |
+| `TasksMcp` | `src/mcp/tasks.rs` | Adapt into canonical service boundary | Must stop being an MCP-owned persistence/business-logic implementation |
+| `StoreLock` | `src/mcp/store_lock.rs` | Reuse where compatible | Existing cross-process task-store locking primitive |
+| Agent/session identity | `src/services/agent_runtime.rs` | Reuse | Assignment and mutation must preserve canonical caller identity |
+| Authorization/PolicyEngine | `src/services/authorization.rs` and policy contracts | Reuse | Task mutation and assignment authorization remain outside the task store |
+| Persistent AuditLog | `src/services/audit.rs` | Reuse | Task lifecycle events must use the canonical audit authority |
+| Workspace/project services | existing workspace/project services | Reuse | Task scope must follow canonical workspace/project identity |
+| Worktree/Git services | existing Git/worktree contracts | Reuse | Optional task worktree association must not create another Git authority |
+
+**Critical convergence requirement:** the repository currently contains two materially different task models/stores: `src/core/tasks.rs` and `src/mcp/tasks.rs`. The implementation must select and document one canonical domain model and persistence authority, migrate/adapt callers, and remove competing writers/readers. Do not hide the divergence behind an adapter while both stores remain authoritative.
+
+## Architecture flow
+
+```text
+CLI / MCP / TUI / Control API
+            |
+            v
+Caller identity + workspace/project scope
+            |
+            v
+Canonical TaskService / TaskStore
+            |
+            +--> lifecycle/state-machine validation
+            +--> assignment + agent/session/worktree validation
+            +--> optimistic-concurrency/version validation
+            +--> PolicyEngine / authorization
+            |
+            v
+Atomic durable task mutation
+            |
+            +--> persistent TaskStore
+            +--> AuditLog / correlated event
+            |
+            v
+Canonical task state
+            |
+            +--> collaboration/task views
+            +--> agent/session/worktree references
+            +--> interface adapters
+```
+
+### Task-specific state invariants
+
+Keep **task state** distinct from **execution state**:
+
+- Task lifecycle records what AWH says about the work item.
+- Agent/session/worktree state records who is working, where, and under which runtime context.
+- A task assignment does not itself start a process, agent, terminal command, workflow, or scheduler.
+- An execution outcome may update task state only through the canonical task service.
+- Assignment never grants the assignee new capabilities.
+
+The final state machine must be derived from the current product contract rather than blindly combining the incompatible `Pending/InProgress/Completed/Cancelled` and `Todo/InProgress/Blocked/Done` enums.
+
+## Persistence ownership and recovery
+
+The canonical task service/store must own exactly one durable task representation after convergence.
+
+Before implementation, determine the supported migration path from:
+- `.agent/tasks/*.json` used by `src/core/tasks.rs`;
+- `.agent/tasks.json` used by `src/mcp/tasks.rs`.
+
+Define a schema/version marker and deterministic migration. Do not silently merge conflicting records or silently treat corruption as an empty store.
+
+Required lifecycle:
+
+`load → validate schema/scope → validate mutation/version → authorize → prepare → atomic publish → reload/verify → audit`.
+
+Define:
+- atomic replacement semantics;
+- cross-process locking;
+- crash/restart behavior;
+- corruption/truncation handling;
+- migration rollback/failure behavior;
+- retention/cleanup ownership;
+- bounded task count and field sizes;
+- no cross-workspace cleanup.
+
+The canonical task store must not be written directly by MCP, TUI, CLI, or API adapters.
+
+## Interfaces acceptance
+
+- [ ] CLI `awh task list|show|create|update|cancel|assign` uses the canonical TaskService.
+- [ ] MCP task operations use the same TaskService and caller/scope semantics.
+- [ ] TUI reads/mutates tasks through the canonical backend/service and never writes task persistence directly.
+- [ ] Control API, if exposed, uses the same versioned service semantics and scoped authorization.
+- [ ] Every interface observes the same lifecycle transitions, assignment rules, limits, conflict semantics, and error classes.
+- [ ] No adapter retains an independent task store or state machine.
+- [ ] Real compiled/interface tests prove the common path.
+
+## Task-specific rollout
+
+1. Inventory all task models, stores, writers, readers, CLI/MCP/TUI/API/collaboration callers.
+2. Choose the canonical task model, status vocabulary, and persistence owner from current `rust` evidence.
+3. Define schema/version and migrate both existing task representations without silent data loss.
+4. Establish the canonical TaskService and lifecycle/assignment/concurrency rules.
+5. Integrate AgentRuntimeService, workspace/project scope, PolicyEngine/authorization, worktree references, and AuditLog.
+6. Route CLI, MCP, TUI, Control API, and collaboration adapters through the canonical service.
+7. Remove or make non-authoritative legacy task writers/readers unreachable.
+8. Verify restart, migration, corruption, concurrency, scope isolation, and real-interface behavior.
+9. Run repository verification gates and document evidence/limitations.
+
+No rollout step may depend on another prompt or PR being merged first.
+
 # 3. Architecture
 
 ## Canonical responsibility
