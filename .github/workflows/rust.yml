@@ -88,7 +88,7 @@ jobs:
   manual-ai-review:
     name: Manual PR-Agent NVIDIA NIM Review
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' ${{
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: [fmt]
     permissions:
       contents: read
@@ -99,8 +99,8 @@ jobs:
       - name: Resolve pull request URL
         id: pr
         env:
-          GH_TOKEN: ${{ github.token ${{
-          PR_NUMBER: ${{ inputs.pr_number ${{
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
 
@@ -123,15 +123,15 @@ jobs:
 
       - name: Run PR-Agent review
         env:
-          OPENAI__KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 ${{
+          OPENAI__KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
           OPENAI__API_BASE: "https://integrate.api.nvidia.com/v1"
           CONFIG__MODEL: "openai/z-ai/glm-5.3"
           CONFIG__FALLBACK_MODELS: '["openai/z-ai/glm-5-3-flash"]'
           CONFIG__AI_TIMEOUT: "300"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
           CONFIG__VERBOSITY_LEVEL: "1"
-          GITHUB__USER_TOKEN: ${{ github.token ${{
-          PR_URL: ${{ steps.pr.outputs.url ${{
+          GITHUB__USER_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.pr.outputs.url }}
         run: |
           set -euo pipefail
           pr-agent --pr_url="$PR_URL" review --config.propagate_tool_errors=true
