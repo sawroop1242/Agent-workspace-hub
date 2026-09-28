@@ -23,7 +23,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build-test:
-    name: Build / test (${{ matrix.os }}
+    name: Build / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -61,7 +61,7 @@ jobs:
   ai-review:
     name: PR-Agent NVIDIA NIM Review
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
     needs: [fmt]
     permissions:
       contents: read
@@ -69,10 +69,58 @@ jobs:
       issues: write
 
     steps:
+      - name: Prepare manual PR-Agent event
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_FILE: ${{ github.workspace }}/pr-agent-event.json
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+
+          gh api \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            > "$EVENT_FILE"
+
+          python - "$EVENT_FILE" <<'PY'
+          import json
+          import os
+          import sys
+
+          path = sys.argv[1]
+          with open(path, encoding="utf-8") as f:
+              pull_request = json.load(f)
+
+          event = {
+              "action": "opened",
+              "pull_request": pull_request,
+              "repository": {
+                  "full_name": os.environ["GITHUB_REPOSITORY"],
+                  "html_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}",
+              },
+              "sender": {
+                  "type": "User",
+                  "login": os.environ["GITHUB_ACTOR"],
+              },
+          }
+
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(event, f)
+          PY
+
       - name: PR-Agent review
         uses: the-pr-agent/pr-agent@main
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_EVENT_NAME: ${{ github.event_name == 'workflow_dispatch' && 'pull_request' || github.event_name }}
+          GITHUB_EVENT_PATH: ${{ github.event_name == 'workflow_dispatch' && format('{0}/pr-agent-event.json', github.workspace) || github.event_path }}
           OPENAI_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
           OPENAI__API_BASE: "https://integrate.api.nvidia.com/v1"
           "config.model": "openai/z-ai/glm-5.3"
