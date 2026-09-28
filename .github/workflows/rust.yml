@@ -24,7 +24,7 @@ jobs:
 
   build-test:
     name: Build / test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +61,7 @@ jobs:
   ai-review:
     name: PR-Agent NVIDIA NIM Review
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' }})
     needs: [fmt]
     permissions:
       contents: read
@@ -72,15 +72,15 @@ jobs:
       - name: PR-Agent review
         uses: the-pr-agent/pr-agent@main
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          OPENAI__KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          GITHUB_TOKEN: ${{ github.token }})
+          OPENAI__KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }})
           OPENAI__API_BASE: "https://integrate.api.nvidia.com/v1"
-          config.model: "openai/z-ai/glm-5.3"
-          config.fallback_models: '["openai/z-ai/glm-5.3"]'
-          config.ai_timeout: "300"
-          config.custom_model_max_tokens: "128000"
-          config.verbosity_level: "1"
-          github_action_config.auto_review: "true"
-          github_action_config.auto_describe: "false"
-          github_action_config.auto_improve: "false"
-          github_action_config.pr_actions: '["opened", "reopened", "synchronize", "ready_for_review", "review_requested"]'
+          "config.model": "openai/z-ai/glm-5.3"
+          "config.fallback_models": '["openai/z-ai/glm-5-3-flash"]'
+          "config.ai_timeout": "300"
+          "config.custom_model_max_tokens": "128000"
+          "config.verbosity_level": "1"
+          "github_action_config.auto_review": "true"
+          "github_action_config.auto_describe": "false"
+          "github_action_config.auto_improve": "false"
+          "github_action_config.pr_actions": '["opened", "reopened", "synchronize", "ready_for_review", "review_requested"]'
