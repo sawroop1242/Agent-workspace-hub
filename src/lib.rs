@@ -8,6 +8,7 @@
 //! token budgets — on top of the same per-project state layout.
 
 pub mod api;
+pub mod cli;
 pub mod context;
 pub mod core;
 pub mod mcp;

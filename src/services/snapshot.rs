@@ -661,6 +661,45 @@ impl SnapshotStore {
             .map_err(|e| SnapshotError::Corruption(format!("provenance parse: {e}")))
     }
 
+    /// AWE-014: the canonical bounded history read over the provenance
+    /// records — newest first, at most `limit` entries (callers bound
+    /// the page themselves; this store never returns unbounded history).
+    /// Every listed record must parse and validate: a corrupt record
+    /// fails closed with a structured error rather than being silently
+    /// skipped or fabricated (§19/§43).
+    pub fn list_provenance(&self, limit: usize) -> Result<Vec<ProvenanceRecord>, SnapshotError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.ensure_dirs()?;
+        let dir = self.provenance_dir();
+        let mut ids: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .map_err(|e| SnapshotError::Storage(format!("listing provenance: {e}")))?
+        {
+            let path = entry
+                .map_err(|e| SnapshotError::Storage(format!("listing provenance: {e}")))?
+                .path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                validate_id_component(stem)?;
+                ids.push(stem.to_owned());
+            }
+        }
+        // Newest first: reverse lexicographic order over the edit-id
+        // stems, which start with a monotonically increasing sequence
+        // prefix from EditId::new.
+        ids.sort();
+        ids.reverse();
+        let mut records = Vec::with_capacity(ids.len().min(limit));
+        for id in ids.iter().take(limit) {
+            records.push(self.provenance(id)?);
+        }
+        Ok(records)
+    }
+
     /// Lists snapshot ids, deterministically ordered for the caller.
     pub fn list(&self) -> Result<Vec<SnapshotId>, SnapshotError> {
         self.ensure_dirs()?;
