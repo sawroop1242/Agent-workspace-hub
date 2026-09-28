@@ -23,8 +23,8 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build-test:
-    name: Build / test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }})
+    name: Build / test (${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +61,7 @@ jobs:
   ai-review:
     name: PR-Agent NVIDIA NIM Review
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }})
+    if: ${{ github.event_name == 'pull_request' }}
     needs: [fmt]
     permissions:
       contents: read
@@ -72,8 +72,8 @@ jobs:
       - name: PR-Agent review
         uses: the-pr-agent/pr-agent@main
         env:
-          GITHUB_TOKEN: ${{ github.token }})
-          OPENAI__KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }})
+          GITHUB_TOKEN: ${{ github.token }}
+          OPENAI_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
           OPENAI__API_BASE: "https://integrate.api.nvidia.com/v1"
           "config.model": "openai/z-ai/glm-5.3"
           "config.fallback_models": '["openai/z-ai/glm-5-3-flash"]'
