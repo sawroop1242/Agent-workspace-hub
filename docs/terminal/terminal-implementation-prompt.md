@@ -103,6 +103,8 @@ rg -n "TODO|FIXME|unimplemented!|todo!|panic!|unwrap\(|expect\("
 
 ### Existing-contract inventory
 
+The inventory is part of the implementation contract: verify each row against the checked-out `rust` branch before coding. A prompt, issue, or missing file name is not sufficient evidence that a contract is absent.
+
 Before implementation, replace/confirm this table against the current branch. Do not infer absence from this prompt alone.
 
 | Existing contract | Current location | Action | Reason |
