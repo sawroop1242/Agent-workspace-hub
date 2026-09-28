@@ -2591,13 +2591,33 @@ impl EditService {
 
         // Phase 3: commit every file atomically. If any write/verification
         // fails, report the failure together with already-committed paths.
+        //
+        // FS-001: the whole commit phase runs under ONE coordination set
+        // covering every affected file, acquired in deterministic
+        // resource-key order (the coordinator sorts + dedups). The locks
+        // are held only across revalidation + atomic writes + verify
+        // reads — never across the earlier in-memory preparation, model
+        // inference, or MCP dispatch.
+        let plan_paths: Vec<&str> = plan.iter().map(|file| file.path.as_str()).collect();
+        let _coordination = self
+            .files
+            .coordination()
+            .acquire(&plan_paths)
+            .map_err(|error| {
+                let edit_error = edit_coordination_error(error);
+                EditError::PatchPreparationFailure {
+                    transaction_id: tx_id_str.clone(),
+                    path: None,
+                    reason: format!("mutation refused: {edit_error}"),
+                }
+            })?;
         let mut steps: Vec<PatchStepResult> = Vec::new();
         let mut committed_paths: Vec<String> = Vec::new();
         let mut commit_error: Option<EditError> = None;
         let mut after_hashes: Vec<(String, String)> = Vec::new();
 
         for file in &plan {
-            match self.commit_verified(&file.path, &file.prepared_content, &file.before) {
+            match self.commit_verified_locked(&file.path, &file.prepared_content, &file.before) {
                 Ok(after) => {
                     after_hashes.push((file.path.clone(), after.hash.clone()));
                     steps.push(PatchStepResult {
@@ -2756,8 +2776,13 @@ impl EditService {
             // restore only counts when the re-read bytes equal the
             // original exactly; a delete only counts when the target is
             // really gone.
+            //
+            // FS-001: these run under the caller's (patch_internal's)
+            // held coordination set — the `_locked` variants revalidate
+            // containment but perform no acquisition, so the recovery
+            // cannot self-deadlock on resources it already holds.
             if !file.original_existed {
-                match self.files.delete(&file.path) {
+                match self.files.delete_locked(&file.path) {
                     Ok(()) => {
                         let still_exists = self.files.read_bytes(&file.path).is_ok();
                         if still_exists {
@@ -2804,8 +2829,10 @@ impl EditService {
                         conflict_free = false;
                     }
                     Ok(original_text) => {
-                        let restored_ok =
-                            self.files.write_atomic(&file.path, original_text).is_ok();
+                        let restored_ok = self
+                            .files
+                            .write_atomic_locked(&file.path, original_text)
+                            .is_ok();
                         let verified = restored_ok
                             && match self.files.read_bytes(&file.path) {
                                 Ok(current) => current == file.original_bytes,
@@ -2857,6 +2884,36 @@ impl EditService {
             conflict_free,
             summary,
         }
+    }
+}
+
+/// Maps a coordination-plane failure into the edit error taxonomy. A
+/// coordination failure is always a fail-closed condition: no mutation
+/// happened, and the error is an honest IO-class failure naming the
+/// workspace-relative target. Stable reason codes ride the AWE-013
+/// audit path (`edit_coordination_timeout`, `edit_coordination_failure`)
+/// — coordination adds no audit store of its own.
+fn edit_coordination_error(error: crate::core::fs_coordination::CoordinationError) -> EditError {
+    use crate::core::fs_coordination::CoordinationError;
+    let reason = match &error {
+        CoordinationError::TimedOut { .. } => "coordination_acquire_timeout",
+        CoordinationError::RegistrySaturated => "coordination_registry_saturated",
+        CoordinationError::InvalidResource(_) => "coordination_invalid_resource",
+        CoordinationError::Infrastructure(_) => "coordination_infrastructure_failure",
+    };
+    crate::services::audit::record_outcome(
+        "failure",
+        "filesystem.coordination",
+        "edit",
+        &format!("mutation refused: {error}"),
+        &crate::services::audit::AuditCorrelation {
+            reason: Some(reason.to_owned()),
+            ..Default::default()
+        },
+    );
+    EditError::WriteFailure {
+        path: String::new(),
+        message: format!("filesystem coordination unavailable: {error}"),
     }
 }
 
@@ -3492,6 +3549,17 @@ impl EditService {
             return Ok(EditRollbackStatus::Restored);
         }
 
+        // FS-001: rollback acquires its OWN coordination set over every
+        // record target (an edit's locks never survive across operations),
+        // in the coordinator's deterministic key order, held across the
+        // conflict checks + restorations + verified re-reads.
+        let record_paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
+        let _coordination = self
+            .files
+            .coordination()
+            .acquire(&record_paths)
+            .map_err(edit_coordination_error)?;
+
         // Phase 1: conflict-check every record before mutating anything.
         for record in records {
             let current_bytes = match self.files.read_bytes(&record.path) {
@@ -3521,7 +3589,7 @@ impl EditService {
         // passed, so every target is still the state this edit produced.
         for record in records.iter().rev() {
             if !record.existed_before {
-                if let Err(error) = self.files.delete(&record.path) {
+                if let Err(error) = self.files.delete_locked(&record.path) {
                     return Ok(EditRollbackStatus::Failed {
                         reason: format!(
                             "failed to delete edit-created file '{}': {}",
@@ -3544,7 +3612,7 @@ impl EditService {
                         path: record.path.clone(),
                     }
                 })?;
-                if let Err(error) = self.files.write_atomic(&record.path, &before_text) {
+                if let Err(error) = self.files.write_atomic_locked(&record.path, &before_text) {
                     return Ok(EditRollbackStatus::Failed {
                         reason: format!(
                             "failed to restore original bytes of '{}': {}",
@@ -3773,7 +3841,35 @@ impl EditService {
     /// Returns the verified after-state. Callers pass the before-state
     /// observed during preparation (`before`); it is the precondition the
     /// guard enforces, not a re-read of current content.
+    ///
+    /// FS-001: when `coordination` is `None`, the commit acquires the
+    /// canonical per-resource coordination set for `path` itself and
+    /// holds it across the stale-state guard + atomic write + verify
+    /// read — the smallest span that protects correctness. When a set is
+    /// passed, the caller (the multi-file patch commit span) already
+    /// holds coordination over every affected path; the commit then
+    /// revalidates under that held lock without re-acquiring (a
+    /// reentrant acquisition would self-deadlock).
     fn commit_verified(
+        &self,
+        path: &str,
+        prepared: &str,
+        before: &FileState,
+    ) -> Result<FileState, EditError> {
+        // Held across the stale-state guard + atomic write + verify read;
+        // dropped (releasing the resource) at scope exit.
+        let _held = self
+            .files
+            .coordination()
+            .acquire(&[path])
+            .map_err(edit_coordination_error)?;
+        self.commit_verified_locked(path, prepared, before)
+    }
+
+    /// [`Self::commit_verified`] under a caller-held coordination set
+    /// covering `path`. Performs the same stale-state guard, atomic
+    /// commit, and verification; performs no acquisition.
+    fn commit_verified_locked(
         &self,
         path: &str,
         prepared: &str,
@@ -3785,7 +3881,7 @@ impl EditService {
         self.verify_live_unchanged(path, before)?;
         let after_predicted = FileState::from_content(path, prepared);
         self.files
-            .write_atomic(path, prepared)
+            .write_atomic_locked(path, prepared)
             .map_err(|error| EditError::WriteFailure {
                 path: path.to_owned(),
                 message: error.to_string(),
@@ -5880,6 +5976,8 @@ mod replace_tests {
         write_file(&tmp, "f.txt", "first\n");
         svc.files().write_atomic("f.txt", "second\n").unwrap();
         assert_eq!(read_file(&tmp, "f.txt"), "second\n");
+        // No staging leftovers: coordination lock state lives in the
+        // system temp dir, so the workspace contains exactly the target.
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
         // A contained binary file round-trips byte-exact through the
         // atomic path (write_atomic takes UTF-8 text; binary via write).
@@ -8356,7 +8454,9 @@ mod atomic_write_tests {
     }
 
     /// No staging leftovers: a successful and a failed atomic write both
-    /// leave the parent directory with exactly the intended entries.
+    /// leave the parent directory with exactly the intended entries —
+    /// coordination lock state lives in the system temp dir, so the
+    /// workspace contains only the target.
     #[test]
     fn leaves_no_temporary_staging_leftovers() {
         let (tmp, svc) = setup();

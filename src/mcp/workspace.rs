@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::core::fs_coordination::FsCoordinator;
+
 /// Maximum size, in bytes, of content writable via [`WorkspaceMcp::write_file`].
 const MAX_WRITE_FILE_BYTES: usize = 5 * 1024 * 1024;
 
@@ -18,6 +20,7 @@ pub struct WorkspaceFile {
 /// Project-scoped MCP workspace access with path-traversal protection.
 pub struct WorkspaceMcp {
     root: PathBuf,
+    coordination: FsCoordinator,
 }
 
 impl WorkspaceMcp {
@@ -27,7 +30,8 @@ impl WorkspaceMcp {
             .into()
             .canonicalize()
             .context("workspace root does not exist")?;
-        Ok(Self { root })
+        let coordination = FsCoordinator::new(root.clone());
+        Ok(Self { root, coordination })
     }
 
     /// Returns the canonical workspace root.
@@ -87,9 +91,17 @@ impl WorkspaceMcp {
     /// Writes (creates or overwrites) a workspace file, bounded to 5 MiB.
     ///
     /// The write is atomic (temp file + rename), the same pattern the JSON
-    /// stores use, so a reader never observes a torn write. Unlike those
-    /// stores a single file overwrite is not a read-modify-write cycle over
-    /// shared state, so no [`crate::mcp::store_lock::StoreLock`] is taken.
+    /// stores use, so a reader never observes a torn write. A single file
+    /// overwrite is not a read-modify-write cycle over shared store state,
+    /// so no [`crate::mcp::store_lock::StoreLock`] is taken — but it IS a
+    /// workspace mutation, so it runs under the canonical filesystem
+    /// coordination boundary (FS-001): acquire the per-resource
+    /// coordination, RE-RUN the path validation under the lock, then
+    /// stage + rename. The resource key derives from the same canonical
+    /// root + relative path the files service and the edit engine use, so
+    /// a `workspace.write_file` tool call serializes with every other AWH
+    /// mutation of that file — across threads and across sibling `awh`
+    /// processes.
     pub fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         if relative.trim().is_empty() {
             bail!("workspace path must not be empty");
@@ -97,6 +109,11 @@ impl WorkspaceMcp {
         if content.len() > MAX_WRITE_FILE_BYTES {
             bail!("content exceeds {MAX_WRITE_FILE_BYTES} bytes");
         }
+        let _set = self.coordination.acquire(&[relative]).map_err(|error| {
+            anyhow::Error::msg(format!("filesystem coordination unavailable: {error}"))
+        })?;
+        // Revalidate UNDER the lock: containment and symlink checks run
+        // against the world as it is at the mutation boundary.
         let path = self.safe_new_path(relative)?;
         let parent = path.parent().context("target has no parent directory")?;
         fs::create_dir_all(parent)?;
@@ -113,10 +130,16 @@ impl WorkspaceMcp {
     /// Deletes a workspace file, returning whether it existed. Traversal and
     /// out-of-root targets are rejected (fail closed); a merely missing file
     /// is a no-op reported as `false`.
+    ///
+    /// FS-001: the deletion runs under the same canonical coordination
+    /// boundary with the path re-validated under the lock.
     pub fn delete_file(&self, relative: &str) -> Result<bool> {
         if relative.trim().is_empty() {
             bail!("workspace path must not be empty");
         }
+        let _set = self.coordination.acquire(&[relative]).map_err(|error| {
+            anyhow::Error::msg(format!("filesystem coordination unavailable: {error}"))
+        })?;
         let path = self.safe_new_path(relative)?;
         if !path.is_file() {
             return Ok(false);
