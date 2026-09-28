@@ -73,8 +73,8 @@ jobs:
         uses: the-pr-agent/pr-agent@main
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          OPENAI_KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
-          OPENAI.API_BASE: "https://integrate.api.nvidia.com/v1"
+          OPENAI__KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
+          OPENAI__API_BASE: "https://integrate.api.nvidia.com/v1"
           config.model: "openai/z-ai/glm-5.3"
           config.fallback_models: '["openai/z-ai/glm-5.3"]'
           config.ai_timeout: "300"
