@@ -185,6 +185,27 @@ impl FilesService {
         }
     }
 
+    /// Deletes a file or directory, reporting whether the target existed.
+    ///
+    /// The same containment and validation rules as [`Self::delete`] apply;
+    /// a target that does not exist is a no-op reported as `false`, while
+    /// an unsafe path or an I/O failure is still an error (fail closed).
+    pub fn delete_if_exists(&self, relative: &str) -> Result<bool> {
+        let path = self.resolve_checked(relative)?;
+        if path == self.root {
+            bail!("refusing to delete the project root");
+        }
+        if !path.exists() {
+            return Ok(false);
+        }
+        if path.is_dir() {
+            fs::remove_dir_all(&path).with_context(|| format!("delete dir {}", path.display()))?;
+        } else {
+            fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+        }
+        Ok(true)
+    }
+
     /// Renames/moves within the root. `to` must stay inside the root.
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
         let src = self.resolve_checked(from)?;

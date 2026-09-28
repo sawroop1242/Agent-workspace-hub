@@ -797,7 +797,8 @@ async fn list_memory(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root = store_scope(&state, params.project.as_deref())?;
     let entries = crate::core::memory::MemoryStore::for_project(&root)
-        .read_all()
+        .map_err(|e| ApiError::internal(&e))?
+        .list_all()
         .map_err(|e| ApiError::internal(&e))?;
     let total = entries.len();
     Ok(Json(json!({
@@ -821,15 +822,12 @@ async fn append_memory(
         return Err(ApiError::bad_request("content is required"));
     }
     let root = store_scope(&state, params.project.as_deref())?;
-    let entry = crate::models::MemoryEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        content: body.content,
-    };
-    crate::core::memory::MemoryStore::for_project(&root)
-        .append(&entry)
+    let entry = crate::core::memory::MemoryStore::for_project(&root)
+        .map_err(|e| ApiError::internal(&e))?
+        .append(&body.content)
         .map_err(|e| ApiError::internal(&e))?;
     audit_allow("api_memory_append", scope_name(&params).as_str(), "remote");
-    Ok(Json(json!({"appended": true})))
+    Ok(Json(json!({"appended": true, "id": entry.id})))
 }
 
 /// Scope label for audit subjects (never includes paths).
@@ -1470,7 +1468,10 @@ mod tests {
         assert_eq!(body["total"], 2);
         assert_eq!(body["entries"][0]["content"], "first fact");
         assert_eq!(body["entries"][1]["content"], "second fact");
-        assert!(!body["entries"][0]["timestamp"].as_str().unwrap().is_empty());
+        assert!(!body["entries"][0]["created_at"]
+            .as_str()
+            .unwrap()
+            .is_empty());
 
         let recent = crate::services::audit::global().recent(500);
         assert!(recent

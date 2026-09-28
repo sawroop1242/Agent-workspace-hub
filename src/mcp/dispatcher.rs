@@ -3807,8 +3807,10 @@ mod tests {
             json!({"path": "../escape.txt", "content": "nope"}),
         )
         .unwrap_err();
+        // The canonical FilesService rejects traversal components at the
+        // service boundary; the MCP adapter passes that error through.
         assert!(
-            error.to_string().contains("unsafe workspace path"),
+            error.to_string().contains("path traversal is not allowed"),
             "unexpected: {error}"
         );
         assert!(!temp.path().join("../escape.txt").exists());
