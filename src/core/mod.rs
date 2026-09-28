@@ -9,6 +9,7 @@ pub mod capability_grants;
 pub mod context;
 /// File helpers.
 pub mod files;
+pub mod fs_coordination;
 /// Typed runtime identity contracts (TW-001).
 pub mod identity;
 /// Memory persistence.
