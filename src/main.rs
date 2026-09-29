@@ -631,6 +631,15 @@ fn main() -> Result<()> {
             // The fs family returns its own stable exit codes (AWE-014
             // §23); propagate them as the process status.
             let root = std::env::current_dir()?;
+            // AWE-013: fs edits emit correlated audit events; switch the
+            // canonical store to durable persistence before the run so
+            // those events land in `.agent/audit/audit.log` instead of
+            // dying with the process ring. Degraded mode is explicit:
+            // keep running (the buffered store still records) and
+            // surface the condition, exactly like the serve arms.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
             std::process::exit(agent_workspace_hub::cli::fs_edit::run(command, &root));
         }
         Some(Command::Tunnel { command }) => handle_tunnel_cli(command)?,
