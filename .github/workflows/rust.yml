@@ -125,8 +125,8 @@ jobs:
         env:
           OPENAI__KEY: ${{ secrets.AWH_AGENT2_NVIDIA_KEY_1 }}
           OPENAI__API_BASE: "https://integrate.api.nvidia.com/v1"
-          CONFIG__MODEL: "openai/z-ai/glm-5.3"
-          CONFIG__FALLBACK_MODELS: '["openai/z-ai/glm-5-3-flash"]'
+          CONFIG__MODEL: "z-ai/glm-5.3"
+          CONFIG__FALLBACK_MODELS: '["z-ai/glm-5-3-flash"]'
           CONFIG__AI_TIMEOUT: "300"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
           CONFIG__VERBOSITY_LEVEL: "1"
