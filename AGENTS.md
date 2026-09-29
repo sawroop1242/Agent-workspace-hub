@@ -401,3 +401,41 @@ cheap-to-clone). Tool catalog 53 static.
   (id,title,description,priority,tags) — all owned Strings.
 
 - **FS-001 filesystem coordination (2026-09, branch fs-001-filesystem-coordination, commit fbcc42b)**: `src/core/fs_coordination.rs` — FsCoordinator; resource key = SHA-256(canonical root + normalized relpath) (spec-mandated; NEVER absolute-path keys). Two tiers: in-process registry (per-key FIFO queue, bounded) + cross-process zero-byte lock files in SYSTEM TEMP (`env::temp_dir()/awh-fs-coordination/`), stale-reclaim only past 30s. Sorted deterministic acquisition; 10s bounded timeout; MAX_LOCKS_PER_SET fail-closed. Wired: FilesService write/write_atomic/delete/rename/create_dir acquire->revalidate-under-lock->mutate (`*_locked` variants for caller-held spans); EditService commit_verified (own set) / patch_internal (one set across commit phase via commit_verified_locked) / attempt_rollback (`_locked` under caller set) / rollback_edits_inner (its OWN set — locks never survive across ops); WorkspaceMcp write_file/delete_file (same key derivation -> TUI/API/MCP converge). Audit = canonical `record_outcome` action `filesystem.coordination` + reason codes, no new store. Gotchas: (1) lock files must NOT live under `.agent/fs-coordination` — they pollute TUI listings and git status of uninitialized workspaces (4 TUI tests broke); system temp + root-hash key keeps workspaces byte-clean; (2) dangling final-component symlink escaped resolve_checked (Path::exists FOLLOWS links, so ancestor walk settled on root; fs::write then followed the link outside) — fixed with symlink_metadata chain-following, bounded 8, loops fail closed; MCP plane was safe (rename/unlink never follow the final link) — FilesService::write was NOT; (3) EditTransaction has 7 fields — construct via EditTransaction::new/single then assign `.expected`; (4) rerun locks: `tests/fs_coordination.rs` 20 integration tests incl. real same-file race (assert exactly one marker in final content), overlapping multi-file A=[a,b] vs B=[b,c] deadlock hammer, timeout >= 10s assertion. Suite: 1191 tests green (955 lib + 20 fs_coordination + rest).
+
+## Prompt 16 (AWE-015/AWE-017/TW-008) - editing acceptance + Fs audit defect fix (PR #126)
+
+- **Defect found by acceptance mapping**: the `Fs` CLI arm of `src/main.rs` never called
+  `services::audit::init_global`, so `awh fs` edit/rollback/conflict events landed only in the
+  process-local ring and were lost on exit (serve arms did init; fs did not). Fixed with the
+  same degraded-mode discipline (log audit_init_failed, keep running). Any future CLI arm that
+  emits auditable events must init_global first - check every arm when adding one.
+- **Acceptance suites** (tests/acceptance_editing.rs 8 + tests/acceptance_edit_gates.rs 3) pin:
+  cross-interface parity (EditService in-proc / real CLI binary / real MCP stdio binary all
+  byte-identical for the same replace + rollback; stale-hash conflict exit 4 on the two planes
+  that express ExpectedState - the MCP filesystem.replace tool schema deliberately does NOT
+  expose expected-state args), exact-byte matrix incl. CRLF/mixed/emoji/no-eol/empty/
+  valid-UTF-8-binary-like with byte-level rollback, MCP restart across 3 processes,
+  unix symlink escape (file + parent shapes), corrupted recovery blob fails closed (exit 5),
+  copied-.agent recovery rejected across workspaces, worktree edit isolation, durable
+  correlated audit.
+- **Contract facts discovered while testing** (now pinned, do not "fix"):
+  (1) the edit plane is a TEXT plane - replace on a non-UTF-8 file is refused cleanly
+  ("target file is not valid UTF-8 text", bytes preserved, no residue); NUL/control bytes are
+  valid UTF-8 and in-contract;
+  (2) durable audit.log lines are CHECKSUMMED ENVELOPES `{"checksum", "event"}` - unwrap
+  `["event"]` before reading action/kind/correlation fields; the event carries workspace_id +
+  edit_id correlation;
+  (3) the SEC-001 built-in gate pins version `"local"` (BUILTIN_TOOL_TRUST_VERSION in
+  mcp/execution_gate.rs) - trust approvals must use exactly "local" or they are
+  trust-level/version denials (tests must mirror mcp_builtin_tool_gate.rs's helper);
+  (4) NO `awh.builtin` record = Medium tools allowed (documented opt-in default); the denial
+  case is a record that EXCLUDES the Filesystem category - assert with a positive control;
+  (5) git worktree checkouts that contain a parent's .agent/workspace.json are (correctly)
+  REFUSED by `awh init` foreign-root binding - worktree test fixtures must git-commit the base
+  BEFORE running `awh init` at the parent, or every checkout carries the foreign manifest.
+- Test-harness gotchas: in-process dispatcher tests use `dispatch_with_lifecycle` +
+  SessionLifecycle (no transport); agent-route tests build AppState{dispatcher, sessions,
+  api_key, ...} and SessionRegistry::create_with_binding - mirror tests/mcp_agent_routes.rs
+  exactly; `read_response` blocks on a line read, so a hung server hangs the test (accepted,
+  same as tests/mcp_executable.rs); grep the payload field names before asserting (fs --
+  json prints {"command","edit_id","path","status"}).
