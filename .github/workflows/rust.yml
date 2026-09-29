@@ -78,7 +78,7 @@ jobs:
           "config.model": "openai/z-ai/glm-5.3"
           "config.fallback_models": '["openai/z-ai/glm-5-3-flash"]'
           "config.ai_timeout": "300"
-          "config.custom_model_max_tokens": "128000"
+          
           "config.verbosity_level": "1"
           "github_action_config.auto_review": "true"
           "github_action_config.auto_describe": "false"
@@ -128,12 +128,12 @@ jobs:
           OPENAI_API_BASE: "https://integrate.api.nvidia.com/v1"
           
           # 2. Use exact NVIDIA model strings (Do not add "openai/")
-          CONFIG__MODEL: "z-ai/glm-5.3"
-          CONFIG__FALLBACK_MODELS: '["z-ai/glm-5.3-flash"]'
+          CONFIG__MODEL: "openai/z-ai/glm-5.3"
+          CONFIG__FALLBACK_MODELS: '["openai/z-ai/glm-5.3-flash"]'
           
           # 3. Timeouts and configs
           CONFIG__AI_TIMEOUT: "300"
-          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "128000"
+        
           CONFIG__VERBOSITY_LEVEL: "1"
           GITHUB__USER_TOKEN: ${{ github.token }}
           PR_URL: ${{ steps.pr.outputs.url }}
