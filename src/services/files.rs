@@ -322,6 +322,40 @@ impl FilesService {
         }
     }
 
+    /// Deletes a file or directory, reporting whether the target existed.
+    ///
+    /// The same containment and validation rules as [`Self::delete`] apply;
+    /// a target that does not exist is a no-op reported as `false`, while
+    /// an unsafe path or an I/O failure is still an error (fail closed).
+    ///
+    /// FS-001: the deletion runs under the canonical coordination
+    /// boundary with the path re-validated under the lock, matching
+    /// [`Self::delete`], so an AWH-conformant concurrent writer cannot
+    /// interleave with a delete reported as "did not exist" vs "existed
+    /// and removed".
+    pub fn delete_if_exists(&self, relative: &str) -> Result<bool> {
+        let _set = self.acquire(&[relative])?;
+        self.delete_if_exists_locked(relative)
+    }
+
+    /// [`Self::delete_if_exists`] for a caller that already holds the
+    /// coordination set for `relative`.
+    pub fn delete_if_exists_locked(&self, relative: &str) -> Result<bool> {
+        let path = self.resolve_checked(relative)?;
+        if path == self.root {
+            bail!("refusing to delete the project root");
+        }
+        if !path.exists() {
+            return Ok(false);
+        }
+        if path.is_dir() {
+            fs::remove_dir_all(&path).with_context(|| format!("delete dir {}", path.display()))?;
+        } else {
+            fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+        }
+        Ok(true)
+    }
+
     /// Renames/moves within the root. `to` must stay inside the root.
     ///
     /// FS-001: both endpoints are coordinated as one set (deterministic

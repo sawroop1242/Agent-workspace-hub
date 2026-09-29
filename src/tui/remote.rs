@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::models::MemoryEntry;
+use crate::core::memory::MemoryEntry;
 use crate::services::files::{FileMeta, ListEntry, SearchHit};
 use crate::services::git::GitOutput;
 use crate::services::terminal::ExecOutcome;

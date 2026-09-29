@@ -87,7 +87,7 @@ See [docs/FEATURES.md](docs/FEATURES.md), [docs/CLI.md](docs/CLI.md), and [docs/
 
 Agent Workspace Hub is an MCP server that preserves enough project state for a
 different AI agent to continue work without a new bootstrap prompt. Each project
-keeps durable state in `.agent/context.md`, `.agent/memory.json`, `.agent/tasks/`,
+keeps durable state in `.agent/context.md`, `.agent/memory.json`, `.agent/tasks.json`,
 enabled skills, and configured connectors.
 
 Recommended new-agent startup:

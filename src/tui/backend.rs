@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::models::MemoryEntry;
+use crate::core::memory::MemoryEntry;
 use crate::services::files::{FileMeta, ListEntry, SearchHit};
 use crate::services::git::GitOutput;
 use crate::services::terminal::ExecOutcome;
@@ -224,12 +224,12 @@ impl WorkspaceBackend for LocalBackend {
     }
 
     fn delete_project(&self, name: &str) -> Result<()> {
-        crate::services::projects::validate_project_name(name)?;
-        let path = crate::core::workspace::Workspace::new(&self.root).project_path(name);
-        if !path.is_dir() {
+        // Business rules (name validation, containment, removal) live in
+        // the canonical service; the TUI only audits.
+        let deleted = crate::services::projects::ProjectsService::new(&self.root).delete(name)?;
+        if !deleted {
             anyhow::bail!("project not found: {name}");
         }
-        std::fs::remove_dir_all(path)?;
         crate::services::audit::record_allow("tui_project_delete", name, "operator");
         Ok(())
     }
@@ -385,15 +385,13 @@ impl WorkspaceBackend for LocalBackend {
     }
 
     fn list_memory(&self, project: Option<&str>) -> Result<Vec<MemoryEntry>> {
-        crate::core::memory::MemoryStore::for_project(&self.store_root(project)).read_all()
+        crate::core::memory::MemoryStore::for_project(&self.store_root(project))?.list_all()
     }
 
     fn append_memory(&self, project: Option<&str>, content: &str) -> Result<()> {
-        let entry = MemoryEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            content: content.to_owned(),
-        };
-        crate::core::memory::MemoryStore::for_project(&self.store_root(project)).append(&entry)
+        crate::core::memory::MemoryStore::for_project(&self.store_root(project))?
+            .append(content)?;
+        Ok(())
     }
 
     fn list_global_skills(&self) -> Result<Vec<Skill>> {

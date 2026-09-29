@@ -1,7 +1,8 @@
 //! Cross-process advisory locking for JSON-backed project stores.
 //!
-//! [`MemoryMcp`](crate::mcp::MemoryMcp), [`TasksMcp`](crate::mcp::TasksMcp),
-//! and [`ConnectorsMcp`](crate::mcp::ConnectorsMcp) each persist their state
+//! [`MemoryStore`](crate::core::memory::MemoryStore),
+//! [`TaskStore`](crate::core::tasks::TaskStore), and
+//! [`ConnectorsMcp`](crate::mcp::ConnectorsMcp) each persist their state
 //! as a single JSON file under a project's `.agent/` directory. When two AI
 //! agents work against the *same* project at once — the core scenario this
 //! runtime exists for — each agent is typically a separate OS process (one

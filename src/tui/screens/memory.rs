@@ -9,7 +9,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::hint_line;
-use crate::models::MemoryEntry;
+use crate::core::memory::MemoryEntry;
 use crate::tui::app::App;
 use crate::tui::backend::WorkspaceBackend;
 
@@ -116,7 +116,7 @@ pub fn draw<B: WorkspaceBackend>(
     for entry in &ui.entries {
         lines.push(ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(
-                format!("{}  ", short_ts(&entry.timestamp)),
+                format!("{}  ", short_ts(&entry.created_at)),
                 Style::default().fg(Color::Cyan),
             ),
             ratatui::text::Span::raw(&entry.content),

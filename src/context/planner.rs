@@ -204,7 +204,7 @@ impl ContextPlanner for DeterministicPlanner {
         // 3. Relevant memories: search the existing memory store (the
         // project-scoped `.agent/memory.json`), reusing — not duplicating —
         // the MCP memory store.
-        let memory = crate::mcp::MemoryMcp::new(self.project_root.clone())?;
+        let memory = crate::core::memory::MemoryStore::new(self.project_root.clone())?;
         for entry in memory.search(task, None)? {
             let score = Self::overlap(&task_words, &entry.content);
             if score > 0.0 || !task_words.is_empty() {

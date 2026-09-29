@@ -1,200 +1,458 @@
-use crate::models::{Task, TaskStatus};
-use anyhow::Result;
-use std::fs;
-use std::path::{Path, PathBuf};
+//! Canonical AWH task store (ARCH-001).
+//!
+//! One authoritative task representation per project scope, persisted at
+//! `.agent/tasks.json` as a JSON object holding one JSON array of [`Task`]
+//! records. The MCP task tools are thin translations over this store; no
+//! interface plane may persist a second task file. (The previous
+//! one-file-per-task store under `.agent/tasks/<id>.json` had no
+//! production callers and was removed by ARCH-001.)
 
-/// Persistent task storage under `.agent/tasks` as per-task JSON files.
+use crate::mcp::store_lock::StoreLock;
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+
+/// Maximum number of tasks a single project task store may hold.
+const MAX_TASKS: usize = 10_000;
+/// Maximum length of a task id.
+const MAX_TASK_ID_LEN: usize = 256;
+/// Maximum length of a task title.
+const MAX_TASK_TITLE_LEN: usize = 1024;
+/// Maximum length of a task description.
+const MAX_TASK_DESCRIPTION_LEN: usize = 64 * 1024;
+/// Maximum number of tags per task.
+const MAX_TASK_TAGS: usize = 64;
+/// Maximum length of a single tag.
+const MAX_TASK_TAG_LEN: usize = 128;
+
+/// A single tracked task with status, priority, and optional assignee.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    /// Unique task id.
+    pub id: String,
+    /// Short human-readable summary.
+    pub title: String,
+    /// Longer description of the work.
+    pub description: String,
+    /// Current lifecycle state.
+    pub status: TaskStatus,
+    /// Relative importance.
+    pub priority: TaskPriority,
+    /// Optional owner/assignee.
+    pub assignee: Option<String>,
+    /// Arbitrary tags for categorization.
+    pub tags: Vec<String>,
+    /// RFC 3339 creation timestamp.
+    pub created_at: String,
+    /// RFC 3339 last-update timestamp.
+    pub updated_at: String,
+}
+
+/// Lifecycle state of a [`Task`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskStatus {
+    /// Not yet started.
+    Todo,
+    /// Currently in progress.
+    InProgress,
+    /// Blocked by a dependency.
+    Blocked,
+    /// Completed.
+    Done,
+}
+
+/// Relative importance of a [`Task`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskPriority {
+    /// Lowest importance.
+    Low,
+    /// Default importance.
+    Normal,
+    /// Important.
+    High,
+    /// Most important.
+    Critical,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TaskFile {
+    tasks: Vec<Task>,
+}
+
+/// Canonical project-scoped task store persisted to `.agent/tasks.json`.
 pub struct TaskStore {
-    root: PathBuf,
+    path: PathBuf,
 }
 
 impl TaskStore {
-    /// Creates a `TaskStore` rooted at `root`.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    /// Creates a task store backed by `.agent/tasks.json` under the project root.
+    pub fn new(project_root: impl Into<PathBuf>) -> Result<Self> {
+        let root = project_root.into();
+        fs::create_dir_all(root.join(".agent"))?;
+        Ok(Self {
+            path: root.join(".agent").join("tasks.json"),
+        })
     }
 
-    fn tasks_dir(&self) -> PathBuf {
-        self.root.join(".agent").join("tasks")
+    fn load(&self) -> Result<TaskFile> {
+        if !self.path.exists() {
+            return Ok(TaskFile::default());
+        }
+        Ok(serde_json::from_str(&fs::read_to_string(&self.path)?)?)
     }
 
-    /// Creates (or overwrites) a task, keyed by its `id`.
-    pub fn create(&self, task: &Task) -> Result<()> {
-        fs::create_dir_all(self.tasks_dir())?;
-        let path = self.tasks_dir().join(format!("{}.json", task.id));
-        let data = serde_json::to_string_pretty(task)?;
-        fs::write(path, data)?;
+    /// Writes `file` atomically (temp file + rename) so a sibling agent
+    /// process reading `.agent/tasks.json` never observes a torn write.
+    fn save(&self, file: &TaskFile) -> Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .context("task store path has no parent directory")?;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent).context("failed to create temp file")?;
+        std::io::Write::write_all(&mut temp, serde_json::to_string_pretty(file)?.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically write task store")?;
         Ok(())
     }
 
-    /// Returns the task with the given `id`, or `None` if it does not exist.
-    pub fn get(&self, id: &str) -> Result<Option<Task>> {
-        let path = self.tasks_dir().join(format!("{}.json", id));
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
-    }
-
-    /// Lists all stored tasks sorted by `id`.
-    pub fn list(&self) -> Result<Vec<Task>> {
-        let dir = self.tasks_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut tasks = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("json") {
-                continue;
-            }
-            let task: Task = serde_json::from_str(&fs::read_to_string(path)?)?;
-            tasks.push(task);
-        }
-        tasks.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(tasks)
-    }
-
-    /// Updates a task's status, returning `false` if the task does not exist.
-    pub fn set_status(&self, id: &str, status: TaskStatus) -> Result<bool> {
-        let Some(mut task) = self.get(id)? else {
-            return Ok(false);
+    /// Creates (or replaces) a task, starting in the `Todo` state.
+    ///
+    /// Fails closed when the task would exceed the store's enforced size
+    /// limits (task count, id/title/description length, tag count/length),
+    /// so a misbehaving client cannot grow the on-disk store without bound.
+    ///
+    /// Holds a [`StoreLock`] across the load-modify-save cycle so a second
+    /// agent process working the same project at the same time serializes
+    /// behind it instead of racing (see `crate::mcp::store_lock`).
+    pub fn create(
+        &self,
+        id: String,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        tags: Vec<String>,
+    ) -> Result<Task> {
+        validate_task_input(&id, &title, &description, &tags)?;
+        let _lock = StoreLock::acquire(&self.path)?;
+        let now = Utc::now().to_rfc3339();
+        let task = Task {
+            id,
+            title,
+            description,
+            status: TaskStatus::Todo,
+            priority,
+            assignee: None,
+            tags,
+            created_at: now.clone(),
+            updated_at: now,
         };
-        task.status = status;
-        self.create(&task)?;
-        Ok(true)
+        let mut file = self.load()?;
+        let exists = file.tasks.iter().any(|t| t.id == task.id);
+        if !exists && file.tasks.len() >= MAX_TASKS {
+            bail!("task store is full (max {MAX_TASKS} tasks)");
+        }
+        file.tasks.retain(|t| t.id != task.id);
+        file.tasks.push(task.clone());
+        self.save(&file)?;
+        Ok(task)
+    }
+
+    /// Lists tasks, optionally filtered by status.
+    pub fn list(&self, status: Option<TaskStatus>) -> Result<Vec<Task>> {
+        Ok(self
+            .load()?
+            .tasks
+            .into_iter()
+            .filter(|t| status.as_ref().is_none_or(|s| &t.status == s))
+            .collect())
+    }
+
+    /// Returns the task with the given `id`, if present — the single-item
+    /// counterpart to [`Self::list`], so a caller doesn't have to list every
+    /// task and filter client-side.
+    pub fn get(&self, id: &str) -> Result<Option<Task>> {
+        Ok(self.load()?.tasks.into_iter().find(|t| t.id == id))
+    }
+
+    /// Updates a task's status, priority, and/or assignee, returning the updated task.
+    pub fn update(
+        &self,
+        id: &str,
+        status: Option<TaskStatus>,
+        priority: Option<TaskPriority>,
+        assignee: Option<Option<String>>,
+    ) -> Result<Option<Task>> {
+        let _lock = StoreLock::acquire(&self.path)?;
+        let mut file = self.load()?;
+        let task = match file.tasks.iter_mut().find(|t| t.id == id) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        if let Some(v) = status {
+            task.status = v;
+        }
+        if let Some(v) = priority {
+            task.priority = v;
+        }
+        if let Some(v) = assignee {
+            task.assignee = v;
+        }
+        task.updated_at = Utc::now().to_rfc3339();
+        let result = task.clone();
+        self.save(&file)?;
+        Ok(Some(result))
+    }
+
+    /// Deletes the task with the given `id`, returning whether it existed.
+    pub fn delete(&self, id: &str) -> Result<bool> {
+        let _lock = StoreLock::acquire(&self.path)?;
+        let mut file = self.load()?;
+        let before = file.tasks.len();
+        file.tasks.retain(|t| t.id != id);
+        self.save(&file)?;
+        Ok(before != file.tasks.len())
     }
 }
 
-/// Returns whether `id` is safe to use as a task filename (no path separators or traversal).
-pub fn is_safe_task_id(id: &str) -> bool {
-    !id.is_empty()
-        && id != "."
-        && id != ".."
-        && !id.contains('/')
-        && !id.contains('\\')
-        && Path::new(id).file_name().and_then(|x| x.to_str()) == Some(id)
+/// Rejects task inputs that would violate the store's size limits.
+fn validate_task_input(id: &str, title: &str, description: &str, tags: &[String]) -> Result<()> {
+    if id.trim().is_empty() {
+        bail!("task id must not be empty");
+    }
+    if id.len() > MAX_TASK_ID_LEN {
+        bail!("task id exceeds {MAX_TASK_ID_LEN} bytes");
+    }
+    if title.trim().is_empty() {
+        bail!("task title must not be empty");
+    }
+    if title.len() > MAX_TASK_TITLE_LEN {
+        bail!("task title exceeds {MAX_TASK_TITLE_LEN} bytes");
+    }
+    if description.len() > MAX_TASK_DESCRIPTION_LEN {
+        bail!("task description exceeds {MAX_TASK_DESCRIPTION_LEN} bytes");
+    }
+    if tags.len() > MAX_TASK_TAGS {
+        bail!("task exceeds {MAX_TASK_TAGS} tags");
+    }
+    if let Some(tag) = tags.iter().find(|t| t.len() > MAX_TASK_TAG_LEN) {
+        bail!("task tag exceeds {MAX_TASK_TAG_LEN} bytes: {tag:?}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn task(id: &str) -> Task {
-        Task {
-            id: id.into(),
-            title: format!("task {id}"),
-            status: TaskStatus::Pending,
-        }
+    fn temp_store() -> (TaskStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path()).unwrap();
+        (store, dir)
+    }
+
+    fn make_task(id: &str) -> (String, String, String, Vec<String>) {
+        (
+            id.to_string(),
+            "title".to_string(),
+            "description".to_string(),
+            vec![],
+        )
     }
 
     #[test]
-    fn create_persists_task_json_and_get_round_trips() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TaskStore::new(temp.path());
-        store.create(&task("t1")).unwrap();
-        let loaded = store.get("t1").unwrap().expect("task must exist");
-        assert_eq!(loaded.id, "t1");
-        assert_eq!(loaded.title, "task t1");
-        assert_eq!(loaded.status, TaskStatus::Pending);
+    fn create_rejects_empty_id_and_title() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("");
+        assert!(store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .is_err());
+
+        // Empty title is rejected even with a valid id.
+        let (_, _, description, tags) = make_task("id");
+        assert!(store
+            .create(
+                "id".into(),
+                String::new(),
+                description,
+                TaskPriority::Normal,
+                tags
+            )
+            .is_err());
     }
 
     #[test]
-    fn get_returns_none_for_unknown_task() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TaskStore::new(temp.path());
+    fn create_rejects_oversized_fields() {
+        let (store, _dir) = temp_store();
+        let oversized_title = "t".repeat(MAX_TASK_TITLE_LEN + 1);
+        assert!(store
+            .create(
+                "id".into(),
+                oversized_title,
+                "d".into(),
+                TaskPriority::Normal,
+                vec![]
+            )
+            .is_err());
+
+        let oversized_desc = "d".repeat(MAX_TASK_DESCRIPTION_LEN + 1);
+        assert!(store
+            .create(
+                "id2".into(),
+                "title".into(),
+                oversized_desc,
+                TaskPriority::Normal,
+                vec![]
+            )
+            .is_err());
+
+        let oversized_id = "i".repeat(MAX_TASK_ID_LEN + 1);
+        assert!(store
+            .create(
+                oversized_id,
+                "title".into(),
+                "d".into(),
+                TaskPriority::Normal,
+                vec![]
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn create_rejects_too_many_tags_and_oversized_tags() {
+        let (store, _dir) = temp_store();
+        let many: Vec<String> = (0..MAX_TASK_TAGS + 1).map(|i| i.to_string()).collect();
+        assert!(store
+            .create(
+                "id".into(),
+                "title".into(),
+                "d".into(),
+                TaskPriority::Normal,
+                many
+            )
+            .is_err());
+
+        let long_tag = vec!["t".repeat(MAX_TASK_TAG_LEN + 1)];
+        assert!(store
+            .create(
+                "id2".into(),
+                "title".into(),
+                "d".into(),
+                TaskPriority::Normal,
+                long_tag
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn create_enforces_task_count_limit() {
+        let (store, _dir) = temp_store();
+        // Seed the store at capacity via pre-serialized state.
+        let tasks: Vec<Task> = (0..MAX_TASKS as u64)
+            .map(|i| Task {
+                id: format!("task-{i}"),
+                title: "t".into(),
+                description: String::new(),
+                status: TaskStatus::Todo,
+                priority: TaskPriority::Normal,
+                assignee: None,
+                tags: vec![],
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
+        fs::write(
+            store.path.clone(),
+            serde_json::to_string(&TaskFile { tasks }).unwrap(),
+        )
+        .unwrap();
+
+        // Creating one more must fail.
+        assert!(store
+            .create(
+                "overflow".into(),
+                "title".into(),
+                "d".into(),
+                TaskPriority::Normal,
+                vec![]
+            )
+            .is_err());
+
+        // Replacing an existing task must still succeed.
+        assert!(store
+            .create(
+                "task-0".into(),
+                "updated".into(),
+                "d".into(),
+                TaskPriority::High,
+                vec![]
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn update_validates_status_transition_and_missing_task() {
+        let (store, _dir) = temp_store();
+        assert!(store
+            .update("missing", Some(TaskStatus::Done), None, None)
+            .unwrap()
+            .is_none());
+
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+        let updated = store
+            .update("t1", Some(TaskStatus::InProgress), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn delete_removes_task_and_reports_existence() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+        assert!(store.delete("t1").unwrap());
+        assert!(!store.delete("t1").unwrap());
+    }
+
+    #[test]
+    fn get_returns_matching_task_and_none_for_missing() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+        let task = store.get("t1").unwrap().expect("task t1 should exist");
+        assert_eq!(task.id, "t1");
+        assert_eq!(task.title, "title");
         assert!(store.get("missing").unwrap().is_none());
+        // A missing id is distinct from an empty one: both are lookups, not
+        // errors — the caller distinguishes by the Option.
+        assert!(store.get("").unwrap().is_none());
     }
 
     #[test]
-    fn list_on_missing_dir_is_empty_and_sorted_when_present() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TaskStore::new(temp.path());
-        assert!(store.list().unwrap().is_empty());
-        store.create(&task("b-task")).unwrap();
-        store.create(&task("a-task")).unwrap();
-        let listed = store.list().unwrap();
-        let ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, vec!["a-task", "b-task"]);
-    }
-
-    #[test]
-    fn list_ignores_non_json_files_in_tasks_dir() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TaskStore::new(temp.path());
-        store.create(&task("t1")).unwrap();
-        let tasks_dir = temp.path().join(".agent").join("tasks");
-        fs::write(tasks_dir.join("notes.txt"), "not a task").unwrap();
-        let listed = store.list().unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, "t1");
-    }
-
-    #[test]
-    fn set_status_updates_and_reports_existence() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TaskStore::new(temp.path());
-        assert!(!store.set_status("missing", TaskStatus::Completed).unwrap());
-        store.create(&task("t1")).unwrap();
-        assert!(store.set_status("t1", TaskStatus::InProgress).unwrap());
-        assert_eq!(
-            store.get("t1").unwrap().unwrap().status,
-            TaskStatus::InProgress
-        );
-        assert!(store.set_status("t1", TaskStatus::Completed).unwrap());
-        assert_eq!(
-            store.get("t1").unwrap().unwrap().status,
-            TaskStatus::Completed
-        );
-    }
-
-    #[test]
-    fn create_overwrites_task_with_same_id() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TaskStore::new(temp.path());
-        store.create(&task("t1")).unwrap();
-        let mut updated = task("t1");
-        updated.title = "renamed".into();
-        updated.status = TaskStatus::Cancelled;
-        store.create(&updated).unwrap();
-        let loaded = store.get("t1").unwrap().unwrap();
-        assert_eq!(loaded.title, "renamed");
-        assert_eq!(loaded.status, TaskStatus::Cancelled);
-        assert_eq!(store.list().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn task_status_serde_uses_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&TaskStatus::InProgress).unwrap(),
-            "\"in_progress\""
-        );
-        let back: TaskStatus = serde_json::from_str("\"in_progress\"").unwrap();
-        assert_eq!(back, TaskStatus::InProgress);
-    }
-
-    #[test]
-    fn safe_task_ids_are_accepted() {
-        for id in ["t1", "task-2", "task_3", "TASK", "a.b.c", "t-1_x.2"] {
-            assert!(is_safe_task_id(id), "{id} should be safe");
-        }
-    }
-
-    #[test]
-    fn traversal_and_separator_ids_are_rejected() {
-        for id in [
-            "",
-            ".",
-            "..",
-            "a/b",
-            "a\\b",
-            "../escape",
-            "..\\escape",
-            "/absolute",
-            "trailing/",
-        ] {
-            assert!(!is_safe_task_id(id), "{id:?} must be rejected");
-        }
+    fn corrupted_store_fails_closed() {
+        let (store, _dir) = temp_store();
+        fs::write(&store.path, "not json {").unwrap();
+        assert!(store
+            .create(
+                "id".into(),
+                "title".into(),
+                "d".into(),
+                TaskPriority::Normal,
+                vec![]
+            )
+            .is_err());
+        assert!(store.list(None).is_err());
     }
 }
