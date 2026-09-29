@@ -401,3 +401,22 @@ cheap-to-clone). Tool catalog 53 static.
   (id,title,description,priority,tags) — all owned Strings.
 
 - **FS-001 filesystem coordination (2026-09, branch fs-001-filesystem-coordination, commit fbcc42b)**: `src/core/fs_coordination.rs` — FsCoordinator; resource key = SHA-256(canonical root + normalized relpath) (spec-mandated; NEVER absolute-path keys). Two tiers: in-process registry (per-key FIFO queue, bounded) + cross-process zero-byte lock files in SYSTEM TEMP (`env::temp_dir()/awh-fs-coordination/`), stale-reclaim only past 30s. Sorted deterministic acquisition; 10s bounded timeout; MAX_LOCKS_PER_SET fail-closed. Wired: FilesService write/write_atomic/delete/rename/create_dir acquire->revalidate-under-lock->mutate (`*_locked` variants for caller-held spans); EditService commit_verified (own set) / patch_internal (one set across commit phase via commit_verified_locked) / attempt_rollback (`_locked` under caller set) / rollback_edits_inner (its OWN set — locks never survive across ops); WorkspaceMcp write_file/delete_file (same key derivation -> TUI/API/MCP converge). Audit = canonical `record_outcome` action `filesystem.coordination` + reason codes, no new store. Gotchas: (1) lock files must NOT live under `.agent/fs-coordination` — they pollute TUI listings and git status of uninitialized workspaces (4 TUI tests broke); system temp + root-hash key keeps workspaces byte-clean; (2) dangling final-component symlink escaped resolve_checked (Path::exists FOLLOWS links, so ancestor walk settled on root; fs::write then followed the link outside) — fixed with symlink_metadata chain-following, bounded 8, loops fail closed; MCP plane was safe (rename/unlink never follow the final link) — FilesService::write was NOT; (3) EditTransaction has 7 fields — construct via EditTransaction::new/single then assign `.expected`; (4) rerun locks: `tests/fs_coordination.rs` 20 integration tests incl. real same-file race (assert exactly one marker in final content), overlapping multi-file A=[a,b] vs B=[b,c] deadlock hammer, timeout >= 10s assertion. Suite: 1191 tests green (955 lib + 20 fs_coordination + rest).
+
+- **Prompt 17 (AWE-018/AWE-019, PR #127, branch awe-018-019-contract-status)**: the
+  artifact IS the prompt file - docs/implementation-prompts/17-contract-status-and-
+  roadmap.md was rewritten in place (original requirements preserved at commit 4769090).
+  Current-rust facts pinned: dispatcher advertises 71 tool names (59 core incl. six
+  filesystem.* + 12 github.*), NOT the 53/65 that docs/mcp.md + README still claim;
+  Command enum = 12 families (Init,Status,Tui,Serve,Mcp,Skill,Registry,Agent,Worktree,
+  Policy,Fs,Tunnel); MCP filesystem.* schemas have NO expected_* args (CLI-only
+  asymmetry); Control API has no edit-plane route and terminal/run has no capability
+  gate; TUI editor is not EditService-backed; worktree merge absent; resolve_effective_root
+  has no consumer outside CLI; rust@0d3a029 = 1227 tests/23 binaries (PR #126 head =
+  1228 incl. 12 acceptance tests; 1216 base + 11 store_convergence). RUST ADVANCES
+  MID-PROMPT: PR #122 (ARCH-001) merged after session start - fetch origin/rust
+  BEFORE claiming "not merged"; live tree beats stale local refs. Toolchain can be
+  wiped mid-session AGAIN (2nd time); rustup --default-toolchain stable --profile
+  minimal + component add rustfmt clippy restores; target/ cache (6.8G) survives and
+  makes re-verification fast. Forensics method that worked: count tool schema entries
+  with regex over dispatcher.rs, extract Command enum variants with a brace-depth
+  parser, grep callers of resolve_effective_root to classify wiring gaps.
