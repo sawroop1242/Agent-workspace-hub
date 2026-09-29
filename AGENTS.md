@@ -439,3 +439,22 @@ cheap-to-clone). Tool catalog 53 static.
   exactly; `read_response` blocks on a line read, so a hung server hangs the test (accepted,
   same as tests/mcp_executable.rs); grep the payload field names before asserting (fs --
   json prints {"command","edit_id","path","status"}).
+
+- **Prompt 17 (AWE-018/AWE-019, PR #127, branch awe-018-019-contract-status)**: the
+  artifact IS the prompt file - docs/implementation-prompts/17-contract-status-and-
+  roadmap.md was rewritten in place (original requirements preserved at commit 4769090).
+  Current-rust facts pinned: dispatcher advertises 71 tool names (59 core incl. six
+  filesystem.* + 12 github.*), NOT the 53/65 that docs/mcp.md + README still claim;
+  Command enum = 12 families (Init,Status,Tui,Serve,Mcp,Skill,Registry,Agent,Worktree,
+  Policy,Fs,Tunnel); MCP filesystem.* schemas have NO expected_* args (CLI-only
+  asymmetry); Control API has no edit-plane route and terminal/run has no capability
+  gate; TUI editor is not EditService-backed; worktree merge absent; resolve_effective_root
+  has no consumer outside CLI; rust@0d3a029 = 1227 tests/23 binaries (PR #126 head =
+  1228 incl. 12 acceptance tests; 1216 base + 11 store_convergence). RUST ADVANCES
+  MID-PROMPT: PR #122 (ARCH-001) merged after session start - fetch origin/rust
+  BEFORE claiming "not merged"; live tree beats stale local refs. Toolchain can be
+  wiped mid-session AGAIN (2nd time); rustup --default-toolchain stable --profile
+  minimal + component add rustfmt clippy restores; target/ cache (6.8G) survives and
+  makes re-verification fast. Forensics method that worked: count tool schema entries
+  with regex over dispatcher.rs, extract Command enum variants with a brace-depth
+  parser, grep callers of resolve_effective_root to classify wiring gaps.
