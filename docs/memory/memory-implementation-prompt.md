@@ -50,10 +50,60 @@ rg -n "TODO|FIXME|unimplemented!|todo!|panic!|unwrap\(|expect\("
 
 Record which existing contracts are reused, extended, adapted, or replaced and why. Missing prompt coverage is not evidence of missing Rust implementation.
 
+### Existing-contract inventory
+
+Verify these locations and their current behavior on the target branch before changing code. If forensics identify a newer canonical implementation, update the inventory and converge to it rather than creating another store.
+
+| Existing contract | Location | Action | Reason |
+|---|---|---|---|
+| MemoryStore | `src/core/memory.rs` | Reuse / Extend | Existing append-only `.agent/memory.jsonl` persistence authority |
+| MemoryEntry model | `src/models/memory.rs` | Reuse / Extend | Existing persisted memory domain model |
+| Memory MCP adapter | `src/mcp/memory.rs` | Reuse / Adapt | Existing project-scoped MCP memory surface; must converge on one authority |
+| Context integration | `src/context/mod.rs` and context engine | Reuse / Adapt | Context explicitly consumes long-term memory rather than owning another memory store |
+| TUI memory surface | `src/tui/screens/memory.rs` | Adapt | Existing UI must delegate to the canonical memory authority |
+| Agent/session identity | `src/services/agent_runtime.rs` | Reuse | Scope and caller identity remain AWH-authoritative |
+| Authorization/policy | `src/services/authorization.rs` and policy/capability services | Reuse | Memory cannot create an alternate authorization path |
+| Audit authority | `src/services/audit.rs` | Reuse | Memory mutations/access events use persistent audit |
+| Workspace/project state | existing workspace/project services | Reuse | Workspace is the primary memory scope |
+
+The repository also contains older/parallel memory-facing concepts. Resolve them through explicit service/store convergence; do not preserve multiple authoritative writers merely because multiple adapters currently exist.
+
 # 3. Architecture
 
 ## Canonical responsibility
 Caller → scope/auth → canonical MemoryService/Store → validated record → bounded query/result → audit. Compatibility adapters may remain, but all reads/writes converge on one authority.
+
+### Architecture flow
+
+```text
+CLI / MCP / TUI / Control API
+            |
+            v
+ identity + workspace/scope validation
+            |
+            v
+ authorization / capability / policy
+            |
+            v
+     canonical MemoryService
+            |
+       +----+----------------+
+       |                     |
+       v                     v
+ persisted MemoryStore    bounded search/read
+       |                     |
+       v                     |
+ .agent/memory.jsonl         |
+       |                     |
+       +----------+----------+
+                  v
+        persistent AuditLog
+
+ContextEngine -----> consumes memory through this authority
+Source files ------> not owned or mutated by Memory
+```
+
+All interfaces must preserve identical scope, authorization, validation, persistence and error semantics.
 
 ### Architectural invariants
 1. One canonical domain/service owner.
@@ -110,12 +160,22 @@ Test unauthorized callers, forged/mismatched identity, cross-scope access, malfo
 
 # 6. Persistence and recovery
 
-Choose one durable format/owner. For JSONL define append/update/delete strategy, schema version, corruption behavior and atomic rewrite rules. Test restart.
+### Persistence owner
+The canonical memory persistence owner is the converged MemoryStore/service over `.agent/memory.jsonl`. `src/models/memory.rs` owns the serialized domain model, not an independent store. MCP, CLI, TUI, Control API and Context adapters must never write the JSONL directly.
+
+Define:
+- schema/version and legacy-record compatibility;
+- append/update/delete publication semantics;
+- atomic rewrite and locking/concurrency behavior;
+- corruption/truncation detection and recovery policy;
+- restart reload and scope validation;
+- explicit migration behavior;
+- retention/cleanup semantics, including whether records are immutable, tombstoned or physically removed.
 
 For durable state prove:
 write/publication → process termination → new process → reload → verification.
 
-Corrupt, truncated, incompatible, or partially published state must fail closed or follow an explicitly documented recovery rule. If another subsystem owns persistence, use that owner.
+A persistence failure must not be reported as a successful mutation. Recovery/cleanup must not affect another workspace's memory or unrelated `.agent` state.
 
 # 7. Integration boundaries
 
@@ -165,14 +225,17 @@ If an external service, platform, terminal emulator, remote target, or release e
 Preserve readable old records or provide explicit idempotent migration. Never silently change their scope.
 
 ## Rollout order
-1. Inspect current contract and implementation.
-2. Establish/extend canonical service and model.
-3. Establish/migrate persistence only where required.
-4. Integrate existing identity and security boundaries.
-5. Add interface adapters.
-6. Add unit/integration/security/recovery tests.
-7. Run verification gates.
-8. Update feature-specific docs/status only for behavior actually proven.
+1. Inventory `src/core/memory.rs`, `src/models/memory.rs`, `src/mcp/memory.rs`, Context, TUI and persisted fixtures.
+2. Establish the canonical MemoryService/MemoryStore and resolve duplicate writer/read semantics.
+3. Stabilize MemoryEntry schema, scope model and CRUD/search semantics.
+4. Stabilize `.agent/memory.jsonl` publication, locking, migration, corruption handling and retention behavior.
+5. Integrate existing agent/session identity, authorization/policy and persistent audit.
+6. Converge CLI, MCP, TUI and Control API adapters on the same authority.
+7. Verify ContextEngine consumes the same memory authority without creating a second store.
+8. Add restart, corruption, concurrency, scope-isolation, resource-limit and real-interface tests.
+9. Run verification gates and record evidence/limitations.
+
+No step depends on another prompt or PR being merged first.
 
 No step depends on another prompt or PR being merged first.
 
@@ -185,18 +248,29 @@ Use existing structured logging and persistent audit. Include correlation identi
 # 10. Acceptance criteria
 
 ## Functional
-- [ ] One canonical memory service/store.
-- [ ] Existing JSONL is readable or explicitly migrated.
+- [ ] One canonical memory service/store is the sole authoritative reader/writer.
+- [ ] Existing JSONL is readable or explicitly migrated without silent scope changes.
 - [ ] Scope and CRUD/search are deterministic and bounded.
 - [ ] Restart/corruption behavior is tested.
 - [ ] All interfaces converge on one authority.
+- [ ] ContextEngine does not introduce a second memory store.
 
 ## Architecture
 - [ ] One canonical implementation/domain owner exists.
+- [ ] Existing-contract inventory is verified against the current repository.
+- [ ] Architecture has one canonical path into MemoryService/Store.
 - [ ] Existing contracts are reused or explicitly extended.
 - [ ] No duplicate business-logic path exists.
 - [ ] Interface adapters preserve identical semantics.
 - [ ] Lifecycle and restart behavior are explicit.
+
+## Interfaces
+- [ ] CLI contract is verified against compiled `awh memory` behavior.
+- [ ] MCP contract is verified against the real memory MCP path.
+- [ ] Control API contract is verified if memory is exposed there.
+- [ ] TUI uses the canonical memory service/backend and contains no authoritative JSONL writer.
+- [ ] ContextEngine consumes the same memory authority.
+- [ ] All applicable interfaces enforce identical scope, authorization, limits and error semantics.
 
 ## Security
 - [ ] Authorization is enforced at the execution boundary.
@@ -207,8 +281,10 @@ Use existing structured logging and persistent audit. Include correlation identi
 
 ## Persistence/recovery
 - [ ] One authoritative persistence owner exists.
+- [ ] Memory schema/version and serialization are explicit.
 - [ ] Required state survives restart.
 - [ ] Corruption/partial publication is detected.
+- [ ] Migration and retention/cleanup semantics are explicit.
 - [ ] Concurrency behavior is deterministic.
 - [ ] Recovery semantics are tested.
 

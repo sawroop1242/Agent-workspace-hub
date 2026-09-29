@@ -50,10 +50,65 @@ rg -n "TODO|FIXME|unimplemented!|todo!|panic!|unwrap\(|expect\("
 
 Record which existing contracts are reused, extended, adapted, or replaced and why. Missing prompt coverage is not evidence of missing Rust implementation.
 
+### Existing-contract inventory
+
+The following repository-grounded contracts are the starting architecture. Verify each location and current behavior on the target branch before changing code; if implementation has moved, update the inventory rather than creating a duplicate.
+
+| Existing contract | Location | Action | Reason |
+|---|---|---|---|
+| ContextEngine and context domain models | `src/context/engine.rs`, `item.rs`, `budget.rs`, `selector.rs`, `scoring.rs` | Reuse / Extend | Existing canonical context runtime and deterministic selection primitives |
+| Context policy/compression/offload | `src/context/policy.rs`, `compressor.rs`, `offload.rs` | Reuse / Extend | Existing context optimization boundaries |
+| Context snapshot state | `src/context/snapshot.rs` | Reuse / Extend | Existing context-specific snapshot contract |
+| Context MCP adapter | `src/mcp/context_engine.rs` | Reuse / Adapt | MCP must delegate to ContextEngine |
+| Memory authority | `src/core/memory.rs` | Reuse | Long-term developer memory remains separate |
+| Filesystem authority | `src/services/files.rs` | Reuse | Source-file reads and path/resource safety remain centralized |
+| Audit authority | `src/services/audit.rs` | Reuse | Context events use persistent audit |
+| Agent/session identity | `src/services/agent_runtime.rs` | Reuse | Context scope uses existing AWH identity/session semantics |
+| Authorization/policy | `src/services/authorization.rs` and policy/capability services | Reuse | No alternate authorization path |
+
+Do not treat this table as permission to preserve obsolete code. If forensics show a better canonical implementation already exists, converge to it and document the replacement decision.
+
 # 3. Architecture
 
 ## Canonical responsibility
 ContextEngine → request/scope validation → budget/scoring/policy → active/offloaded/snapshot state → result. Keep active context, offloaded context, source files and long-term memory as distinct domains.
+
+### Architecture flow
+
+```text
+CLI / MCP / TUI / Control API
+            |
+            v
+   request + identity validation
+            |
+            v
+       ContextEngine
+            |
+      +-----+------------------+
+      |                        |
+      v                        v
+budget / scoring / policy   scope + resource checks
+      |                        |
+      +-----------+------------+
+                  |
+                  v
+       active context state
+          |             |
+          v             v
+      offload        snapshot
+          |             |
+          +-------> restore
+                  |
+                  v
+        bounded context result
+
+Long-term memory -----> canonical memory authority
+Source files ----------> FilesService; never mutated by ContextEngine
+Audit -----------------> persistent AuditLog
+Authorization ---------> existing policy/authorization boundary
+```
+
+Every interface must converge on these semantics; the diagram does not authorize a second implementation.
 
 ### Architectural invariants
 1. One canonical domain/service owner.
@@ -110,12 +165,15 @@ Test unauthorized callers, forged/mismatched identity, cross-scope access, malfo
 
 # 6. Persistence and recovery
 
-Use existing .agent/context-engine storage. Define version/integrity/atomic publication/reload. Corrupt offload/snapshot data must not become silently altered context.
+### Persistence owner
+Context Engine owns only context-specific durable state under `.agent/context-engine/`. It does not own long-term memory, source files, generic snapshots, audit storage, or workspace identity. Reuse the owning subsystem at those boundaries.
+
+Define schema/version, serialization, atomic publication, locking/concurrency, integrity checks, restart loading, migration, and explicit cleanup/retention for context-owned offloads/snapshots. Corrupt, truncated, incompatible, missing, or partially published state must fail closed or follow an explicit recovery rule.
 
 For durable state prove:
 write/publication → process termination → new process → reload → verification.
 
-Corrupt, truncated, incompatible, or partially published state must fail closed or follow an explicitly documented recovery rule. If another subsystem owns persistence, use that owner.
+Context cleanup must never delete source files, developer memory, canonical audit records, or generic recovery state owned by another service.
 
 # 7. Integration boundaries
 
@@ -165,14 +223,17 @@ If an external service, platform, terminal emulator, remote target, or release e
 Preserve existing context schemas where possible; version incompatible changes and never silently discard recoverable context.
 
 ## Rollout order
-1. Inspect current contract and implementation.
-2. Establish/extend canonical service and model.
-3. Establish/migrate persistence only where required.
-4. Integrate existing identity and security boundaries.
-5. Add interface adapters.
-6. Add unit/integration/security/recovery tests.
-7. Run verification gates.
-8. Update feature-specific docs/status only for behavior actually proven.
+1. Inventory and verify existing `src/context/*`, MCP, CLI and persistence contracts.
+2. Converge ContextEngine and its models as the sole context owner.
+3. Stabilize scope, budget, deterministic selection, compression and offload/restore semantics.
+4. Stabilize `.agent/context-engine/` schema, integrity, atomic publication, migration, restart and retention.
+5. Integrate existing identity, authorization/policy, FilesService, memory authority and AuditLog.
+6. Bring CLI, MCP, TUI and Control API adapters onto the canonical service.
+7. Add real restart, corruption, isolation, concurrency, resource-limit and interface tests.
+8. Run verification gates and record evidence/limitations.
+9. Update Context documentation/status only for verified behavior.
+
+No step depends on another prompt or PR being merged first.
 
 No step depends on another prompt or PR being merged first.
 
@@ -194,10 +255,19 @@ Use existing structured logging and persistent audit. Include correlation identi
 
 ## Architecture
 - [ ] One canonical implementation/domain owner exists.
+- [ ] Existing-contract inventory is verified against the current repository.
+- [ ] Architecture has one canonical path into ContextEngine.
 - [ ] Existing contracts are reused or explicitly extended.
 - [ ] No duplicate business-logic path exists.
 - [ ] Interface adapters preserve identical semantics.
 - [ ] Lifecycle and restart behavior are explicit.
+
+## Interfaces
+- [ ] CLI contract is verified against the compiled `awh context` interface.
+- [ ] MCP contract is verified against the real context MCP path.
+- [ ] Control API contract is verified if context is exposed there.
+- [ ] TUI uses the canonical ContextEngine/backend and has no authoritative context state.
+- [ ] All applicable interfaces enforce identical scope, authorization, budget and error semantics.
 
 ## Security
 - [ ] Authorization is enforced at the execution boundary.
@@ -207,9 +277,11 @@ Use existing structured logging and persistent audit. Include correlation identi
 - [ ] Consequential failures fail closed where required.
 
 ## Persistence/recovery
-- [ ] One authoritative persistence owner exists.
+- [ ] One authoritative persistence owner exists for each persisted domain.
+- [ ] Context-owned state has an explicit schema/version and serialization contract.
 - [ ] Required state survives restart.
 - [ ] Corruption/partial publication is detected.
+- [ ] Migration and retention/cleanup semantics are explicit.
 - [ ] Concurrency behavior is deterministic.
 - [ ] Recovery semantics are tested.
 

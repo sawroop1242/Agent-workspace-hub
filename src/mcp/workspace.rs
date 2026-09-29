@@ -121,7 +121,9 @@ impl WorkspaceMcp {
     ///
     /// Delegates to the canonical atomic write (temp file + fsync + rename)
     /// so an MCP write and a Control API write to the same path commit
-    /// through the exact same code path.
+    /// through the exact same code path. The canonical service runs the
+    /// FS-001 coordination boundary (acquire per-resource set, re-validate
+    /// the path under the lock) before staging and renaming.
     pub fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         if relative.trim().is_empty() {
             bail!("workspace path must not be empty");

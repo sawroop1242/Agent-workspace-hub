@@ -4,10 +4,26 @@
 //! escape prevention: resolved paths (after following symlinks) must stay
 //! inside the authorized project directory. Reads and writes enforce size
 //! limits, and listings are bounded.
+//!
+//! Every mutation (write, atomic write, delete, rename, directory
+//! creation) runs under the canonical filesystem coordination boundary
+//! (FS-001, [`crate::core::fs_coordination`]): acquire the per-resource
+//! coordination set, RE-VALIDATE the path against the root *under the
+//! lock* (closing the validate→mutate race for AWH-conformant actors),
+//! then mutate, then release. The `*_locked` variants are for callers
+//! that already hold the coordination set (the edit service's
+//! multi-file commit span) — they revalidate but skip acquisition, so
+//! the single-owner rule holds without a reentrant lock.
 
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+use crate::core::fs_coordination::{CoordinationSet, FsCoordinator};
+
+/// Upper bound on symlink chain hops in containment validation; a longer
+/// chain (or a loop) fails closed instead of recursing without limit.
+const SYMLINK_FOLLOW_LIMIT: usize = 8;
 
 /// Maximum bytes for a single read/write.
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -17,17 +33,35 @@ pub const MAX_LIST_ENTRIES: usize = 1000;
 /// Files application service scoped to one project root.
 pub struct FilesService {
     root: PathBuf,
+    coordination: FsCoordinator,
 }
 
 impl FilesService {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: project_root.into(),
-        }
+        let root = project_root.into();
+        let coordination = FsCoordinator::new(root.clone());
+        Self { root, coordination }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The canonical coordination coordinator backing this service's
+    /// mutations. Exposed so composing services (the edit engine) can
+    /// acquire their own multi-resource sets against the same boundary
+    /// instead of a second lock mechanism.
+    pub fn coordination(&self) -> &FsCoordinator {
+        &self.coordination
+    }
+
+    /// Acquires coordination over the named workspace-relative paths and
+    /// returns the held set. Failures are reported as errors (fail
+    /// closed) with a stable category the audit layer can filter on.
+    fn acquire(&self, relative_paths: &[&str]) -> Result<CoordinationSet> {
+        self.coordination.acquire(relative_paths).map_err(|error| {
+            anyhow::Error::msg(format!("filesystem coordination unavailable: {error}"))
+        })
     }
 
     /// Resolves `relative` under the root with full traversal and symlink
@@ -67,6 +101,64 @@ impl FilesService {
         if !resolved.starts_with(&root_canonical) {
             bail!("resolved path escapes the project root");
         }
+        // FS-001 (§20): a DANGLING final-component symlink escapes the
+        // ancestor walk above — `Path::exists()` follows links, so a
+        // link to a not-yet-existing outside target reads as "missing"
+        // and the walk settles on the workspace root, after which the
+        // mutation would follow the link outside. `symlink_metadata`
+        // does NOT follow the link: if the final component is a symlink
+        // (live or dangling), follow the chain — bounded, loops fail
+        // closed — and require every resolution to stay inside the
+        // canonical root. A dangling link pointing INSIDE the root
+        // stays allowed: writing through it creates the file inside.
+        if let Ok(metadata) = fs::symlink_metadata(&joined) {
+            if metadata.file_type().is_symlink() {
+                let mut link = joined.clone();
+                for _ in 0..SYMLINK_FOLLOW_LIMIT {
+                    let next = match fs::read_link(&link) {
+                        Ok(next) => next,
+                        Err(_) => break, // vanished: the ordinary path checks govern
+                    };
+                    let candidate = if next.is_absolute() {
+                        next
+                    } else {
+                        link.parent()
+                            .context("symlink has no parent directory")?
+                            .join(next)
+                    };
+                    let resolved = match candidate.canonicalize() {
+                        Ok(resolved) => resolved,
+                        Err(_) => {
+                            // Dangling link: validate its deepest existing
+                            // ancestor, exactly like a plain missing path.
+                            let mut ancestor = candidate.as_path();
+                            let mut found = false;
+                            while let Some(parent) = ancestor.parent() {
+                                if ancestor.exists() {
+                                    found = true;
+                                    break;
+                                }
+                                ancestor = parent;
+                            }
+                            if !found {
+                                bail!("symlink target has no existing ancestor");
+                            }
+                            ancestor.canonicalize()?
+                        }
+                    };
+                    if !resolved.starts_with(&root_canonical) {
+                        bail!("resolved path escapes the project root");
+                    }
+                    link = resolved;
+                    if fs::symlink_metadata(&link)
+                        .map(|meta| !meta.file_type().is_symlink())
+                        .unwrap_or(true)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
         Ok(joined)
     }
 
@@ -93,11 +185,24 @@ impl FilesService {
     }
 
     /// Writes a UTF-8 text file under the root, enforcing the size cap.
+    /// The write runs under the canonical coordination boundary with the
+    /// path re-validated under the lock.
     pub fn write(&self, relative: &str, content: &str) -> Result<()> {
-        let path = self.resolve_checked(relative)?;
+        let _set = self.acquire(&[relative])?;
+        self.write_locked(relative, content)
+    }
+
+    /// [`Self::write`] for a caller that already holds the coordination
+    /// set for `relative`. Revalidates the path but skips acquisition —
+    /// the edit engine's multi-file commit span calls this so a nested
+    /// acquisition cannot self-deadlock.
+    pub fn write_locked(&self, relative: &str, content: &str) -> Result<()> {
         if content.len() as u64 > MAX_FILE_BYTES {
             bail!("content exceeds the {} byte limit", MAX_FILE_BYTES);
         }
+        // Re-resolve UNDER the coordination lock: containment, traversal
+        // and symlink-escape checks are repeated at the mutation boundary.
+        let path = self.resolve_checked(relative)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create parent of {}", path.display()))?;
@@ -116,6 +221,12 @@ impl FilesService {
     /// file. This is the canonical commit boundary for edit operations:
     /// prepare in memory, commit in one step.
     ///
+    /// FS-001: the commit runs under the canonical coordination boundary
+    /// and the target path is RE-RESOLVED and re-validated under the
+    /// lock, immediately before the temporary file is created — the
+    /// path-identity that was checked is the path-identity that is
+    /// mutated for every AWH-conformant actor.
+    ///
     /// On any failure before the rename (containment, size cap, temp-file
     /// creation, write, flush) the target is left untouched and the
     /// temporary file is removed. A failure of the rename itself likewise
@@ -123,16 +234,28 @@ impl FilesService {
     /// best-effort so the rename survives a crash on platforms that
     /// support directory fsync.
     ///
-    /// Known limitation (shared with every operation in this service):
-    /// path resolution and the final rename are separate steps, so a
-    /// final-component symlink swap between them is not prevented
-    /// (final-component TOCTOU). Stronger safe-open primitives belong to
-    /// the dedicated filesystem hardening work.
+    /// Residual window (documented, not claimed closed): a *foreign*
+    /// actor that swaps the final component (symlink or rename) between
+    /// this revalidation and the rename is not serialized by AWH's
+    /// advisory coordination. The swap is detected at verification (the
+    /// re-read bytes mismatch) and reported, never silently absorbed.
+    /// Stronger descriptor-relative primitives (openat2 with
+    /// `RESOLVE_BENEATH|NO_SYMLINKS`) are a Linux-only hardening path and
+    /// are documented in `docs/filesystem-coordination.md`.
     pub fn write_atomic(&self, relative: &str, content: &str) -> Result<()> {
-        let path = self.resolve_checked(relative)?;
+        let _set = self.acquire(&[relative])?;
+        self.write_atomic_locked(relative, content)
+    }
+
+    /// [`Self::write_atomic`] for a caller that already holds the
+    /// coordination set for `relative` (the edit engine's commit span).
+    /// Revalidates the path under the caller's held lock but performs no
+    /// acquisition.
+    pub fn write_atomic_locked(&self, relative: &str, content: &str) -> Result<()> {
         if content.len() as u64 > MAX_FILE_BYTES {
             bail!("content exceeds the {} byte limit", MAX_FILE_BYTES);
         }
+        let path = self.resolve_checked(relative)?;
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("target has no parent directory"))?;
@@ -173,7 +296,21 @@ impl FilesService {
 
     /// Deletes a file or (empty or not) directory under the root. The
     /// caller must have confirmed the destructive action.
+    ///
+    /// FS-001: the deletion runs under the canonical coordination
+    /// boundary with the path re-validated under the lock, so an
+    /// AWH-conformant concurrent writer cannot interleave with the
+    /// delete.
     pub fn delete(&self, relative: &str) -> Result<()> {
+        let _set = self.acquire(&[relative])?;
+        self.delete_locked(relative)
+    }
+
+    /// [`Self::delete`] for a caller that already holds the coordination
+    /// set for `relative` (the edit engine's rollback/commit spans).
+    pub fn delete_locked(&self, relative: &str) -> Result<()> {
+        // Re-resolve UNDER the lock: containment re-checked at the
+        // mutation boundary.
         let path = self.resolve_checked(relative)?;
         if path == self.root {
             bail!("refusing to delete the project root");
@@ -190,7 +327,20 @@ impl FilesService {
     /// The same containment and validation rules as [`Self::delete`] apply;
     /// a target that does not exist is a no-op reported as `false`, while
     /// an unsafe path or an I/O failure is still an error (fail closed).
+    ///
+    /// FS-001: the deletion runs under the canonical coordination
+    /// boundary with the path re-validated under the lock, matching
+    /// [`Self::delete`], so an AWH-conformant concurrent writer cannot
+    /// interleave with a delete reported as "did not exist" vs "existed
+    /// and removed".
     pub fn delete_if_exists(&self, relative: &str) -> Result<bool> {
+        let _set = self.acquire(&[relative])?;
+        self.delete_if_exists_locked(relative)
+    }
+
+    /// [`Self::delete_if_exists`] for a caller that already holds the
+    /// coordination set for `relative`.
+    pub fn delete_if_exists_locked(&self, relative: &str) -> Result<bool> {
         let path = self.resolve_checked(relative)?;
         if path == self.root {
             bail!("refusing to delete the project root");
@@ -207,7 +357,19 @@ impl FilesService {
     }
 
     /// Renames/moves within the root. `to` must stay inside the root.
+    ///
+    /// FS-001: both endpoints are coordinated as one set (deterministic
+    /// key order; the pair is small) and both are re-validated under the
+    /// lock, so a concurrent writer targeting either endpoint cannot
+    /// interleave.
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let _set = self.acquire(&[from, to])?;
+        self.rename_locked(from, to)
+    }
+
+    /// [`Self::rename`] for a caller that already holds the coordination
+    /// set covering both endpoints.
+    pub fn rename_locked(&self, from: &str, to: &str) -> Result<()> {
         let src = self.resolve_checked(from)?;
         let dst = self.resolve_checked(to)?;
         if !src.starts_with(&self.root) || !dst.starts_with(&self.root) {
@@ -223,7 +385,15 @@ impl FilesService {
     }
 
     /// Creates a directory (with parents) under the root.
+    ///
+    /// FS-001: directory creation is a workspace mutation (it changes
+    /// listings and can be raced with a same-name file creation), so it
+    /// takes the same per-resource coordination with under-lock
+    /// revalidation.
     pub fn create_dir(&self, relative: &str) -> Result<()> {
+        let _set = self.acquire(&[relative])?;
+        // Re-resolve under the lock: containment re-checked at the
+        // mutation boundary.
         let path = self.resolve_checked(relative)?;
         if path == self.root {
             bail!("refusing to create the project root");
@@ -475,6 +645,8 @@ mod tests {
         svc.write("x.txt", "12345").unwrap();
         svc.create_dir("sub").unwrap();
         let entries = svc.list("").unwrap();
+        // Coordination lock state lives outside the workspace (system
+        // temp), so the listing contains exactly the seeded entries.
         assert_eq!(entries.len(), 2);
         let sub = entries.iter().find(|e| e.name == "sub").unwrap();
         assert!(sub.is_dir);
