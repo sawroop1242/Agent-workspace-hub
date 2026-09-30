@@ -273,8 +273,23 @@ fn fs_history_and_verify_failures() {
 
     // Unknown edit id → recovery failure (5), no mutation. A missing
     // provenance record IS a recovery-material failure by the canonical
-    // error taxonomy.
-    ws.fails(&["fs", "verify", "edit-does-not-exist"], 5);
+    // error taxonomy. The message must name the actual contract: an
+    // edit id from `fs history`, not a file path (a hand-typed path is
+    // the common mistake and the old wording hid it behind recovery
+    // jargon).
+    let output = ws.fails(&["fs", "verify", "edit-does-not-exist"], 5);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no recovery record") && stderr.contains("awh fs history"),
+        "verify message should explain the edit-id contract: {stderr}"
+    );
+    // A bare file path is the classic mistake: same contract, same code.
+    let output = ws.fails(&["fs", "verify", "h.txt"], 5);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no recovery record for 'h.txt'") && !stderr.contains("snapshot not found"),
+        "path-like input should get the edit-id hint, not snapshot jargon: {stderr}"
+    );
     ws.fails(&["fs", "rollback", "edit-does-not-exist"], 5);
     assert_eq!(ws.read("h.txt"), "two\n");
 

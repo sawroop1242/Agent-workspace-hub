@@ -401,9 +401,19 @@ fn run_inner(command: FsCommand, root: &Path) -> Result<(), FsError> {
         }
         FsCommand::Verify { edit_id, json } => {
             let store = crate::services::snapshot::SnapshotStore::new(root.to_path_buf());
-            let provenance = store
-                .provenance(&edit_id)
-                .map_err(|error| FsError::Recovery(error.to_string()))?;
+            let provenance = store.provenance(&edit_id).map_err(|error| match error {
+                // A missing record keeps the pinned recovery exit code,
+                // but the message must tell the caller what the command
+                // actually takes — an edit id from `awh fs history`, not a
+                // file path (the most common hand-typed mistake).
+                crate::services::snapshot::SnapshotError::NotFound(_) => {
+                    FsError::Recovery(format!(
+                        "no recovery record for '{edit_id}' — fs verify takes an edit id \
+                         (list them with `awh fs history`), not a file path"
+                    ))
+                }
+                other => FsError::Recovery(other.to_string()),
+            })?;
             // Read-only integrity check of the whole recovery chain:
             // the manifest load verifies schema, ids, sequence, and every
             // content blob's length + SHA-256 without mutating anything.

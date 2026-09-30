@@ -435,7 +435,7 @@ PASS every tool has an inputSchema
 PASS tools/call workspace.context
 PASS tools/call skills.list
 PASS tools/call memory.store -> memory.search round-trip
-PASS unknown tool -> JSON-RPC error (code -32603)
+PASS unknown tool -> JSON-RPC error (code -32602)
 PASS clean disconnect (client.close)
 STDIO INTEROP: ALL CHECKS PASSED
 
