@@ -127,6 +127,16 @@ enum Command {
         #[command(subcommand)]
         command: agent_workspace_hub::cli::tasks::TaskCommand,
     },
+    /// Terminal (TRM-001): thin adapter over the canonical
+    /// TerminalService — the same authority the MCP `terminal.run`
+    /// tool, the Control API `/terminal/run` route, and the TUI
+    /// terminal screen use. argv-only (never a shell), bounded by a
+    /// wall-clock timeout and a 256 KiB capture cap, and audited.
+    /// Lifecycle is ephemeral: runs complete within the command.
+    Terminal {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::terminal::TerminalCommand,
+    },
     Tunnel {
         #[command(subcommand)]
         command: TunnelCommand,
@@ -752,6 +762,16 @@ fn main() -> Result<()> {
                 tracing::error!(event = "audit_init_failed", error = %error);
             }
             agent_workspace_hub::cli::tasks::handle_task_cli(&root, command)?;
+        }
+        Some(Command::Terminal { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // TRM-001: terminal execution is high-risk, so runs must land
+            // in the durable audit log — same treatment as the task arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::terminal::handle_terminal_cli(&root, command)?;
         }
         Some(Command::Context { command }) => {
             // CTX-001: the CLI mirrors the MCP dispatcher's construction

@@ -6,4 +6,5 @@ pub mod context;
 pub mod fs_edit;
 pub mod memory;
 pub mod tasks;
+pub mod terminal;
 pub mod worktree;

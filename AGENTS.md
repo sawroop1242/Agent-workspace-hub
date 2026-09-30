@@ -537,3 +537,34 @@ cheap-to-clone). Tool catalog 53 static.
   failed workspace-wide, fmt+clippy clean. Audit parity confirmed: every tools/call emits
   `tool_invoke` (name only, args never logged, caller-attributed when bound) in addition to
   the CLI's `cli_task_*` durable audit events.
+
+- **Prompt 18 Terminal domain (TRM-001, 2026-09)**: the documented `awh terminal
+  run|list|kill` CLI contract (docs/CLI.md command tree + security-ordering list)
+  was missing entirely — the CLI was the only plane without a terminal surface.
+  Added src/cli/terminal.rs (thin adapter, same pattern as task/memory/context):
+  `run` delegates to the canonical TerminalService (argv-only, kill_on_drop,
+  --timeout bounded 1..=600s over the 30s default, 256 KiB caps inherited from the
+  service), prints child stdout/stderr unmixed, propagates the child exit code
+  (124 on timeout, 1 on spawn failure via Result), and audits cli_terminal_run
+  (program name + timeout as detail; args NEVER logged — pinned adversarially by
+  a test that greps the durable audit log for a sentinel arg). `list`/`kill`
+  implement TRM-001's documented ephemeral-lifecycle allowance (its §6: no
+  background-process plane exists — bounded synchronous runs only): list prints
+  `[]` + explanatory stderr note; kill fails deterministically with "unknown
+  execution id: {id}" for ANY id (never a raw-PID signal). The decision is
+  documented in docs/terminal/README.md, not left implicit. Verified the other
+  three planes already share the service: MCP terminal.run (authorize_tool +
+  policy gate on program name + tool_invoke audit), Control API /terminal/run
+  (bearer + api_terminal_run), TUI backend terminal_run (tui_terminal_run).
+  Known limitation recorded: no OS sandbox around terminal children (the MCP
+  sandbox wraps custom MCP server spawns only) — controls are auth/policy/argv/
+  timeout/cap/audit. Tests: tests/terminal_cli.rs (9, real compiled binary;
+  platform commands cfg-gated unix/windows like mcp_builtin_tool_gate.rs, since
+  the SERVICE unit tests already use printf/sleep/head un-gated). Gotchas: (1)
+  clap `trailing_var_arg` + `required` means empty argv is a USAGE error naming
+  `<ARGV>...` — don't assert on the word "program"; (2) `tokio::runtime::Runtime
+  ::new()?.block_on` is the CLI's bridge to the async service (main() is sync);
+  (3) `std::process::exit(code)` does NOT flush stdout (LineWriter flushes on newline only) — flush stdout/stderr explicitly before ANY process::exit in the run path, or non-newline-terminated child output dies with the process (pinned by nonzero_exit_does_not_drop_buffered_child_stdout: awk writes no trailing newline, exits 3).
+  automatically, but `print!` to a LineWriter... actually print! flushes on
+  newline only; use explicit flush before process::exit to avoid losing the
+  final stdout line on non-newline-terminated child output.
