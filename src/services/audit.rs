@@ -536,6 +536,46 @@ fn trusted_snapshot_id(value: &str) -> String {
     }
 }
 
+/// §16 shape guard: a typed identity id (workspace/agent/session/task/
+/// audit correlation fields) is stored verbatim only when it matches the
+/// generated `prefix-<16-hex>-<pid>-<seq>` shape those ids always carry
+/// (see `core::identity::generate`); anything else is redacted like
+/// free-form text. These fields exist for exact-match correlation — a
+/// redacted generated id would break the audit join — so pass-through is
+/// limited to that one shape and stays fail-closed for secrets.
+fn trusted_identity_id(value: &str) -> String {
+    let generated_shape = value
+        .split_once('-')
+        .and_then(|(prefix, rest)| {
+            let known_prefix = matches!(prefix, "ws" | "agent" | "sess" | "task" | "audit");
+            if !known_prefix || value.len() > 128 {
+                return None;
+            }
+            // rest = `<16 lowercase-hex nanos>-<pid>-<seq>`
+            let mut parts = rest.splitn(3, '-');
+            let nanos = parts.next()?;
+            let pid = parts.next()?;
+            let seq = parts.next()?;
+            if nanos.len() == 16
+                && nanos.bytes().all(|b| b.is_ascii_hexdigit())
+                && !pid.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && !seq.is_empty()
+                && seq.bytes().all(|b| b.is_ascii_digit())
+            {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .is_some();
+    if generated_shape {
+        bound_text(value)
+    } else {
+        bound_text(&redact_token_like(value))
+    }
+}
+
 /// §16 shape guard: a stable lowercase snake_case reason code (the
 /// shape every reason code in this crate uses) is stored verbatim so it
 /// stays machine-filterable; free-form reason text is redacted and
@@ -627,9 +667,9 @@ impl AuditLog {
             schema_version: AUDIT_SCHEMA_VERSION,
             event_id: None,
             sequence: None,
-            workspace_id: correlation.workspace_id.as_deref().map(redact_token_like),
-            agent_id: correlation.agent_id.as_deref().map(redact_token_like),
-            session_id: correlation.session_id.as_deref().map(redact_token_like),
+            workspace_id: correlation.workspace_id.as_deref().map(trusted_identity_id),
+            agent_id: correlation.agent_id.as_deref().map(trusted_identity_id),
+            session_id: correlation.session_id.as_deref().map(trusted_identity_id),
             edit_id: correlation.edit_id.as_deref().map(trusted_edit_id),
             snapshot_id: correlation.snapshot_id.as_deref().map(trusted_snapshot_id),
             reason: correlation.reason.as_deref().map(trusted_reason),
@@ -1149,6 +1189,35 @@ mod persistent_audit_tests {
         assert!(!raw.contains(secret), "secret never persists: {raw}");
         let entry = &log.recent(1)[0];
         assert!(entry.agent_id.as_deref().unwrap().contains("[redacted]"));
+    }
+
+    /// §16: a generated-shape identity id (workspace/agent/session) is
+    /// stored verbatim so correlation joins survive; only non-shaped
+    /// values take the redaction path.
+    #[test]
+    fn generated_identity_ids_survive_redaction_verbatim() {
+        let (dir, log) = open_store();
+        let agent = crate::core::identity::AgentId::new();
+        let workspace = crate::core::identity::WorkspaceId::new();
+        let session = crate::core::identity::SessionId::new();
+        log.record_correlated(
+            "allow",
+            "tool_invoke",
+            "skills.list",
+            "tools/call",
+            &crate::services::audit::AuditCorrelation {
+                workspace_id: Some(workspace.to_string()),
+                agent_id: Some(agent.to_string()),
+                session_id: Some(session.to_string()),
+                ..Default::default()
+            },
+        );
+        let entry = &log.recent(1)[0];
+        assert_eq!(entry.workspace_id.as_deref(), Some(workspace.as_str()));
+        assert_eq!(entry.agent_id.as_deref(), Some(agent.as_str()));
+        assert_eq!(entry.session_id.as_deref(), Some(session.as_str()));
+        let raw = fs::read_to_string(log_path(&dir)).unwrap();
+        assert!(raw.contains(agent.as_str()), "agent id must persist: {raw}");
     }
 
     /// §36: oversize diagnostic text is bounded char-safely (and

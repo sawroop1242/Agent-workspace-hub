@@ -80,7 +80,9 @@ pub mod trust_store;
 /// MCP workspace access.
 pub mod workspace;
 
-pub use audit::{audit_allow, audit_circuit_open, audit_deny, audit_secret_deny};
+pub use audit::{
+    audit_allow, audit_allow_as, audit_circuit_open, audit_deny, audit_deny_as, audit_secret_deny,
+};
 pub use auth::{bearer_token, load_api_key, verify_token};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerMcpClient};
 pub use cli_trust::{block_mcp, revoke_mcp, trust_mcp};

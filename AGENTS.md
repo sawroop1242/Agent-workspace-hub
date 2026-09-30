@@ -459,3 +459,41 @@ cheap-to-clone). Tool catalog 53 static.
   with regex over dispatcher.rs, extract Command enum variants with a brace-depth
   parser, grep callers of resolve_effective_root to classify wiring gaps.
 - **windows-latest CI traps (PR #129 round, 2026-09)**: three found in one go. (1) The runner image ships machine-wide `core.autocrlf=true`, so any test that `git init`s a fixture then `git worktree add`/`checkout`s gets LF->CRLF smudging and byte-exact content asserts read `\r\n` — pin the fixture repo with repo-local `git config core.autocrlf false` (repo-local beats system/global scope; only command-scope GIT_CONFIG_* env would beat it, and runners don't use that). Reproduce on Linux with a scratch HOME containing `.gitconfig` with `autocrlf=true` (pin CARGO_HOME/RUSTUP_HOME to the real ones or rustup forgets its default toolchain). (2) Tests asserting the shared global audit ring via `dashboard()` (surfaces only recent(5)) race sibling threads: dashboard() does FS work (project scan, git probe) between the audit write and the ring read, and rate-limit/api tests spray audit events — fixed with a bounded re-record/re-check loop; sibling tests must also match on (action, subject), not action alone, since concurrent tests write the same action. (3) The `release-readiness` job (ci.yml) runs `cargo package` and REJECTS tarballs containing .github/workflows, .env, or key material — with no `package.exclude`, cargo's default ships everything not gitignored, so the job failed. Cargo.toml now has `exclude = [".github"]`. The job `needs: build-test`, so it had literally never run on a PR before (the windows leg was red since #127) — expect more never-exercised jobs to surface the first time the full matrix goes green.
+
+- **Prompt 18 (master completion) — catalog-count correction (2026-09-30)**: the
+  advertised MCP catalog is 59 core tools / 71 with github.* (verified live via
+  tools/list and both interop harnesses). Earlier notes saying "53 core / 65"
+  are historical (pre-filesystem.* exposure in prompt 11). docs/mcp.md,
+  README.md updated; docs/mcp.md catalog table now carries the filesystem.*
+  row. Fresh interop evidence regenerated (both harnesses PASS, incl. the six
+  filesystem.* editing-interop checks the harness gained in prompt 11).
+  Also: control API audit completeness fix — git push/pull/stage/unstage and
+  files/content PUT now record api_git_* / api_file_write allow+deny events
+  (subject = truncated path or remote name, detail = branch or byte count,
+  never content); tests pin allow, deny, and no-content-leak behavior.
+
+- **Prompt 18 — §15 caller attribution (MCP authorization/audit path)**:
+  threaded `caller: Option<&SessionIdentity>` through `authorize_tool` /
+  `authorize_policy` (the capability gate already had it). `McpDispatcher` has
+  NO `caller()` accessor — removed the obsolete `caller_correlation` method in
+  favor of the free fn `caller_audit_correlation(caller)` (dispatcher.rs,
+  `pub`); SSE's `session_create` reuses it: bound sessions emit
+  `audit_allow_as`, plain `audit_allow` otherwise (no invented identity). Gate
+  order per tools/call: capability (-32005) -> builtin trust (-32003) -> policy
+  (-32004) -> service. Gotchas: (1) `audit_deny_as(action, reason, subject,
+  corr)` is positional — record_correlated stores `subject` as entry.subject
+  and `reason` as entry.detail, so `policy_denied`'s SUBJECT is the RULE ID
+  while the resource lands in detail; tests must match action + detail.
+  (2) `redact_token_like` masks >=16-char base62 runs INCLUDING hyphens, so
+  generated identity ids (`ws-`/`agent-`/`sess-` + 16-hex nanos) were coming
+  out `[redacted]` in workspace_id/agent_id/session_id; new
+  `services::audit::trusted_identity_id` (shape guard like
+  trusted_edit_id/trusted_snapshot_id) stores the generated shape verbatim,
+  everything else still redacts. Token-shaped POLICY RULE IDS (e.g. auto
+  `policy-<sha>`) remain masked in audit subjects — pre-existing documented
+  residual; the resource stays visible in detail. (3) A bound-caller test
+  pinning a POLICY denial must first seed a CapabilityGrant
+  (`crate::models::CapabilityGrant`, permission via
+  `crate::mcp::permissions::Permission`, store root = the dispatcher's
+  project root) or the capability gate answers -32005 before policy runs.
+  Suite after the fix: 1246 tests green workspace-wide, fmt+clippy clean.

@@ -10,15 +10,15 @@ use crate::context::{
 };
 use crate::core::policy::PolicyStore;
 use crate::mcp::{
-    audit_allow, audit_deny, authorize_builtin_tool, authorize_mcp_execution, client_name_version,
-    validate_schema, validate_schema_syntax, validate_tool_arguments, AuthMethod,
-    CircuitBreakerConfig, CircuitBreakerMcpClient, ComposioAccount, ComposioAuth, ComposioProvider,
-    ComposioRegistry, Connector, ConnectorsMcp, CustomMcpProvider, CustomMcpRegistry,
-    CustomMcpServerConfig, GithubProvider, McpEvent, McpExecutionRequest, McpHook, McpHooks,
-    McpTransport, MemoryMcp, MemoryScope, PersistentTrustStore, PolicyDenialError,
-    ProviderRegistry, RepoTarget, ResourceLimits, SkillMcp, StdioMcpClient,
-    StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp, ToolMetrics, WorkspaceMcp,
-    BUILTIN_TOOL_TRUST_ID, MAX_TRACKED_TOOLS,
+    audit_allow, audit_allow_as, audit_deny, audit_deny_as, authorize_builtin_tool,
+    authorize_mcp_execution, client_name_version, validate_schema, validate_schema_syntax,
+    validate_tool_arguments, AuthMethod, CircuitBreakerConfig, CircuitBreakerMcpClient,
+    ComposioAccount, ComposioAuth, ComposioProvider, ComposioRegistry, Connector, ConnectorsMcp,
+    CustomMcpProvider, CustomMcpRegistry, CustomMcpServerConfig, GithubProvider, McpEvent,
+    McpExecutionRequest, McpHook, McpHooks, McpTransport, MemoryMcp, MemoryScope,
+    PersistentTrustStore, PolicyDenialError, ProviderRegistry, RepoTarget, ResourceLimits,
+    SkillMcp, StdioMcpClient, StreamableHttpMcpClient, TaskPriority, TaskStatus, TasksMcp,
+    ToolMetrics, WorkspaceMcp, BUILTIN_TOOL_TRUST_ID, MAX_TRACKED_TOOLS,
 };
 use crate::mcp::{permissions, tool_broker::RESOURCE_SCOPED_TOOLS, tool_registry};
 use crate::services::edit::{EditOperation, EditService, EditTransaction};
@@ -715,10 +715,19 @@ impl McpDispatcher {
     /// and surfaces as a [`POLICY_DENIED_CODE`] JSON-RPC server error naming
     /// the tool, the rule id, and the optional reason. No rule means the
     /// call proceeds, audited with the `policy_allowed` action.
-    fn authorize_policy(&self, tool: &str, resource: &str) -> Result<()> {
+    fn authorize_policy(
+        &self,
+        tool: &str,
+        resource: &str,
+        caller: Option<&crate::core::identity::SessionIdentity>,
+    ) -> Result<()> {
+        // §15 audit attribution: policy decisions inside an agent-scoped
+        // session carry the bound caller's identity; unbound sessions
+        // keep the plain event (no invented identities).
+        let correlation = caller_audit_correlation(caller);
         match self.policy.matching(tool, resource) {
             Ok(Some(rule)) => {
-                audit_deny("policy_denied", resource, &rule.id);
+                audit_deny_as("policy_denied", resource, &rule.id, &correlation);
                 let error = PolicyDenialError::Denied {
                     tool: tool.to_string(),
                     rule_id: rule.id,
@@ -728,7 +737,7 @@ impl McpDispatcher {
                 Err(DispatchError::new(POLICY_DENIED_CODE, error.to_string()).into())
             }
             Ok(None) => {
-                audit_allow("policy_allowed", resource, tool);
+                audit_allow_as("policy_allowed", resource, tool, &correlation);
                 Ok(())
             }
             Err(error) => {
@@ -753,11 +762,16 @@ impl McpDispatcher {
     /// the same [`strval`] helper the call sites use today, so a call site no
     /// longer needs to extract `path`/`program` before this check runs (though
     /// it may still need the value afterward for the tool's own logic).
-    fn authorize_tool(&self, name: &str, arguments: &Value) -> Result<()> {
+    fn authorize_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+        caller: Option<&crate::core::identity::SessionIdentity>,
+    ) -> Result<()> {
         self.authorize_builtin(name)?;
         if let Some((_, arg_name)) = RESOURCE_SCOPED_TOOLS.iter().find(|(tool, _)| *tool == name) {
             let resource = strval(arguments, arg_name)?;
-            self.authorize_policy(name, &resource)?;
+            self.authorize_policy(name, &resource, caller)?;
         }
         Ok(())
     }
@@ -799,7 +813,12 @@ impl McpDispatcher {
         let grants = crate::core::capability_grants::CapabilityGrantStore::new(self.project_root())
             .list_for_agent(caller.agent_id.as_str())
             .map_err(|e| {
-                audit_deny("agent_capability_check", "store_unreadable", name);
+                audit_deny_as(
+                    "agent_capability_check",
+                    "store_unreadable",
+                    name,
+                    &caller_audit_correlation(Some(caller)),
+                );
                 DispatchError::internal(format!(
                     "capability store unreadable for agent {}: {e}",
                     caller.agent_id.as_str()
@@ -827,7 +846,12 @@ impl McpDispatcher {
                     }
             });
             if !covers {
-                audit_deny("agent_capability_denied", name, permission.as_str());
+                audit_deny_as(
+                    "agent_capability_denied",
+                    name,
+                    permission.as_str(),
+                    &caller_audit_correlation(Some(caller)),
+                );
                 return Err(DispatchError::new(
                     CAPABILITY_DENIED_CODE,
                     format!(
@@ -1684,7 +1708,14 @@ impl McpDispatcher {
 
         // Audit every tool invocation by name only. Arguments are deliberately
         // never logged: they may contain file contents or secret material.
-        audit_allow("tool_invoke", name, "tools/call");
+        // §15 attribution: an agent-scoped session also carries its
+        // workspace/agent/session identity on the event.
+        audit_allow_as(
+            "tool_invoke",
+            name,
+            "tools/call",
+            &caller_audit_correlation(caller),
+        );
 
         let value = match name {
             // Read-only MCP health/status: bounded, secret-free snapshot
@@ -1738,7 +1769,7 @@ impl McpDispatcher {
                 )?,
             )?,
             "skills.add" => {
-                self.authorize_tool("skills.add", &arguments)?;
+                self.authorize_tool("skills.add", &arguments, caller)?;
                 self.skills.add(
                     arguments
                         .get("name")
@@ -1748,7 +1779,7 @@ impl McpDispatcher {
                 json!({"ok": true})
             }
             "skills.remove" => {
-                self.authorize_tool("skills.remove", &arguments)?;
+                self.authorize_tool("skills.remove", &arguments, caller)?;
                 json!({
                     "removed": self.skills.remove(
                         arguments.get("name").and_then(Value::as_str).unwrap_or_default()
@@ -1781,7 +1812,7 @@ impl McpDispatcher {
                 )?,
             )?,
             "workspace.write_file" => {
-                self.authorize_tool("workspace.write_file", &arguments)?;
+                self.authorize_tool("workspace.write_file", &arguments, caller)?;
                 let path = strval(&arguments, "path")?;
                 let content = strval(&arguments, "content")?;
                 // File mutation is exactly what the audit log exists for;
@@ -1791,7 +1822,7 @@ impl McpDispatcher {
                 json!({"written": true})
             }
             "workspace.delete_file" => {
-                self.authorize_tool("workspace.delete_file", &arguments)?;
+                self.authorize_tool("workspace.delete_file", &arguments, caller)?;
                 let path = strval(&arguments, "path")?;
                 audit_allow("workspace_delete", &path, "");
                 json!({"deleted": self.workspace.delete_file(&path)?})
@@ -1799,7 +1830,7 @@ impl McpDispatcher {
             // ---- filesystem.* editing tools (AWE-009) ----
             // edit_principal is computed above (AWE-011/TW-004 wiring).
             "filesystem.replace" => {
-                self.authorize_tool("filesystem.replace", &arguments)?;
+                self.authorize_tool("filesystem.replace", &arguments, caller)?;
                 let path = strval(&arguments, "path")?;
                 let old = strval(&arguments, "old")?;
                 let new = strval(&arguments, "new")?;
@@ -1821,7 +1852,7 @@ impl McpDispatcher {
                 }
             }
             "filesystem.insert" => {
-                self.authorize_tool("filesystem.insert", &arguments)?;
+                self.authorize_tool("filesystem.insert", &arguments, caller)?;
                 let path = strval(&arguments, "path")?;
                 let line = arguments
                     .get("line")
@@ -1843,7 +1874,7 @@ impl McpDispatcher {
                 }
             }
             "filesystem.delete_range" => {
-                self.authorize_tool("filesystem.delete_range", &arguments)?;
+                self.authorize_tool("filesystem.delete_range", &arguments, caller)?;
                 let path = strval(&arguments, "path")?;
                 let start_line = arguments
                     .get("start_line")
@@ -1870,7 +1901,7 @@ impl McpDispatcher {
                 }
             }
             "filesystem.apply_diff" => {
-                self.authorize_tool("filesystem.apply_diff", &arguments)?;
+                self.authorize_tool("filesystem.apply_diff", &arguments, caller)?;
                 let diff = strval(&arguments, "diff")?;
                 audit_allow("workspace_edit", "apply_diff", "");
                 let tx = EditTransaction::single(EditOperation::ApplyDiff { diff });
@@ -1882,7 +1913,7 @@ impl McpDispatcher {
                 }
             }
             "filesystem.patch" => {
-                self.authorize_tool("filesystem.patch", &arguments)?;
+                self.authorize_tool("filesystem.patch", &arguments, caller)?;
                 let ops_array = arguments
                     .get("operations")
                     .and_then(Value::as_array)
@@ -1945,7 +1976,7 @@ impl McpDispatcher {
                 }
             }
             "filesystem.rollback" => {
-                self.authorize_tool("filesystem.rollback", &arguments)?;
+                self.authorize_tool("filesystem.rollback", &arguments, caller)?;
                 let edit_id = strval(&arguments, "edit_id")?;
                 audit_allow("workspace_edit", "rollback", &edit_id);
                 // The canonical by-id rollback requires an explicit
@@ -1996,7 +2027,7 @@ impl McpDispatcher {
                 })
             }
             "memory.store" => {
-                self.authorize_tool("memory.store", &arguments)?;
+                self.authorize_tool("memory.store", &arguments, caller)?;
                 let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
                 serde_json::to_value(self.memory.store(
                     strval(&arguments, "id")?,
@@ -2027,7 +2058,7 @@ impl McpDispatcher {
                 )?,
             )?,
             "memory.delete" => {
-                self.authorize_tool("memory.delete", &arguments)?;
+                self.authorize_tool("memory.delete", &arguments, caller)?;
                 json!({
                     "deleted": self.memory.delete(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -2035,7 +2066,7 @@ impl McpDispatcher {
                 })
             }
             "memory.update" => {
-                self.authorize_tool("memory.update", &arguments)?;
+                self.authorize_tool("memory.update", &arguments, caller)?;
                 // Updating must not silently create: the entry has to
                 // exist, otherwise the caller gets a clear error. The
                 // existence check and the write happen under one lock hold
@@ -2053,7 +2084,7 @@ impl McpDispatcher {
                 serde_json::to_value(entry)?
             }
             "tasks.create" => {
-                self.authorize_tool("tasks.create", &arguments)?;
+                self.authorize_tool("tasks.create", &arguments, caller)?;
                 serde_json::to_value(self.tasks.create(
                     strval(&arguments, "id")?,
                     strval(&arguments, "title")?,
@@ -2073,7 +2104,7 @@ impl McpDispatcher {
             )?,
             "tasks.get" => serde_json::to_value(self.tasks.get(&strval(&arguments, "id")?)?)?,
             "tasks.update" => {
-                self.authorize_tool("tasks.update", &arguments)?;
+                self.authorize_tool("tasks.update", &arguments, caller)?;
                 serde_json::to_value(
                     self.tasks.update(
                         arguments
@@ -2097,7 +2128,7 @@ impl McpDispatcher {
                 )?
             }
             "tasks.delete" => {
-                self.authorize_tool("tasks.delete", &arguments)?;
+                self.authorize_tool("tasks.delete", &arguments, caller)?;
                 json!({
                     "deleted": self.tasks.delete(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -2109,7 +2140,7 @@ impl McpDispatcher {
                 serde_json::to_value(self.connectors.get(&strval(&arguments, "id")?)?)?
             }
             "connectors.add" => {
-                self.authorize_tool("connectors.add", &arguments)?;
+                self.authorize_tool("connectors.add", &arguments, caller)?;
                 let connector = Connector {
                     id: strval(&arguments, "id")?,
                     name: strval(&arguments, "name")?,
@@ -2124,7 +2155,7 @@ impl McpDispatcher {
                 serde_json::to_value(self.connectors.add(connector)?)?
             }
             "connectors.enable" => {
-                self.authorize_tool("connectors.enable", &arguments)?;
+                self.authorize_tool("connectors.enable", &arguments, caller)?;
                 serde_json::to_value(
                     self.connectors.set_enabled(
                         arguments
@@ -2136,7 +2167,7 @@ impl McpDispatcher {
                 )?
             }
             "connectors.disable" => {
-                self.authorize_tool("connectors.disable", &arguments)?;
+                self.authorize_tool("connectors.disable", &arguments, caller)?;
                 serde_json::to_value(
                     self.connectors.set_enabled(
                         arguments
@@ -2148,7 +2179,7 @@ impl McpDispatcher {
                 )?
             }
             "connectors.remove" => {
-                self.authorize_tool("connectors.remove", &arguments)?;
+                self.authorize_tool("connectors.remove", &arguments, caller)?;
                 json!({
                     "removed": self.connectors.remove(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -2168,7 +2199,7 @@ impl McpDispatcher {
                 serde_json::to_value(registry.tools(provider).await?)?
             }
             "connector.invoke" => {
-                self.authorize_tool("connector.invoke", &arguments)?;
+                self.authorize_tool("connector.invoke", &arguments, caller)?;
                 let provider = arguments
                     .get("provider")
                     .and_then(Value::as_str)
@@ -2194,7 +2225,7 @@ impl McpDispatcher {
                 serde_json::to_value(registry.invoke(provider, tool, args).await?)?
             }
             "connector.composio_link" => {
-                self.authorize_tool("connector.composio_link", &arguments)?;
+                self.authorize_tool("connector.composio_link", &arguments, caller)?;
                 let auth_config_id = strval(&arguments, "auth_config_id")?;
                 let user_id = strval(&arguments, "user_id")?;
                 let alias = arguments.get("alias").and_then(Value::as_str);
@@ -2214,7 +2245,7 @@ impl McpDispatcher {
                 serde_json::to_value(accounts)?
             }
             "connector.composio_register" => {
-                self.authorize_tool("connector.composio_register", &arguments)?;
+                self.authorize_tool("connector.composio_register", &arguments, caller)?;
                 let label = strval(&arguments, "label")?;
                 let connected_account_id = strval(&arguments, "connected_account_id")?;
                 let toolkit = arguments
@@ -2247,7 +2278,7 @@ impl McpDispatcher {
                 serde_json::to_value(account)?
             }
             "connector.composio_remove" => {
-                self.authorize_tool("connector.composio_remove", &arguments)?;
+                self.authorize_tool("connector.composio_remove", &arguments, caller)?;
                 let label = strval(&arguments, "label")?;
                 let removed = ComposioRegistry::new()?.remove(&label)?;
                 self.providers
@@ -2258,7 +2289,7 @@ impl McpDispatcher {
             }
             "context.status" => serde_json::to_value(self.context()?.status()?)?,
             "context.insert" => {
-                self.authorize_tool("context.insert", &arguments)?;
+                self.authorize_tool("context.insert", &arguments, caller)?;
                 let item = ContextItem::new(
                     strval(&arguments, "id")?,
                     parse_context_source(arguments.get("source").and_then(Value::as_str)),
@@ -2304,7 +2335,7 @@ impl McpDispatcher {
                 ),
             )?,
             "context.remove" => {
-                self.authorize_tool("context.remove", &arguments)?;
+                self.authorize_tool("context.remove", &arguments, caller)?;
                 json!({
                     "removed": self.context()?.remove_item(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -2324,7 +2355,7 @@ impl McpDispatcher {
                 )?
             }
             "context.optimize" => {
-                self.authorize_tool("context.optimize", &arguments)?;
+                self.authorize_tool("context.optimize", &arguments, caller)?;
                 serde_json::to_value(
                     self.context()?.optimize(
                         arguments
@@ -2356,7 +2387,7 @@ impl McpDispatcher {
                 serde_json::to_value(engine.get_context(&request)?)?
             }
             "context.protect" => {
-                self.authorize_tool("context.protect", &arguments)?;
+                self.authorize_tool("context.protect", &arguments, caller)?;
                 json!({
                     "protected": self.context()?.protect(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -2364,7 +2395,7 @@ impl McpDispatcher {
                 })
             }
             "context.unprotect" => {
-                self.authorize_tool("context.unprotect", &arguments)?;
+                self.authorize_tool("context.unprotect", &arguments, caller)?;
                 json!({
                     "unprotected": self.context()?.unprotect(
                         arguments.get("id").and_then(Value::as_str).unwrap_or_default()
@@ -2372,7 +2403,7 @@ impl McpDispatcher {
                 })
             }
             "context.offload" => {
-                self.authorize_tool("context.offload", &arguments)?;
+                self.authorize_tool("context.offload", &arguments, caller)?;
                 self.context()?.offload(
                     arguments
                         .get("id")
@@ -2386,7 +2417,7 @@ impl McpDispatcher {
                 json!({"offloaded": true})
             }
             "context.restore" => {
-                self.authorize_tool("context.restore", &arguments)?;
+                self.authorize_tool("context.restore", &arguments, caller)?;
                 let item = self.context()?.restore(
                     arguments
                         .get("id")
@@ -2420,7 +2451,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_create" => {
-                self.authorize_tool("github.pr_create", &arguments)?;
+                self.authorize_tool("github.pr_create", &arguments, caller)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_create", &target);
@@ -2438,7 +2469,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_merge" => {
-                self.authorize_tool("github.pr_merge", &arguments)?;
+                self.authorize_tool("github.pr_merge", &arguments, caller)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_merge", &target);
@@ -2453,7 +2484,7 @@ impl McpDispatcher {
                 )?
             }
             "github.pr_review" => {
-                self.authorize_tool("github.pr_review", &arguments)?;
+                self.authorize_tool("github.pr_review", &arguments, caller)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.pr_review", &target);
@@ -2493,7 +2524,7 @@ impl McpDispatcher {
                 )?
             }
             "github.issue_create" => {
-                self.authorize_tool("github.issue_create", &arguments)?;
+                self.authorize_tool("github.issue_create", &arguments, caller)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.issue_create", &target);
@@ -2518,7 +2549,7 @@ impl McpDispatcher {
                 )?
             }
             "github.issue_comment" => {
-                self.authorize_tool("github.issue_comment", &arguments)?;
+                self.authorize_tool("github.issue_comment", &arguments, caller)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.issue_comment", &target);
@@ -2543,7 +2574,7 @@ impl McpDispatcher {
                 )?
             }
             "github.workflow_dispatch" => {
-                self.authorize_tool("github.workflow_dispatch", &arguments)?;
+                self.authorize_tool("github.workflow_dispatch", &arguments, caller)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.workflow_dispatch", &target);
@@ -2558,7 +2589,7 @@ impl McpDispatcher {
                 )?
             }
             "github.release_create" => {
-                self.authorize_tool("github.release_create", &arguments)?;
+                self.authorize_tool("github.release_create", &arguments, caller)?;
                 let github = self.github()?;
                 let target = self.resolve_github_target(&arguments).await?;
                 audit_github_invocation("github.release_create", &target);
@@ -2580,7 +2611,7 @@ impl McpDispatcher {
                 serde_json::to_value(git.status().await?)?
             }
             "git.branch" => {
-                self.authorize_tool("git.branch", &arguments)?;
+                self.authorize_tool("git.branch", &arguments, caller)?;
                 let git = GitService::open(self.workspace.root())?;
                 serde_json::to_value(git.branch().await?)?
             }
@@ -2608,7 +2639,7 @@ impl McpDispatcher {
                 serde_json::to_value(out)?
             }
             "git.stage" => {
-                self.authorize_tool("git.stage", &arguments)?;
+                self.authorize_tool("git.stage", &arguments, caller)?;
                 let git = GitService::open(self.workspace.root())?;
                 let path = strval(&arguments, "path")?;
                 if path.is_empty() {
@@ -2617,7 +2648,7 @@ impl McpDispatcher {
                 serde_json::to_value(git.stage(&path).await?)?
             }
             "git.unstage" => {
-                self.authorize_tool("git.unstage", &arguments)?;
+                self.authorize_tool("git.unstage", &arguments, caller)?;
                 let git = GitService::open(self.workspace.root())?;
                 let path = strval(&arguments, "path")?;
                 if path.is_empty() {
@@ -2626,13 +2657,13 @@ impl McpDispatcher {
                 serde_json::to_value(git.unstage(&path).await?)?
             }
             "git.commit" => {
-                self.authorize_tool("git.commit", &arguments)?;
+                self.authorize_tool("git.commit", &arguments, caller)?;
                 let git = GitService::open(self.workspace.root())?;
                 let message = strval(&arguments, "message")?;
                 serde_json::to_value(git.commit(&message).await?)?
             }
             "terminal.run" => {
-                self.authorize_tool("terminal.run", &arguments)?;
+                self.authorize_tool("terminal.run", &arguments, caller)?;
                 let program = strval(&arguments, "program")?;
                 let args: Vec<String> = arguments
                     .get("args")
@@ -2878,6 +2909,26 @@ fn is_authorized(cfg: &CustomMcpServerConfig, trust_store: Option<&PersistentTru
             tracing::warn!(event = "mcp_execution_denied", id = %cfg.id, error = %error);
             false
         }
+    }
+}
+
+/// Correlation metadata for the caller bound to a session, if any — the
+/// shared shape the capability gate, policy gate, tool-invoke, and session
+/// lifecycle audit events use to make agent-scoped decisions attributable
+/// (§15). `None` (an unbound session — legacy global endpoint, stdio
+/// transport) yields the empty correlation: identity fields stay absent,
+/// never invented.
+pub fn caller_audit_correlation(
+    identity: Option<&crate::core::identity::SessionIdentity>,
+) -> crate::services::audit::AuditCorrelation {
+    match identity {
+        Some(identity) => crate::services::audit::AuditCorrelation {
+            workspace_id: Some(identity.workspace_id.to_string()),
+            agent_id: Some(identity.agent_id.to_string()),
+            session_id: Some(identity.session_id.to_string()),
+            ..std::default::Default::default()
+        },
+        None => crate::services::audit::AuditCorrelation::default(),
     }
 }
 
@@ -3854,5 +3905,202 @@ mod tests {
         assert_eq!(connector["id"], "c-1");
         let missing_connector = call(&dispatcher, "connectors.get", json!({"id": "nope"})).unwrap();
         assert!(missing_connector.is_null());
+    }
+
+    // ---- §15 audit attribution (Prompt 18) --------------------------------
+
+    /// Audit entries for one (action, subject) pair, newest-first.
+    fn audit_entries_for(action: &str, subject: &str) -> Vec<crate::services::audit::AuditEntry> {
+        crate::services::audit::global()
+            .recent(1000)
+            .into_iter()
+            .filter(|entry| entry.action == action && entry.subject == subject)
+            .collect()
+    }
+
+    /// Drives a full MCP session over `dispatch_strict_with_lifecycle` with
+    /// the given caller bound at session establishment, then returns the
+    /// `tools/call` response envelope.
+    fn call_bound(
+        dispatcher: &McpDispatcher,
+        lifecycle: &SessionLifecycle,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let text = rt.block_on(async {
+            let init = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "attribution-test", "version": "0"}
+                }
+            }))
+            .unwrap();
+            let result = dispatcher
+                .dispatch_strict_with_lifecycle(&init, lifecycle)
+                .await
+                .expect("initialize");
+            assert!(result_is_ok(&result), "initialize failed: {result:?}");
+
+            let initialized = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .unwrap();
+            let result = dispatcher
+                .dispatch_strict_with_lifecycle(&initialized, lifecycle)
+                .await
+                .expect("initialized notification");
+            assert!(matches!(result, DispatchResult::NoResponse));
+
+            let request = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }))
+            .unwrap();
+            match dispatcher
+                .dispatch_strict_with_lifecycle(&request, lifecycle)
+                .await
+            {
+                Ok(DispatchResult::Response(response)) => {
+                    serde_json::to_string(&response).expect("response")
+                }
+                Ok(DispatchResult::NoResponse) => String::new(),
+                Err(error) => serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "error": {"code": error.code, "message": error.message}
+                }))
+                .expect("error envelope"),
+            }
+        });
+        if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).expect("valid envelope")
+        }
+    }
+
+    /// A bound caller's tool invocation must carry its workspace/agent/
+    /// session identity on the `tool_invoke` audit event (§15) — the
+    /// audit trail attributes consequential MCP calls to the agent-scoped
+    /// session that produced them, not just to the tool name.
+    #[test]
+    fn tool_invoke_audit_carries_bound_caller_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+        let identity = crate::core::identity::SessionIdentity::new(
+            crate::core::identity::AgentId::new(),
+            crate::core::identity::WorkspaceId::new(),
+        );
+        let lifecycle = SessionLifecycle::default();
+        lifecycle.set_caller(identity.clone());
+
+        let response = call_bound(&dispatcher, &lifecycle, "skills.list", json!({}));
+        assert!(response["error"].is_null(), "call failed: {response}");
+
+        let entries = audit_entries_for("tool_invoke", "skills.list");
+        assert!(
+            entries.iter().any(|entry| entry.agent_id.as_deref()
+                == Some(identity.agent_id.as_str())
+                && entry.session_id.as_deref() == Some(identity.session_id.as_str())
+                && entry.workspace_id.as_deref() == Some(identity.workspace_id.as_str())),
+            "bound tool_invoke must be attributed to the caller; entries: {entries:?}"
+        );
+    }
+
+    /// A policy denial inside a bound session carries the caller identity on
+    /// the `policy_denied` audit event — denials are attributable too.
+    #[test]
+    fn policy_denial_audit_carries_bound_caller_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy_dir = tempfile::tempdir().unwrap();
+        let store = crate::core::policy::PolicyStore::new(policy_dir.path());
+        store
+            .add(&crate::models::policy_rule::PolicyRule {
+                id: "attribution-rule".to_string(),
+                tool: "workspace.write_file".to_string(),
+                pattern: "secrets/".to_string(),
+                reason: Some("attribution test".to_string()),
+                created_at: "2026-09-30T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf())
+            .unwrap()
+            .with_policy_store(crate::core::policy::PolicyStore::new(policy_dir.path()));
+        let identity = crate::core::identity::SessionIdentity::new(
+            crate::core::identity::AgentId::new(),
+            crate::core::identity::WorkspaceId::new(),
+        );
+        // Grant the capability the tool declares so the call reaches the
+        // policy layer — this test pins the *policy* denial's attribution,
+        // not the capability gate's.
+        crate::core::capability_grants::CapabilityGrantStore::new(temp.path())
+            .create(&crate::models::CapabilityGrant {
+                id: "attribution-grant".to_string(),
+                agent_id: identity.agent_id.as_str().to_string(),
+                permission: permissions::Permission::Filesystem,
+                scope: None,
+                granted_at: chrono::Utc::now().to_rfc3339(),
+                expires_at: None,
+            })
+            .unwrap();
+        let lifecycle = SessionLifecycle::default();
+        lifecycle.set_caller(identity.clone());
+
+        let response = call_bound(
+            &dispatcher,
+            &lifecycle,
+            "workspace.write_file",
+            json!({"path": "secrets/token.txt", "content": "nope"}),
+        );
+        assert_eq!(
+            response["error"]["code"],
+            json!(crate::mcp::POLICY_DENIED_CODE)
+        );
+
+        // The policy event keeps its original field semantics: the resource
+        // lands in `detail` (the deny `reason` position); the rule id is the
+        // subject, which the redaction choke point may mask for long
+        // token-shaped rule ids — so match on action + detail + identity.
+        let entries = crate::services::audit::global()
+            .recent(1000)
+            .into_iter()
+            .filter(|entry| {
+                entry.action == "policy_denied" && entry.detail.contains("secrets/token.txt")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.agent_id.as_deref() == Some(identity.agent_id.as_str())),
+            "bound policy_denied must be attributed to the caller; entries: {entries:?}"
+        );
+    }
+
+    /// Sessions without an agent binding keep the plain audit event: no
+    /// identity fields are invented for the legacy global route (§15 —
+    /// absent stays absent).
+    #[test]
+    fn unbound_tool_invoke_audit_has_no_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = McpDispatcher::new(temp.path().to_path_buf()).unwrap();
+
+        call(&dispatcher, "mcp.status", json!({})).unwrap();
+
+        let entries = audit_entries_for("tool_invoke", "mcp.status");
+        assert!(!entries.is_empty(), "tool_invoke must be audited");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.agent_id.is_none() && entry.session_id.is_none()),
+            "unbound sessions must not carry invented identity; entries: {entries:?}"
+        );
     }
 }

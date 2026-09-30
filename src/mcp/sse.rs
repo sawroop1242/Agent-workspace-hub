@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
-use super::dispatcher::SessionLifecycle;
+use super::dispatcher::{caller_audit_correlation, SessionLifecycle};
 
 /// An event emitted on an SSE stream to a single client.
 #[derive(Debug, Clone, Serialize)]
@@ -126,11 +126,22 @@ impl SessionRegistry {
             id: id.clone(),
             endpoint,
             lifecycle,
-            binding,
+            binding: binding.clone(),
             tx,
         };
         self.sessions.lock().await.insert(id, session.clone());
-        crate::mcp::audit_allow("session_create", &session.id, endpoint_path);
+        // §15 attribution: session lifecycle events on the agent-scoped
+        // route carry the bound identity; unbound sessions keep the plain
+        // event (no invented identities).
+        match &binding {
+            Some(binding) => crate::mcp::audit_allow_as(
+                "session_create",
+                &session.id,
+                endpoint_path,
+                &caller_audit_correlation(Some(binding)),
+            ),
+            None => crate::mcp::audit_allow("session_create", &session.id, endpoint_path),
+        }
         session
     }
 

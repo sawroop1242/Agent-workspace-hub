@@ -1,7 +1,8 @@
 //! Memory screen (spec section 13): a read-mostly view of the focused
-//! project's append-only memory log (`.agent/memory.jsonl`), with a
-//! simple append prompt. Entries are listed newest first; memory is
-//! never editable in place (append-only by design).
+//! project's memory store (`.agent/memory.json` via the canonical
+//! `core::memory::MemoryStore`), with a simple append prompt. Entries are
+//! listed newest first; the screen only ever appends — in-place edits
+//! are deliberately not offered here (the MCP plane owns update/delete).
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;

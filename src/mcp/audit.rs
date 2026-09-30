@@ -37,6 +37,47 @@ pub fn audit_allow(action: &str, subject: &str, detail: &str) {
     crate::services::audit::record_allow(action, subject, detail);
 }
 
+/// [`audit_deny`] with correlation metadata: the workspace/agent/session
+/// ids of the bound caller, when the event happens inside an agent-scoped
+/// session. Identity fields are redacted at the audit choke point like
+/// every other subject/detail string; unbound sessions simply carry no
+/// identity (absent fields stay absent — never invented).
+pub fn audit_deny_as(
+    action: &str,
+    reason: &str,
+    subject: &str,
+    correlation: &crate::services::audit::AuditCorrelation,
+) {
+    tracing::warn!(event = "mcp_security_denied", action, reason, subject,);
+    crate::services::audit::global().record_correlated(
+        "deny",
+        action,
+        subject,
+        reason,
+        correlation,
+    );
+}
+
+/// [`audit_allow`] with correlation metadata: the workspace/agent/session
+/// ids of the bound caller, when the event happens inside an agent-scoped
+/// session. Used so consequential MCP-plane events are attributable to
+/// the agent that produced them, not just to the tool name.
+pub fn audit_allow_as(
+    action: &str,
+    subject: &str,
+    detail: &str,
+    correlation: &crate::services::audit::AuditCorrelation,
+) {
+    tracing::info!(event = "mcp_audit", action, subject, detail,);
+    crate::services::audit::global().record_correlated(
+        "allow",
+        action,
+        subject,
+        detail,
+        correlation,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
