@@ -362,6 +362,50 @@ async fn tools_call_argument_failures_are_invalid_params_not_internal() {
 }
 
 // --------------------------------------------------------------------------
+// skills.enable / skills.disable (state-mutating reference toggles)
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn skills_enable_disable_deny_unreferenced_names_via_dispatcher() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let input = request(Some(json!(1)), "initialize", init_params());
+    dispatch(&dispatcher, &input, &lifecycle).await;
+
+    // Both toggles are catalogued and schema-validated: a missing `name`
+    // is rejected before the store is consulted.
+    for name in ["skills.enable", "skills.disable"] {
+        let input = request(
+            Some(json!(2)),
+            "tools/call",
+            json!({"name": name, "arguments": {}}),
+        );
+        let response = dispatch(&dispatcher, &input, &lifecycle).await;
+        assert_eq!(response["error"]["code"], -32602, "{name}: {response}");
+    }
+
+    // A well-formed call against a name the project does not reference
+    // fails closed with the canonical store's message — authorization
+    // ran first, then the store owned the verdict.
+    for name in ["skills.enable", "skills.disable"] {
+        let input = request(
+            Some(json!(3)),
+            "tools/call",
+            json!({"name": name, "arguments": {"name": "ghost"}}),
+        );
+        let response = dispatch(&dispatcher, &input, &lifecycle).await;
+        assert_eq!(response["error"]["code"], -32603, "{name}: {response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("skill is not referenced by the current project: ghost"),
+            "{name}: {response}"
+        );
+    }
+}
+
+// --------------------------------------------------------------------------
 // mcp.status health tool + metrics
 // --------------------------------------------------------------------------
 

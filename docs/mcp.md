@@ -2,7 +2,7 @@
 
 `awh mcp serve` exposes Agent Workspace Hub as a standards-compliant MCP
 server. This document describes the protocol surface, both transports, the
-tool catalog (59 core tools, plus 12 optional `github.*` tools for a 71-tool
+tool catalog (61 core tools, plus 12 optional `github.*` tools for a 73-tool
 catalog when `GITHUB_TOKEN` is set), and the interoperability evidence.
 
 ## Transports
@@ -39,7 +39,7 @@ matching `AWH_API_KEY` (constant-time comparison). Sessions are capped at
 every 15 s. TLS is strongly recommended; without `--tls-cert/--tls-key` the
 server runs plain HTTP, which is only acceptable on a private network.
 
-## Tool catalog (59 core tools; 71 with `github.*`)
+## Tool catalog (61 core tools; 73 with `github.*`)
 
 The core catalog below is always advertised. The 12 `github.*` tools in the
 last row appear in `tools/list` **only when `GITHUB_TOKEN` is set** (a classic
@@ -48,7 +48,7 @@ callable, and callers get a clear error if they try.
 
 | Tool | Purpose |
 | --- | --- |
-| `skills.list` / `skills.read` / `skills.add` / `skills.remove` / `skills.search` | Skill discovery and management |
+| `skills.list` / `skills.read` / `skills.add` / `skills.remove` / `skills.enable` / `skills.disable` / `skills.search` | Skill discovery and management (enable/disable toggle runtime exposure without dropping the reference) |
 | `workspace.context` / `workspace.list_files` / `workspace.read_file` / `workspace.write_file` / `workspace.delete_file` | Workspace inspection and bounded file editing (2 MiB read / 5 MiB write caps, path-traversal checked) |
 | `filesystem.replace` / `filesystem.insert` / `filesystem.delete_range` / `filesystem.apply_diff` / `filesystem.patch` / `filesystem.rollback` | Structured, provenance-tracked editing over the shared `EditService` (every mutation is a verified, byte-precise edit; `rollback` restores the recorded snapshot) — the same engine the CLI `awh fs edit` family uses, exposed for agents |
 | `memory.store` / `memory.search` / `memory.get` / `memory.update` / `memory.delete` | Project-scoped memory |
@@ -431,7 +431,7 @@ Recorded results (full harness output in `examples/mcp-interop/`):
 ```text
 $ node examples/mcp-interop/stdio-client.mjs
 PASS connect + initialize                      (server: agent-workspace-hub 0.1.0)
-PASS tools/list (59 tools)
+PASS tools/list (61 tools)
 PASS every tool has an inputSchema
 PASS tools/call workspace.context
 PASS tools/call skills.list
@@ -448,7 +448,7 @@ STDIO INTEROP: ALL CHECKS PASSED
 
 $ node examples/mcp-interop/sse-client.mjs
 PASS SSE connect + initialize (server: agent-workspace-hub 0.1.0)   [HTTPS + bearer]
-PASS SSE tools/list (59 tools)
+PASS SSE tools/list (61 tools)
 PASS SSE tools/call workspace.context
 PASS unknown sessionId rejected with 404
 PASS wrong bearer token rejected with 401
@@ -459,8 +459,8 @@ SSE INTEROP: ALL CHECKS PASSED
 ```
 
 > The recorded runs above were taken **without** `GITHUB_TOKEN`, so the 12
-> `github.*` tools are hidden and 59 tools are advertised. With a token the
-> same harnesses advertise 71 tools and pass identically — the count is
+> `github.*` tools are hidden and 61 tools are advertised. With a token the
+> same harnesses advertise 73 tools and pass identically — the count is
 > expected to vary with the environment, which is why the harness prints it
 > dynamically.
 

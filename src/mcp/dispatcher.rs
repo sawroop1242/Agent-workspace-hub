@@ -1395,13 +1395,15 @@ impl McpDispatcher {
     /// dynamic provider tools). Public so tests and tooling can verify
     /// catalog/registry exhaustiveness.
     pub fn tools_list_static(&self) -> Value {
-        // Split into two macro invocations to stay under the macro
-        // recursion limit; merged into one array below.
+        // The static catalog is split across several json! invocations to
+        // stay under serde_json's macro recursion limit; merged below.
         let core = json!([
             {"name":"skills.list","description":"List project-referenced skills","inputSchema":{"type":"object","properties":{}}},
             {"name":"skills.read","description":"Read a project-referenced skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
             {"name":"skills.add","description":"Add an installed global skill","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
             {"name":"skills.remove","description":"Remove a project skill reference","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+            {"name":"skills.enable","description":"Enable a referenced skill for runtime exposure","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+            {"name":"skills.disable","description":"Disable a referenced skill without dropping the reference","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
             {"name":"skills.search","description":"Search globally installed skills","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
             {"name":"workspace.context","description":"Read project agent instructions","inputSchema":{"type":"object","properties":{}}},
             {"name":"workspace.list_files","description":"List workspace files","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
@@ -1420,6 +1422,10 @@ impl McpDispatcher {
             {"name":"connectors.enable","description":"Enable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
             {"name":"connectors.disable","description":"Disable a connector","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
             {"name":"connectors.remove","description":"Remove connector metadata","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
+        ]);
+        // The connector.* provider plane and context.* engine tools get
+        // their own invocation — same recursion-limit reason as below.
+        let runtime = json!([
             {"name":"connector.providers","description":"List registered connector and custom MCP providers","inputSchema":{"type":"object","properties":{}}},
             {"name":"connector.tools","description":"List tools exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"}},"required":["provider"]}},
             {"name":"connector.invoke","description":"Invoke a tool exposed by a provider","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["provider","tool"]}},
@@ -1436,7 +1442,7 @@ impl McpDispatcher {
             {"name":"context.restore","description":"Restore a soft-offloaded context item to active","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
         ]);
         // AWE-009: the filesystem.* editing tools live in their own json!
-        // invocation — the merged catalog is split into two macro blocks
+        // invocation — the merged catalog is split across macro calls
         // to stay under serde_json's recursion limit.
         let editing = json!([
             {"name":"filesystem.apply_diff","description":"Apply a unified diff to workspace files; paths in diff headers stay workspace-relative and malformed diffs are rejected before any mutation","inputSchema":{"type":"object","properties":{"diff":{"type":"string"}},"required":["diff"]}},
@@ -1472,8 +1478,11 @@ impl McpDispatcher {
         if let (Value::Array(core_arr), Value::Array(edit_arr)) = (&mut tools, &editing) {
             core_arr.extend(edit_arr.iter().cloned());
         }
-        // The github.* surface is a third macro invocation (the recursion
-        // limit documented for the core/extended split binds here too) and is
+        if let (Value::Array(core_arr), Value::Array(run_arr)) = (&mut tools, &runtime) {
+            core_arr.extend(run_arr.iter().cloned());
+        }
+        // The github.* surface gets its own macro invocation (the same
+        // recursion limit documented for the splits above binds here) and is
         // merged only when GITHUB_TOKEN enabled the provider, so clients
         // never see tools that would reject every call.
         if self.github.is_some() {
@@ -1785,6 +1794,26 @@ impl McpDispatcher {
                         arguments.get("name").and_then(Value::as_str).unwrap_or_default()
                     )?
                 })
+            }
+            "skills.enable" => {
+                self.authorize_tool("skills.enable", &arguments, caller)?;
+                self.skills.enable(
+                    arguments
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?;
+                json!({"ok": true})
+            }
+            "skills.disable" => {
+                self.authorize_tool("skills.disable", &arguments, caller)?;
+                self.skills.disable(
+                    arguments
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?;
+                json!({"ok": true})
             }
             "skills.search" => serde_json::to_value(
                 self.skills.search_global(

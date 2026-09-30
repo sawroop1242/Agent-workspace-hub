@@ -896,9 +896,18 @@ async fn list_project_skills(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root = store_scope(&state, params.project.as_deref())?;
     let registry = state.global_skill_registry()?;
-    let skills = crate::skills::ProjectSkillReferences::new(&root)
+    let references = crate::skills::ProjectSkillReferences::new(&root);
+    let skills = references
         .resolve(&registry)
         .map_err(|e| ApiError::internal(&e))?;
+    // Enabled state comes from the same canonical reference store the
+    // CLI/MCP read: the API renders state, it never tracks it separately.
+    let enabled_by_name: std::collections::HashMap<String, bool> = references
+        .states()
+        .map_err(|e| ApiError::internal(&e))?
+        .into_iter()
+        .map(|state| (state.name, state.enabled))
+        .collect();
     let items: Vec<serde_json::Value> = skills
         .iter()
         .map(|s| {
@@ -906,6 +915,7 @@ async fn list_project_skills(
                 "name": s.name,
                 "description": s.description,
                 "version": s.version.as_deref().unwrap_or("unknown"),
+                "enabled": enabled_by_name.get(&s.name).copied().unwrap_or(true),
             })
         })
         .collect();
@@ -1708,6 +1718,26 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_json(res).await;
         assert_eq!(body["skills"][0]["name"], "demo");
+        // The API renders enable state from the canonical reference
+        // store — a fresh reference is exposed.
+        assert_eq!(body["skills"][0]["enabled"], true);
+
+        // Disabling through the ONE canonical store flips what the API
+        // serves, without the API tracking any state of its own.
+        crate::skills::ProjectSkillReferences::new(tmp.path())
+            .disable("demo")
+            .unwrap();
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/skills/project", Some("test-key")))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["skills"][0]["name"], "demo");
+        assert_eq!(
+            body["skills"][0]["enabled"], false,
+            "a disabled reference stays listed but unexposed"
+        );
 
         let res = app
             .clone()
