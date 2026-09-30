@@ -2994,7 +2994,7 @@ fn with_optional<T, V>(value: T, optional: Option<V>, f: impl FnOnce(T, V) -> T)
     }
 }
 
-fn parse_context_source(value: Option<&str>) -> ContextSource {
+pub(crate) fn parse_context_source(value: Option<&str>) -> ContextSource {
     match value.unwrap_or("Other") {
         "System" => ContextSource::System,
         "User" => ContextSource::User,
@@ -3010,7 +3010,7 @@ fn parse_context_source(value: Option<&str>) -> ContextSource {
     }
 }
 
-fn parse_context_scope(value: Option<&str>) -> Result<ContextScope> {
+pub(crate) fn parse_context_scope(value: Option<&str>) -> Result<ContextScope> {
     match value.unwrap_or("Project") {
         "Session" => Ok(ContextScope::Session),
         "Project" => Ok(ContextScope::Project),

@@ -103,6 +103,14 @@ enum Command {
         #[command(subcommand)]
         command: agent_workspace_hub::cli::fs_edit::FsCommand,
     },
+    /// Context Engine (CTX-001): thin adapter over the canonical
+    /// ContextEngine — scoped items, budgets, deterministic scoring,
+    /// soft offloading and snapshots. Offloaded items are never lost
+    /// and source files are never modified.
+    Context {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::context::ContextCommand,
+    },
     Tunnel {
         #[command(subcommand)]
         command: TunnelCommand,
@@ -627,6 +635,14 @@ fn main() -> Result<()> {
             std::process::exit(agent_workspace_hub::cli::worktree::run(command, &root));
         }
         Some(Command::Policy { command }) => handle_policy_cli(command)?,
+        Some(Command::Context { command }) => {
+            // CTX-001: the CLI mirrors the MCP dispatcher's construction
+            // path (same root, same AWH_CONTEXT_* env overrides) so both
+            // interfaces observe identical engine semantics.
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            agent_workspace_hub::cli::context::handle_context_cli(&root, command)?;
+        }
         Some(Command::Fs { command }) => {
             // The fs family returns its own stable exit codes (AWE-014
             // §23); propagate them as the process status.

@@ -42,6 +42,8 @@ pub mod selector;
 pub mod snapshot;
 /// Documented approximate token counting.
 pub mod tokens;
+/// Durable active-window persistence (the engine's primary index).
+pub mod window;
 
 pub use budget::{ContextBudget, ContextBudgetStatus};
 pub use compressor::{CompressOptions, CompressedContent, ContextCompressor};

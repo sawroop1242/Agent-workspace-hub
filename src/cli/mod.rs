@@ -2,5 +2,6 @@
 //! the canonical application services — the CLI owns argument parsing,
 //! output formatting, and exit codes only.
 
+pub mod context;
 pub mod fs_edit;
 pub mod worktree;
