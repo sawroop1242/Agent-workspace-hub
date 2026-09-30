@@ -920,10 +920,16 @@ fn worktree_edit_isolation_end_to_end() {
     // `.agent` manifest — each checkout becomes its own workspace root
     // below (a checkout carrying a foreign manifest is, correctly, refused
     // by `awh init`'s canonical-root binding).
+    // `core.autocrlf false` makes the fixture hermetic: on windows-latest
+    // the runner image ships a system-wide `autocrlf=true`, which smudges
+    // LF -> CRLF in every `git worktree add` checkout and breaks the
+    // byte-exact content asserts below. All platforms agree with the
+    // committed bytes.
     for args in [
         vec!["init"],
         vec!["config", "user.email", "test@example.invalid"],
         vec!["config", "user.name", "test"],
+        vec!["config", "core.autocrlf", "false"],
     ] {
         let _ = Command::new("git").args(&args).current_dir(&root).output();
     }

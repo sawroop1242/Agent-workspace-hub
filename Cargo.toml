@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Agent Workspace Hub — portable project context, memory, tasks, skills, plugins and MCP"
 license = "MIT"
+# `cargo package` ships everything not gitignored by default, which
+# would embed .github/workflows (CI config) in the release .crate —
+# material the release-readiness job explicitly forbids.
+exclude = [".github"]
 
 [[bin]]
 name = "awh"

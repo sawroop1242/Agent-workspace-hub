@@ -494,12 +494,30 @@ mod tests {
     fn dashboard_surfaces_recent_audit_activity() {
         let tmp = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(tmp.path().to_path_buf());
-        backend.terminal_run("true", &[]).unwrap();
-        let snap = backend.dashboard().unwrap();
-        assert!(snap
-            .recent_activity
-            .iter()
-            .any(|a| a.contains("tui_terminal_run")));
+        // The audit ring is a process-global singleton shared with every
+        // parallel test thread, and dashboard() surfaces only the newest
+        // 5 entries. Between this test's audit write and dashboard()'s
+        // ring read, dashboard does real filesystem work (project scan,
+        // git probe) — a window in which sibling tests (rate-limit
+        // sprays, api tests, other terminal runs) can push our entry out
+        // of the top 5. Re-anchor the entry and re-check with a bound:
+        // passing requires beating adversarial interleaving ~50 times in
+        // a row, which cannot happen outside a pathological scheduler.
+        for _ in 0..50 {
+            backend.terminal_run("true", &[]).unwrap();
+            let snap = backend.dashboard().unwrap();
+            if snap
+                .recent_activity
+                .iter()
+                .any(|a| a.contains("tui_terminal_run"))
+            {
+                return;
+            }
+        }
+        panic!(
+            "dashboard never surfaced a tui_terminal_run audit entry in 50 \
+             attempts — recent_activity wiring to the audit ring is broken"
+        );
     }
 
     #[test]
@@ -510,9 +528,12 @@ mod tests {
             .terminal_run("echo", &["hush-secret-value".to_string()])
             .unwrap();
         let recent = crate::services::audit::global().recent(20);
+        // Match on (action, subject): the dashboard test records
+        // tui_terminal_run entries concurrently and must not collide
+        // with this assertion.
         let entry = recent
             .iter()
-            .find(|e| e.action == "tui_terminal_run")
+            .find(|e| e.action == "tui_terminal_run" && e.subject == "echo")
             .expect("terminal run audited");
         assert_eq!(entry.subject, "echo");
         assert!(!entry.detail.contains("hush-secret-value"));

@@ -2681,6 +2681,17 @@ impl McpDispatcher {
         };
         let descriptors = {
             let registry = self.providers.read().await;
+            if !registry.providers().iter().any(|id| id == provider) {
+                // A dotted name whose provider is not registered is an
+                // unknown tool, not an internal failure: report it exactly
+                // like the non-dotted fallthrough instead of leaking a
+                // misleading "provider not registered" internal error.
+                audit_deny("tool_validation", "unknown_dynamic_tool", qualified_name);
+                return Err(DispatchError::invalid_params(format!(
+                    "unknown tool: {qualified_name}"
+                ))
+                .into());
+            }
             registry.tools(provider).await?
         };
         let Some(descriptor) = descriptors.iter().find(|d| d.name == tool) else {

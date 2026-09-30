@@ -294,10 +294,24 @@ async fn unknown_dynamic_tool_is_rejected() {
         )));
 
     // Provider not registered at all: the lookup failure surfaces as a
-    // JSON-RPC error envelope (never a fabricated success result).
+    // JSON-RPC error envelope (never a fabricated success result). A
+    // dotted name with no provider behind it is an UNKNOWN TOOL, so it
+    // must carry the same -32602 "unknown tool" wording as the
+    // non-dotted fallthrough — not a misleading internal
+    // "provider not registered" (-32603).
     let response = call_tool(&dispatcher, &lifecycle, "ghost.tool", json!({})).await;
     let code = response["error"]["code"].as_i64().unwrap_or(0);
-    assert_ne!(code, 0, "unknown provider must error, got: {response}");
+    assert_eq!(
+        code, -32602,
+        "unknown provider must be invalid-params, not internal: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown tool"),
+        "message should say 'unknown tool', got: {response}"
+    );
     assert!(
         response["result"].is_null(),
         "unknown tool must not produce a result"
