@@ -1413,3 +1413,55 @@ async fn tools_list_carries_registry_metadata() {
     assert_eq!(read["risk"], "low");
     assert_eq!(read["requiredPermissions"], json!(["filesystem"]));
 }
+
+// --------------------------------------------------------------------------
+// tasks.update: fieldless update is the same error class on every plane
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tasks_update_without_changes_fails_closed_on_the_wire() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let input = request(Some(json!(1)), "initialize", init_params());
+    dispatch(&dispatcher, &input, &lifecycle).await;
+
+    let input = request(
+        Some(json!(2)),
+        "tools/call",
+        json!({"name": "tasks.create", "arguments": {"id": "wire-1", "title": "t", "description": "d"}}),
+    );
+    let response = dispatch(&dispatcher, &input, &lifecycle).await;
+    assert!(response["result"].is_object(), "got: {response}");
+
+    // The CLI rejects a fieldless `awh task update` at argument parsing;
+    // the canonical store owns the same verdict, so the MCP plane — which
+    // delegates straight to the store — fails closed identically instead
+    // of silently bumping updated_at.
+    let input = request(
+        Some(json!(3)),
+        "tools/call",
+        json!({"name": "tasks.update", "arguments": {"id": "wire-1"}}),
+    );
+    let response = dispatch(&dispatcher, &input, &lifecycle).await;
+    assert_eq!(response["error"]["code"], -32603, "got: {response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no changes requested"),
+        "got: {response}"
+    );
+
+    // An unknown id keeps the missing → null contract (no error):
+    // tool results are wrapped in the MCP content envelope (text "null").
+    let input = request(
+        Some(json!(4)),
+        "tools/call",
+        json!({"name": "tasks.update", "arguments": {"id": "ghost", "status": "Done"}}),
+    );
+    let response = dispatch(&dispatcher, &input, &lifecycle).await;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(text, "null", "got: {response}");
+}

@@ -243,6 +243,12 @@ impl TaskStore {
             Some(t) => t,
             None => return Ok(None),
         };
+        if status.is_none() && priority.is_none() && assignee.is_none() {
+            // Same error class the CLI surfaces for a fieldless `awh task
+            // update`: a mutation call must name what it changes, on
+            // every interface plane.
+            bail!("no changes requested: provide at least one of status, priority, or assignee");
+        }
         if let Some(new_status) = &status {
             if &task.status != new_status && !is_valid_task_transition(&task.status, new_status) {
                 bail!(
@@ -674,6 +680,30 @@ mod tests {
                 vec![]
             )
             .is_ok());
+    }
+
+    #[test]
+    fn update_without_changes_fails_closed_on_every_plane() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+
+        // Fieldless update: same error class the CLI's argument guard
+        // produces — the store is the authority so MCP callers hit it too.
+        let err = store.update("t1", None, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "no changes requested: provide at least one of status, priority, or assignee"
+            ),
+            "got: {err}"
+        );
+
+        // An unknown id still resolves to `Ok(None)` (missing → null, not
+        // an error) — the guard fires only when a real task would be
+        // pointlessly rewritten.
+        assert!(store.update("missing", None, None, None).unwrap().is_none());
     }
 
     #[test]

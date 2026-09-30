@@ -497,3 +497,43 @@ cheap-to-clone). Tool catalog 53 static.
   `crate::mcp::permissions::Permission`, store root = the dispatcher's
   project root) or the capability gate answers -32005 before policy runs.
   Suite after the fix: 1246 tests green workspace-wide, fmt+clippy clean.
+
+- **Prompt 18 Skills domain (2026-09, commit c230e53)**: `skills.enable`/`skills.disable`
+  shipped end-to-end. `ProjectSkillReferences` (src/skills/project.rs) is the ONE canonical
+  project-skill reference store (duplicate `references.rs` deleted): `states()`/`enable()`/
+  `disable()` persist a `disabled: Vec<String>` list at `.agent/skills.json` (serde default,
+  so legacy files load all-enabled), StoreLock-serialized + atomic-rename writes. Exposure
+  state changes ONLY through enable/disable — add/remove never flip it; both toggles fail
+  closed on unreferenced names ("skill is not referenced by the current project: {name}").
+  MCP: two new tools (Medium risk), `skills.list` annotates `enabled`, `skills.read` refuses
+  disabled references. CLI: `awh skill show/enable/disable` + state-marked list + durable
+  audit (`init_global` at CLI startup, `cli_skill_*` actions). Control API GET
+  `/api/v1/skills/project` renders `enabled` from the same store. Tool counts: 61 core /
+  73 with github.*. Gotchas: (1) **tool_registry.rs MUST stay name-sorted** —
+  `registry_lookup` is a binary search; a row out of alphabetical order silently breaks
+  lookups for OTHER tools near it (skills.enable/disable placed after skills.search made
+  skills.list resolve "uncategorized"). (2) NEVER re-type json! schema lines from terminal
+  output — restore via `git show HEAD:src/mcp/dispatcher.rs` + a line-matching script; a
+  retype drift in 8 entries broke schema-validation tests. (3) Long heredocs ECHO garbled
+  prefixes (stray b/|/e/t) in this terminal, but the written file is correct — verify with
+  `python3 -m py_compile` / grep, never trust the echo. (4)
+  `GlobalSkillRegistry::discover()` honors `AWH_GLOBAL_SKILLS_ROOT` (registry.rs) as the
+  test/embedder seam so tests never mutate HOME. (5) `SkillMcp::with_registry` is the
+  in-crate injection seam; out-of-crate integration tests can only reach the ghost-denial
+  path (no private-field injection across crates).
+
+- **Prompt 18 Tasks domain audit (2026-09)**: verified TSK-001 convergence is complete and
+  pinned. `src/core/tasks.rs` is the single task authority (ARCH-001; `src/mcp/tasks.rs` is a
+  9-line re-export, CLI is a thin adapter); no Control-API tasks routes and no TUI tasks
+  screen exist by contract (both prompts are conditional: "if exposed" / "as evidence
+  permits"). One real gap fixed: a fieldless `tasks.update {id}` was a silent no-op on the
+  MCP plane while the CLI rejected it at argument parsing — the canonical store now owns
+  the verdict (`no changes requested: provide at least one of status, priority, or
+  assignee`), firing AFTER the missing-id lookup so the missing -> null contract is intact
+  (unknown id still returns Ok(None)/text "null"). Pinned by a store unit test
+  (update_without_changes_fails_closed_on_every_plane) and a wire test
+  (tasks_update_without_changes_fails_closed_on_the_wire; remember tools/call results are
+  content-envelope-wrapped - assert on result.content[0].text). Suite: 1285 passed / 0
+  failed workspace-wide, fmt+clippy clean. Audit parity confirmed: every tools/call emits
+  `tool_invoke` (name only, args never logged, caller-attributed when bound) in addition to
+  the CLI's `cli_task_*` durable audit events.
