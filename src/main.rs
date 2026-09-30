@@ -119,6 +119,14 @@ enum Command {
         #[command(subcommand)]
         command: agent_workspace_hub::cli::memory::MemoryCommand,
     },
+    /// Tasks (TSK-001): thin adapter over the canonical TaskStore —
+    /// the same authority the MCP task tools use. Status changes run
+    /// through the canonical state machine, assignment targets must
+    /// exist in this workspace, and mutations are audited.
+    Task {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::tasks::TaskCommand,
+    },
     Tunnel {
         #[command(subcommand)]
         command: TunnelCommand,
@@ -652,6 +660,16 @@ fn main() -> Result<()> {
                 tracing::error!(event = "audit_init_failed", error = %error);
             }
             agent_workspace_hub::cli::memory::handle_memory_cli(&root, command)?;
+        }
+        Some(Command::Task { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // TSK-001: mutations must land in the durable audit log, not
+            // die with the process ring — same treatment as the fs arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::tasks::handle_task_cli(&root, command)?;
         }
         Some(Command::Context { command }) => {
             // CTX-001: the CLI mirrors the MCP dispatcher's construction
