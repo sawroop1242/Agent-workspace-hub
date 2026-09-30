@@ -2976,7 +2976,7 @@ fn strings(arguments: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn parse_scope(value: Option<&str>) -> Result<MemoryScope> {
+pub(crate) fn parse_scope(value: Option<&str>) -> Result<MemoryScope> {
     match value.unwrap_or("Project") {
         "Session" => Ok(MemoryScope::Session),
         "Project" => Ok(MemoryScope::Project),

@@ -238,6 +238,66 @@ impl MemoryStore {
         self.store(id, content.to_owned(), MemoryScope::Project, vec![])
     }
 
+    /// Appends a new entry with a generated id at an explicit scope with
+    /// tags — the CLI's `awh memory add` shape. Id minting stays inside
+    /// the store so no adapter can invent ids or bypass validation.
+    pub fn append_scoped(
+        &self,
+        content: &str,
+        scope: MemoryScope,
+        tags: Vec<String>,
+    ) -> Result<MemoryEntry> {
+        if content.trim().is_empty() {
+            bail!("memory content must not be empty");
+        }
+        let id = self.generate_id();
+        self.store(id, content.to_owned(), scope, tags)
+    }
+
+    /// Partially updates an existing entry: only the provided fields
+    /// change. Fails closed when the id is unknown and when no field was
+    /// provided at all. The existence check and the write share one
+    /// [`StoreLock`] hold, so a concurrent delete from another process
+    /// cannot race a separate read-then-write into resurrecting the
+    /// entry (the same guarantee `update_existing` gives).
+    pub fn update_partial(
+        &self,
+        id: &str,
+        content: Option<String>,
+        scope: Option<MemoryScope>,
+        tags: Option<Vec<String>>,
+    ) -> Result<MemoryEntry> {
+        if content.is_none() && scope.is_none() && tags.is_none() {
+            bail!("memory update requires at least one of content, scope, or tags");
+        }
+        // Id bounds plus the bounds of whichever fields are present.
+        validate_memory_input(id, content.as_deref().unwrap_or(""), &[])?;
+        if let Some(tags) = &tags {
+            validate_memory_input(id, "", tags)?;
+        }
+        let _lock = StoreLock::acquire(&self.path)?;
+        let mut db = self.load()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let entry = db
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("memory entry not found: {id}"))?;
+        if let Some(content) = content {
+            entry.content = content;
+        }
+        if let Some(scope) = scope {
+            entry.scope = scope;
+        }
+        if let Some(tags) = tags {
+            entry.tags = tags;
+        }
+        entry.updated_at = now;
+        let result = entry.clone();
+        self.save(&db)?;
+        Ok(result)
+    }
+
     /// Lists every entry across all scopes, oldest first.
     pub fn list_all(&self) -> Result<Vec<MemoryEntry>> {
         Ok(self.load()?.entries)
@@ -713,5 +773,73 @@ mod tests {
     fn missing_legacy_file_is_not_an_error() {
         let (store, _dir) = temp_store();
         assert!(store.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_scoped_honors_scope_tags_and_mints_ids() {
+        let (store, _dir) = temp_store();
+        let a = store
+            .append_scoped(
+                "session note",
+                MemoryScope::Session,
+                vec!["note".to_string()],
+            )
+            .unwrap();
+        let b = store
+            .append_scoped("global fact", MemoryScope::Global, vec![])
+            .unwrap();
+        assert_ne!(a.id, b.id, "ids must be minted uniquely");
+        assert_eq!(a.scope, MemoryScope::Session);
+        assert_eq!(a.tags, vec!["note".to_string()]);
+        assert_eq!(b.scope, MemoryScope::Global);
+        // Validation flows through the store path.
+        assert!(store
+            .append_scoped(
+                &"x".repeat(MAX_MEMORY_CONTENT_BYTES + 1),
+                MemoryScope::Project,
+                vec![]
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn update_partial_changes_only_provided_fields() {
+        let (store, _dir) = temp_store();
+        let entry = store
+            .store(
+                "m1".to_string(),
+                "original".to_string(),
+                MemoryScope::Project,
+                vec!["t1".to_string()],
+            )
+            .unwrap();
+
+        // content-only update keeps scope and tags
+        let updated = store
+            .update_partial("m1", Some("new content".to_string()), None, None)
+            .unwrap();
+        assert_eq!(updated.content, "new content");
+        assert_eq!(updated.scope, MemoryScope::Project);
+        assert_eq!(updated.tags, vec!["t1".to_string()]);
+        assert_eq!(updated.created_at, entry.created_at);
+
+        // scope + tags replace wholesale; content untouched
+        let updated = store
+            .update_partial(
+                "m1",
+                None,
+                Some(MemoryScope::Global),
+                Some(vec!["t2".to_string(), "t3".to_string()]),
+            )
+            .unwrap();
+        assert_eq!(updated.content, "new content");
+        assert_eq!(updated.scope, MemoryScope::Global);
+        assert_eq!(updated.tags, vec!["t2".to_string(), "t3".to_string()]);
+
+        // unknown id fails closed, no field provided fails closed
+        assert!(store
+            .update_partial("ghost", Some("c".to_string()), None, None)
+            .is_err());
+        assert!(store.update_partial("m1", None, None, None).is_err());
     }
 }

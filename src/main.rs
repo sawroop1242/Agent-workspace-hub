@@ -111,6 +111,14 @@ enum Command {
         #[command(subcommand)]
         command: agent_workspace_hub::cli::context::ContextCommand,
     },
+    /// Memory (MEM-001): thin adapter over the canonical MemoryStore —
+    /// the same authority MCP, the Control API, the TUI, and the Context
+    /// Engine use. Mutations are validated, lock-guarded, atomically
+    /// published, and audited.
+    Memory {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::memory::MemoryCommand,
+    },
     Tunnel {
         #[command(subcommand)]
         command: TunnelCommand,
@@ -635,6 +643,16 @@ fn main() -> Result<()> {
             std::process::exit(agent_workspace_hub::cli::worktree::run(command, &root));
         }
         Some(Command::Policy { command }) => handle_policy_cli(command)?,
+        Some(Command::Memory { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // MEM-001: mutations must land in the durable audit log, not
+            // die with the process ring — same treatment as the fs arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::memory::handle_memory_cli(&root, command)?;
+        }
         Some(Command::Context { command }) => {
             // CTX-001: the CLI mirrors the MCP dispatcher's construction
             // path (same root, same AWH_CONTEXT_* env overrides) so both
