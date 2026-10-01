@@ -33,10 +33,10 @@ impl Default for CircuitBreakerConfig {
 
 /// Saturating metric increment: counters must pin at `u64::MAX`, never
 /// wrap to 0 (which would report a healthy provider). The CAS loop in
-/// `fetch_update` keeps concurrent increments correct.
+/// `try_update` keeps concurrent increments correct.
 fn saturating_increment_u64(counter: &AtomicU64) {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         })
         .ok();
@@ -45,7 +45,7 @@ fn saturating_increment_u64(counter: &AtomicU64) {
 /// Same, for the u32 open-counter.
 fn saturating_increment_u32(counter: &AtomicU32) {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         })
         .ok();
