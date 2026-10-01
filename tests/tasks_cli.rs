@@ -176,6 +176,89 @@ fn task_cancel_is_terminal_and_fails_closed_on_repeat() {
 }
 
 #[test]
+fn task_lifecycle_is_distinct_from_session_lifecycle() {
+    // §9 Tasks × sessions: assignment binds a task to a REAL session id,
+    // but the task plane is independent of the execution lifecycle —
+    // stopping the session neither touches the task nor blocks task
+    // mutations, and the durable session record keeps the assignment
+    // reference honest long after the session is terminal.
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+
+    run(root, &["init"]);
+    run(
+        root,
+        &["agent", "create", "writer", "Writer", "--role", "writer"],
+    );
+    run(root, &["agent", "start", "writer"]);
+
+    let (ok, _, err) = run(
+        root,
+        &["task", "create", "--id", "t1", "--title", "Survives"],
+    );
+    assert!(ok, "task create failed: {err}");
+
+    // assign to the live session
+    let (ok, out, err) = run(root, &["agent", "session", "open", "writer"]);
+    assert!(ok, "session open failed: {err}");
+    let session_id = out
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("opened session "))
+        .and_then(|l| l.split(' ').next())
+        .expect("session id in output")
+        .to_owned();
+    let (ok, out, err) = run(root, &["task", "assign", "--id", "t1", "--to", &session_id]);
+    assert!(ok, "assign to live session failed: {err}");
+    assert!(
+        out.contains(&format!("assigned task t1 to {session_id}")),
+        "got: {out}"
+    );
+
+    // stop is TERMINAL on the execution plane…
+    let (ok, out, err) = run(root, &["agent", "session", "stop", "writer", &session_id]);
+    assert!(ok, "session stop failed: {err}");
+    assert!(out.contains("terminal"), "got: {out}");
+
+    // …but the task is untouched: same state, same assignee reference.
+    let (ok, out, err) = run(root, &["task", "show", "--id", "t1"]);
+    assert!(ok, "task show failed: {err}");
+    assert!(out.contains("\"status\": \"Todo\""), "got: {out}");
+    assert!(
+        out.contains(&format!("\"assignee\": \"{session_id}\"")),
+        "assignee reference survives the session's terminal state: {out}"
+    );
+
+    // the task plane does not consult session liveness: mutations and
+    // even NEW references to the durable (terminal) session record work.
+    let (ok, out, err) = run(
+        root,
+        &["task", "update", "--id", "t1", "--status", "InProgress"],
+    );
+    assert!(ok, "task update after session stop failed: {err}");
+    assert!(
+        out.contains("updated task t1 (status InProgress)"),
+        "got: {out}"
+    );
+    let (ok, _, err) = run(
+        root,
+        &["task", "create", "--id", "t2", "--title", "Follow-up"],
+    );
+    assert!(ok, "second task create failed: {err}");
+    let (ok, _, err) = run(root, &["task", "assign", "--id", "t2", "--to", &session_id]);
+    assert!(
+        ok,
+        "assignment to the durable session record must not depend on \
+         the session's execution state: {err}"
+    );
+
+    // list keeps showing both tasks after the session is long gone.
+    let (ok, out, err) = run(root, &["task", "list"]);
+    assert!(ok, "task list failed: {err}");
+    assert!(out.contains("t1") && out.contains("t2"), "got: {out}");
+}
+
+#[test]
 fn task_assign_requires_existing_target() {
     let dir = tempdir().expect("tempdir");
     let root = dir.path();

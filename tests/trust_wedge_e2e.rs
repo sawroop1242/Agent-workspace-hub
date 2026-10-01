@@ -17,7 +17,11 @@
 //! with worktree isolation: a REAL managed `git worktree` bound to the
 //! same session, session-root isolation against foreign sessions, the
 //! §10 ownership invariant on removal, and the owning session's own
-//! remove.
+//! remove. The wedge then crosses into the §9 matrix at the same seam:
+//! worktree × snapshot (provenance lands in the worktree's own store,
+//! never the main tree's) and worktree × rollback (restoration is
+//! confined to the assigned root and still evaluates a current
+//! authorization decision — the edit id alone is never authority).
 //!
 //! What this pins that the per-layer tests cannot, because they pin the
 //! layers in isolation with synthetic identities:
@@ -517,6 +521,11 @@ fn trust_wedge_end_to_end_composes_and_survives_restart() {
         run_git(&["config", "user.email", "wedge@invalid"]);
         run_git(&["config", "user.name", "wedge"]);
         std::fs::write(root.join("WEDGE-README.md"), "base\n").unwrap();
+        // Keep `.agent/` out of the checkout (the real project gitignores
+        // it too): the worktree gets a clean slate so Phase H can bind it
+        // as its own initialized workspace instead of inheriting a stale
+        // committed copy of the main root's identity stores.
+        std::fs::write(root.join(".gitignore"), "/.agent/\n").unwrap();
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "wedge base"]);
 
@@ -556,6 +565,117 @@ fn trust_wedge_end_to_end_composes_and_survives_restart() {
             .expect("foreign session root");
         assert_eq!(bound, checkout, "bound session sees its worktree");
         assert_eq!(foreign, root, "foreign session sees the workspace root");
+
+        // ---- Phase H: the §9 worktree pairs through the bound
+        // session's effective root. The worktree is its own initialized
+        // workspace (clean-slate `.agent`, §TW-001), so snapshot
+        // PROVENANCE for worktree edits lands in the WORKTREE's
+        // canonical store, and rollback is confined to the worktree
+        // while still evaluating a CURRENT authorization decision —
+        // a same-named sentinel in the main tree proves no escape.
+        let main_sentinel = "main-tree sentinel untouched by the worktree";
+        std::fs::write(root.join("wt-doc.md"), main_sentinel).unwrap();
+        std::fs::write(checkout.join("wt-doc.md"), "alpha beta gamma").unwrap();
+        let provenance_listing = |dir: &std::path::Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| entry.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let main_provenance_before = provenance_listing(&root.join(".agent/provenance"));
+        let wt_manifest = initialize_workspace(&bound)
+            .expect("worktree as its own workspace")
+            .manifest()
+            .clone();
+        assert_ne!(
+            wt_manifest.workspace_id.as_str(),
+            workspace_id.as_str(),
+            "the worktree is a distinct initialized workspace, not a copy"
+        );
+
+        let edit_service = agent_workspace_hub::services::edit::EditService::new(&bound);
+        let operator = agent_workspace_hub::services::authorization::AuthorizingPrincipal::operator(
+            wt_manifest.workspace_id.as_str(),
+        );
+        let tx = agent_workspace_hub::services::edit::EditTransaction::single(
+            agent_workspace_hub::services::edit::EditOperation::Replace {
+                path: "wt-doc.md".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                occurrence: None,
+            },
+        );
+        let replaced = edit_service
+            .replace_as(&operator, tx)
+            .expect("worktree edit through the canonical service");
+        let wt_edit_id = replaced.id.0.clone();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("wt-doc.md")).expect("worktree file"),
+            "alpha BETA gamma",
+            "the worktree edit must have mutated the worktree bytes"
+        );
+        assert!(
+            !provenance_listing(&bound.join(".agent/provenance")).is_empty(),
+            "worktree × snapshot: the edit recorded provenance in the worktree's own store"
+        );
+        assert_eq!(
+            provenance_listing(&root.join(".agent/provenance")),
+            main_provenance_before,
+            "worktree × snapshot: the main tree's provenance store is unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("wt-doc.md")).expect("main-tree sentinel"),
+            main_sentinel,
+            "a worktree edit must not touch the main tree"
+        );
+
+        // Rollback authorization is preserved (§9): a foreign agent
+        // with no capability is denied at ROLLBACK time — the edit id is
+        // never authority — and the denial leaves the worktree bytes.
+        let foreign_principal =
+            agent_workspace_hub::services::authorization::AuthorizingPrincipal::agent(
+                "agent-foreign",
+                "sess-foreign",
+                wt_manifest.workspace_id.as_str(),
+            );
+        match edit_service.rollback_edit(&foreign_principal, &wt_edit_id) {
+            Err(agent_workspace_hub::services::edit::EditError::AuthorizationDenied { .. }) => {}
+            other => {
+                panic!("foreign-principal rollback must be authorization-denied, got {other:?}")
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("wt-doc.md")).expect("worktree file"),
+            "alpha BETA gamma",
+            "a denied rollback must not mutate the worktree"
+        );
+
+        // Rollback never escapes the assigned worktree (§9): restoring
+        // through the bound root restores the WORKTREE bytes only.
+        edit_service
+            .rollback_edit(&operator, &wt_edit_id)
+            .expect("operator rolls the worktree edit back");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("wt-doc.md")).expect("worktree file"),
+            "alpha beta gamma",
+            "rollback restores the worktree bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("wt-doc.md")).expect("main-tree sentinel"),
+            main_sentinel,
+            "rollback must never escape the assigned worktree"
+        );
+
+        // Phase H leaves no residue in the checkout: `wt-doc.md` was
+        // never committed, so the ownership-removal tail below must see
+        // a pristine tree — removal fails closed on a dirty checkout,
+        // and Phase H cleans up after itself rather than loosening that
+        // contract.
+        std::fs::remove_file(checkout.join("wt-doc.md")).unwrap();
 
         // Ownership invariant (§10): a non-owning session's removal is
         // denied and the checkout survives untouched.
