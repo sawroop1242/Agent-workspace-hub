@@ -13,7 +13,11 @@
 //! …then continues into the editing plane over the same bound session:
 //! write → edit transaction (with the session's principal) → rollback
 //! by exact edit id — the snapshot/provenance tail of the §8 chain,
-//! proven through the real filesystem boundary.
+//! proven through the real filesystem boundary — and closes the chain
+//! with worktree isolation: a REAL managed `git worktree` bound to the
+//! same session, session-root isolation against foreign sessions, the
+//! §10 ownership invariant on removal, and the owning session's own
+//! remove.
 //!
 //! What this pins that the per-layer tests cannot, because they pin the
 //! layers in isolation with synthetic identities:
@@ -488,5 +492,93 @@ fn trust_wedge_end_to_end_composes_and_survives_restart() {
             builtin.agent_id.is_none(),
             "builtin gate has no agent identity"
         );
+
+        // ---- Phase G: worktree isolation closes the §8 chain.
+        // The bound session gets a REAL managed worktree (actual
+        // `git worktree` checkout on disk, §6), and the isolation
+        // boundary holds: the bound session's effective root is the
+        // worktree, a foreign session's is the workspace root, and a
+        // non-owning session cannot remove what it does not own.
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}{}",
+                args,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "wedge@invalid"]);
+        run_git(&["config", "user.name", "wedge"]);
+        std::fs::write(root.join("WEDGE-README.md"), "base\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "wedge base"]);
+
+        let worktrees = agent_workspace_hub::services::worktree::WorktreeStore::new(&root);
+        let record = worktrees
+            .create(
+                workspace_id.as_str(),
+                agent_id.as_str(),
+                session_id.as_str(),
+                None,
+                None,
+            )
+            .await
+            .expect("worktree for the bound session");
+        assert_eq!(record.workspace_id, workspace_id.as_str());
+        assert_eq!(record.agent_id, agent_id.as_str());
+        assert_eq!(record.session_id, session_id.as_str());
+        assert!(matches!(
+            record.state,
+            agent_workspace_hub::services::worktree::WorktreeState::Active
+        ));
+        let checkout = root.join(&record.path);
+        assert!(
+            checkout.join("WEDGE-README.md").exists(),
+            "checkout shares the repository content"
+        );
+
+        // Session-root isolation (§11): the bound session resolves to
+        // its worktree; every other session still resolves to the
+        // workspace root — callers construct existing services against
+        // this root, so the boundary IS filesystem isolation.
+        let bound = worktrees
+            .resolve_effective_root(session_id.as_str())
+            .expect("bound session root");
+        let foreign = worktrees
+            .resolve_effective_root("sess-foreign")
+            .expect("foreign session root");
+        assert_eq!(bound, checkout, "bound session sees its worktree");
+        assert_eq!(foreign, root, "foreign session sees the workspace root");
+
+        // Ownership invariant (§10): a non-owning session's removal is
+        // denied and the checkout survives untouched.
+        match worktrees
+            .remove(record.worktree_id.as_str(), "sess-foreign")
+            .await
+        {
+            Err(agent_workspace_hub::services::worktree::WorktreeError::Ownership(id)) => {
+                assert_eq!(id, record.worktree_id);
+            }
+            other => panic!("foreign-session remove must be Ownership-denied, got {other:?}"),
+        }
+        assert!(checkout.is_dir(), "denied removal left the checkout intact");
+
+        // The owning session removes its own worktree.
+        let removed = worktrees
+            .remove(record.worktree_id.as_str(), session_id.as_str())
+            .await
+            .expect("owner removes its worktree");
+        assert!(matches!(
+            removed.state,
+            agent_workspace_hub::services::worktree::WorktreeState::Removed
+        ));
+        assert!(!checkout.exists(), "checkout gone after owner removal");
     });
 }
