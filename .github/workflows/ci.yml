@@ -335,7 +335,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c "import yaml,sys; yaml.safe_load(open('.github/agent-engine/feature-registry.yml'))"
+          if [ -f .github/agent-engine/feature-registry.yml ]; then
+            python3 -c "import yaml,sys; yaml.safe_load(open('.github/agent-engine/feature-registry.yml'))"
+          else
+            echo "feature-registry.yml was removed with the external agent infrastructure — nothing to validate."
+          fi
 
       - name: Run agent-engine orchestrator tests
         if: steps.changed.outputs.relevant == 'true'

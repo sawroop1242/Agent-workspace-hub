@@ -60,6 +60,7 @@ Each row maps a boundary to the implemented control and its source module.
 | Tool authorization | Execution gate approves/denies tool calls | `mcp/execution_gate` |
 | Provider resilience | Circuit breaker trips after configured consecutive failures | `mcp/circuit_breaker` |
 | Auditability | Structured audit events for every denied decision and circuit trip | `mcp/audit` |
+| Connector auditability | Every consequential connector-registration mutation (`connectors.add`/`enable`/`disable`/`remove`, any surface) is audited at the store choke point: `connector_added`/`connector_enabled`/`connector_disabled`/`connector_removed` (allow) and `connector_add_rejected` (deny) — subject is the bounded connector id, detail carries only the bounded name/provider labels, never OAuth scopes or auth material | `mcp/connectors` |
 | Remote transport auth | Mandatory bearer-token auth for the HTTP/SSE transport; constant-time comparison; fail closed when the API key is unset | `mcp/auth` |
 | Remote transport TLS | TLS 1.2+ with certificate/key material loaded from files; half-configured TLS rejected | `mcp/tls` |
 | Remote request limits | Bounded HTTP body, connection, session, and timeout limits; per-session isolation | `mcp/http`, `mcp/sse` |
