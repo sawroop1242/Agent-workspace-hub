@@ -154,9 +154,9 @@ Terminal access is high-risk and requires policy/capability checks, session iden
 
 ### Multi-agent collaboration
 
-`awh collaboration agents|status|handoff|assign|conflicts|events`
+`awh collaboration agents|status|assign|activate|handoff|accept|release|conflicts|events`
 
-AWH coordinates state, ownership, isolation and events. Agents remain responsible for reasoning. Distributed swarms, generic DAG workflow engines and autonomous schedulers are out of scope.
+AWH coordinates state, ownership, isolation and events. Ownership records are revision-checked, owner-gated, bound to canonical agent/session/task/worktree identities, and audited durably; `conflicts` reports observable ownership problems (stale owner lifecycle, missing resources) as evidence only, never resolving them automatically. Agents remain responsible for reasoning. Distributed swarms, generic DAG workflow engines and autonomous schedulers are out of scope.
 
 ### Control API
 

@@ -6,6 +6,8 @@
 pub mod agent_runtime;
 pub mod audit;
 pub mod authorization;
+/// Canonical collaboration service (COL-001).
+pub mod collaboration;
 pub mod edit;
 pub use edit::{EditOperation, EditService, EditTransaction};
 pub mod files;

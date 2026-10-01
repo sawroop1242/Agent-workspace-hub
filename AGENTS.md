@@ -568,3 +568,40 @@ cheap-to-clone). Tool catalog 53 static.
   automatically, but `print!` to a LineWriter... actually print! flushes on
   newline only; use explicit flush before process::exit to avoid losing the
   final stdout line on non-newline-terminated child output.
+
+- **COL-001 Collaboration domain (Prompt 18, 2026-09)**: `src/core/collaboration.rs`
+  (CollaborationStore, `.agent/collaboration.json`, schema-versioned, StoreLock +
+  atomic rename) is the SINGLE collaboration state owner; `src/services/collaboration.rs`
+  (CollaborationService) is the shared boundary all planes must call; `src/cli/collaboration.rs`
+  + main.rs arm are thin adapters. Verbs: `awh collaboration agents|status|assign|
+  activate|handoff(--request)|accept|release|conflicts|events`. Ownership states:
+  Assigned/Active/HandoffRequested/HandedOff/Released (Released+HandedOff end a cycle;
+  reactivation requires echoing the observed terminal revision; per-record revision
+  increments). Store API returns `Result<CollabResult<T>>` (outer = I/O/anyhow, inner =
+  domain CollabError) so domain denials ride `Ok(Err(..))`; service maps inner errors to
+  stable category text via `CollabError::message()` - CLI exit-1 text == service text.
+  Audit: transitions -> kind "collab" actions assign/activate/handoff_request/
+  handoff_accept/release via `record_correlated` (subject `task:<id>`, detail owner/
+  revision/state, correlation workspace/agent/session); refusals -> `record_deny` with
+  actions collab_assign/collab_handoff/collab_accept/collab_activate/collab_release.
+  `events` reads the durable log via `AuditLog::open(root).recent()` filtered by kind -
+  requires the CLI arm's `init_global(&root)` (same pattern as task/memory arms).
+  `conflicts` is evidence-only (never auto-resolves): scans held records for
+  owner_agent_unknown/disabled/stopped, owner_session_unknown/not_usable, task_missing/
+  task_terminal, worktree_missing; requires nothing to be deleted on the caller side.
+  Validation at the mutation boundary: owner must exist + enabled (Active NOT required -
+  stopped owners surface as conflict evidence instead of blocking transfer); supplied
+  session must resolve via AgentRuntimeService::resolve_session (re-validates everything);
+  Task/Worktree must exist in-workspace (TaskStore.get / WorktreeStore.list with
+  removed_at.is_none()). Assignment never starts agents/activates sessions/mutates
+  worktrees. GOTCHA (extends TW-002): StoreLock lock-file creation ENOENTs when
+  `.agent/` parent is missing - CollaborationStore::ensure_parent() runs create_dir_all
+  BEFORE StoreLock::acquire in assign/mutate paths (unit tests were failing on exactly
+  this). Test shapes: core unit 11 (double-unwrap `.unwrap().unwrap()` for the two-layer
+  Result), service unit 8 (single-unwrap; durable audit assertions must go through
+  `audit::global().recent()` - init_global is OnceLock/process-wide so parallel unit
+  tests cannot re-point the durable root; the durable round-trip is pinned by e2e),
+  CLI unit 1, e2e `tests/collaboration_cli.rs` 6 (real binary; `agent session open` is
+  POSITIONAL - `awh agent session open <AGENT_ID>`; `agent start <id>` required before
+  session open; task create needs --description or it reads stdin). Suite: 1327 passed /
+  0 failed (was 1301 pre-COL-001). Docs updated: CLI.md tree+counts, FEATURES.md.
