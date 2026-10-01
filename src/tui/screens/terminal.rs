@@ -45,6 +45,9 @@ pub fn tokenize(line: &str) -> Vec<String> {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // The terminal screen is a command line: it always owns the
+    // keyboard so typed commands are never hijacked by global keys.
+    app.ui.capture_input = true;
     let ui = &mut app.ui.terminal_ui;
     match key.code {
         KeyCode::Enter => {

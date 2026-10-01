@@ -2,20 +2,23 @@
 
 use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::backend::{DashboardSnapshot, WorkspaceBackend};
+use super::operations::{OperationTracker, TrackedOperation};
+use super::palette::{CommandAction, PaletteState};
 use super::screens::{self, ScreenId, ScreenState, SCREENS};
+use super::shell;
 
 /// How long a Dashboard snapshot stays fresh before the bounded
 /// refresh recomputes it (spec section 7: no expensive continuous
 /// polling — the git subprocess calls run at most once per TTL).
 const DASHBOARD_TTL: Duration = Duration::from_secs(2);
+
+/// Shared TTL for the premium read-only view caches (agents, tasks,
+/// changes, commits, audit). Per-view 'r' refresh and mutations
+/// invalidate immediately; this bound keeps renders cheap.
+const VIEW_TTL: Duration = Duration::from_secs(3);
 
 /// A concrete action the user asked the UI to perform. Destructive
 /// actions wait for modal confirmation before `execute` runs them.
@@ -25,6 +28,10 @@ pub enum ActionKind {
     DeletePath(String),
     /// Discard unsaved editor changes for the given path.
     DiscardChanges(String),
+    /// Start a registered agent (service-owned lifecycle).
+    AgentStart(String),
+    /// Stop a running agent (terminal; service-owned lifecycle).
+    AgentStop(String),
 }
 
 impl ActionKind {
@@ -42,6 +49,8 @@ impl ActionKind {
             ActionKind::DeleteProject(name) => format!("delete project {name:?} and all its files"),
             ActionKind::DeletePath(path) => format!("delete {path:?}"),
             ActionKind::DiscardChanges(path) => format!("discard unsaved changes to {path:?}"),
+            ActionKind::AgentStart(id) => format!("start agent {id}"),
+            ActionKind::AgentStop(id) => format!("stop agent {id}"),
         }
     }
 }
@@ -59,6 +68,51 @@ impl From<ActionKind> for PendingAction {
     }
 }
 
+/// TTL cache for one premium view. Mutation-driven invalidation clears
+/// it; manual 'r' refresh forces recompute; renders within the TTL
+/// serve the cached copy without touching the backend.
+struct ViewCache<T> {
+    data: Option<T>,
+    fresh_until: Option<Instant>,
+}
+
+impl<T> ViewCache<T> {
+    fn new() -> Self {
+        Self {
+            data: None,
+            fresh_until: None,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.fresh_until = None;
+    }
+
+    fn get_or_reload(&mut self, reload: impl FnOnce() -> anyhow::Result<T>) -> Option<&T> {
+        let fresh = self.fresh_until.is_some_and(|t| Instant::now() < t);
+        if !fresh {
+            match reload() {
+                Ok(data) => {
+                    self.data = Some(data);
+                    self.fresh_until = Some(Instant::now() + VIEW_TTL);
+                }
+                Err(_) => {
+                    // Errors are not cached: the next render retries the
+                    // backend so a recovered backend heals without 'r'.
+                    self.fresh_until = None;
+                }
+            }
+        }
+        self.data.as_ref()
+    }
+}
+
+impl<T> Default for ViewCache<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Top-level application state shared by all screens.
 pub struct App<B: WorkspaceBackend> {
     pub backend: B,
@@ -73,9 +127,21 @@ pub struct App<B: WorkspaceBackend> {
     pub message: Option<String>,
     /// Per-screen UI state (selections, listings).
     pub ui: ScreenState,
+    /// Command palette overlay state.
+    pub palette: PaletteState,
+    /// Operation progress/notifications (bounded).
+    pub ops: OperationTracker,
     /// Bounded-refresh cache for the Dashboard (spec section 7).
     dashboard_cache: Option<DashboardSnapshot>,
-    dashboard_fresh_until: Option<std::time::Instant>,
+    dashboard_fresh_until: Option<Instant>,
+    /// Premium-view caches: agents / sessions / tasks / changes /
+    /// commits / audit.
+    agents_cache: ViewCache<Vec<super::backend::AgentView>>,
+    sessions_cache: ViewCache<Vec<super::backend::SessionView>>,
+    tasks_cache: ViewCache<Vec<super::backend::TaskView>>,
+    changes_cache: ViewCache<Vec<super::backend::ChangedFile>>,
+    commits_cache: ViewCache<Vec<super::backend::CommitView>>,
+    audit_cache: ViewCache<Vec<super::backend::AuditRow>>,
     quit: bool,
 }
 
@@ -89,8 +155,16 @@ impl<B: WorkspaceBackend> App<B> {
             error: None,
             message: None,
             ui: ScreenState::default(),
+            palette: PaletteState::default(),
+            ops: OperationTracker::default(),
             dashboard_cache: None,
             dashboard_fresh_until: None,
+            agents_cache: ViewCache::new(),
+            sessions_cache: ViewCache::new(),
+            tasks_cache: ViewCache::new(),
+            changes_cache: ViewCache::new(),
+            commits_cache: ViewCache::new(),
+            audit_cache: ViewCache::new(),
             quit: false,
         }
     }
@@ -111,32 +185,103 @@ impl<B: WorkspaceBackend> App<B> {
         self.error = Some(error.into());
     }
 
-    /// Dashboard snapshot with bounded refresh: recomputes only after
-    /// the TTL elapses (or after [`Self::invalidate_dashboard`]), so
-    /// redrawing never triggers repeated git subprocess calls.
+    /// Headline operation for the footer status line, if any.
+    pub fn pending_operation(&self) -> Option<&TrackedOperation> {
+        self.ops.headline()
+    }
+
+    // ----- View caches (bounded refresh + mutation invalidation) -----
+
+    pub fn cached_agents(&mut self) -> Option<&Vec<super::backend::AgentView>> {
+        self.agents_cache
+            .get_or_reload(|| self.backend.list_agents())
+    }
+
+    pub fn cached_sessions(&mut self) -> Option<&Vec<super::backend::SessionView>> {
+        self.sessions_cache
+            .get_or_reload(|| self.backend.list_sessions(None))
+    }
+
+    pub fn cached_tasks(&mut self) -> Option<&Vec<super::backend::TaskView>> {
+        self.tasks_cache.get_or_reload(|| self.backend.list_tasks())
+    }
+
+    pub fn cached_changes(&mut self) -> Option<&Vec<super::backend::ChangedFile>> {
+        self.changes_cache
+            .get_or_reload(|| self.backend.list_changed_files())
+    }
+
+    pub fn cached_commits(&mut self) -> Option<&Vec<super::backend::CommitView>> {
+        self.commits_cache
+            .get_or_reload(|| self.backend.recent_commits(20))
+    }
+
+    pub fn cached_audit(&mut self) -> Option<&Vec<super::backend::AuditRow>> {
+        self.audit_cache
+            .get_or_reload(|| self.backend.list_audit(200))
+    }
+
+    /// Invalidates every data view (scope change, mutation, or manual
+    /// refresh). Cheap: only TTLs are cleared.
+    pub fn invalidate_views(&mut self) {
+        self.dashboard_fresh_until = None;
+        self.agents_cache.invalidate();
+        self.sessions_cache.invalidate();
+        self.tasks_cache.invalidate();
+        self.changes_cache.invalidate();
+        self.commits_cache.invalidate();
+        self.audit_cache.invalidate();
+    }
+
+    /// Manual 'r' refresh for the active view.
+    pub fn refresh_active_view(&mut self) {
+        self.invalidate_views();
+        self.set_message("refreshed");
+    }
+
+    /// Resets per-view selection/cursor state after a scope change
+    /// (Prompt 30: stale-selection invalidation). Selections that point
+    /// at another project's rows are never carried across.
+    pub fn reset_view_state(&mut self) {
+        self.ui.projects.select(Some(0));
+        self.ui.files.select(Some(0));
+        self.ui.git.select(Some(0));
+        self.ui.files_ui.cwd.clear();
+        self.ui.files_ui.search_results.clear();
+        self.ui.files_ui.show_search = false;
+        self.ui.files_ui.input.clear();
+        self.ui.files_ui.input_mode = None;
+        self.ui.audit.select(Some(0));
+    }
+
+    // ----- Dashboard (pre-existing bounded refresh) -----
+
     pub fn dashboard_cached(&mut self) -> DashboardSnapshot {
         let fresh = self
             .dashboard_fresh_until
-            .is_some_and(|t| std::time::Instant::now() < t);
+            .is_some_and(|t| Instant::now() < t);
         if !fresh {
             if let Ok(snap) = self.backend.dashboard() {
                 self.dashboard_cache = Some(snap);
-                self.dashboard_fresh_until = Some(std::time::Instant::now() + DASHBOARD_TTL);
+                self.dashboard_fresh_until = Some(Instant::now() + DASHBOARD_TTL);
             }
         }
         self.dashboard_cache.clone().unwrap_or_default()
     }
 
-    /// Forces the next [`Self::dashboard_cached`] to recompute.
     pub fn invalidate_dashboard(&mut self) {
         self.dashboard_fresh_until = None;
     }
+
+    // ----- Actions -----
 
     /// Requests an action. Destructive actions are held until the user
     /// confirms the modal; non-destructive ones execute immediately.
     pub fn request_action(&mut self, kind: ActionKind) {
         let action = PendingAction { kind };
         if action.kind.destructive() {
+            self.ops.track(action.kind.describe());
+            self.ops.to_authorizing();
             self.confirm = Some(action);
         } else {
             self.execute(action.kind);
@@ -155,23 +300,30 @@ impl<B: WorkspaceBackend> App<B> {
     }
 
     /// Runs an action against the backend and records the outcome in
-    /// the message/error bars. A discarded editor buffer is stashed in
-    /// `reload_content` so the Editor screen can adopt it on its next
-    /// draw.
+    /// the operation tracker + footer. Unknown-result classification
+    /// (remote timeouts) stays visible until reconciled.
     fn execute(&mut self, kind: ActionKind) {
-        // DiscardChanges is UI-local: reload the editor buffer through
-        // the backend and stash it for the Editor screen to adopt.
+        self.ops.track(kind.describe());
+        self.ops.to_executing();
+
+        // UI-local: reload the editor buffer through the backend and
+        // stash it for the Editor screen to adopt.
         if let ActionKind::DiscardChanges(path) = &kind {
             match self.backend.read_file(path) {
                 Ok(fresh) => {
                     self.ui.reload_content = Some((path.clone(), fresh));
+                    self.ops.to_confirmed();
                     self.set_message(format!("done: {}", kind.describe()));
                 }
-                Err(e) => self.set_error(format!("{}: {e:#}", kind.describe())),
+                Err(e) => {
+                    self.ops.to_failed(format!("{e:#}"));
+                    self.set_error(format!("{}: {e:#}", kind.describe()));
+                }
             }
             return;
         }
-        let result = match &kind {
+
+        let result: anyhow::Result<()> = match &kind {
             ActionKind::DeleteProject(name) => self
                 .backend
                 .delete_project(name)
@@ -180,18 +332,68 @@ impl<B: WorkspaceBackend> App<B> {
                 .backend
                 .delete_path(path)
                 .with_context(|| format!("delete {path}")),
+            ActionKind::AgentStart(id) => self.backend.agent_start(id),
+            ActionKind::AgentStop(id) => self.backend.agent_stop(id),
             ActionKind::DiscardChanges(_) => unreachable!("handled above"),
         };
         match result {
             Ok(()) => {
-                // Workspace shape changed; the Dashboard must not serve
-                // a stale project count.
-                self.invalidate_dashboard();
+                self.ops.to_confirmed();
+                // Workspace shape changed; every data view must not
+                // serve stale state.
+                self.invalidate_views();
+                if matches!(kind, ActionKind::AgentStart(_) | ActionKind::AgentStop(_)) {
+                    self.agents_cache.invalidate();
+                    self.sessions_cache.invalidate();
+                }
                 self.set_message(format!("done: {}", kind.describe()));
             }
-            Err(e) => self.set_error(format!("{}: {e:#}", kind.describe())),
+            Err(e) => {
+                let text = format!("{e:#}");
+                // Ambiguous remote timeouts are Unknown, not Failed:
+                // the effect may have happened; reconcile before retry.
+                if text.contains("timed out") || text.contains("timeout") {
+                    self.ops.to_unknown(text.clone());
+                } else {
+                    self.ops.to_failed(text.clone());
+                }
+                self.set_error(format!("{}: {text}", kind.describe()));
+            }
         }
     }
+
+    // ----- Palette execution (same paths as key handlers) -----
+
+    pub fn run_palette_command(&mut self, action: CommandAction) {
+        match action {
+            CommandAction::Navigate(id) => self.goto(id),
+            CommandAction::Refresh => self.refresh_active_view(),
+            CommandAction::Help => self.goto_fresh(ScreenId::Help),
+            CommandAction::Quit => {
+                self.quit = true;
+            }
+            CommandAction::OpenProject(name) => {
+                self.ops.track(format!("open project {name}"));
+                self.ops.to_executing();
+                match self.backend.open_project(&name) {
+                    Ok(()) => {
+                        self.ops.to_confirmed();
+                        // Scope changed: no stale selections may survive.
+                        self.reset_view_state();
+                        self.invalidate_views();
+                        self.set_message(format!("opened project {name}"));
+                    }
+                    Err(e) => {
+                        self.ops.to_failed(format!("{e:#}"));
+                        self.set_error(format!("open project {name}: {e:#}"));
+                    }
+                }
+            }
+            CommandAction::Request(kind) => self.request_action(kind),
+        }
+    }
+
+    // ----- Navigation -----
 
     pub fn goto(&mut self, screen: ScreenId) {
         if screen == self.screen {
@@ -258,10 +460,11 @@ pub fn run<B: WorkspaceBackend>(
     Ok(())
 }
 
+/// Global key dispatch. Priority: modal confirmation > palette overlay >
+/// screen input capture > global keys > active screen.
 fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
-    // Global keys first; modal confirmation takes precedence over
-    // everything so a destructive action can never be triggered while
-    // another confirmation is pending.
+    // Destructive confirmation intercepts everything so no second
+    // action can be triggered while a confirmation is pending.
     if app.confirm.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => app.confirm_pending(),
@@ -270,110 +473,161 @@ fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
         }
         return;
     }
+
+    // Command palette overlay owns the keyboard while open.
+    if app.palette.open {
+        match key.code {
+            KeyCode::Esc => app.palette.close(),
+            KeyCode::Backspace => {
+                app.palette.query.pop();
+            }
+            KeyCode::Up => {
+                if app.palette.selected > 0 {
+                    app.palette.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let count = super::palette::matches(app).len();
+                if app.palette.selected + 1 < count {
+                    app.palette.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let action = super::palette::matches(app)
+                    .into_iter()
+                    .nth(app.palette.selected)
+                    .and_then(|cmd| cmd.enabled.then_some(cmd.action));
+                app.palette.close();
+                if let Some(action) = action {
+                    app.run_palette_command(action);
+                } else {
+                    app.set_message("command unavailable");
+                }
+            }
+            KeyCode::Char(c) => app.palette.query.push(c),
+            _ => {}
+        }
+        return;
+    }
+
+    // Errors are dismissed from any screen.
+    if app.error.is_some() && key.code == KeyCode::Char('x') {
+        app.error = None;
+        return;
+    }
+
+    // Screens that own a text input must receive every key, including
+    // the digits and letters the global layer would otherwise claim.
+    let captured = app.ui.capture_input;
+
+    // Ctrl+K (palette) and Ctrl+Q (quit) work even while a screen
+    // input is active: they are modifier-guarded and never insert
+    // characters into the screen's buffer.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
-        if let KeyCode::Char('q') = key.code {
-            app.quit = true;
-            return;
+        match key.code {
+            KeyCode::Char('k') => {
+                app.palette.open();
+                return;
+            }
+            KeyCode::Char('q') => {
+                app.quit = true;
+                return;
+            }
+            _ => {}
         }
     }
-    match key.code {
-        KeyCode::Tab => app.next_screen(),
-        KeyCode::BackTab => app.prev_screen(),
-        KeyCode::Esc => app.back(),
-        KeyCode::F(1) => app.goto_fresh(ScreenId::Help),
-        KeyCode::F(12) => app.quit = true,
-        _ => screens::handle_key(app, key),
+
+    if !captured {
+        match key.code {
+            KeyCode::Tab => {
+                app.next_screen();
+                return;
+            }
+            KeyCode::BackTab => {
+                app.prev_screen();
+                return;
+            }
+            KeyCode::Esc => {
+                app.back();
+                return;
+            }
+            KeyCode::F(1) => {
+                app.goto_fresh(ScreenId::Help);
+                return;
+            }
+            KeyCode::F(12) => {
+                app.quit = true;
+                return;
+            }
+            KeyCode::Char('?') => {
+                app.goto_fresh(ScreenId::Help);
+                return;
+            }
+            KeyCode::Char('b') => {
+                app.back();
+                return;
+            }
+            KeyCode::Char('r') => {
+                app.refresh_active_view();
+                return;
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                // Rail digit navigation to the primary sections.
+                let index = c as usize - '1' as usize;
+                if let Some((id, _)) = shell::PRIMARY_SECTIONS.get(index) {
+                    app.goto_fresh(*id);
+                }
+                return;
+            }
+            _ => {}
+        }
     }
+
+    screens::handle_key(app, key);
 }
 
-fn draw(frame: &mut Frame, app: &mut App<impl WorkspaceBackend>) {
-    let small = frame.area().width < 60 || frame.area().height < 12;
-    let [body, footer] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(if small { 1 } else { 3 }),
-    ])
-    .areas(frame.area());
-
-    if small {
-        draw_small(frame, app, body);
-    } else {
-        screens::draw(frame, app, body);
-    }
-    draw_footer(frame, app, footer, small);
-}
-
-/// Ultra-condensed rendering for very small terminals: title plus a
-/// hint that the full layout needs more space.
-fn draw_small(
-    frame: &mut Frame,
-    app: &mut App<impl WorkspaceBackend>,
-    area: ratatui::layout::Rect,
-) {
-    let screen = SCREENS
-        .iter()
-        .find(|s| s.id == app.screen())
-        .map(|s| s.title)
-        .unwrap_or("AWH");
-    let line = Line::from(vec![
-        Span::styled("AWH", Style::default().fg(Color::Cyan)),
-        Span::raw(" "),
-        Span::styled(screen, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  [Tab/±] screens  [Esc] back  [F1] help"),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn draw_footer(
-    frame: &mut Frame,
-    app: &mut App<impl WorkspaceBackend>,
-    area: ratatui::layout::Rect,
-    small: bool,
-) {
-    let block = if small {
-        None
-    } else {
-        Some(Block::default().borders(Borders::TOP))
+/// Renders the shell, the active screen, then any overlay (palette,
+/// confirmation dialog) on top. Resize-safe: every panel guards zero
+/// dimensions and the shell returns None below the minimum.
+fn draw(frame: &mut ratatui::Frame, app: &mut App<impl WorkspaceBackend>) {
+    let area = frame.area();
+    let Some(content) = shell::render_shell(frame, app, area) else {
+        return;
     };
-    let mut lines: Vec<Line> = Vec::new();
+    screens::draw(frame, app, content);
+
+    if app.palette.open {
+        super::palette::render(frame, content, app);
+    }
+
     if let Some(action) = &app.confirm {
-        let verb = if action.kind.destructive() {
-            "CONFIRM"
-        } else {
-            "RUN"
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{verb}: "), Style::default().fg(Color::Yellow)),
-            Span::styled(action.kind.describe(), Style::default().fg(Color::Red)),
-            Span::raw("  [y] yes   [n/Esc] no"),
-        ]));
-    } else if let Some(error) = &app.error {
-        lines.push(Line::from(vec![
-            Span::styled("error: ", Style::default().fg(Color::Red)),
-            Span::raw(error.clone()),
-            Span::raw("  [x] dismiss"),
-        ]));
-    } else if let Some(message) = &app.message {
-        lines.push(Line::from(vec![
-            Span::styled("i: ", Style::default().fg(Color::Cyan)),
-            Span::raw(message.clone()),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("Tab", Style::default().fg(Color::Cyan)),
-            Span::raw(" next  "),
-            Span::styled("Esc", Style::default().fg(Color::Cyan)),
-            Span::raw(" back  "),
-            Span::styled("F1", Style::default().fg(Color::Cyan)),
-            Span::raw(" help  "),
-            Span::styled("C-q", Style::default().fg(Color::Cyan)),
-            Span::raw(" quit"),
-        ]));
+        let destructive = action.kind.destructive();
+        let describe = action.kind.describe();
+        super::components::render_dialog(
+            frame,
+            area,
+            if destructive { "Confirm" } else { "Run" },
+            &[ratatui::text::Line::from(describe)],
+            "[y] yes   [n/Esc] no",
+            if destructive {
+                super::theme::Role::Warning
+            } else {
+                super::theme::Role::Focused
+            },
+        );
     }
-    let mut paragraph = Paragraph::new(lines);
-    if let Some(block) = block {
-        paragraph = paragraph.block(block);
+
+    if let Some(error) = &app.error {
+        let error = error.clone();
+        super::components::render_dialog(
+            frame,
+            area,
+            "Error",
+            &[ratatui::text::Line::from(error)],
+            "[x] dismiss",
+            super::theme::Role::Error,
+        );
     }
-    frame.render_widget(paragraph, area);
 }
 
 #[cfg(test)]
@@ -391,10 +645,13 @@ mod tests {
 
     #[test]
     fn navigation_cycles_the_screen_ring() {
+        // The premium ring puts the 13 primary sections first (Prompt
+        // 30 navigation order), so Tab lands on Agents after the
+        // Dashboard; Projects is a secondary screen now.
         let mut app = test_app();
         assert_eq!(app.screen(), ScreenId::Dashboard);
         app.next_screen();
-        assert_eq!(app.screen(), ScreenId::Projects);
+        assert_eq!(app.screen(), ScreenId::Agents);
         app.prev_screen();
         assert_eq!(app.screen(), ScreenId::Dashboard);
     }
@@ -476,9 +733,69 @@ mod tests {
     fn global_keys_are_handled_before_screens() {
         let mut app = test_app();
         handle_key(&mut app, KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.screen(), ScreenId::Projects);
+        assert_eq!(app.screen(), ScreenId::Agents);
         handle_key(&mut app, KeyEvent::from(KeyCode::F(1)));
         assert_eq!(app.screen(), ScreenId::Help);
+    }
+
+    #[test]
+    fn digit_keys_jump_to_primary_sections() {
+        // Digits index PRIMARY_SECTIONS (Dashboard takes 1):
+        // 2 Agents, 3 Tasks, 4 Files, 5 Changes, 6 Git, 7 Context,
+        // 8 Memory, 9 Skills.
+        let mut app = test_app();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('4')));
+        assert_eq!(app.screen(), ScreenId::Files);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')));
+        assert_eq!(app.screen(), ScreenId::Changes);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')));
+        assert_eq!(app.screen(), ScreenId::Git);
+    }
+
+    #[test]
+    fn ctrl_k_opens_the_command_palette() {
+        let mut app = test_app();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert!(app.palette.open);
+        // Typing filters; Enter runs the first match (Go to Dashboard).
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('d')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(!app.palette.open);
+    }
+
+    #[test]
+    fn palette_refuses_disabled_commands() {
+        let mut app = test_app();
+        app.palette.open();
+        // Empty workspace: project switch is disabled with a reason.
+        let matches = super::super::palette::matches(&app);
+        let disabled = matches
+            .iter()
+            .find(|c| !c.enabled)
+            .expect("disabled command present");
+        assert!(!disabled.disabled_reason.is_empty());
+    }
+
+    #[test]
+    fn editor_input_capture_blocks_global_digits() {
+        let mut app = test_app();
+        app.goto(ScreenId::Editor);
+        // Seed an open buffer (the editor ignores typing when no file
+        // is open — 'o' is the only live key in that state).
+        app.ui.editor_ui.path = Some("scratch.txt".into());
+        app.ui.editor_ui.buffer = "seed".into();
+        // The Editor screen always owns the keyboard once a key has
+        // been dispatched to it (its handler sets capture_input).
+        screens::handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert!(app.ui.capture_input);
+        // A digit must type into the buffer, not navigate.
+        let before = app.ui.editor_ui.buffer.len();
+        screens::handle_key(&mut app, KeyEvent::from(KeyCode::Char('1')));
+        assert_eq!(app.ui.editor_ui.buffer.len(), before + 1);
+        assert_eq!(app.screen(), ScreenId::Editor);
     }
 
     #[test]
@@ -525,8 +842,9 @@ mod tests {
         let mut app = test_app();
         app.dashboard_cached();
         app.backend.create_project("alpha").unwrap();
-        // 'r' on the Dashboard screen must trigger a recompute.
-        super::super::screens::handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')));
+        // 'r' is a global refresh now: it invalidates every view cache
+        // (dashboard included) instead of only the dashboard.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')));
         assert_eq!(app.dashboard_cached().project_count, 1);
         assert_eq!(app.message.as_deref(), Some("refreshed"));
     }

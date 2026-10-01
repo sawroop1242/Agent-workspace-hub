@@ -80,6 +80,7 @@ impl SkillsUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    app.ui.capture_input = false;
     let ui = &mut app.ui.skills_ui;
     let project = app.backend.current_project_hint();
 

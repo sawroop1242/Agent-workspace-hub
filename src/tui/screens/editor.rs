@@ -108,6 +108,9 @@ impl EditorUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // The editor always owns the keyboard: plain keys type into the
+    // buffer, so the global layer must not claim them.
+    app.ui.capture_input = true;
     // Adopt content reloaded by a completed DiscardChanges action.
     if let Some((path, content)) = app.ui.reload_content.take() {
         if app.ui.editor_ui.path.as_deref() == Some(&path) {

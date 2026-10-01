@@ -45,6 +45,9 @@ impl GitUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // The commit form collects free text; it owns the keyboard while
+    // active so global digits/letters cannot fire mid-message.
+    app.ui.capture_input = app.ui.git_ui.commit_active;
     // Commit form borrows only its own input state.
     if app.ui.git_ui.commit_active {
         match key.code {

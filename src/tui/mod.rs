@@ -6,8 +6,14 @@
 
 pub mod app;
 pub mod backend;
+pub mod components;
+pub mod keymap;
+pub mod operations;
+pub mod palette;
 pub mod remote;
 pub mod screens;
+pub mod shell;
+pub mod theme;
 
 /// Runs the TUI against a local backend rooted at `root`.
 /// Rejects non-interactive stdin before ratatui's terminal setup: piping

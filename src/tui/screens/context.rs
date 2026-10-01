@@ -76,6 +76,8 @@ fn backend_current_project<B: WorkspaceBackend>(backend: &B) -> Option<String> {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // Edit mode collects free text; it owns the keyboard while active.
+    app.ui.capture_input = app.ui.context_ui.editing;
     let ui = &mut app.ui.context_ui;
     let project = app.backend.current_project_hint();
 

@@ -18,6 +18,8 @@ pub struct ProjectsUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // New-project input owns the keyboard while active.
+    app.ui.capture_input = app.ui.projects_ui.input_active;
     let ui = &mut app.ui.projects_ui;
     if ui.input_active {
         match key.code {

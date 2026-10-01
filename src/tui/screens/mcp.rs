@@ -30,6 +30,7 @@ impl McpUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    app.ui.capture_input = false;
     if key.code == KeyCode::Char('r') {
         if let Err(msg) = app.ui.mcp_ui.load(&app.backend) {
             app.set_error(msg);

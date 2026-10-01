@@ -34,6 +34,9 @@ pub struct FilesUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // While an input mode collects a name/search, every key belongs
+    // to the input (global digits/letters must not fire).
+    app.ui.capture_input = app.ui.files_ui.input_mode.is_some();
     let ui = &mut app.ui.files_ui;
     if let Some(mode) = ui.input_mode {
         match key.code {
@@ -108,7 +111,7 @@ pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
         KeyCode::Char('n') => {
             ui.input_mode = Some(InputMode::Create);
         }
-        KeyCode::Char('r') => {
+        KeyCode::Char('m') => {
             if entries.is_empty() {
                 app.set_error("nothing selected to rename");
             } else {
@@ -253,13 +256,13 @@ pub fn draw<B: WorkspaceBackend>(
         hint_line(
             frame,
             area,
-            "[Enter] open  [Backspace] up  [n] new  [r] rename  [d/Del] delete (confirms)  [s] search  [Esc] hide results",
+            "[Enter] open  [Backspace] up  [n] new  [m] rename  [d/Del] delete (confirms)  [s] search  [Esc] hide results",
         );
     } else {
         hint_line(
             frame,
             area,
-            "[Enter] open  [Backspace] up  [n] new  [r] rename  [d/Del] delete (confirms)  [s] search",
+            "[Enter] open  [Backspace] up  [n] new  [m] rename  [d/Del] delete (confirms)  [s] search",
         );
     }
 }
@@ -336,7 +339,7 @@ mod tests {
         app.backend.write_file("old.txt", "1").unwrap();
         app.goto(ScreenId::Files);
         app.ui.files.select(Some(0));
-        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('m'));
         // Clear the seeded name entirely, then type the new one.
         for _ in 0.."old.txt".len() {
             press(&mut app, KeyCode::Backspace);
