@@ -5,6 +5,8 @@
 pub mod agents;
 /// Capability grant persistence.
 pub mod capability_grants;
+/// Collaboration ownership persistence (COL-001).
+pub mod collaboration;
 /// Workspace context assembly.
 pub mod context;
 /// File helpers.

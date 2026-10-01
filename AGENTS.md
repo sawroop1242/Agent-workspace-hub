@@ -569,4 +569,40 @@ cheap-to-clone). Tool catalog 53 static.
   newline only; use explicit flush before process::exit to avoid losing the
   final stdout line on non-newline-terminated child output.
 
+- **COL-001 Collaboration domain (Prompt 18, 2026-09)**: `src/core/collaboration.rs`
+  (CollaborationStore, `.agent/collaboration.json`, schema-versioned, StoreLock +
+  atomic rename) is the SINGLE collaboration state owner; `src/services/collaboration.rs`
+  (CollaborationService) is the shared boundary all planes must call; `src/cli/collaboration.rs`
+  + main.rs arm are thin adapters. Verbs: `awh collaboration agents|status|assign|
+  activate|handoff(--request)|accept|release|conflicts|events`. Ownership states:
+  Assigned/Active/HandoffRequested/HandedOff/Released (Released+HandedOff end a cycle;
+  reactivation requires echoing the observed terminal revision; per-record revision
+  increments). Store API returns `Result<CollabResult<T>>` (outer = I/O/anyhow, inner =
+  domain CollabError) so domain denials ride `Ok(Err(..))`; service maps inner errors to
+  stable category text via `CollabError::message()` - CLI exit-1 text == service text.
+  Audit: transitions -> kind "collab" actions assign/activate/handoff_request/
+  handoff_accept/release via `record_correlated` (subject `task:<id>`, detail owner/
+  revision/state, correlation workspace/agent/session); refusals -> `record_deny` with
+  actions collab_assign/collab_handoff/collab_accept/collab_activate/collab_release.
+  `events` reads the durable log via `AuditLog::open(root).recent()` filtered by kind -
+  requires the CLI arm's `init_global(&root)` (same pattern as task/memory arms).
+  `conflicts` is evidence-only (never auto-resolves): scans held records for
+  owner_agent_unknown/disabled/stopped, owner_session_unknown/not_usable, task_missing/
+  task_terminal, worktree_missing; requires nothing to be deleted on the caller side.
+  Validation at the mutation boundary: owner must exist + enabled (Active NOT required -
+  stopped owners surface as conflict evidence instead of blocking transfer); supplied
+  session must resolve via AgentRuntimeService::resolve_session (re-validates everything);
+  Task/Worktree must exist in-workspace (TaskStore.get / WorktreeStore.list with
+  removed_at.is_none()). Assignment never starts agents/activates sessions/mutates
+  worktrees. GOTCHA (extends TW-002): StoreLock lock-file creation ENOENTs when
+  `.agent/` parent is missing - CollaborationStore::ensure_parent() runs create_dir_all
+  BEFORE StoreLock::acquire in assign/mutate paths (unit tests were failing on exactly
+  this). Test shapes: core unit 11 (double-unwrap `.unwrap().unwrap()` for the two-layer
+  Result), service unit 8 (single-unwrap; durable audit assertions must go through
+  `audit::global().recent()` - init_global is OnceLock/process-wide so parallel unit
+  tests cannot re-point the durable root; the durable round-trip is pinned by e2e),
+  CLI unit 1, e2e `tests/collaboration_cli.rs` 6 (real binary; `agent session open` is
+  POSITIONAL - `awh agent session open <AGENT_ID>`; `agent start <id>` required before
+  session open; task create needs --description or it reads stdin). Suite: 1327 passed /
+  0 failed (was 1301 pre-COL-001). Docs updated: CLI.md tree+counts, FEATURES.md.
 - **Prompt 18 build phase (branch master-completion-18, PR #130)**: CI `agent-pipeline-validation` job hard-opens `.github/agent-engine/feature-registry.yml` whenever the PR diff touches `.github/agent-engine/|.github/agent/|scripts/` — the file was REMOVED by 2b1fef5 ("remove external agent infrastructure") so every relevant PR fails; fixed in 4cfd3cb by mirroring the orchestrator-step's file-existence guard. §9 matrix closed in 5e7d990: wedge Phase H (worktree×snapshot = provenance lands under the WORKTREE's own store, main tree untouched; worktree×rollback = confined to the effective root + rollback re-evaluates a CURRENT authorization — foreign principal denied), tasks×sessions (task plane independent of session lifecycle: stop is terminal for execution, tasks survive + terminal session records stay valid assignees since SessionStore.get checks existence, not liveness), context×memory (CLI context plane = ContextEngine, stores under `.agent/context-engine/` — NOT `.agent/context.md` which is the MCP/API ContextStore; there is NO `awh context status` subcommand; nothing ever creates `.agent/memory.json`). Phase H gotchas: (1) wedge fixture must gitignore `/.agent/` before the base commit so the worktree checkout is a clean slate — `initialize_workspace` on a checkout containing a copied manifest fails closed as foreign-root; (2) `WorktreeStore::remove` fails `Dirty(...)` on untracked files in the checkout — tests that write into the checkout must remove their residue before the ownership-removal tail; (3) `initialize_workspace` returns `InitOutcome` (Created/AlreadyInitialized) — use `.manifest()`, no direct `.workspace_id` field. Collaboration (COL-001) lives ONLY on PR #131 branch collaboration-col-001 (c803847 NOT an ancestor of master-completion-18); that branch had ZERO pull_request-triggered CI runs despite ci.yml having `pull_request: branches:[rust]` — dispatched manually via `gh workflow run ci.yml --ref collaboration-col-001` (run 36894154596); base-branch docs (909b703) already document `awh collaboration ...`, so on this branch the CLI docs run ahead of the binary until #131 merges — do not "fix" those docs on this branch (conflicts with #131's file set). §20 verified: 73-tool catalog (61 core + 12 github.*) matches dispatcher.

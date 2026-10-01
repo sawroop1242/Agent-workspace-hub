@@ -127,6 +127,15 @@ enum Command {
         #[command(subcommand)]
         command: agent_workspace_hub::cli::tasks::TaskCommand,
     },
+    /// Collaboration (COL-001): thin adapter over the canonical
+    /// CollaborationService — assignment, handoff, release, and
+    /// evidence-based conflict reporting over canonical agent, task,
+    /// and worktree identities. Ownership mutations are revision-checked
+    /// and audited; possession of an id is never authority.
+    Collaboration {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::collaboration::CollaborationCommand,
+    },
     /// Terminal (TRM-001): thin adapter over the canonical
     /// TerminalService — the same authority the MCP `terminal.run`
     /// tool, the Control API `/terminal/run` route, and the TUI
@@ -762,6 +771,17 @@ fn main() -> Result<()> {
                 tracing::error!(event = "audit_init_failed", error = %error);
             }
             agent_workspace_hub::cli::tasks::handle_task_cli(&root, command)?;
+        }
+        Some(Command::Collaboration { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // COL-001: ownership transitions must land in the durable
+            // audit log, not die with the process ring — same treatment
+            // as the task arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::collaboration::handle_collaboration_cli(&root, command)?;
         }
         Some(Command::Terminal { command }) => {
             let root =

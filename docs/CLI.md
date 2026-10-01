@@ -169,8 +169,11 @@ awh
 ├── collaboration
 │   ├── agents
 │   ├── status
-│   ├── handoff
 │   ├── assign
+│   ├── activate
+│   ├── handoff (--request)
+│   ├── accept
+│   ├── release
 │   ├── conflicts
 │   └── events
 ├── api
@@ -326,7 +329,7 @@ Failed  → (terminal: no transitions)
 | `task *` | 9 | session + agent ownership |
 | `audit *` / `logs *` | 10 | events/tracing |
 | `terminal *` | 10/16 | policy, capability, session, resource limits |
-| `collaboration *` | 12 | agents, sessions, worktrees, tasks, events |
+| `collaboration *` | 9 | ownership lifecycle (assign/activate/handoff/accept/release), agents, status, conflicts, events |
 | `api *` | 13 | application services, auth, policy |
 | `tui` | 11/14 | service/backend abstraction |
 | `connector *` | 15 | adapter registry, auth, policy, audit |
