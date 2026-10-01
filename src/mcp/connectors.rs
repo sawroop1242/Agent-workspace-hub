@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Records a connector mutation in the shared audit store — the §9
+/// Connectors × audit attribution requirement. Subject is the bounded
+/// connector id; detail carries only the bounded name/provider labels,
+/// never OAuth scopes, auth methods, or any secret-shaped material.
+fn audit_connector(kind: &'static str, action: &str, subject: &str, detail: &str) {
+    crate::services::audit::global().record(kind, action, subject, detail);
+}
+
 /// Maximum number of connectors a single project may register.
 const MAX_CONNECTORS: usize = 500;
 /// Maximum length of connector id, name, or provider.
@@ -104,7 +112,15 @@ impl ConnectorsMcp {
     /// agent process registering connectors on the same project at the same
     /// time serializes behind it instead of racing.
     pub fn add(&self, connector: Connector) -> Result<Connector> {
-        validate_connector(&connector)?;
+        if let Err(error) = validate_connector(&connector) {
+            audit_connector(
+                "deny",
+                "connector_add_rejected",
+                &connector.id,
+                &error.to_string(),
+            );
+            return Err(error);
+        }
         let _lock = StoreLock::acquire(&self.path)?;
         let mut store = self.load()?;
         let exists = store.connectors.iter().any(|c| c.id == connector.id);
@@ -114,6 +130,12 @@ impl ConnectorsMcp {
         store.connectors.retain(|c| c.id != connector.id);
         store.connectors.push(connector.clone());
         self.save(&store)?;
+        audit_connector(
+            "allow",
+            "connector_added",
+            &connector.id,
+            &format!("{} / {}", connector.name, connector.provider),
+        );
         Ok(connector)
     }
 
@@ -124,7 +146,16 @@ impl ConnectorsMcp {
         let before = store.connectors.len();
         store.connectors.retain(|c| c.id != id);
         self.save(&store)?;
-        Ok(before != store.connectors.len())
+        let removed = before != store.connectors.len();
+        if removed {
+            audit_connector(
+                "allow",
+                "connector_removed",
+                id,
+                "connector registration removed",
+            );
+        }
+        Ok(removed)
     }
 
     /// Toggles a connector's enabled state, returning the updated connector.
@@ -138,6 +169,17 @@ impl ConnectorsMcp {
         connector.enabled = enabled;
         let result = connector.clone();
         self.save(&store)?;
+        let action = if enabled {
+            "connector_enabled"
+        } else {
+            "connector_disabled"
+        };
+        audit_connector(
+            "allow",
+            action,
+            id,
+            &format!("{} / {}", result.name, result.provider),
+        );
         Ok(Some(result))
     }
 }
@@ -207,7 +249,7 @@ mod tests {
         c.provider = String::new();
         assert!(store.add(c).is_err());
 
-        let mut c = connector("");
+        let mut c = connector("id");
         c.id = "   ".into();
         assert!(store.add(c).is_err());
     }

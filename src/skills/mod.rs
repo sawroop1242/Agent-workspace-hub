@@ -14,10 +14,8 @@ pub mod model;
 pub mod package;
 /// SKILL.md parsing.
 pub mod parser;
-/// Project skill references.
+/// Project skill references (the ONE canonical reference store).
 pub mod project;
-/// Skill references.
-pub mod references;
 /// Skill registries.
 pub mod registries;
 /// Global skill registry.
@@ -38,8 +36,7 @@ pub use lockfile::{LockedSkill, LockfileStore, SkillLockfile};
 pub use model::Skill;
 pub use package::{safe_package_path, sha256_file, validate_skill_package};
 pub use parser::parse_skill;
-pub use project::ProjectSkillReferences;
-pub use references::SkillReferences;
+pub use project::{ProjectSkillReferences, SkillRefState, SkillReferences};
 pub use registries::{RegistryConfig, RegistryStore};
 pub use registry::GlobalSkillRegistry;
 pub use registry_client::RegistryClient;

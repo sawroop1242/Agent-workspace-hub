@@ -133,11 +133,11 @@ impl McpHooks {
 
 /// Saturating atomic increment: a metric counter must never wrap to 0
 /// (that would silently report "no failures"); it pins at `u64::MAX`.
-/// `fetch_update` is a CAS loop, so concurrent increments are all applied —
+/// `try_update` is a CAS loop, so concurrent increments are all applied —
 /// no lost updates, no torn counts, no ordering hazard.
 fn saturating_increment(counter: &AtomicU64) {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
         })
         .ok();
@@ -146,7 +146,7 @@ fn saturating_increment(counter: &AtomicU64) {
 /// Saturating atomic add for duration accounting.
 fn saturating_add_to(counter: &AtomicU64, amount: u64) {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(amount))
         })
         .ok();

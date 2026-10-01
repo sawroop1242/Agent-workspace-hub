@@ -398,10 +398,25 @@ async fn write_file(
     State(state): State<Arc<ControlState>>,
     Json(body): Json<WriteBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Spec 10: every mutating control-plane operation lands in the audit
+    // ring. The path (truncated) is the subject; content never reaches
+    // the audit log — only its byte count does.
     state
         .files()
         .write(&body.path, &body.content)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        .map_err(|e| {
+            audit_deny(
+                "api_file_write",
+                "rejected",
+                &truncate_detail(&body.path, 120),
+            );
+            ApiError::bad_request(format!("{e:#}"))
+        })?;
+    audit_allow(
+        "api_file_write",
+        &truncate_detail(&body.path, 120),
+        &format!("bytes={}", body.content.len()),
+    );
     Ok(Json(json!({"written": body.path})))
 }
 
@@ -450,10 +465,13 @@ async fn delete_entry(
     let path = params
         .get("path")
         .ok_or_else(|| ApiError::bad_request("path query parameter is required"))?;
-    state
-        .files()
-        .delete(path)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state.files().delete(path).map_err(|e| {
+        // Spec 10: every mutating control-plane operation lands in
+        // the audit ring, including the refusals.
+        audit_deny("api_file_delete", "rejected", &truncate_detail(path, 120));
+        ApiError::bad_request(format!("{e:#}"))
+    })?;
+    audit_allow("api_file_delete", &truncate_detail(path, 120), "remote");
     Ok(Json(json!({"deleted": path})))
 }
 
@@ -465,10 +483,19 @@ async fn rename_entry(
         .new_name
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("new_name is required"))?;
-    state
-        .files()
-        .rename(&body.path, new_name)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state.files().rename(&body.path, new_name).map_err(|e| {
+        audit_deny(
+            "api_file_rename",
+            "rejected",
+            &truncate_detail(&body.path, 120),
+        );
+        ApiError::bad_request(format!("{e:#}"))
+    })?;
+    audit_allow(
+        "api_file_rename",
+        &truncate_detail(&body.path, 120),
+        &truncate_detail(new_name, 120),
+    );
     Ok(Json(json!({"renamed": body.path, "to": new_name})))
 }
 
@@ -476,10 +503,19 @@ async fn create_dir(
     State(state): State<Arc<ControlState>>,
     Json(body): Json<EntryBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .files()
-        .create_dir(&body.path)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state.files().create_dir(&body.path).map_err(|e| {
+        audit_deny(
+            "api_file_mkdir",
+            "rejected",
+            &truncate_detail(&body.path, 120),
+        );
+        ApiError::bad_request(format!("{e:#}"))
+    })?;
+    audit_allow(
+        "api_file_mkdir",
+        &truncate_detail(&body.path, 120),
+        "remote",
+    );
     Ok(Json(json!({"created": body.path})))
 }
 
@@ -562,7 +598,22 @@ async fn git_push(
             params.branch.as_deref().unwrap_or("HEAD"),
         )
         .await
-        .map_err(|e| ApiError::internal(&e))?;
+        .map_err(|e| {
+            audit_deny(
+                "api_git_push",
+                "failed",
+                params.remote.as_deref().unwrap_or("origin"),
+            );
+            ApiError::internal(&e)
+        })?;
+    // Spec 10: push moves code off this machine — the audit entry must
+    // show where it went (remote) and what was moved (branch). Paths and
+    // refs only; never credentials or remote URLs (they can embed tokens).
+    audit_allow(
+        "api_git_push",
+        params.remote.as_deref().unwrap_or("origin"),
+        params.branch.as_deref().unwrap_or("HEAD"),
+    );
     Ok(Json(
         serde_json::to_value(out).unwrap_or_else(|_| json!({})),
     ))
@@ -579,7 +630,19 @@ async fn git_pull(
             params.branch.as_deref().unwrap_or("HEAD"),
         )
         .await
-        .map_err(|e| ApiError::internal(&e))?;
+        .map_err(|e| {
+            audit_deny(
+                "api_git_pull",
+                "failed",
+                params.remote.as_deref().unwrap_or("origin"),
+            );
+            ApiError::internal(&e)
+        })?;
+    audit_allow(
+        "api_git_pull",
+        params.remote.as_deref().unwrap_or("origin"),
+        params.branch.as_deref().unwrap_or("HEAD"),
+    );
     Ok(Json(
         serde_json::to_value(out).unwrap_or_else(|_| json!({})),
     ))
@@ -620,10 +683,11 @@ async fn git_stage(
     Json(body): Json<GitPathBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let git = open_repo(&state)?;
-    let out = git
-        .stage(&body.path)
-        .await
-        .map_err(|e| ApiError::internal(&e))?;
+    let out = git.stage(&body.path).await.map_err(|e| {
+        audit_deny("api_git_stage", "failed", &truncate_detail(&body.path, 120));
+        ApiError::internal(&e)
+    })?;
+    audit_allow("api_git_stage", &truncate_detail(&body.path, 120), "remote");
     Ok(Json(
         serde_json::to_value(out).unwrap_or_else(|_| json!({})),
     ))
@@ -634,10 +698,19 @@ async fn git_unstage(
     Json(body): Json<GitPathBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let git = open_repo(&state)?;
-    let out = git
-        .unstage(&body.path)
-        .await
-        .map_err(|e| ApiError::internal(&e))?;
+    let out = git.unstage(&body.path).await.map_err(|e| {
+        audit_deny(
+            "api_git_unstage",
+            "failed",
+            &truncate_detail(&body.path, 120),
+        );
+        ApiError::internal(&e)
+    })?;
+    audit_allow(
+        "api_git_unstage",
+        &truncate_detail(&body.path, 120),
+        "remote",
+    );
     Ok(Json(
         serde_json::to_value(out).unwrap_or_else(|_| json!({})),
     ))
@@ -783,7 +856,8 @@ async fn write_context(
         audit_deny("api_context_write", "too_large", &scope);
         return Err(ApiError::bad_request("context exceeds 512 KiB cap"));
     }
-    let root = store_scope(&state, params.project.as_deref())?;
+    let root = store_scope(&state, params.project.as_deref())
+        .inspect_err(|_| audit_deny("api_context_write", "rejected", &scope))?;
     crate::core::context::ContextStore::for_project(&root)
         .write(&body.content)
         .map_err(|e| ApiError::internal(&e))?;
@@ -818,15 +892,24 @@ async fn append_memory(
     Query(params): Query<ScopeParams>,
     Json(body): Json<AppendMemoryBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let scope = scope_name(&params);
     if body.content.trim().is_empty() {
+        audit_deny("api_memory_append", "empty_content", &scope);
         return Err(ApiError::bad_request("content is required"));
     }
-    let root = store_scope(&state, params.project.as_deref())?;
+    let root = store_scope(&state, params.project.as_deref())
+        .inspect_err(|_| audit_deny("api_memory_append", "rejected", &scope))?;
     let entry = crate::core::memory::MemoryStore::for_project(&root)
-        .map_err(|e| ApiError::internal(&e))?
+        .map_err(|e| {
+            audit_deny("api_memory_append", "rejected", &scope);
+            ApiError::internal(&e)
+        })?
         .append(&body.content)
-        .map_err(|e| ApiError::internal(&e))?;
-    audit_allow("api_memory_append", scope_name(&params).as_str(), "remote");
+        .map_err(|e| {
+            audit_deny("api_memory_append", "rejected", &scope);
+            ApiError::internal(&e)
+        })?;
+    audit_allow("api_memory_append", scope.as_str(), "remote");
     Ok(Json(json!({"appended": true, "id": entry.id})))
 }
 
@@ -844,9 +927,18 @@ async fn list_project_skills(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root = store_scope(&state, params.project.as_deref())?;
     let registry = state.global_skill_registry()?;
-    let skills = crate::skills::ProjectSkillReferences::new(&root)
+    let references = crate::skills::ProjectSkillReferences::new(&root);
+    let skills = references
         .resolve(&registry)
         .map_err(|e| ApiError::internal(&e))?;
+    // Enabled state comes from the same canonical reference store the
+    // CLI/MCP read: the API renders state, it never tracks it separately.
+    let enabled_by_name: std::collections::HashMap<String, bool> = references
+        .states()
+        .map_err(|e| ApiError::internal(&e))?
+        .into_iter()
+        .map(|state| (state.name, state.enabled))
+        .collect();
     let items: Vec<serde_json::Value> = skills
         .iter()
         .map(|s| {
@@ -854,6 +946,7 @@ async fn list_project_skills(
                 "name": s.name,
                 "description": s.description,
                 "version": s.version.as_deref().unwrap_or("unknown"),
+                "enabled": enabled_by_name.get(&s.name).copied().unwrap_or(true),
             })
         })
         .collect();
@@ -870,12 +963,19 @@ async fn add_project_skill(
     State(state): State<Arc<ControlState>>,
     Json(body): Json<ProjectSkillBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = store_scope(&state, body.project.as_deref())?;
-    let registry = state.global_skill_registry()?;
+    let scope = scope_name_body(&body);
+    let root = store_scope(&state, body.project.as_deref())
+        .inspect_err(|_| audit_deny("api_skill_add", "rejected", &scope))?;
+    let registry = state.global_skill_registry().inspect_err(|_| {
+        audit_deny("api_skill_add", "rejected", &scope);
+    })?;
     crate::skills::ProjectSkillReferences::new(&root)
         .add(&body.name, &registry)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    audit_allow("api_skill_add", &body.name, &scope_name_body(&body));
+        .map_err(|e| {
+            audit_deny("api_skill_add", "rejected", &scope);
+            ApiError::bad_request(format!("{e:#}"))
+        })?;
+    audit_allow("api_skill_add", &body.name, &scope);
     Ok(Json(json!({"added": body.name})))
 }
 
@@ -883,11 +983,16 @@ async fn remove_project_skill(
     State(state): State<Arc<ControlState>>,
     Query(body): Query<ProjectSkillQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = store_scope(&state, body.project.as_deref())?;
+    let scope = scope_name_body_q(&body);
+    let root = store_scope(&state, body.project.as_deref())
+        .inspect_err(|_| audit_deny("api_skill_remove", "rejected", &scope))?;
     crate::skills::ProjectSkillReferences::new(&root)
         .remove(&body.name)
-        .map_err(|e| ApiError::internal(&e))?;
-    audit_allow("api_skill_remove", &body.name, &scope_name_body_q(&body));
+        .map_err(|e| {
+            audit_deny("api_skill_remove", "rejected", &scope);
+            ApiError::internal(&e)
+        })?;
+    audit_allow("api_skill_remove", &body.name, &scope);
     Ok(Json(json!({"removed": body.name})))
 }
 
@@ -998,6 +1103,31 @@ mod tests {
 
     fn get(path: &str, token: Option<&str>) -> Request<Body> {
         authed(Request::get(path).body(Body::empty()).unwrap(), token)
+    }
+
+    /// Initializes a git repo with a committed `tracked.txt` and a
+    /// persistent local identity (config lives in the repo, not in
+    /// per-invocation `-c` flags — see AGENTS.md test-fixture notes).
+    fn init_repo_with_commit(root: &std::path::Path) {
+        use std::process::Command;
+        fn run(root: &std::path::Path, args: &[&str]) {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git spawns");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        run(root, &["init", "-q"]);
+        run(root, &["config", "user.email", "test@awh.invalid"]);
+        run(root, &["config", "user.name", "awh-test"]);
+        std::fs::write(root.join("tracked.txt"), "content").unwrap();
+        run(root, &["add", "tracked.txt"]);
+        run(root, &["commit", "-q", "-m", "init"]);
     }
 
     fn post_json(path: &str, token: Option<&str>, body: serde_json::Value) -> Request<Body> {
@@ -1279,6 +1409,250 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_write_is_audited_on_allow_and_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/files/content",
+                Some("test-key"),
+                json!({"path": "notes/audit-probe.txt", "content": "body-secret-xyz"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let recent = crate::services::audit::global().recent(500);
+        let entry = recent
+            .iter()
+            .find(|e| {
+                e.action == "api_file_write"
+                    && e.kind == "allow"
+                    && e.subject == "notes/audit-probe.txt"
+            })
+            .expect("successful file write audited");
+        assert_eq!(entry.subject, "notes/audit-probe.txt");
+        assert_eq!(entry.detail, "bytes=15");
+        // File CONTENT is deliberately never recorded.
+        assert!(!format!("{entry:?}").contains("body-secret-xyz"));
+
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/files/content",
+                Some("test-key"),
+                json!({"path": "../../etc/passwd", "content": "x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_file_write"
+                && e.kind == "deny"
+                && e.subject == "../../etc/passwd"
+                && e.detail == "rejected"
+        }));
+    }
+
+    #[tokio::test]
+    async fn file_entry_mutations_are_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+
+        // mkdir (PUT /files/entry)
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/files/entry",
+                Some("test-key"),
+                json!({"path": "made-dir"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Seed a file, then rename it (POST /files/entry).
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/files/content",
+                Some("test-key"),
+                json!({"path": "probe-file.txt", "content": "x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/files/entry",
+                Some("test-key"),
+                json!({"path": "probe-file.txt", "new_name": "renamed-file.txt"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_file_mkdir" && e.kind == "allow" && e.subject == "made-dir"));
+        assert!(recent.iter().any(|e| {
+            e.action == "api_file_rename"
+                && e.kind == "allow"
+                && e.subject == "probe-file.txt"
+                && e.detail == "renamed-file.txt"
+        }));
+
+        let res = app
+            .clone()
+            .oneshot(delete(
+                "/api/v1/files/entry?path=renamed-file.txt",
+                Some("test-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_file_delete" && e.kind == "allow" && e.subject == "renamed-file.txt"
+        }));
+
+        // Refusals audit as denies with the same shape as file write.
+        let res = app
+            .clone()
+            .oneshot(delete(
+                "/api/v1/files/entry?path=../../etc/passwd",
+                Some("test-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_file_delete" && e.kind == "deny" && e.detail == "rejected"
+        }));
+    }
+
+    #[tokio::test]
+    async fn scoped_mutation_refusals_are_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+
+        // Empty memory content is a semantic refusal (terminal's
+        // empty_program precedent) and must deny-audit.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memory",
+                Some("test-key"),
+                json!({"content": "   "}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_memory_append" && e.kind == "deny" && e.detail == "empty_content"
+        }));
+
+        // Adding a skill that is not installed globally is rejected by
+        // the canonical reference store and must deny-audit.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/skills/project",
+                Some("test-key"),
+                json!({"name": "ghost-skill"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_skill_add" && e.kind == "deny" && e.detail == "rejected"
+        }));
+
+        // A scope validation refusal (traversal project name) on the
+        // context write path must deny-audit with the scope label.
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/context?project=../../etc",
+                Some("test-key"),
+                json!({"content": "x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_context_write"
+                && e.kind == "deny"
+                && e.detail == "rejected"
+                && e.subject == "../../etc"
+        }));
+    }
+
+    #[tokio::test]
+    async fn git_stage_and_unstage_are_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo_with_commit(tmp.path());
+        let app = build_router(state(tmp.path()));
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/git/stage",
+                Some("test-key"),
+                json!({"path": "tracked.txt"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let recent = crate::services::audit::global().recent(500);
+        let entry = recent
+            .iter()
+            .find(|e| e.action == "api_git_stage" && e.kind == "allow")
+            .expect("git stage audited");
+        assert_eq!(entry.subject, "tracked.txt");
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/git/unstage",
+                Some("test-key"),
+                json!({"path": "tracked.txt"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_git_unstage" && e.kind == "allow"));
+    }
+
+    #[tokio::test]
+    async fn git_push_failure_is_audited() {
+        // No remote configured: `git push` fails and the handler must
+        // record the attempt as a deny with the remote it tried.
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo_with_commit(tmp.path());
+        let app = build_router(state(tmp.path()));
+        let res = app
+            .oneshot(post_json("/api/v1/git/push", Some("test-key"), json!({})))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent
+            .iter()
+            .any(|e| { e.action == "api_git_push" && e.kind == "deny" && e.detail == "failed" }));
+    }
+
+    #[tokio::test]
     async fn project_create_and_delete_are_audited() {
         let tmp = tempfile::tempdir().unwrap();
         let app = build_router(state(tmp.path()));
@@ -1533,6 +1907,26 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_json(res).await;
         assert_eq!(body["skills"][0]["name"], "demo");
+        // The API renders enable state from the canonical reference
+        // store — a fresh reference is exposed.
+        assert_eq!(body["skills"][0]["enabled"], true);
+
+        // Disabling through the ONE canonical store flips what the API
+        // serves, without the API tracking any state of its own.
+        crate::skills::ProjectSkillReferences::new(tmp.path())
+            .disable("demo")
+            .unwrap();
+        let res = app
+            .clone()
+            .oneshot(get("/api/v1/skills/project", Some("test-key")))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["skills"][0]["name"], "demo");
+        assert_eq!(
+            body["skills"][0]["enabled"], false,
+            "a disabled reference stays listed but unexposed"
+        );
 
         let res = app
             .clone()

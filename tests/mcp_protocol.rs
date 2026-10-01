@@ -362,6 +362,50 @@ async fn tools_call_argument_failures_are_invalid_params_not_internal() {
 }
 
 // --------------------------------------------------------------------------
+// skills.enable / skills.disable (state-mutating reference toggles)
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn skills_enable_disable_deny_unreferenced_names_via_dispatcher() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let input = request(Some(json!(1)), "initialize", init_params());
+    dispatch(&dispatcher, &input, &lifecycle).await;
+
+    // Both toggles are catalogued and schema-validated: a missing `name`
+    // is rejected before the store is consulted.
+    for name in ["skills.enable", "skills.disable"] {
+        let input = request(
+            Some(json!(2)),
+            "tools/call",
+            json!({"name": name, "arguments": {}}),
+        );
+        let response = dispatch(&dispatcher, &input, &lifecycle).await;
+        assert_eq!(response["error"]["code"], -32602, "{name}: {response}");
+    }
+
+    // A well-formed call against a name the project does not reference
+    // fails closed with the canonical store's message — authorization
+    // ran first, then the store owned the verdict.
+    for name in ["skills.enable", "skills.disable"] {
+        let input = request(
+            Some(json!(3)),
+            "tools/call",
+            json!({"name": name, "arguments": {"name": "ghost"}}),
+        );
+        let response = dispatch(&dispatcher, &input, &lifecycle).await;
+        assert_eq!(response["error"]["code"], -32603, "{name}: {response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("skill is not referenced by the current project: ghost"),
+            "{name}: {response}"
+        );
+    }
+}
+
+// --------------------------------------------------------------------------
 // mcp.status health tool + metrics
 // --------------------------------------------------------------------------
 
@@ -1368,4 +1412,56 @@ async fn tools_list_carries_registry_metadata() {
     assert_eq!(read["category"], "workspace");
     assert_eq!(read["risk"], "low");
     assert_eq!(read["requiredPermissions"], json!(["filesystem"]));
+}
+
+// --------------------------------------------------------------------------
+// tasks.update: fieldless update is the same error class on every plane
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tasks_update_without_changes_fails_closed_on_the_wire() {
+    let (dispatcher, _dir) = new_dispatcher().await;
+    let lifecycle = SessionLifecycle::default();
+    let input = request(Some(json!(1)), "initialize", init_params());
+    dispatch(&dispatcher, &input, &lifecycle).await;
+
+    let input = request(
+        Some(json!(2)),
+        "tools/call",
+        json!({"name": "tasks.create", "arguments": {"id": "wire-1", "title": "t", "description": "d"}}),
+    );
+    let response = dispatch(&dispatcher, &input, &lifecycle).await;
+    assert!(response["result"].is_object(), "got: {response}");
+
+    // The CLI rejects a fieldless `awh task update` at argument parsing;
+    // the canonical store owns the same verdict, so the MCP plane — which
+    // delegates straight to the store — fails closed identically instead
+    // of silently bumping updated_at.
+    let input = request(
+        Some(json!(3)),
+        "tools/call",
+        json!({"name": "tasks.update", "arguments": {"id": "wire-1"}}),
+    );
+    let response = dispatch(&dispatcher, &input, &lifecycle).await;
+    assert_eq!(response["error"]["code"], -32603, "got: {response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no changes requested"),
+        "got: {response}"
+    );
+
+    // An unknown id keeps the missing → null contract (no error):
+    // tool results are wrapped in the MCP content envelope (text "null").
+    let input = request(
+        Some(json!(4)),
+        "tools/call",
+        json!({"name": "tasks.update", "arguments": {"id": "ghost", "status": "Done"}}),
+    );
+    let response = dispatch(&dispatcher, &input, &lifecycle).await;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(text, "null", "got: {response}");
 }

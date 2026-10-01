@@ -7,6 +7,7 @@
 
 use serde_json::{json, Value};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use tempfile::tempdir;
 
@@ -25,12 +26,20 @@ impl Drop for ServerProcess {
 
 fn spawn_server() -> (ServerProcess, tempfile::TempDir) {
     let dir = tempdir().expect("tempdir");
+    let server = spawn_server_over(dir.path());
+    (server, dir)
+}
+
+/// Spawns a stdio MCP server rooted at an EXISTING workspace root —
+/// used by the cross-process restart test, where server B must serve
+/// the same initialized workspace server A already mutated.
+fn spawn_server_over(root: &Path) -> ServerProcess {
     let mut child = Command::new(env!("CARGO_BIN_EXE_awh"))
         .arg("mcp")
         .arg("serve")
         .arg("--transport")
         .arg("stdio")
-        .current_dir(dir.path())
+        .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -38,14 +47,11 @@ fn spawn_server() -> (ServerProcess, tempfile::TempDir) {
         .expect("spawn awh binary");
     let stdin = child.stdin.take().expect("stdin piped");
     let stdout = std::io::BufReader::new(child.stdout.take().expect("stdout piped"));
-    (
-        ServerProcess {
-            child,
-            stdin: Some(stdin),
-            stdout,
-        },
-        dir,
-    )
+    ServerProcess {
+        child,
+        stdin: Some(stdin),
+        stdout,
+    }
 }
 
 fn send(server: &mut ServerProcess, value: &Value) {
@@ -561,6 +567,63 @@ fn editing_full_matrix_through_real_binary() {
 
     server.stdin = None;
     let status = server.child.wait().expect("clean exit");
+    assert!(status.success());
+}
+
+#[test]
+fn editing_state_survives_mcp_process_restart() {
+    // §8 restart durability across the MCP plane: server A commits an
+    // edit, its process EXITS, and a brand-new server B over the same
+    // workspace must resolve A's exact edit id and roll it back — the
+    // durable provenance/snapshot stores, not any process memory, are
+    // the recovery authority.
+    let dir = tempdir().expect("tempdir");
+    agent_workspace_hub::services::init::initialize_workspace(dir.path())
+        .expect("initialize workspace");
+    let mut server_a = spawn_server_over(dir.path());
+    initialize_session(&mut server_a, 1);
+    std::fs::write(dir.path().join("restart.txt"), "before\n").unwrap();
+
+    let response = call_tool(
+        &mut server_a,
+        2,
+        "filesystem.replace",
+        json!({"path": "restart.txt", "old": "before", "new": "after"}),
+    );
+    let edit: Value = serde_json::from_str(&tool_text(&response)).expect("EditResult JSON");
+    let edit_id = edit["id"].as_str().expect("edit id").to_owned();
+    assert_eq!(edit["status"], "committed");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("restart.txt")).unwrap(),
+        "after\n"
+    );
+
+    // A exits cleanly; nothing survives in memory.
+    server_a.stdin = None;
+    let status = server_a.child.wait().expect("server A exits");
+    assert!(status.success());
+
+    // Fresh process over the SAME initialized workspace root.
+    let mut server_b = spawn_server_over(dir.path());
+    initialize_session(&mut server_b, 1);
+    let rollback = call_tool(
+        &mut server_b,
+        2,
+        "filesystem.rollback",
+        json!({"edit_id": edit_id}),
+    );
+    assert!(
+        rollback["error"].is_null(),
+        "fresh server must resolve the committed edit id: {rollback}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("restart.txt")).unwrap(),
+        "before\n",
+        "server B must restore A's exact pre-edit bytes"
+    );
+
+    server_b.stdin = None;
+    let status = server_b.child.wait().expect("server B exits");
     assert!(status.success());
 }
 

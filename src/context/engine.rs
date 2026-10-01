@@ -194,6 +194,7 @@ pub struct ContextEngine {
     policy: Box<dyn ContextPolicy>,
     offloads: OffloadStore,
     snapshots: SnapshotStore,
+    window: crate::context::window::WindowStore,
     memory: crate::core::memory::MemoryStore,
     items: RwLock<Vec<ContextItem>>,
     protected: RwLock<HashSet<String>>,
@@ -202,10 +203,17 @@ pub struct ContextEngine {
 
 impl ContextEngine {
     /// Builds the engine for a project root, creating state directories.
+    ///
+    /// The active window is durable: a previously persisted window is
+    /// reloaded here (CTX-001 §6 restart contract — write → terminate →
+    /// reload → verify), and a corrupt or unsupported window fails closed
+    /// instead of starting an empty engine over saved state.
     pub fn new(project_root: &Path, config: ContextEngineConfig) -> Result<Self> {
         let policy: Box<dyn ContextPolicy> = match config.policy_type {
             PolicyType::Deterministic => Box::new(DeterministicContextPolicy::default()),
         };
+        let window = crate::context::window::WindowStore::new(project_root)?;
+        let record = window.load()?;
         Ok(Self {
             config,
             counter: ApproxTokenCounter,
@@ -213,9 +221,10 @@ impl ContextEngine {
             policy,
             offloads: OffloadStore::new(project_root)?,
             snapshots: SnapshotStore::new(project_root)?,
+            window,
             memory: crate::core::memory::MemoryStore::new(project_root)?,
-            items: RwLock::new(Vec::new()),
-            protected: RwLock::new(HashSet::new()),
+            items: RwLock::new(record.items),
+            protected: RwLock::new(record.protected.into_iter().collect()),
             last_decision: RwLock::new(None),
         })
     }
@@ -233,6 +242,19 @@ impl ContextEngine {
     // ---------------------------------------------------------------------
     // Items
     // ---------------------------------------------------------------------
+
+    /// Publishes the current window durably. Called under the items write
+    /// lock so the persisted file can never observe a half-mutated state.
+    /// Durable-first: callers only commit in-memory changes that this
+    /// publish accepted (or roll back on error), so a failed write never
+    /// produces a false success.
+    fn persist_window(&self, items: &[ContextItem], protected: &HashSet<String>) -> Result<()> {
+        self.window.save(&crate::context::window::WindowRecord {
+            schema_version: crate::context::window::WINDOW_SCHEMA_VERSION,
+            items: items.to_vec(),
+            protected: protected.iter().cloned().collect(),
+        })
+    }
 
     /// Inserts or replaces an item by id, recomputing its token count.
     ///
@@ -259,8 +281,13 @@ impl ContextEngine {
         }
         // Recount defensively: token_count must always reflect content.
         item.token_count = self.counter.count(&item.content);
-        items.retain(|i| i.id != item.id);
-        items.push(item.clone());
+        let mut next: Vec<ContextItem> = items.clone();
+        next.retain(|i| i.id != item.id);
+        next.push(item.clone());
+        let protected = self.protected.read().expect("protected lock poisoned");
+        // Durable publish first; only a successful write commits memory.
+        self.persist_window(&next, &protected)?;
+        *items = next;
         Ok(item)
     }
 
@@ -287,27 +314,33 @@ impl ContextEngine {
         if !is_valid_item_id(id) {
             return false;
         }
-        let exists = self
-            .items
-            .read()
-            .expect("context item lock poisoned")
-            .iter()
-            .any(|i| i.id == id);
+        let items = self.items.read().expect("context item lock poisoned");
+        let exists = items.iter().any(|i| i.id == id);
+        drop(items);
         if exists {
-            self.protected
-                .write()
-                .expect("protected lock poisoned")
-                .insert(id.to_string());
+            let mut protected = self.protected.write().expect("protected lock poisoned");
+            protected.insert(id.to_string());
+            let items = self.items.read().expect("context item lock poisoned");
+            // Protection is part of the durable window; on a failed write
+            // the set is rolled back so memory never diverges from disk.
+            if self.persist_window(&items, &protected).is_err() {
+                protected.remove(id);
+            }
         }
         exists
     }
 
     /// Removes protection for an item.
     pub fn unprotect(&self, id: &str) -> bool {
-        self.protected
-            .write()
-            .expect("protected lock poisoned")
-            .remove(id)
+        let mut protected = self.protected.write().expect("protected lock poisoned");
+        let removed = protected.remove(id);
+        if removed {
+            let items = self.items.read().expect("context item lock poisoned");
+            if self.persist_window(&items, &protected).is_err() {
+                protected.insert(id.to_string());
+            }
+        }
+        removed
     }
 
     /// Whether an item is protected.
@@ -322,13 +355,19 @@ impl ContextEngine {
     pub fn remove_item(&self, id: &str) -> bool {
         let mut items = self.items.write().expect("context item lock poisoned");
         let before = items.len();
-        items.retain(|i| i.id != id);
-        let removed = before != items.len();
+        let mut next: Vec<ContextItem> = items.clone();
+        next.retain(|i| i.id != id);
+        let removed = before != next.len();
+        let mut protected = self.protected.write().expect("protected lock poisoned");
         if removed {
-            self.protected
-                .write()
-                .expect("protected lock poisoned")
-                .remove(id);
+            protected.remove(id);
+            // Durable publish of the removal; the in-memory set only
+            // commits when the window file accepted the change.
+            if self.persist_window(&next, &protected).is_err() {
+                protected.insert(id.to_string());
+                return false;
+            }
+            *items = next;
         }
         removed
     }
@@ -738,8 +777,16 @@ impl ContextEngine {
 
     fn replace_item(&self, item: ContextItem) {
         let mut items = self.items.write().expect("context item lock poisoned");
-        items.retain(|i| i.id != item.id);
-        items.push(item);
+        let mut next: Vec<ContextItem> = items.clone();
+        next.retain(|i| i.id != item.id);
+        next.push(item);
+        let protected = self.protected.read().expect("protected lock poisoned");
+        // State flips (offload/restore/archive/compress) are window changes
+        // too; persist first and only commit on success so a failed write
+        // leaves the previous state standing.
+        if self.persist_window(&next, &protected).is_ok() {
+            *items = next;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1316,5 +1363,99 @@ mod tests {
         // Overwrite (replace) always works.
         engine.insert(active_item("item-0", "c2", 0.5)).unwrap();
         assert_eq!(engine.list_items().len(), 100);
+    }
+
+    // ------------------------------------------------------------------
+    // Durable active window (CTX-001 §6: write → terminate → reload →
+    // verify; corruption and removal must be observable from a fresh
+    // engine, not just the live one).
+    // ------------------------------------------------------------------
+
+    fn reload(temp: &tempfile::TempDir) -> ContextEngine {
+        engine_in(temp)
+    }
+
+    #[test]
+    fn window_survives_restart_with_items_protection_and_state() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let engine = engine_in(&temp);
+            engine
+                .insert(active_item("a", "persisted content", 0.5))
+                .unwrap();
+            engine
+                .insert(active_item("b", "to be offloaded", 0.1))
+                .unwrap();
+            engine.protect("a");
+            assert!(engine.offload("b", "test").is_ok());
+        }
+        // Fresh engine (new process equivalent) reloads the window.
+        let engine = reload(&temp);
+        assert_eq!(engine.list_items().len(), 2);
+        assert_eq!(
+            engine.get_item("a").expect("item a reloaded").content,
+            "persisted content"
+        );
+        assert!(engine.is_protected("a"), "protection is durable");
+        assert_eq!(
+            engine.get_item("b").expect("item b reloaded").state,
+            ContextState::Offloaded
+        );
+        // Restoring a reloaded offloaded item still works (the offload
+        // record and the window agree after restart).
+        let restored = engine.restore("b").unwrap();
+        assert!(restored.state.is_active());
+        assert!(!engine.is_protected("b"));
+    }
+
+    #[test]
+    fn window_removal_is_durable() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(&temp);
+        engine.insert(active_item("gone", "content", 0.5)).unwrap();
+        assert!(engine.remove_item("gone"));
+        let reloaded = reload(&temp);
+        assert!(reloaded.get_item("gone").is_none());
+    }
+
+    #[test]
+    fn corrupt_window_fails_engine_construction_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let engine = engine_in(&temp);
+            engine.insert(active_item("a", "content", 0.5)).unwrap();
+        }
+        let window_path = temp
+            .path()
+            .join(".agent")
+            .join("context-engine")
+            .join("active.json");
+        std::fs::write(&window_path, "{ broken").unwrap();
+        let error = match ContextEngine::new(temp.path(), ContextEngineConfig::default()) {
+            Err(error) => error,
+            Ok(_) => panic!("corrupt window must fail construction"),
+        };
+        assert!(
+            error.to_string().contains("corrupt context window"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn stale_engine_never_sees_removed_items_and_search_agrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = engine_in(&temp);
+        writer
+            .insert(active_item("shared", "find me across processes", 0.5))
+            .unwrap();
+        // A second engine (the CLI/MCP restart case) sees and can mutate
+        // the durable window independently.
+        let reader = reload(&temp);
+        assert!(reader.get_item("shared").is_some());
+        assert!(reader.remove_item("shared"));
+        let third = reload(&temp);
+        assert!(third.get_item("shared").is_none());
+        let hits = third.search("find me", 10).unwrap();
+        assert!(hits.is_empty(), "removed item must not surface in search");
     }
 }

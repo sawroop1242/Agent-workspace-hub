@@ -257,22 +257,48 @@ impl WorkspaceBackend for LocalBackend {
     fn write_file(&self, relative: &str, content: &str) -> Result<bool> {
         let svc = crate::services::files::FilesService::new(&self.root);
         svc.write(relative, content)?;
+        // Same audit shape as api_file_write: the path (truncated) is
+        // the subject, the byte count is the detail, and the content —
+        // which can carry secrets — never reaches the audit log.
+        crate::services::audit::record_allow(
+            "tui_file_write",
+            &truncate_detail(relative, 120),
+            &format!("bytes={}", content.len()),
+        );
         Ok(true)
     }
 
     fn delete_path(&self, relative: &str) -> Result<()> {
         let svc = crate::services::files::FilesService::new(&self.root);
-        svc.delete(relative)
+        svc.delete(relative)?;
+        crate::services::audit::record_allow(
+            "tui_file_delete",
+            &truncate_detail(relative, 120),
+            "operator",
+        );
+        Ok(())
     }
 
     fn rename_path(&self, from: &str, to: &str) -> Result<()> {
         let svc = crate::services::files::FilesService::new(&self.root);
-        svc.rename(from, to)
+        svc.rename(from, to)?;
+        crate::services::audit::record_allow(
+            "tui_file_rename",
+            &truncate_detail(from, 120),
+            &truncate_detail(to, 120),
+        );
+        Ok(())
     }
 
     fn create_dir(&self, relative: &str) -> Result<()> {
         let svc = crate::services::files::FilesService::new(&self.root);
-        svc.create_dir(relative)
+        svc.create_dir(relative)?;
+        crate::services::audit::record_allow(
+            "tui_file_mkdir",
+            &truncate_detail(relative, 120),
+            "operator",
+        );
+        Ok(())
     }
 
     fn meta(&self, relative: &str) -> Result<FileMeta> {
@@ -381,7 +407,16 @@ impl WorkspaceBackend for LocalBackend {
         if content.len() > MAX_CONTEXT_BYTES {
             anyhow::bail!("context exceeds {} byte safety cap", MAX_CONTEXT_BYTES);
         }
-        crate::core::context::ContextStore::for_project(&self.store_root(project)).write(content)
+        crate::core::context::ContextStore::for_project(&self.store_root(project))
+            .write(content)?;
+        // Same audit shape as api_context_write: the scope label is the
+        // subject, never the content.
+        crate::services::audit::record_allow(
+            "tui_context_write",
+            &scope_label(project),
+            "operator",
+        );
+        Ok(())
     }
 
     fn list_memory(&self, project: Option<&str>) -> Result<Vec<MemoryEntry>> {
@@ -391,6 +426,13 @@ impl WorkspaceBackend for LocalBackend {
     fn append_memory(&self, project: Option<&str>, content: &str) -> Result<()> {
         crate::core::memory::MemoryStore::for_project(&self.store_root(project))?
             .append(content)?;
+        // Same audit shape as api_memory_append: scope as the subject,
+        // never the appended content.
+        crate::services::audit::record_allow(
+            "tui_memory_append",
+            &scope_label(project),
+            "operator",
+        );
         Ok(())
     }
 
@@ -407,11 +449,26 @@ impl WorkspaceBackend for LocalBackend {
     fn toggle_project_skill(&self, project: Option<&str>, name: &str) -> Result<bool> {
         let registry = crate::skills::GlobalSkillRegistry::discover()?;
         let refs = crate::skills::ProjectSkillReferences::new(self.store_root(project));
-        if refs.load()?.skills.iter().any(|s| s == name) {
+        let was_referenced = refs.load()?.skills.iter().any(|s| s == name);
+        let changed = if was_referenced {
             refs.remove(name)
         } else {
             refs.add(name, &registry)
+        }?;
+        if changed {
+            // Same audit shape as api_skill_add/api_skill_remove: the
+            // skill name is the subject, the scope label the detail.
+            crate::services::audit::record_allow(
+                if was_referenced {
+                    "tui_skill_remove"
+                } else {
+                    "tui_skill_add"
+                },
+                name,
+                &scope_label(project),
+            );
         }
+        Ok(changed)
     }
 
     fn current_project_hint(&self) -> Option<String> {
@@ -449,6 +506,12 @@ fn truncate_detail(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max - 1).collect();
         format!("{cut}\u{2026}")
     }
+}
+
+/// Scope label for audit subjects (never includes paths) — the same
+/// convention the Control API uses (`scope_name`).
+fn scope_label(project: Option<&str>) -> String {
+    project.unwrap_or("(root)").to_owned()
 }
 
 #[cfg(test)]
@@ -574,5 +637,114 @@ mod tests {
         let backend = LocalBackend::new(tmp.path().to_path_buf());
         assert!(backend.read_file("../etc/passwd").is_err());
         assert!(backend.list_dir("../../").is_err());
+    }
+
+    #[test]
+    fn local_file_mutations_audit_identifiers_never_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(tmp.path().to_path_buf());
+        backend
+            .write_file("secret-note.txt", "hush-file-secret")
+            .unwrap();
+        backend.create_dir("made").unwrap();
+        backend.rename_path("secret-note.txt", "moved.txt").unwrap();
+        backend.delete_path("moved.txt").unwrap();
+
+        // The ring is shared with every parallel test thread; scan the
+        // full ring (newest-first) rather than a small window so
+        // sibling events cannot hide this test's entries.
+        let recent = crate::services::audit::global().recent(1000);
+        // The same shape as api_file_write: truncated path as the
+        // subject, byte count as the detail, content never present.
+        let write = recent
+            .iter()
+            .find(|e| e.action == "tui_file_write" && e.subject == "secret-note.txt")
+            .expect("file write audited");
+        assert!(write.detail.starts_with("bytes="));
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "tui_file_mkdir" && e.subject == "made"));
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "tui_file_rename" && e.subject == "secret-note.txt"));
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "tui_file_delete" && e.subject == "moved.txt"));
+        assert!(!recent
+            .iter()
+            .any(|e| format!("{e:?}").contains("hush-file-secret")));
+    }
+
+    #[test]
+    fn local_context_and_memory_writes_audit_scope_not_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(tmp.path().to_path_buf());
+        backend.write_context(None, "hush-context-secret").unwrap();
+        backend.append_memory(None, "hush-memory-secret").unwrap();
+
+        let recent = crate::services::audit::global().recent(1000);
+        // The same shape as api_context_write/api_memory_append: the
+        // scope label is the subject, the content never appears.
+        let context = recent
+            .iter()
+            .find(|e| e.action == "tui_context_write" && e.subject == "(root)")
+            .expect("context write audited");
+        assert_eq!(context.detail, "operator");
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "tui_memory_append" && e.subject == "(root)"));
+        assert!(!recent
+            .iter()
+            .any(|e| format!("{e:?}").contains("hush-context-secret")));
+        assert!(!recent
+            .iter()
+            .any(|e| format!("{e:?}").contains("hush-memory-secret")));
+    }
+
+    #[test]
+    fn local_skill_toggle_audits_add_then_remove() {
+        // LocalBackend resolves the global registry via the documented
+        // AWH_GLOBAL_SKILLS_ROOT seam; point it at a private tempdir so
+        // the test seeds and toggles its own skill and never touches
+        // the developer's real registry.
+        let skills_root = tempfile::tempdir().unwrap();
+        std::env::set_var("AWH_GLOBAL_SKILLS_ROOT", skills_root.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(workspace.path().to_path_buf());
+        let registry = crate::skills::GlobalSkillRegistry::discover().unwrap();
+        // Keep the name under the audit redactor's 16-char token-run
+        // threshold (redact_token_like) so the subject survives intact
+        // for assertion — long hyphenated names are deliberately
+        // masked as token-like by Phase 10's choke point.
+        registry
+            .create("audit-probe", "pins tui skill toggle audit")
+            .unwrap();
+
+        // The ring is a shared singleton and sibling tests can push
+        // entries between this test's toggle and its read; re-anchor
+        // the same way the dashboard test does — each round toggles
+        // once (flipping add/remove) and rescans the full ring, with a
+        // bound that adversarial interleaving cannot approach.
+        let mut saw_add = false;
+        let mut saw_remove = false;
+        for _ in 0..50 {
+            assert!(backend.toggle_project_skill(None, "audit-probe").unwrap());
+            let recent = crate::services::audit::global().recent(1000);
+            saw_add |= recent
+                .iter()
+                .any(|e| e.action == "tui_skill_add" && e.subject == "audit-probe");
+            saw_remove |= recent
+                .iter()
+                .any(|e| e.action == "tui_skill_remove" && e.subject == "audit-probe");
+            if saw_add && saw_remove {
+                break;
+            }
+        }
+        assert!(
+            saw_add && saw_remove,
+            "tui skill toggle must audit both directions (add={saw_add}, remove={saw_remove})"
+        );
+
+        std::env::remove_var("AWH_GLOBAL_SKILLS_ROOT");
     }
 }

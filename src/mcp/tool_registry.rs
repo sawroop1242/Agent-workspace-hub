@@ -445,6 +445,20 @@ static REGISTRY: &[ToolDefinition] = &[
         Medium,
         []
     ),
+    awh_tool!(
+        "skills.disable",
+        "Disable a skill reference",
+        "skills",
+        Medium,
+        []
+    ),
+    awh_tool!(
+        "skills.enable",
+        "Enable a skill reference",
+        "skills",
+        Medium,
+        []
+    ),
     awh_tool!("skills.list", "List project skills", "skills", Low, []),
     awh_tool!("skills.read", "Read a skill", "skills", Low, []),
     awh_tool!(

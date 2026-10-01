@@ -7,7 +7,10 @@
 //! one-file-per-task store under `.agent/tasks/<id>.json` had no
 //! production callers and was removed by ARCH-001.)
 
+use crate::core::agents::AgentStore;
+use crate::core::sessions::SessionStore;
 use crate::mcp::store_lock::StoreLock;
+use crate::services::worktree::WorktreeStore;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -59,8 +62,40 @@ pub enum TaskStatus {
     InProgress,
     /// Blocked by a dependency.
     Blocked,
-    /// Completed.
+    /// Completed (terminal).
     Done,
+    /// Abandoned without completing (terminal). The CLI `task cancel`
+    /// verb lands here; a cancelled task is never silently reopened —
+    /// create a new task instead.
+    Cancelled,
+}
+
+impl TaskStatus {
+    /// The canonical wire name (identical to the serde representation),
+    /// used in stable error messages.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskStatus::Todo => "Todo",
+            TaskStatus::InProgress => "InProgress",
+            TaskStatus::Blocked => "Blocked",
+            TaskStatus::Done => "Done",
+            TaskStatus::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Terminal states have no outgoing transitions.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, TaskStatus::Done | TaskStatus::Cancelled)
+    }
+}
+
+/// The task state machine: `Done` and `Cancelled` are terminal — every
+/// transition out of them is invalid, so a completed or abandoned task
+/// can never be silently reopened (create a new task instead). All
+/// moves among the live states (`Todo`/`InProgress`/`Blocked`) are
+/// legal, and a live task may be completed or cancelled at any time.
+pub fn is_valid_task_transition(from: &TaskStatus, _to: &TaskStatus) -> bool {
+    !from.is_terminal()
 }
 
 /// Relative importance of a [`Task`].
@@ -84,6 +119,7 @@ struct TaskFile {
 /// Canonical project-scoped task store persisted to `.agent/tasks.json`.
 pub struct TaskStore {
     path: PathBuf,
+    root: PathBuf,
 }
 
 impl TaskStore {
@@ -93,6 +129,7 @@ impl TaskStore {
         fs::create_dir_all(root.join(".agent"))?;
         Ok(Self {
             path: root.join(".agent").join("tasks.json"),
+            root,
         })
     }
 
@@ -180,6 +217,14 @@ impl TaskStore {
     }
 
     /// Updates a task's status, priority, and/or assignee, returning the updated task.
+    ///
+    /// Status changes run through the canonical state machine
+    /// ([`is_valid_task_transition`]): terminal states (`Done`,
+    /// `Cancelled`) have no outgoing transitions, so a completed or
+    /// abandoned task can never be silently reopened. Assignment
+    /// targets must exist in this workspace as a canonical agent,
+    /// session, or worktree id — assignment is metadata only and never
+    /// grants the assignee capabilities.
     pub fn update(
         &self,
         id: &str,
@@ -187,14 +232,32 @@ impl TaskStore {
         priority: Option<TaskPriority>,
         assignee: Option<Option<String>>,
     ) -> Result<Option<Task>> {
+        if let Some(target) = assignee.as_ref().and_then(|a| a.as_deref()) {
+            if !target.is_empty() {
+                self.validate_assignee(target)?;
+            }
+        }
         let _lock = StoreLock::acquire(&self.path)?;
         let mut file = self.load()?;
         let task = match file.tasks.iter_mut().find(|t| t.id == id) {
             Some(t) => t,
             None => return Ok(None),
         };
-        if let Some(v) = status {
-            task.status = v;
+        if status.is_none() && priority.is_none() && assignee.is_none() {
+            // Same error class the CLI surfaces for a fieldless `awh task
+            // update`: a mutation call must name what it changes, on
+            // every interface plane.
+            bail!("no changes requested: provide at least one of status, priority, or assignee");
+        }
+        if let Some(new_status) = &status {
+            if &task.status != new_status && !is_valid_task_transition(&task.status, new_status) {
+                bail!(
+                    "invalid task transition {} -> {}: terminal tasks cannot be reopened; create a new task instead",
+                    task.status.as_str(),
+                    new_status.as_str()
+                );
+            }
+            task.status = new_status.clone();
         }
         if let Some(v) = priority {
             task.priority = v;
@@ -206,6 +269,62 @@ impl TaskStore {
         let result = task.clone();
         self.save(&file)?;
         Ok(Some(result))
+    }
+
+    /// Cancels a task: the live-state → `Cancelled` transition with the
+    /// same validation and locking as [`Self::update`]. Cancelling an
+    /// already-terminal task is a stable conflict error (never a silent
+    /// success), and an unknown id fails closed.
+    pub fn cancel(&self, id: &str) -> Result<Task> {
+        let _lock = StoreLock::acquire(&self.path)?;
+        let mut file = self.load()?;
+        let task = file
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))?;
+        if task.status.is_terminal() {
+            bail!(
+                "invalid task transition {} -> Cancelled: terminal tasks cannot be reopened; create a new task instead",
+                task.status.as_str()
+            );
+        }
+        task.status = TaskStatus::Cancelled;
+        task.updated_at = Utc::now().to_rfc3339();
+        let result = task.clone();
+        self.save(&file)?;
+        Ok(result)
+    }
+
+    /// Assignment targets must be canonical ids that exist in this
+    /// workspace: a runtime session (`sess-…`), a managed worktree
+    /// record (`wt-…`), or an agent profile id (free-form safe ids like
+    /// `writer`; the agent store fails closed on unsafe ids, so an
+    /// arbitrary string simply resolves to "not found"). Free-text
+    /// targets that match nothing are rejected — assignment is a
+    /// reference, not a capability grant, and a dangling reference is
+    /// a lie about who owns the work.
+    fn validate_assignee(&self, target: &str) -> Result<()> {
+        let found = if target.starts_with("sess-") {
+            SessionStore::new(&self.root)
+                .get(target)
+                .map(|s| s.is_some())?
+        } else if target.starts_with("wt-") {
+            WorktreeStore::new(self.root.clone())
+                .list()
+                .map_err(anyhow::Error::from)
+                .map(|records| records.iter().any(|r| r.worktree_id == target))?
+        } else {
+            AgentStore::new(&self.root)
+                .get(target)
+                .map(|a| a.is_some())?
+        };
+        if !found {
+            bail!(
+                "assignee not found: {target} (must be an existing agent profile, sess-, or wt- id in this workspace)"
+            );
+        }
+        Ok(())
     }
 
     /// Deletes the task with the given `id`, returning whether it existed.
@@ -253,6 +372,175 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path()).unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn terminal_states_have_no_outgoing_transitions() {
+        // live states may move freely and may finish or cancel
+        for from in [
+            TaskStatus::Todo,
+            TaskStatus::InProgress,
+            TaskStatus::Blocked,
+        ] {
+            for to in [
+                TaskStatus::Todo,
+                TaskStatus::InProgress,
+                TaskStatus::Blocked,
+                TaskStatus::Done,
+                TaskStatus::Cancelled,
+            ] {
+                assert!(
+                    is_valid_task_transition(&from, &to),
+                    "{from:?} -> {to:?} must be legal"
+                );
+            }
+        }
+        // terminal states are terminal
+        for from in [TaskStatus::Done, TaskStatus::Cancelled] {
+            for to in [
+                TaskStatus::Todo,
+                TaskStatus::InProgress,
+                TaskStatus::Blocked,
+                TaskStatus::Done,
+                TaskStatus::Cancelled,
+            ] {
+                assert!(
+                    !is_valid_task_transition(&from, &to),
+                    "{from:?} -> {to:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn update_rejects_reopening_terminal_tasks() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+
+        // Todo -> Done is legal
+        store
+            .update("t1", Some(TaskStatus::Done), None, None)
+            .unwrap()
+            .expect("task exists");
+
+        // Done -> InProgress is rejected, and the store did not mutate
+        let err = store
+            .update("t1", Some(TaskStatus::InProgress), None, None)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid task transition Done -> InProgress"));
+        assert_eq!(store.get("t1").unwrap().unwrap().status, TaskStatus::Done);
+
+        // same-status update stays a permitted no-op (idempotent)
+        store
+            .update("t1", Some(TaskStatus::Done), None, None)
+            .unwrap()
+            .expect("task exists");
+    }
+
+    #[test]
+    fn cancel_is_terminal_and_repeated_cancel_fails_closed() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+
+        let cancelled = store.cancel("t1").unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+
+        // replayed cancel: stable conflict error, never a silent success
+        let err = store.cancel("t1").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid task transition Cancelled -> Cancelled"));
+
+        // cancel of a Done task is rejected too
+        let (id, title, description, tags) = make_task("t2");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+        store
+            .update("t2", Some(TaskStatus::Done), None, None)
+            .unwrap();
+        assert!(store
+            .cancel("t2")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid task transition Done -> Cancelled"));
+
+        // unknown id fails closed
+        assert!(store.cancel("ghost").is_err());
+    }
+
+    #[test]
+    fn assignee_must_exist_in_this_workspace() {
+        let (store, dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+
+        // unknown free-text target rejected
+        let err = store
+            .update("t1", None, None, Some(Some("nobody".to_string())))
+            .unwrap_err();
+        assert!(err.to_string().contains("assignee not found: nobody"));
+
+        // unknown session-shaped id rejected (not merely prefix-trusted)
+        let err = store
+            .update("t1", None, None, Some(Some("sess-ghost".to_string())))
+            .unwrap_err();
+        assert!(err.to_string().contains("assignee not found: sess-ghost"));
+
+        // a real agent profile is accepted
+        crate::core::agents::AgentStore::new(dir.path())
+            .create(&crate::models::agent::Agent {
+                id: "writer".to_string(),
+                name: "Writer".to_string(),
+                role: "writer".to_string(),
+                status: crate::models::agent::AgentStatus::Active,
+                enabled: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        store
+            .update("t1", None, None, Some(Some("writer".to_string())))
+            .unwrap()
+            .expect("task exists");
+        assert_eq!(
+            store.get("t1").unwrap().unwrap().assignee.as_deref(),
+            Some("writer")
+        );
+
+        // clearing the assignee needs no validation
+        store
+            .update("t1", None, None, Some(None))
+            .unwrap()
+            .expect("task exists");
+        assert_eq!(store.get("t1").unwrap().unwrap().assignee, None);
+    }
+
+    #[test]
+    fn legacy_records_without_cancelled_still_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".agent/tasks.json"),
+            r#"{"tasks":[{"id":"old-1","title":"t","description":"d","status":"Done","priority":"Normal","assignee":null,"tags":[],"created_at":"2024-01-01T00:00:00+00:00","updated_at":"2024-01-01T00:00:00+00:00"}]}"#,
+        )
+        .unwrap();
+        let store = TaskStore::new(dir.path()).unwrap();
+        let task = store.get("old-1").unwrap().expect("legacy record");
+        assert_eq!(task.status, TaskStatus::Done);
+        // and it stays terminal
+        assert!(store
+            .update("old-1", Some(TaskStatus::Todo), None, None)
+            .is_err());
     }
 
     fn make_task(id: &str) -> (String, String, String, Vec<String>) {
@@ -392,6 +680,30 @@ mod tests {
                 vec![]
             )
             .is_ok());
+    }
+
+    #[test]
+    fn update_without_changes_fails_closed_on_every_plane() {
+        let (store, _dir) = temp_store();
+        let (id, title, description, tags) = make_task("t1");
+        store
+            .create(id, title, description, TaskPriority::Normal, tags)
+            .unwrap();
+
+        // Fieldless update: same error class the CLI's argument guard
+        // produces — the store is the authority so MCP callers hit it too.
+        let err = store.update("t1", None, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "no changes requested: provide at least one of status, priority, or assignee"
+            ),
+            "got: {err}"
+        );
+
+        // An unknown id still resolves to `Ok(None)` (missing → null, not
+        // an error) — the guard fires only when a real task would be
+        // pointlessly rewritten.
+        assert!(store.update("missing", None, None, None).unwrap().is_none());
     }
 
     #[test]

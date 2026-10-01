@@ -6,7 +6,7 @@
 
 ## At a glance
 
-- **MCP server** — 53 core tools (65 with the GitHub provider) exposed over stdio and HTTPS + SSE.
+- **MCP server** — 59 core tools (71 with the GitHub provider) exposed over stdio and HTTPS + SSE.
 - **Durable handoff** — project state (context, memory, tasks, skills) persists in `.agent/`, so a fresh agent can resume work without a new bootstrap prompt.
 - **Agent profiles** — named profiles with policy-routed, namespaced routes (`/claude/mcp`, `/qwen/sse`, …); authorization stays in a single capability/policy engine.
 - **Security-first** — fail-closed policy gates, token authentication, path-traversal rejection, and a bounded audit ring.

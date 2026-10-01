@@ -103,6 +103,40 @@ enum Command {
         #[command(subcommand)]
         command: agent_workspace_hub::cli::fs_edit::FsCommand,
     },
+    /// Context Engine (CTX-001): thin adapter over the canonical
+    /// ContextEngine — scoped items, budgets, deterministic scoring,
+    /// soft offloading and snapshots. Offloaded items are never lost
+    /// and source files are never modified.
+    Context {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::context::ContextCommand,
+    },
+    /// Memory (MEM-001): thin adapter over the canonical MemoryStore —
+    /// the same authority MCP, the Control API, the TUI, and the Context
+    /// Engine use. Mutations are validated, lock-guarded, atomically
+    /// published, and audited.
+    Memory {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::memory::MemoryCommand,
+    },
+    /// Tasks (TSK-001): thin adapter over the canonical TaskStore —
+    /// the same authority the MCP task tools use. Status changes run
+    /// through the canonical state machine, assignment targets must
+    /// exist in this workspace, and mutations are audited.
+    Task {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::tasks::TaskCommand,
+    },
+    /// Terminal (TRM-001): thin adapter over the canonical
+    /// TerminalService — the same authority the MCP `terminal.run`
+    /// tool, the Control API `/terminal/run` route, and the TUI
+    /// terminal screen use. argv-only (never a shell), bounded by a
+    /// wall-clock timeout and a 256 KiB capture cap, and audited.
+    /// Lifecycle is ephemeral: runs complete within the command.
+    Terminal {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::terminal::TerminalCommand,
+    },
     Tunnel {
         #[command(subcommand)]
         command: TunnelCommand,
@@ -232,6 +266,9 @@ enum SkillCommand {
         description: String,
     },
     List,
+    Show {
+        name: String,
+    },
     Read {
         name: String,
     },
@@ -239,6 +276,12 @@ enum SkillCommand {
         name: String,
     },
     Remove {
+        name: String,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
         name: String,
     },
     Project,
@@ -484,6 +527,14 @@ fn main() -> Result<()> {
     let project = ProjectSkillReferences::new(std::env::current_dir()?);
     let home = dirs::home_dir().context("could not determine home directory")?;
     let registry_store = RegistryStore::new(home.join(".agent-workspace-hub"));
+    // Skill mutations audit like every other mutating surface: switch the
+    // shared audit store to durable persistence (cwd workspace) first;
+    // buffered startup events replay into it. Degraded mode stays
+    // explicit — keep going on failure, the ring still records.
+    if let Err(error) = agent_workspace_hub::services::audit::init_global(std::env::current_dir()?)
+    {
+        tracing::error!(event = "audit_init_failed", error = %error);
+    }
     match cli.command {
         Some(Command::Init { path }) => {
             use agent_workspace_hub::services::init::{initialize_workspace, InitOutcome};
@@ -526,6 +577,7 @@ fn main() -> Result<()> {
         Some(Command::Skill { command }) => match command {
             SkillCommand::Create { name, description } => {
                 let s = global.create(&name, &description)?;
+                audit_skill_mutation("cli_skill_create", &s.name, "created global skill");
                 println!(
                     "created global skill: {}\npath: {}",
                     s.name,
@@ -533,9 +585,46 @@ fn main() -> Result<()> {
                 );
             }
             SkillCommand::List => {
+                // One view distinguishing the three contract states:
+                // every listed skill is installed; the suffix says
+                // whether this project references it, and whether that
+                // reference is enabled for runtime exposure.
+                let referenced: std::collections::HashMap<String, bool> = project
+                    .states()?
+                    .into_iter()
+                    .map(|state| (state.name, state.enabled))
+                    .collect();
                 for s in global.list()? {
-                    println!("{} — {}", s.name, s.description)
+                    match referenced.get(&s.name) {
+                        Some(true) => println!(
+                            "{} — {} [installed; referenced; enabled]",
+                            s.name, s.description
+                        ),
+                        Some(false) => println!(
+                            "{} — {} [installed; referenced; disabled]",
+                            s.name, s.description
+                        ),
+                        None => {
+                            println!("{} — {} [installed; not referenced]", s.name, s.description)
+                        }
+                    }
                 }
+            }
+            SkillCommand::Show { name } => {
+                let s = global
+                    .get(&name)?
+                    .ok_or_else(|| anyhow::anyhow!("skill not found: {name}"))?;
+                let state = project.states()?;
+                let referenced = state.iter().find(|st| st.name == name);
+                println!(
+                    "name: {}\ndescription: {}\nversion: {}\npath: {}\ninstalled: yes\nreferenced: {}\nenabled: {}",
+                    s.name,
+                    s.description,
+                    s.version.as_deref().unwrap_or("unknown"),
+                    s.path.display(),
+                    referenced.is_some(),
+                    referenced.is_some_and(|st| st.enabled),
+                );
             }
             SkillCommand::Read { name } => match global.get(&name)? {
                 Some(s) => println!(
@@ -549,14 +638,34 @@ fn main() -> Result<()> {
             },
             SkillCommand::Add { name } => {
                 project.add(&name, &global)?;
+                audit_skill_mutation("cli_skill_add", &name, "added project skill reference");
                 println!("added project skill reference: {name}")
             }
             SkillCommand::Remove { name } => {
                 if project.remove(&name)? {
+                    audit_skill_mutation(
+                        "cli_skill_remove",
+                        &name,
+                        "removed project skill reference",
+                    );
                     println!("removed project skill reference: {name}")
                 } else {
                     bail!("skill reference not found: {name}")
                 }
+            }
+            SkillCommand::Enable { name } => {
+                project.enable(&name)?;
+                audit_skill_mutation("cli_skill_enable", &name, "enabled project skill reference");
+                println!("enabled project skill reference: {name}")
+            }
+            SkillCommand::Disable { name } => {
+                project.disable(&name)?;
+                audit_skill_mutation(
+                    "cli_skill_disable",
+                    &name,
+                    "disabled project skill reference",
+                );
+                println!("disabled project skill reference: {name}")
             }
             SkillCommand::Project => {
                 for s in project.resolve(&global)? {
@@ -581,9 +690,15 @@ fn main() -> Result<()> {
                 rt.block_on(
                     SkillInstaller::new(cache).install_from_registry(&client, &name, &global),
                 )?;
+                audit_skill_mutation(
+                    "cli_skill_install",
+                    &name,
+                    "installed global skill from registry",
+                );
                 println!("installed global skill: {name}");
                 if add {
                     project.add(&name, &global)?;
+                    audit_skill_mutation("cli_skill_add", &name, "added project skill reference");
                     println!("added project reference: {name}")
                 }
             }
@@ -591,6 +706,7 @@ fn main() -> Result<()> {
                 let path = global.skills_dir().join(&name);
                 if path.exists() {
                     std::fs::remove_dir_all(path)?;
+                    audit_skill_mutation("cli_skill_uninstall", &name, "uninstalled global skill");
                     println!("uninstalled global skill: {name}")
                 } else {
                     bail!("skill not installed: {name}")
@@ -627,6 +743,50 @@ fn main() -> Result<()> {
             std::process::exit(agent_workspace_hub::cli::worktree::run(command, &root));
         }
         Some(Command::Policy { command }) => handle_policy_cli(command)?,
+        Some(Command::Memory { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // MEM-001: mutations must land in the durable audit log, not
+            // die with the process ring — same treatment as the fs arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::memory::handle_memory_cli(&root, command)?;
+        }
+        Some(Command::Task { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // TSK-001: mutations must land in the durable audit log, not
+            // die with the process ring — same treatment as the fs arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::tasks::handle_task_cli(&root, command)?;
+        }
+        Some(Command::Terminal { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // TRM-001: terminal execution is high-risk, so runs must land
+            // in the durable audit log — same treatment as the task arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::terminal::handle_terminal_cli(&root, command)?;
+        }
+        Some(Command::Context { command }) => {
+            // CTX-001: the CLI mirrors the MCP dispatcher's construction
+            // path (same root, same AWH_CONTEXT_* env overrides) so both
+            // interfaces observe identical engine semantics. Context
+            // mutations audit identifiers/outcomes, so switch the store
+            // to durable persistence before the run — same treatment
+            // as the task arm.
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::context::handle_context_cli(&root, command)?;
+        }
         Some(Command::Fs { command }) => {
             // The fs family returns its own stable exit codes (AWE-014
             // §23); propagate them as the process status.
@@ -950,6 +1110,13 @@ fn search_registry(url: &str, query: &str) -> Result<()> {
         println!("{} v{} — {}", s.name, s.version, s.description)
     }
     Ok(())
+}
+
+/// Records a skill mutation in the shared audit store (durable when
+/// `init_global` switched it, ring-only otherwise). Skill names only —
+/// never registry URLs, tokens, or skill content.
+fn audit_skill_mutation(action: &str, name: &str, detail: &str) {
+    agent_workspace_hub::services::audit::global().record("allow", action, name, detail);
 }
 
 /// Builds and runs the versioned HTTP Control API (`/api/v1`).

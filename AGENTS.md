@@ -459,3 +459,114 @@ cheap-to-clone). Tool catalog 53 static.
   with regex over dispatcher.rs, extract Command enum variants with a brace-depth
   parser, grep callers of resolve_effective_root to classify wiring gaps.
 - **windows-latest CI traps (PR #129 round, 2026-09)**: three found in one go. (1) The runner image ships machine-wide `core.autocrlf=true`, so any test that `git init`s a fixture then `git worktree add`/`checkout`s gets LF->CRLF smudging and byte-exact content asserts read `\r\n` — pin the fixture repo with repo-local `git config core.autocrlf false` (repo-local beats system/global scope; only command-scope GIT_CONFIG_* env would beat it, and runners don't use that). Reproduce on Linux with a scratch HOME containing `.gitconfig` with `autocrlf=true` (pin CARGO_HOME/RUSTUP_HOME to the real ones or rustup forgets its default toolchain). (2) Tests asserting the shared global audit ring via `dashboard()` (surfaces only recent(5)) race sibling threads: dashboard() does FS work (project scan, git probe) between the audit write and the ring read, and rate-limit/api tests spray audit events — fixed with a bounded re-record/re-check loop; sibling tests must also match on (action, subject), not action alone, since concurrent tests write the same action. (3) The `release-readiness` job (ci.yml) runs `cargo package` and REJECTS tarballs containing .github/workflows, .env, or key material — with no `package.exclude`, cargo's default ships everything not gitignored, so the job failed. Cargo.toml now has `exclude = [".github"]`. The job `needs: build-test`, so it had literally never run on a PR before (the windows leg was red since #127) — expect more never-exercised jobs to surface the first time the full matrix goes green.
+
+- **Prompt 18 (master completion) — catalog-count correction (2026-09-30)**: the
+  advertised MCP catalog is 59 core tools / 71 with github.* (verified live via
+  tools/list and both interop harnesses). Earlier notes saying "53 core / 65"
+  are historical (pre-filesystem.* exposure in prompt 11). docs/mcp.md,
+  README.md updated; docs/mcp.md catalog table now carries the filesystem.*
+  row. Fresh interop evidence regenerated (both harnesses PASS, incl. the six
+  filesystem.* editing-interop checks the harness gained in prompt 11).
+  Also: control API audit completeness fix — git push/pull/stage/unstage and
+  files/content PUT now record api_git_* / api_file_write allow+deny events
+  (subject = truncated path or remote name, detail = branch or byte count,
+  never content); tests pin allow, deny, and no-content-leak behavior.
+
+- **Prompt 18 — §15 caller attribution (MCP authorization/audit path)**:
+  threaded `caller: Option<&SessionIdentity>` through `authorize_tool` /
+  `authorize_policy` (the capability gate already had it). `McpDispatcher` has
+  NO `caller()` accessor — removed the obsolete `caller_correlation` method in
+  favor of the free fn `caller_audit_correlation(caller)` (dispatcher.rs,
+  `pub`); SSE's `session_create` reuses it: bound sessions emit
+  `audit_allow_as`, plain `audit_allow` otherwise (no invented identity). Gate
+  order per tools/call: capability (-32005) -> builtin trust (-32003) -> policy
+  (-32004) -> service. Gotchas: (1) `audit_deny_as(action, reason, subject,
+  corr)` is positional — record_correlated stores `subject` as entry.subject
+  and `reason` as entry.detail, so `policy_denied`'s SUBJECT is the RULE ID
+  while the resource lands in detail; tests must match action + detail.
+  (2) `redact_token_like` masks >=16-char base62 runs INCLUDING hyphens, so
+  generated identity ids (`ws-`/`agent-`/`sess-` + 16-hex nanos) were coming
+  out `[redacted]` in workspace_id/agent_id/session_id; new
+  `services::audit::trusted_identity_id` (shape guard like
+  trusted_edit_id/trusted_snapshot_id) stores the generated shape verbatim,
+  everything else still redacts. Token-shaped POLICY RULE IDS (e.g. auto
+  `policy-<sha>`) remain masked in audit subjects — pre-existing documented
+  residual; the resource stays visible in detail. (3) A bound-caller test
+  pinning a POLICY denial must first seed a CapabilityGrant
+  (`crate::models::CapabilityGrant`, permission via
+  `crate::mcp::permissions::Permission`, store root = the dispatcher's
+  project root) or the capability gate answers -32005 before policy runs.
+  Suite after the fix: 1246 tests green workspace-wide, fmt+clippy clean.
+
+- **Prompt 18 Skills domain (2026-09, commit c230e53)**: `skills.enable`/`skills.disable`
+  shipped end-to-end. `ProjectSkillReferences` (src/skills/project.rs) is the ONE canonical
+  project-skill reference store (duplicate `references.rs` deleted): `states()`/`enable()`/
+  `disable()` persist a `disabled: Vec<String>` list at `.agent/skills.json` (serde default,
+  so legacy files load all-enabled), StoreLock-serialized + atomic-rename writes. Exposure
+  state changes ONLY through enable/disable — add/remove never flip it; both toggles fail
+  closed on unreferenced names ("skill is not referenced by the current project: {name}").
+  MCP: two new tools (Medium risk), `skills.list` annotates `enabled`, `skills.read` refuses
+  disabled references. CLI: `awh skill show/enable/disable` + state-marked list + durable
+  audit (`init_global` at CLI startup, `cli_skill_*` actions). Control API GET
+  `/api/v1/skills/project` renders `enabled` from the same store. Tool counts: 61 core /
+  73 with github.*. Gotchas: (1) **tool_registry.rs MUST stay name-sorted** —
+  `registry_lookup` is a binary search; a row out of alphabetical order silently breaks
+  lookups for OTHER tools near it (skills.enable/disable placed after skills.search made
+  skills.list resolve "uncategorized"). (2) NEVER re-type json! schema lines from terminal
+  output — restore via `git show HEAD:src/mcp/dispatcher.rs` + a line-matching script; a
+  retype drift in 8 entries broke schema-validation tests. (3) Long heredocs ECHO garbled
+  prefixes (stray b/|/e/t) in this terminal, but the written file is correct — verify with
+  `python3 -m py_compile` / grep, never trust the echo. (4)
+  `GlobalSkillRegistry::discover()` honors `AWH_GLOBAL_SKILLS_ROOT` (registry.rs) as the
+  test/embedder seam so tests never mutate HOME. (5) `SkillMcp::with_registry` is the
+  in-crate injection seam; out-of-crate integration tests can only reach the ghost-denial
+  path (no private-field injection across crates).
+
+- **Prompt 18 Tasks domain audit (2026-09)**: verified TSK-001 convergence is complete and
+  pinned. `src/core/tasks.rs` is the single task authority (ARCH-001; `src/mcp/tasks.rs` is a
+  9-line re-export, CLI is a thin adapter); no Control-API tasks routes and no TUI tasks
+  screen exist by contract (both prompts are conditional: "if exposed" / "as evidence
+  permits"). One real gap fixed: a fieldless `tasks.update {id}` was a silent no-op on the
+  MCP plane while the CLI rejected it at argument parsing — the canonical store now owns
+  the verdict (`no changes requested: provide at least one of status, priority, or
+  assignee`), firing AFTER the missing-id lookup so the missing -> null contract is intact
+  (unknown id still returns Ok(None)/text "null"). Pinned by a store unit test
+  (update_without_changes_fails_closed_on_every_plane) and a wire test
+  (tasks_update_without_changes_fails_closed_on_the_wire; remember tools/call results are
+  content-envelope-wrapped - assert on result.content[0].text). Suite: 1285 passed / 0
+  failed workspace-wide, fmt+clippy clean. Audit parity confirmed: every tools/call emits
+  `tool_invoke` (name only, args never logged, caller-attributed when bound) in addition to
+  the CLI's `cli_task_*` durable audit events.
+
+- **Prompt 18 Terminal domain (TRM-001, 2026-09)**: the documented `awh terminal
+  run|list|kill` CLI contract (docs/CLI.md command tree + security-ordering list)
+  was missing entirely — the CLI was the only plane without a terminal surface.
+  Added src/cli/terminal.rs (thin adapter, same pattern as task/memory/context):
+  `run` delegates to the canonical TerminalService (argv-only, kill_on_drop,
+  --timeout bounded 1..=600s over the 30s default, 256 KiB caps inherited from the
+  service), prints child stdout/stderr unmixed, propagates the child exit code
+  (124 on timeout, 1 on spawn failure via Result), and audits cli_terminal_run
+  (program name + timeout as detail; args NEVER logged — pinned adversarially by
+  a test that greps the durable audit log for a sentinel arg). `list`/`kill`
+  implement TRM-001's documented ephemeral-lifecycle allowance (its §6: no
+  background-process plane exists — bounded synchronous runs only): list prints
+  `[]` + explanatory stderr note; kill fails deterministically with "unknown
+  execution id: {id}" for ANY id (never a raw-PID signal). The decision is
+  documented in docs/terminal/README.md, not left implicit. Verified the other
+  three planes already share the service: MCP terminal.run (authorize_tool +
+  policy gate on program name + tool_invoke audit), Control API /terminal/run
+  (bearer + api_terminal_run), TUI backend terminal_run (tui_terminal_run).
+  Known limitation recorded: no OS sandbox around terminal children (the MCP
+  sandbox wraps custom MCP server spawns only) — controls are auth/policy/argv/
+  timeout/cap/audit. Tests: tests/terminal_cli.rs (9, real compiled binary;
+  platform commands cfg-gated unix/windows like mcp_builtin_tool_gate.rs, since
+  the SERVICE unit tests already use printf/sleep/head un-gated). Gotchas: (1)
+  clap `trailing_var_arg` + `required` means empty argv is a USAGE error naming
+  `<ARGV>...` — don't assert on the word "program"; (2) `tokio::runtime::Runtime
+  ::new()?.block_on` is the CLI's bridge to the async service (main() is sync);
+  (3) `std::process::exit(code)` does NOT flush stdout (LineWriter flushes on newline only) — flush stdout/stderr explicitly before ANY process::exit in the run path, or non-newline-terminated child output dies with the process (pinned by nonzero_exit_does_not_drop_buffered_child_stdout: awk writes no trailing newline, exits 3).
+  automatically, but `print!` to a LineWriter... actually print! flushes on
+  newline only; use explicit flush before process::exit to avoid losing the
+  final stdout line on non-newline-terminated child output.
+
+- **Prompt 18 build phase (branch master-completion-18, PR #130)**: CI `agent-pipeline-validation` job hard-opens `.github/agent-engine/feature-registry.yml` whenever the PR diff touches `.github/agent-engine/|.github/agent/|scripts/` — the file was REMOVED by 2b1fef5 ("remove external agent infrastructure") so every relevant PR fails; fixed in 4cfd3cb by mirroring the orchestrator-step's file-existence guard. §9 matrix closed in 5e7d990: wedge Phase H (worktree×snapshot = provenance lands under the WORKTREE's own store, main tree untouched; worktree×rollback = confined to the effective root + rollback re-evaluates a CURRENT authorization — foreign principal denied), tasks×sessions (task plane independent of session lifecycle: stop is terminal for execution, tasks survive + terminal session records stay valid assignees since SessionStore.get checks existence, not liveness), context×memory (CLI context plane = ContextEngine, stores under `.agent/context-engine/` — NOT `.agent/context.md` which is the MCP/API ContextStore; there is NO `awh context status` subcommand; nothing ever creates `.agent/memory.json`). Phase H gotchas: (1) wedge fixture must gitignore `/.agent/` before the base commit so the worktree checkout is a clean slate — `initialize_workspace` on a checkout containing a copied manifest fails closed as foreign-root; (2) `WorktreeStore::remove` fails `Dirty(...)` on untracked files in the checkout — tests that write into the checkout must remove their residue before the ownership-removal tail; (3) `initialize_workspace` returns `InitOutcome` (Created/AlreadyInitialized) — use `.manifest()`, no direct `.workspace_id` field. Collaboration (COL-001) lives ONLY on PR #131 branch collaboration-col-001 (c803847 NOT an ancestor of master-completion-18); that branch had ZERO pull_request-triggered CI runs despite ci.yml having `pull_request: branches:[rust]` — dispatched manually via `gh workflow run ci.yml --ref collaboration-col-001` (run 36894154596); base-branch docs (909b703) already document `awh collaboration ...`, so on this branch the CLI docs run ahead of the binary until #131 merges — do not "fix" those docs on this branch (conflicts with #131's file set). §20 verified: 73-tool catalog (61 core + 12 github.*) matches dispatcher.

@@ -17,6 +17,13 @@ impl GlobalSkillRegistry {
 
     /// Locates the user-global registry under `~/.agent-workspace-hub/skills`.
     pub fn discover() -> Result<Self> {
+        // Test/embedding seam (mirrors the Control API's
+        // `global_skills_root` injection): an explicit root keeps tests
+        // off the real home registry without HOME mutation, which
+        // silently no-ops on Windows and races parallel tests.
+        if let Some(root) = std::env::var_os("AWH_GLOBAL_SKILLS_ROOT") {
+            return Ok(Self::new(root));
+        }
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
         Ok(Self::new(home.join(".agent-workspace-hub").join("skills")))

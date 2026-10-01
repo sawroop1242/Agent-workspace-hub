@@ -426,3 +426,48 @@ fn fs_state_survives_process_restart() {
     ws.ok(&["fs", "rollback", &edit_id]);
     assert_eq!(ws.read("r.txt"), "before\n");
 }
+
+#[test]
+fn fs_edit_events_land_in_durable_audit() {
+    // AWE-013 contract: CLI-plane mutations must reach the DURABLE audit
+    // log (.agent/audit/audit.log), not just the process-local ring —
+    // the process exits right after the edit, so only the durable store
+    // can carry the evidence. Readback happens in THIS process, the
+    // way a restarted auditor would see it.
+    let ws = Workspace::new();
+    ws.write("audit.txt", "alpha beta\n");
+    let stdout = ws.ok(&["fs", "replace", "audit.txt", "beta", "BETA", "--json"]);
+    let edit_id = ws.edit_id_of(&stdout);
+    ws.ok(&["fs", "rollback", &edit_id]);
+
+    let log = agent_workspace_hub::services::audit::AuditLog::open(&ws.root)
+        .expect("durable audit store opens");
+    let entries = log.recent(100);
+    assert!(!entries.is_empty(), "durable audit must not be empty");
+
+    // The edit-plane outcome events are correlated to the exact edit id.
+    let replace = entries
+        .iter()
+        .find(|entry| {
+            entry.action == "filesystem.replace"
+                && entry.edit_id.as_deref() == Some(edit_id.as_str())
+        })
+        .expect("replace outcome event in durable audit");
+    assert_eq!(replace.kind, "allow");
+    assert_eq!(replace.subject, "audit.txt");
+    // The CLI caller is the operator, not an agent session: the
+    // identity fields stay absent rather than inventing attribution.
+    assert!(replace.agent_id.is_none());
+    assert!(replace.session_id.is_none());
+
+    let rollback = entries
+        .iter()
+        .find(|entry| {
+            entry.action == "filesystem.rollback"
+                && entry.edit_id.as_deref() == Some(edit_id.as_str())
+        })
+        .expect("rollback outcome event in durable audit");
+    assert_eq!(rollback.kind, "allow");
+    assert!(rollback.agent_id.is_none());
+    assert!(rollback.session_id.is_none());
+}
