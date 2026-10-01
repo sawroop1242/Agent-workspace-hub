@@ -21,19 +21,19 @@ Install Agent Workspace Hub with one command (downloads a prebuilt Rust binary
 for your OS/architecture):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/scripts/install.sh | bash
 ```
 
 Build directly from Git source instead of the latest release binary:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --source source
+curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/scripts/install.sh | bash -s -- --source source
 ```
 
 Install a specific release tag, or to a custom directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/main/scripts/install.sh | bash -s -- --version v0.1.0 --prefix "$HOME/.bin"
+curl -fsSL https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/scripts/install.sh | bash -s -- --version v0.1.0 --prefix "$HOME/.bin"
 ```
 
 The installer requires `curl`; source installs additionally require `cargo`.

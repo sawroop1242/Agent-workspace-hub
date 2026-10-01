@@ -102,6 +102,51 @@ fn context_mutations_audit_identifiers_never_content() {
 }
 
 #[test]
+fn context_retrieval_never_becomes_memory_mutation() {
+    // §9 Context × memory: the context plane writes to
+    // `.agent/context.md` — every retrieval-shaped operation (search,
+    // status, show) and even the mutations stay entirely on that store;
+    // nothing may silently persist into the project memory store
+    // (`.agent/memory.json` / legacy `.agent/memory.jsonl`).
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let (ok, _, err) = run(
+        root,
+        &[
+            "context",
+            "save",
+            "--id",
+            "wire-notes",
+            "--content",
+            "context items are not memory records",
+        ],
+    );
+    assert!(ok, "context save failed: {err}");
+
+    let (ok, _, err) = run(root, &["context", "search", "--query", "memory"]);
+    assert!(ok, "context search failed: {err}");
+    let (ok, _, err) = run(root, &["context", "show", "--id", "wire-notes"]);
+    assert!(ok, "context show failed: {err}");
+
+    // No operation in the context plane ever materialized a memory store.
+    assert!(
+        !root.join(".agent/memory.json").exists(),
+        "context retrieval must not silently become persistent memory mutation"
+    );
+    assert!(
+        !root.join(".agent/memory.jsonl").exists(),
+        "context retrieval must not create legacy memory records either"
+    );
+    // And the context engine's own store carries the data, proving the
+    // operations genuinely executed rather than no-opped.
+    assert!(
+        root.join(".agent/context-engine").exists(),
+        "context items persisted in the context engine's store"
+    );
+}
+
+#[test]
 fn context_save_show_search_clear_lifecycle() {
     let dir = tempdir().expect("tempdir");
     let root = dir.path();
