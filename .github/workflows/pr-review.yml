@@ -22,6 +22,8 @@ jobs:
           config.fallback_models: '["nvidia_nim/deepseek-ai/deepseek-v4.1-flash"]'
           # Explicit context-window budget for custom/unrecognized NVIDIA NIM model IDs.
           config.custom_model_max_tokens: "128000"
+          # Allow slower NVIDIA NIM responses more time to complete.
+          config.ai_timeout: "300"
           # NVIDIA NIM credential required by LiteLLM
           NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
           # Uncomment only when using a custom/self-hosted NIM endpoint
