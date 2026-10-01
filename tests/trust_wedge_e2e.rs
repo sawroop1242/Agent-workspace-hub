@@ -314,6 +314,57 @@ fn trust_wedge_end_to_end_composes_and_survives_restart() {
             "rollback must restore the pre-apply snapshot"
         );
 
+        // ---- Phase F: zero-side-effect denial on the EDIT plane. Revoke
+        // the Filesystem grant live and attempt another replace: the
+        // capability gate must deny BEFORE the service runs, leaving the
+        // file bytes and the durable provenance store untouched. (The
+        // isolated gate tests pin the gate's code; only a composed pass
+        // can pin that no downstream state was created.)
+        grants
+            .revoke("wedge-grant-fs")
+            .expect("revoke filesystem capability");
+        let provenance_dir = root.join(".agent/provenance");
+        let provenance_before: Vec<String> = std::fs::read_dir(&provenance_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let edit_denied = call_tool(
+            "filesystem.replace",
+            json!({
+                "path": "wedge-doc.md", "old": "gamma", "new": "GAMMA"
+            }),
+            8,
+        )
+        .await;
+        let denied_code = edit_denied["error"]["code"]
+            .as_i64()
+            .expect("capability denial error code");
+        assert_eq!(
+            denied_code, CAPABILITY_DENIED_CODE,
+            "revoked capability must deny the edit: {edit_denied}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("wedge-doc.md")).expect("file on disk"),
+            "alpha beta gamma",
+            "a capability-denied edit must not execute"
+        );
+        let provenance_after: Vec<String> = std::fs::read_dir(&provenance_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            provenance_before, provenance_after,
+            "a denied edit must leave no provenance residue"
+        );
+
         // ---- Phase D: restart durability. A fresh AuditLog over the
         // same root (what a restarted process sees) must reconstruct the
         // whole wedge story, newest first, with identities intact.
@@ -363,14 +414,15 @@ fn trust_wedge_end_to_end_composes_and_survives_restart() {
         // the capability gate but BEFORE the per-tool resource gates —
         // the authoritative decisions are the capability/builtin/policy
         // allow|deny events, not `tool_invoke`'s presence.
-        let position = |action: &str| {
+        let position = |action: &str, detail: &str| {
             entries
                 .iter()
                 .position(|entry| {
                     entry.action == action
                         && entry.session_id.as_deref() == Some(session_id.as_str())
+                        && (detail.is_empty() || entry.detail == detail)
                 })
-                .expect("session-scoped entry present")
+                .unwrap_or_else(|| panic!("session-scoped {action}/{detail} entry present"))
         };
         // The OLDEST correlated tool_invoke is the successful allow-phase
         // call (phase C also emits one before its policy denial).
@@ -381,10 +433,19 @@ fn trust_wedge_end_to_end_composes_and_survives_restart() {
                     && entry.session_id.as_deref() == Some(session_id.as_str())
             })
             .expect("session-scoped tool_invoke present");
-        assert!(position("policy_denied") < position("agent_capability_denied"));
+        assert!(
+            position("policy_denied", "") < position("agent_capability_denied", "terminal.run")
+        );
         // The successful invocation is the oldest of the three attempts:
         // both denials are strictly newer than it.
-        assert!(position("agent_capability_denied") < oldest_tool_invoke);
+        assert!(position("agent_capability_denied", "terminal.run") < oldest_tool_invoke);
+        // Phase F's edit-plane capability denial is the NEWEST decision of
+        // the composed story: newer than the policy deny (phase C) and
+        // than the terminal capability deny (phase B).
+        assert!(
+            position("agent_capability_denied", "filesystem.replace")
+                < position("policy_denied", "")
+        );
 
         // The editing plane's service-boundary outcome events correlate
         // to the exact edit id AND to the bound session identity
