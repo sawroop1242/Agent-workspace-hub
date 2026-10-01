@@ -92,7 +92,7 @@ jobs:
           echo "NVIDIA NIM API key is present."
 
       - name: Run Kilo
-        uses: Kilo-Org/kilocode/github@latest
+        uses: Kilo-Org/kilocode/github@main
         env:
           NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
