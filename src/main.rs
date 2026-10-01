@@ -776,9 +776,15 @@ fn main() -> Result<()> {
         Some(Command::Context { command }) => {
             // CTX-001: the CLI mirrors the MCP dispatcher's construction
             // path (same root, same AWH_CONTEXT_* env overrides) so both
-            // interfaces observe identical engine semantics.
+            // interfaces observe identical engine semantics. Context
+            // mutations audit identifiers/outcomes, so switch the store
+            // to durable persistence before the run — same treatment
+            // as the task arm.
             let root =
                 std::env::current_dir().context("could not determine the workspace directory")?;
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
             agent_workspace_hub::cli::context::handle_context_cli(&root, command)?;
         }
         Some(Command::Fs { command }) => {

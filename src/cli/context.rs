@@ -9,6 +9,7 @@ use clap::Subcommand;
 
 use crate::context::{ContextEngine, ContextEngineConfig, ContextItem};
 use crate::mcp::dispatcher::{parse_context_scope, parse_context_source};
+use crate::services::audit;
 
 #[derive(Debug, Subcommand)]
 pub enum ContextCommand {
@@ -133,6 +134,18 @@ fn save_like(root: &std::path::Path, update: bool, args: SaveArgs) -> Result<()>
         args.priority,
     )?;
     let saved = engine.insert(item)?;
+    // CTX-001 §5: audit identifiers/outcomes only — content is treated
+    // as potentially sensitive and never reaches the audit log.
+    audit::global().record(
+        "allow",
+        if update {
+            "cli_context_update"
+        } else {
+            "cli_context_save"
+        },
+        &saved.id,
+        &format!("scope {:?} ({} tokens)", saved.scope, saved.token_count),
+    );
     println!(
         "{} context item {} ({} tokens, scope {:?})",
         if update { "updated" } else { "saved" },
@@ -223,12 +236,19 @@ pub fn handle_context_cli(root: &std::path::Path, command: ContextCommand) -> Re
                 for id in ids {
                     engine.remove_item(&id);
                 }
+                audit::global().record(
+                    "allow",
+                    "cli_context_clear_all",
+                    "workspace",
+                    &format!("{count} items"),
+                );
                 println!("cleared {count} active context item(s); offloaded items are preserved");
             } else {
                 let id = id.unwrap_or_default();
                 if !engine.remove_item(&id) {
                     bail!("context item {id:?} not found");
                 }
+                audit::global().record("allow", "cli_context_clear", &id, "cleared");
                 println!("cleared context item {id}");
             }
         }

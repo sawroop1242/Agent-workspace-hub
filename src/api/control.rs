@@ -465,10 +465,13 @@ async fn delete_entry(
     let path = params
         .get("path")
         .ok_or_else(|| ApiError::bad_request("path query parameter is required"))?;
-    state
-        .files()
-        .delete(path)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state.files().delete(path).map_err(|e| {
+        // Spec 10: every mutating control-plane operation lands in
+        // the audit ring, including the refusals.
+        audit_deny("api_file_delete", "rejected", &truncate_detail(path, 120));
+        ApiError::bad_request(format!("{e:#}"))
+    })?;
+    audit_allow("api_file_delete", &truncate_detail(path, 120), "remote");
     Ok(Json(json!({"deleted": path})))
 }
 
@@ -480,10 +483,19 @@ async fn rename_entry(
         .new_name
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("new_name is required"))?;
-    state
-        .files()
-        .rename(&body.path, new_name)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state.files().rename(&body.path, new_name).map_err(|e| {
+        audit_deny(
+            "api_file_rename",
+            "rejected",
+            &truncate_detail(&body.path, 120),
+        );
+        ApiError::bad_request(format!("{e:#}"))
+    })?;
+    audit_allow(
+        "api_file_rename",
+        &truncate_detail(&body.path, 120),
+        &truncate_detail(new_name, 120),
+    );
     Ok(Json(json!({"renamed": body.path, "to": new_name})))
 }
 
@@ -491,10 +503,19 @@ async fn create_dir(
     State(state): State<Arc<ControlState>>,
     Json(body): Json<EntryBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .files()
-        .create_dir(&body.path)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    state.files().create_dir(&body.path).map_err(|e| {
+        audit_deny(
+            "api_file_mkdir",
+            "rejected",
+            &truncate_detail(&body.path, 120),
+        );
+        ApiError::bad_request(format!("{e:#}"))
+    })?;
+    audit_allow(
+        "api_file_mkdir",
+        &truncate_detail(&body.path, 120),
+        "remote",
+    );
     Ok(Json(json!({"created": body.path})))
 }
 
@@ -835,7 +856,8 @@ async fn write_context(
         audit_deny("api_context_write", "too_large", &scope);
         return Err(ApiError::bad_request("context exceeds 512 KiB cap"));
     }
-    let root = store_scope(&state, params.project.as_deref())?;
+    let root = store_scope(&state, params.project.as_deref())
+        .inspect_err(|_| audit_deny("api_context_write", "rejected", &scope))?;
     crate::core::context::ContextStore::for_project(&root)
         .write(&body.content)
         .map_err(|e| ApiError::internal(&e))?;
@@ -870,15 +892,24 @@ async fn append_memory(
     Query(params): Query<ScopeParams>,
     Json(body): Json<AppendMemoryBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let scope = scope_name(&params);
     if body.content.trim().is_empty() {
+        audit_deny("api_memory_append", "empty_content", &scope);
         return Err(ApiError::bad_request("content is required"));
     }
-    let root = store_scope(&state, params.project.as_deref())?;
+    let root = store_scope(&state, params.project.as_deref())
+        .inspect_err(|_| audit_deny("api_memory_append", "rejected", &scope))?;
     let entry = crate::core::memory::MemoryStore::for_project(&root)
-        .map_err(|e| ApiError::internal(&e))?
+        .map_err(|e| {
+            audit_deny("api_memory_append", "rejected", &scope);
+            ApiError::internal(&e)
+        })?
         .append(&body.content)
-        .map_err(|e| ApiError::internal(&e))?;
-    audit_allow("api_memory_append", scope_name(&params).as_str(), "remote");
+        .map_err(|e| {
+            audit_deny("api_memory_append", "rejected", &scope);
+            ApiError::internal(&e)
+        })?;
+    audit_allow("api_memory_append", scope.as_str(), "remote");
     Ok(Json(json!({"appended": true, "id": entry.id})))
 }
 
@@ -932,12 +963,19 @@ async fn add_project_skill(
     State(state): State<Arc<ControlState>>,
     Json(body): Json<ProjectSkillBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = store_scope(&state, body.project.as_deref())?;
-    let registry = state.global_skill_registry()?;
+    let scope = scope_name_body(&body);
+    let root = store_scope(&state, body.project.as_deref())
+        .inspect_err(|_| audit_deny("api_skill_add", "rejected", &scope))?;
+    let registry = state.global_skill_registry().inspect_err(|_| {
+        audit_deny("api_skill_add", "rejected", &scope);
+    })?;
     crate::skills::ProjectSkillReferences::new(&root)
         .add(&body.name, &registry)
-        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    audit_allow("api_skill_add", &body.name, &scope_name_body(&body));
+        .map_err(|e| {
+            audit_deny("api_skill_add", "rejected", &scope);
+            ApiError::bad_request(format!("{e:#}"))
+        })?;
+    audit_allow("api_skill_add", &body.name, &scope);
     Ok(Json(json!({"added": body.name})))
 }
 
@@ -945,11 +983,16 @@ async fn remove_project_skill(
     State(state): State<Arc<ControlState>>,
     Query(body): Query<ProjectSkillQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = store_scope(&state, body.project.as_deref())?;
+    let scope = scope_name_body_q(&body);
+    let root = store_scope(&state, body.project.as_deref())
+        .inspect_err(|_| audit_deny("api_skill_remove", "rejected", &scope))?;
     crate::skills::ProjectSkillReferences::new(&root)
         .remove(&body.name)
-        .map_err(|e| ApiError::internal(&e))?;
-    audit_allow("api_skill_remove", &body.name, &scope_name_body_q(&body));
+        .map_err(|e| {
+            audit_deny("api_skill_remove", "rejected", &scope);
+            ApiError::internal(&e)
+        })?;
+    audit_allow("api_skill_remove", &body.name, &scope);
     Ok(Json(json!({"removed": body.name})))
 }
 
@@ -1403,6 +1446,145 @@ mod tests {
         let recent = crate::services::audit::global().recent(500);
         assert!(recent.iter().any(|e| {
             e.action == "api_file_write" && e.kind == "deny" && e.detail == "rejected"
+        }));
+    }
+
+    #[tokio::test]
+    async fn file_entry_mutations_are_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+
+        // mkdir (PUT /files/entry)
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/files/entry",
+                Some("test-key"),
+                json!({"path": "made-dir"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Seed a file, then rename it (POST /files/entry).
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/files/content",
+                Some("test-key"),
+                json!({"path": "probe-file.txt", "content": "x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/files/entry",
+                Some("test-key"),
+                json!({"path": "probe-file.txt", "new_name": "renamed-file.txt"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent
+            .iter()
+            .any(|e| e.action == "api_file_mkdir" && e.kind == "allow" && e.subject == "made-dir"));
+        assert!(recent.iter().any(|e| {
+            e.action == "api_file_rename"
+                && e.kind == "allow"
+                && e.subject == "probe-file.txt"
+                && e.detail == "renamed-file.txt"
+        }));
+
+        let res = app
+            .clone()
+            .oneshot(delete(
+                "/api/v1/files/entry?path=renamed-file.txt",
+                Some("test-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_file_delete" && e.kind == "allow" && e.subject == "renamed-file.txt"
+        }));
+
+        // Refusals audit as denies with the same shape as file write.
+        let res = app
+            .clone()
+            .oneshot(delete(
+                "/api/v1/files/entry?path=../../etc/passwd",
+                Some("test-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_file_delete" && e.kind == "deny" && e.detail == "rejected"
+        }));
+    }
+
+    #[tokio::test]
+    async fn scoped_mutation_refusals_are_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_router(state(tmp.path()));
+
+        // Empty memory content is a semantic refusal (terminal's
+        // empty_program precedent) and must deny-audit.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memory",
+                Some("test-key"),
+                json!({"content": "   "}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_memory_append" && e.kind == "deny" && e.detail == "empty_content"
+        }));
+
+        // Adding a skill that is not installed globally is rejected by
+        // the canonical reference store and must deny-audit.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/skills/project",
+                Some("test-key"),
+                json!({"name": "ghost-skill"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_skill_add" && e.kind == "deny" && e.detail == "rejected"
+        }));
+
+        // A scope validation refusal (traversal project name) on the
+        // context write path must deny-audit with the scope label.
+        let res = app
+            .clone()
+            .oneshot(put_json(
+                "/api/v1/context?project=../../etc",
+                Some("test-key"),
+                json!({"content": "x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let recent = crate::services::audit::global().recent(500);
+        assert!(recent.iter().any(|e| {
+            e.action == "api_context_write"
+                && e.kind == "deny"
+                && e.detail == "rejected"
+                && e.subject == "../../etc"
         }));
     }
 

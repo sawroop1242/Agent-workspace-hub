@@ -39,6 +39,68 @@ fn run(dir: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     run_with_stdin(dir, args, "")
 }
 
+/// Reads the durable audit log (checksummed JSONL envelopes) and
+/// returns the inner events as JSON values.
+fn audit_events(root: &std::path::Path) -> Vec<serde_json::Value> {
+    let log_path = root.join(".agent").join("audit").join("audit.log");
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|_| panic!("context arm must durably audit: {log_path:?} missing"));
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|envelope| envelope["event"].clone())
+        .collect()
+}
+
+#[test]
+fn context_mutations_audit_identifiers_never_content() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let secret = "hush-context-secret-hunter2";
+    let (ok, _out, err) = run_with_stdin(
+        root,
+        &[
+            "context",
+            "save",
+            "--id",
+            "audit-probe",
+            "--source",
+            "User",
+            "--content",
+            secret,
+        ],
+        "",
+    );
+    assert!(ok, "context save failed: {err}");
+
+    let (ok, _out, err) = run(root, &["context", "clear", "--id", "audit-probe"]);
+    assert!(ok, "context clear failed: {err}");
+
+    let events = audit_events(root);
+    let saved = events
+        .iter()
+        .find(|e| e["action"] == "cli_context_save" && e["subject"] == "audit-probe")
+        .expect("context save must land in the durable audit log");
+    assert!(
+        saved["detail"].as_str().unwrap().starts_with("scope "),
+        "save detail should carry scope and tokens only: {saved}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "cli_context_clear" && e["subject"] == "audit-probe"),
+        "context clear must land in the durable audit log"
+    );
+    // CTX-001 treats context content as sensitive: the sentinel must
+    // appear nowhere in the durable log.
+    let log = std::fs::read_to_string(root.join(".agent").join("audit").join("audit.log"))
+        .expect("audit log readable");
+    assert!(
+        !log.contains(secret),
+        "context content leaked into audit log"
+    );
+}
+
 #[test]
 fn context_save_show_search_clear_lifecycle() {
     let dir = tempdir().expect("tempdir");
