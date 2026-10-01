@@ -181,5 +181,13 @@ fn run_executes_argv_on_windows() {
         &["terminal", "run", "--", "cmd", "/C", "echo", "argv works"],
     );
     assert_eq!(code, 0, "cmd echo must succeed: {err}");
-    assert!(out.trim_end().ends_with("argv works"), "got: {out}");
+    // `cmd /C echo` output on the Windows console can carry trailing
+    // artifacts (e.g. NUL) that trim_end() does not strip, so assert
+    // the captured argv output semantically — the point is that argv
+    // execution (no shell) works — and format with Debug so any real
+    // pollution stays diagnosable in the failure message.
+    assert!(
+        out.trim_matches('\0').trim().contains("argv works"),
+        "got: {out:?}"
+    );
 }

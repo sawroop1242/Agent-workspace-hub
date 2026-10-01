@@ -1426,7 +1426,11 @@ mod tests {
         let recent = crate::services::audit::global().recent(500);
         let entry = recent
             .iter()
-            .find(|e| e.action == "api_file_write" && e.kind == "allow")
+            .find(|e| {
+                e.action == "api_file_write"
+                    && e.kind == "allow"
+                    && e.subject == "notes/audit-probe.txt"
+            })
             .expect("successful file write audited");
         assert_eq!(entry.subject, "notes/audit-probe.txt");
         assert_eq!(entry.detail, "bytes=15");
@@ -1445,7 +1449,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let recent = crate::services::audit::global().recent(500);
         assert!(recent.iter().any(|e| {
-            e.action == "api_file_write" && e.kind == "deny" && e.detail == "rejected"
+            e.action == "api_file_write"
+                && e.kind == "deny"
+                && e.subject == "../../etc/passwd"
+                && e.detail == "rejected"
         }));
     }
 
