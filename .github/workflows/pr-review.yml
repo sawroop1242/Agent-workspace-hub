@@ -15,12 +15,12 @@ jobs:
       - name: PR Agent action step
         uses: the-pr-agent/pr-agent@main
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
           # Configure model name using the provider prefix pattern
           config.model: "nvidia_nim/<your-model-name>"
           config.fallback_models: '["nvidia_nim/<your-model-name>"]'
           # Credentials supported internally by PR-Agent
-          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
           # Set the API base if you are self-hosting or using a custom endpoint
           # NVIDIA_NIM_API_BASE: "https://integrate.api.nvidia.com/v1"
           github_action_config.auto_review: "true"
