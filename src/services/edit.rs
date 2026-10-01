@@ -1945,7 +1945,7 @@ impl EditService {
             resources,
             transaction_id,
         )?;
-        self.rollback_edits(records)
+        self.rollback_edits_with_identity(records, Some(principal))
     }
 
     // -----------------------------------------------------------------
@@ -2237,7 +2237,7 @@ impl EditService {
                 ),
             };
             self.correlate_rollback_outcome(edit_id, conflict.clone());
-            self.record_rollback_audit(edit_id, "rollback_conflict", &conflict);
+            self.record_rollback_audit(edit_id, "rollback_conflict", &conflict, Some(principal));
             return Ok(conflict);
         }
         if pending.is_empty() {
@@ -2246,7 +2246,7 @@ impl EditService {
             // newer content.
             let no_op = EditRollbackStatus::AlreadyRolledBack;
             self.correlate_rollback_outcome(edit_id, no_op.clone());
-            self.record_rollback_audit(edit_id, "rollback_noop", &no_op);
+            self.record_rollback_audit(edit_id, "rollback_noop", &no_op, Some(principal));
             return Ok(no_op);
         }
 
@@ -2256,13 +2256,13 @@ impl EditService {
         // targets are skipped, so a retry after a partial restoration
         // completes the remaining files without touching the ones back
         // at their pre-edit state.
-        let outcome = self.rollback_edits(&pending)?;
+        let outcome = self.rollback_edits_with_identity(&pending, Some(principal))?;
 
         // 16: correlate the observed outcome through the canonical
         // provenance record (one record per edit id: the outcome
         // reflects the latest observed state of this edit).
         self.correlate_rollback_outcome(edit_id, outcome.clone());
-        self.record_rollback_audit(edit_id, "rollback_outcome", &outcome);
+        self.record_rollback_audit(edit_id, "rollback_outcome", &outcome, Some(principal));
         Ok(outcome)
     }
 
@@ -2311,13 +2311,16 @@ impl EditService {
         edit_id: &str,
         action: &'static str,
         outcome: &EditRollbackStatus,
+        identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
     ) {
-        // AWE-013: the same correlated outcome vocabulary as the
+        // AWE-013 / §4: the same correlated outcome vocabulary as the
         // record-based rollback surface — kind from the outcome, the
         // stable `filesystem.rollback` action, and the reason code the
         // prompt-10 taxonomy defines (already-rolled-back/conflict/
         // failure), so both rollback entry points emit identical,
-        // machine-filterable events.
+        // machine-filterable events. The trusted caller identity is
+        // propagated onto the correlation exactly like the edit plane's
+        // `audit_edit_outcome`; absent identity stays absent.
         let (kind, reason, detail) = match outcome {
             EditRollbackStatus::Restored => (
                 "allow",
@@ -2343,6 +2346,10 @@ impl EditService {
         let mut correlation =
             crate::services::audit::AuditCorrelation::for_edit(edit_id.to_owned());
         correlation.reason = reason;
+        if let Some(principal) = identity {
+            correlation.agent_id = principal.agent_id.clone();
+            correlation.session_id = principal.session_id.clone();
+        }
         crate::services::audit::record_outcome(
             kind,
             "filesystem.rollback",
@@ -3488,6 +3495,17 @@ impl EditService {
         &self,
         records: &[RollbackRecord],
     ) -> Result<EditRollbackStatus, EditError> {
+        self.rollback_edits_with_identity(records, None)
+    }
+
+    /// `rollback_edits` with the caller's trusted identity propagated onto
+    /// the authoritative outcome event (§4): `rollback_edits_as` passes its
+    /// principal, `rollback_edit` passes the by-id caller's principal.
+    fn rollback_edits_with_identity(
+        &self,
+        records: &[RollbackRecord],
+        identity: Option<&crate::services::authorization::AuthorizingPrincipal>,
+    ) -> Result<EditRollbackStatus, EditError> {
         if records.is_empty() {
             // Nothing to roll back is not an error, but it is also not a
             // restoration: report honestly.
@@ -3495,9 +3513,11 @@ impl EditService {
         }
 
         let result = self.rollback_edits_inner(records);
-        // AWE-013: the ONE authoritative rollback outcome, correlated to
-        // the edit id of the records. Best-effort — an audit failure
-        // never rewrites the rollback outcome.
+        // AWE-013 / §4 identity propagation: the ONE authoritative
+        // rollback outcome, correlated to the edit id of the records
+        // AND to the trusted caller identity where a principal is
+        // present. Best-effort — an audit failure never rewrites the
+        // rollback outcome.
         let edit_id = records[0].edit_id.to_string();
         let subject = records
             .iter()
@@ -3531,6 +3551,10 @@ impl EditService {
         let mut correlation =
             crate::services::audit::AuditCorrelation::for_edit(edit_id.to_owned());
         correlation.reason = reason;
+        if let Some(principal) = identity {
+            correlation.agent_id = principal.agent_id.clone();
+            correlation.session_id = principal.session_id.clone();
+        }
         crate::services::audit::record_outcome(
             kind,
             "filesystem.rollback",
