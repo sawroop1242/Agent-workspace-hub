@@ -3,7 +3,7 @@ on:
   pull_request:
     types: [opened, reopened, ready_for_review]
   issue_comment:
-  
+
 jobs:
   pr_agent_job:
     if: ${{ github.event.sender.type != 'Bot' }}
@@ -16,14 +16,13 @@ jobs:
       - name: PR Agent action step
         uses: the-pr-agent/pr-agent@main
         env:
-          GITHUB_TOKEN: ${{ secrets.AWH_AUTOMATION_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           # Configure model name using the provider prefix pattern
           config.model: "nvidia_nim/z-ai/glm-5.3"
           config.fallback_models: '["nvidia_nim/deepseek-ai/deepseek-v4.1-flash"]'
-          # Credentials supported internally by PR-Agent
+          # NVIDIA NIM credential required by LiteLLM
           NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
-          # Set the API base if you are self-hosting or using a custom endpoint
+          # Uncomment only when using a custom/self-hosted NIM endpoint
           # NVIDIA_NIM_API_BASE: "https://integrate.api.nvidia.com/v1"
           github_action_config.auto_review: "true"
           github_action_config.auto_describe: "true"
-          
