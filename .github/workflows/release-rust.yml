@@ -90,11 +90,36 @@ jobs:
         if: matrix.target == 'aarch64-linux-android'
         run: |
           set -euo pipefail
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Install Android NDK
         if: matrix.target == 'aarch64-linux-android'
-        run: sdkmanager "ndk;27.2.12479018"
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "ndk;27.2.12479018"
+
+      - name: Verify Android SDK/NDK installation
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+
+          echo "Android SDK root: $ANDROID_SDK_ROOT"
+          echo "Installed Android SDK packages:"
+          "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --list_installed | grep -E 'platform-tools|platforms;android-35|build-tools;35\.0\.0|ndk;27\.2\.12479018' || true
+
+          test -d "$ANDROID_SDK_ROOT/platforms/android-35"
+          test -d "$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          test -d "$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+
+          echo "Platform: android-35"
+          echo "Build-tools: 35.0.0"
+          echo "NDK: 27.2.12479018"
 
       - name: Configure Android linker
         if: matrix.target == 'aarch64-linux-android'
