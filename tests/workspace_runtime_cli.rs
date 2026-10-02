@@ -99,12 +99,17 @@ fn init_creates_missing_parent_directories_and_binds_that_root() {
 
     assert!(manifest_path(&root).exists(), "state under a/b/c");
     // The recorded root is the canonical target root, not the CWD and not
-    // an intermediate directory.
-    let manifest = fs::read_to_string(manifest_path(&root)).unwrap();
+    // an intermediate directory. Compare canonical-to-canonical (the
+    // parsed manifest VALUE against the canonicalized path): raw-text
+    // containment falsely fails on Windows, where canonical paths carry
+    // backslashes that JSON-escape inside the file bytes.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(manifest_path(&root)).unwrap()).unwrap();
     let canonical = target.canonicalize().unwrap();
-    assert!(
-        manifest.contains(canonical.to_str().expect("utf8 path")),
-        "manifest must record the canonical target root: {manifest}"
+    assert_eq!(
+        manifest["workspace_root"].as_str().expect("root string"),
+        canonical.to_str().expect("utf8 path"),
+        "manifest must record the canonical target root"
     );
     // No state leaks into any intermediate directory or the CWD.
     for intermediate in [dir.path(), &dir.path().join("a"), &dir.path().join("a/b")] {
@@ -121,23 +126,27 @@ fn init_accepts_trailing_slash_and_dot_path_forms() {
     let dir = tempdir().expect("tempdir");
     let root = init_ok(dir.path(), "ws/");
     assert!(manifest_path(&root).exists());
-    let manifest = fs::read_to_string(manifest_path(&root)).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(manifest_path(&root)).unwrap()).unwrap();
     let canonical = dir.path().join("ws").canonicalize().unwrap();
-    assert!(manifest.contains(canonical.to_str().expect("utf8 path")));
+    assert_eq!(
+        manifest["workspace_root"].as_str().expect("root string"),
+        canonical.to_str().expect("utf8 path")
+    );
 
     let dir2 = tempdir().expect("tempdir");
     let root2 = init_ok(dir2.path(), ".");
     assert!(manifest_path(&root2).exists());
-    let manifest2 = fs::read_to_string(manifest_path(&root2)).unwrap();
-    assert!(
-        manifest2.contains(
-            dir2.path()
-                .canonicalize()
-                .unwrap()
-                .to_str()
-                .expect("utf8 path")
-        ),
-        "dot path must bind the canonical CWD: {manifest2}"
+    let manifest2: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(manifest_path(&root2)).unwrap()).unwrap();
+    assert_eq!(
+        manifest2["workspace_root"].as_str().expect("root string"),
+        dir2.path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .expect("utf8 path"),
+        "dot path must bind the canonical CWD"
     );
 }
 
@@ -215,12 +224,15 @@ fn two_workspaces_have_distinct_identities_and_roots() {
     assert!(id_a.starts_with("ws-") && id_b.starts_with("ws-"));
 
     // Each manifest records its own canonical root and its own identity.
+    // Canonical-to-canonical comparison (parsed JSON value) so Windows
+    // backslash JSON-escaping cannot falsely fail the root assertion.
     for (root, id) in [(&a, &id_a), (&b, &id_b)] {
-        let manifest = fs::read_to_string(manifest_path(root)).unwrap();
-        assert!(manifest.contains(id.as_str()), "{manifest}");
-        assert!(
-            manifest.contains(root.canonicalize().unwrap().to_str().expect("utf8 path")),
-            "{manifest}"
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest_path(root)).unwrap()).unwrap();
+        assert_eq!(manifest["workspace_id"].as_str().expect("id"), id);
+        assert_eq!(
+            manifest["workspace_root"].as_str().expect("root string"),
+            root.canonicalize().unwrap().to_str().expect("utf8 path")
         );
     }
 
