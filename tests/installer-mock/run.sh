@@ -60,10 +60,18 @@ EOF
 chmod +x "${FAKEBIN}/uname"
 
 run_install() { # $1=version $2=prefix-dir -> sets RUN_OUT and RUN_RC
-    RUN_OUT="$(env -i PATH="${FAKEBIN}:/usr/bin:/bin" HOME="${HOME:-/tmp}" \
+    # The if-form (rather than plain assignment + $?) is deliberate: it
+    # keeps RUN_RC meaningful even if someone later adds `set -e` to this
+    # script — a failing command in an if-condition never triggers errexit,
+    # whereas a bare `RUN_OUT="$(...)"` would abort the driver before the
+    # failure scenarios could assert on the exit code.
+    if RUN_OUT="$(env -i PATH="${FAKEBIN}:/usr/bin:/bin" HOME="${HOME:-/tmp}" \
         AWH_GITHUB_API="$API" AWH_REPO="mock/awh" AWH_PREFIX="$2" AWH_VERSION="$1" \
-        bash "$INSTALL" 2>&1)"
-    RUN_RC=$?
+        bash "$INSTALL" 2>&1)"; then
+        RUN_RC=0
+    else
+        RUN_RC=$?
+    fi
 }
 
 check() { # $1=label $2=zero|fail $3=expected_files $4=expected_grep(re|EMPTY) $5=version $6=expected_release_hits
@@ -79,6 +87,14 @@ check() { # $1=label $2=zero|fail $3=expected_files $4=expected_grep(re|EMPTY) $
         [ "$RUN_RC" = "0" ] || fail_case "${label}: expected rc=0 got rc=${RUN_RC}; output: ${RUN_OUT}"
     else
         [ "$RUN_RC" != "0" ] || fail_case "${label}: expected nonzero rc, got 0; output: ${RUN_OUT}"
+        # The security property on failure: unverified bytes may remain as a
+        # `.part` file, but NOTHING installable is left under the real asset
+        # name — no `awh` symlink/binary a user could otherwise execute
+        # believing it was verified. The files list pins the exact leftovers
+        # (typically only the `.part`); this asserts the stronger negative.
+        [ ! -e "${d}/awh" ] || fail_case "${label}: failed install must not leave an installable 'awh' behind"
+        [ ! -e "${d}/awh-linux-x86_64" ] || fail_case "${label}: failed install must not leave unverified bytes under the real asset name"
+        [ ! -e "${d}/awh.exe" ] || fail_case "${label}: failed install must not leave 'awh.exe' behind"
     fi
     [ "$files" = "$want_files" ] || fail_case "${label}: files=[$files] want=[$want_files]"
     if [ "$want_grep" != "EMPTY" ]; then

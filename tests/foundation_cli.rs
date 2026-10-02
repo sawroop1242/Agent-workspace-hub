@@ -75,9 +75,13 @@ const SANITIZED_AWH_VARS: &[&str] = &[
     "AWH_NGROK_AUTHTOKEN",
 ];
 
-/// Non-`AWH_*` credentials and provider routing the binary may read.
+/// Non-`AWH_*` credentials and provider routing the binary reads.
 /// Stripped alongside the AWH set for the same reason: a developer's or
 /// runner's credentials must not enable provider behavior mid-test.
+/// (Fixed names only — dynamic reads like `--api-key-env` or
+/// registry-driven `${secret:NAME}` expansion are user/registry-named and
+/// cannot be enumerated statically; they are also fail-closed behind
+/// explicit allow-lists in the product.)
 const SANITIZED_PROVIDER_VARS: &[&str] = &[
     "GITHUB_TOKEN",
     "GITHUB_PERSONAL_ACCESS_TOKEN",
@@ -85,6 +89,8 @@ const SANITIZED_PROVIDER_VARS: &[&str] = &[
     "GITHUB_DEFAULT_OWNER",
     "GITHUB_DEFAULT_REPO",
     "COMPOSIO_API_KEY",
+    "COMPOSIO_CONNECTED_ACCOUNT_ID",
+    "COMPOSIO_TOOLKIT",
     "NGROK_AUTHTOKEN",
 ];
 

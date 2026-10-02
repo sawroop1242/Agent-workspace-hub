@@ -86,6 +86,10 @@ if [ "$INSTALL_SOURCE" != "release" ] && [ "$INSTALL_SOURCE" != "source" ]; then
 fi
 
 log()    { printf '%s\n' "$*"; }
+# For diagnostics emitted from inside a $(...) command substitution: those
+# capture stdout, so a plain log() there would vanish into the captured
+# variable instead of reaching the user's terminal. stderr is never captured.
+log_err() { printf '%s\n' "$*" >&2; }
 fail()   { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 require_cmd() {
@@ -148,7 +152,7 @@ resolve_tag() {
         api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/latest"
     fi
     if ! body="$(curl -fsSL "$api")"; then
-        log "Could not fetch release metadata from: ${api}"
+        log_err "Could not fetch release metadata from: ${api}"
         return 1
     fi
     if [ "$VERSION" = "latest" ]; then
@@ -165,10 +169,14 @@ resolve_tag() {
 # https://api.github.com -> https://github.com, and a GHES-style
 # https://host/api/v3 -> https://host. Keeps the fallback download URL on
 # the same instance the metadata came from when AWH_GITHUB_API is set.
+# A trailing slash (a natural way to spell the override) is normalized
+# away so the derived URL is never malformed with a double slash.
 download_host() {
     local root="${1:-https://api.github.com}"
+    root="${root%/}"
     root="${root%/api/v3}"
     root="${root%/api}"
+    root="${root%/}"
     if [ "$root" = "https://api.github.com" ]; then
         root="https://github.com"
     fi

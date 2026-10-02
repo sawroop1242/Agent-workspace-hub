@@ -270,4 +270,41 @@ Five more findings — all accepted and fixed:
    (exit codes, leftover files, transcript lines, and exactly one
    release-API hit per install). All 8 checks pass.
 
+### Round 4 (Kilo re-review of the round-3 commit)
+
+Five findings — 4 accepted+fixed, 1 reframed with a stronger assertion:
+
+1. **`log` diagnostic was swallowed by the command substitution**
+   (WARNING, real): `resolve_tag` runs as `resolved="$(resolve_tag)"`, and
+   `log()` writes to stdout — so "Could not fetch release metadata from:
+   <url>" was captured into `$resolved` and discarded, never reaching the
+   terminal (confirmed: the round-2/3 transcripts show curl's own stderr
+   line but not ours). Added `log_err()` (stderr) for diagnostics emitted
+   from inside `$(...)` and used it in `resolve_tag`; verified live that
+   the line now appears before the fallback message.
+2. **`run_install` would break under `set -e`** (WARNING, latent): the
+   driver currently runs `set -Euo pipefail` without `-e`, so failure
+   scenarios work — but a bare `RUN_OUT="$(...)"` pattern aborts under
+   errexit before `RUN_RC` can be asserted, so anyone re-adding `-e`
+   would silently break the failure scenarios. Rewrote as an if-form
+   (errexit never fires for commands in an if-condition), with a comment
+   explaining why the shape matters.
+3. **`SANITIZED_PROVIDER_VARS` missed two Composio variables**
+   (`COMPOSIO_CONNECTED_ACCOUNT_ID`, `COMPOSIO_TOOLKIT`, read at
+   `src/mcp/composio.rs`). Both added; the constant's comment now also
+   records that dynamic reads (`--api-key-env`, registry-driven
+   `${secret:NAME}` expansion) are user/registry-named and cannot be
+   enumerated statically — and are fail-closed behind allow-lists in the
+   product.
+4. **`download_host` did not normalize a trailing slash** in
+   `AWH_GITHUB_API`, producing a double-slash fallback URL. Now stripped
+   (verified live: `http://host:port/` resolves and installs via the
+   fallback host).
+5. **The harness pinned `.part` leftovers as expected output** — fair
+   reframing: the assertable security property is that a failed install
+   leaves NOTHING installable under the real names. `run.sh` now also
+   asserts the stronger negatives on every failure scenario: no `awh`
+   symlink/binary, no `awh-linux-x86_64`, no `awh.exe` — on top of the
+   exact-leftovers list. All 8 scenarios still pass.
+
 
