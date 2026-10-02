@@ -89,10 +89,14 @@ check() { # $1=label $2=zero|fail $3=expected_files $4=expected_grep(re|EMPTY) $
         [ "$RUN_RC" != "0" ] || fail_case "${label}: expected nonzero rc, got 0; output: ${RUN_OUT}"
         # The security property on failure: unverified bytes may remain as a
         # `.part` file, but NOTHING installable is left under the real asset
-        # name — no `awh` symlink/binary a user could otherwise execute
-        # believing it was verified. The files list pins the exact leftovers
-        # (typically only the `.part`); this asserts the stronger negative.
-        [ ! -e "${d}/awh" ] || fail_case "${label}: failed install must not leave an installable 'awh' behind"
+        # name — no `awh` link a user could otherwise execute believing it
+        # was verified. -e alone follows symlinks and misses a DANGLING one
+        # (install.sh creates `awh` via ln -sf, so a failure between link
+        # creation and cleanup would leave exactly that), hence the extra
+        # -L. The other two names are regular files, so -e suffices.
+        if [ -e "${d}/awh" ] || [ -L "${d}/awh" ]; then
+            fail_case "${label}: failed install must not leave an installable 'awh' behind"
+        fi
         [ ! -e "${d}/awh-linux-x86_64" ] || fail_case "${label}: failed install must not leave unverified bytes under the real asset name"
         [ ! -e "${d}/awh.exe" ] || fail_case "${label}: failed install must not leave 'awh.exe' behind"
     fi

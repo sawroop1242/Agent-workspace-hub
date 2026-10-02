@@ -268,7 +268,11 @@ Five more findings — all accepted and fixed:
    `-star`/`-mismatch`/`-missing`/`-nosums`/`-noasset`/`-badtag`) and
    `run.sh`, a self-asserting driver that runs the 8-scenario matrix
    (exit codes, leftover files, transcript lines, and exactly one
-   release-API hit per install). All 8 checks pass.
+   release-API hit per install). Reproduce with
+   `bash tests/installer-mock/run.sh`; it also runs in CI as the
+   "Validate installer against mock GitHub release server" step of the
+   `release-readiness` job on every PR, so the matrix cannot silently
+   regress.
 
 ### Round 4 (Kilo re-review of the round-3 commit)
 
@@ -280,8 +284,9 @@ Five findings — 4 accepted+fixed, 1 reframed with a stronger assertion:
    <url>" was captured into `$resolved` and discarded, never reaching the
    terminal (confirmed: the round-2/3 transcripts show curl's own stderr
    line but not ours). Added `log_err()` (stderr) for diagnostics emitted
-   from inside `$(...)` and used it in `resolve_tag`; verified live that
-   the line now appears before the fallback message.
+   from inside `$(...)` and used it in `resolve_tag`; the behavior is
+   reproducible via `bash tests/installer-mock/run.sh` (also run in the
+   `release-readiness` CI job).
 2. **`run_install` would break under `set -e`** (WARNING, latent): the
    driver currently runs `set -Euo pipefail` without `-e`, so failure
    scenarios work — but a bare `RUN_OUT="$(...)"` pattern aborts under
@@ -297,14 +302,34 @@ Five findings — 4 accepted+fixed, 1 reframed with a stronger assertion:
    enumerated statically — and are fail-closed behind allow-lists in the
    product.
 4. **`download_host` did not normalize a trailing slash** in
-   `AWH_GITHUB_API`, producing a double-slash fallback URL. Now stripped
-   (verified live: `http://host:port/` resolves and installs via the
-   fallback host).
+   `AWH_GITHUB_API`, producing a double-slash fallback URL. Now stripped;
+   the `asset-url-fallback` scenario of
+   `bash tests/installer-mock/run.sh` (CI: `release-readiness` job)
+   exercises the derived-host path end-to-end.
 5. **The harness pinned `.part` leftovers as expected output** — fair
    reframing: the assertable security property is that a failed install
    leaves NOTHING installable under the real names. `run.sh` now also
    asserts the stronger negatives on every failure scenario: no `awh`
-   symlink/binary, no `awh-linux-x86_64`, no `awh.exe` — on top of the
-   exact-leftovers list. All 8 scenarios still pass.
+   link or symlink — including a dangling one — no `awh-linux-x86_64`,
+   no `awh.exe`, on top of the exact-leftovers list. The matrix
+   (`bash tests/installer-mock/run.sh`, CI: `release-readiness` job)
+   passes all 8 scenarios.
+
+### Round 5 (Kilo re-review of the round-4 commit)
+
+Two suggestions — both accepted:
+
+1. **`[ ! -e ... ]` cannot see a dangling symlink**: install.sh creates
+   `awh` via `ln -sf`, so a failure between link creation and cleanup
+   could leave a dangling `awh` that `-e` (which follows links) misses
+   — exactly the case the new negative claimed to guard. The `awh`
+   check now fails on `-e OR -L`; the two regular-file negatives keep
+   `-e`.
+2. **Report claims were not reproducible**: "verified live" / "all N
+   scenarios still pass" phrasings were replaced with the concrete
+   reproduction command (`bash tests/installer-mock/run.sh`) and the CI
+   hook that runs it (the `release-readiness` job), so a reader can
+   re-check any claim and the harness — not prose — is the source of
+   truth.
 
 
