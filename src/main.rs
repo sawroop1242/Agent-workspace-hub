@@ -1648,9 +1648,16 @@ fn serve_sse(
     let host = host
         .or_else(|| std::env::var("AWH_HOST").ok())
         .unwrap_or_else(|| "0.0.0.0".to_string());
-    let port = port
-        .or_else(|| std::env::var("AWH_PORT").ok().and_then(|v| v.parse().ok()))
-        .unwrap_or(8443);
+    let port = match port {
+        Some(port) => port,
+        None => match std::env::var("AWH_PORT") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u16>()
+                .with_context(|| format!("invalid value for AWH_PORT: {raw:?}"))?,
+            Err(_) => 8443,
+        },
+    };
     let tls_cert = tls_cert.or_else(|| std::env::var("AWH_TLS_CERT").ok());
     let tls_key = tls_key.or_else(|| std::env::var("AWH_TLS_KEY").ok());
 

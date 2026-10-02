@@ -136,6 +136,44 @@ resolve_tag() {
         sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1
 }
 
+verify_checksum() {
+    # Verifies the downloaded asset against the release's published
+    # sha256sums.txt. The checksum file is mandatory for release installs:
+    # a missing or mismatching checksum aborts the whole install (it does
+    # NOT fall back to a source build, which would mask an integrity
+    # failure) — never trust unverified bytes.
+    # (AWH_TP01: release artifacts and checksums are part of the
+    # distribution contract.)
+    local dest="$1" asset="$2" tag="$3" release_api="$4"
+    local sums sum_url expected actual
+
+    sum_url="$(curl -fsSL "$release_api" |
+        sed -n "s|.*\"browser_download_url\": \"\([^\"]*sha256sums.txt[^\"]*\)\".*|\1|p" | head -n 1)"
+
+    if [ -z "$sum_url" ]; then
+        fail "Release ${tag} does not publish sha256sums.txt; refusing to install unverified bytes. Use --source source to build from source instead."
+    fi
+
+    sums="$(curl -fsSL "$sum_url")" ||
+        fail "Could not download sha256sums.txt from ${sum_url}"
+
+    expected="$(printf '%s\n' "$sums" | awk -v a="$asset" '$2 == a {print $1; exit}')"
+    [ -n "$expected" ] ||
+        fail "sha256sums.txt does not contain an entry for ${asset}"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$dest" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$dest" | awk '{print $1}')"
+    else
+        fail "Neither sha256sum nor shasum is available to verify the download."
+    fi
+
+    [ "$actual" = "$expected" ] ||
+        fail "Checksum mismatch for ${asset}: expected ${expected}, got ${actual}"
+    log "Checksum verified for ${asset}"
+}
+
 download_binary() {
     local os arch asset tag release_api url dest final
 
@@ -167,6 +205,8 @@ download_binary() {
     curl -fsSL -o "$dest" "$url"
 
     [ -s "$dest" ] || fail "Downloaded asset is empty: $url"
+
+    verify_checksum "$dest" "$asset" "$tag" "$release_api"
 
     if [ "$os" != "windows" ]; then
         chmod +x "$dest"
@@ -227,6 +267,10 @@ else
     if download_binary; then
         :
     else
+        # Only an *unavailable* prebuilt binary falls back to a source
+        # build. Integrity failures (missing/mismatching checksums)
+        # already aborted the install inside download_binary — falling
+        # back here would mask a corrupted or tampered download.
         log "Prebuilt binary unavailable; falling back to building from source."
         build_from_source
     fi

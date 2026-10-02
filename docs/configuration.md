@@ -26,7 +26,7 @@ injected key-value source; tests never mutate the process environment).
 | --- | --- | --- |
 | `AWH_API_KEY` | *(required)* | Bearer token for `/sse` and `/mcp`. Rejects startup if missing/empty |
 | `AWH_HOST` | `0.0.0.0` | HTTPS bind address |
-| `AWH_PORT` | `8443` | HTTPS port |
+| `AWH_PORT` | `8443` | HTTPS port; a non-numeric value fails startup with a clear error naming the variable (never a silent fallback) |
 | `AWH_TLS_CERT` | *(unset → plain HTTP)* | PEM certificate path |
 | `AWH_TLS_KEY` | *(unset → plain HTTP)* | PEM private key path |
 | `AWH_ALLOWED_ORIGINS` | *(unset → CORS disabled)* | Comma-separated origin allow-list for browser clients |
