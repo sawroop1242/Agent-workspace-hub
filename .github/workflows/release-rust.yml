@@ -228,12 +228,35 @@ jobs:
           echo "Build-tools: $EXPECTED_BUILD_TOOLS"
           echo "NDK: $EXPECTED_NDK"
 
-      - name: Configure Android linker
+      - name: Configure Android linker and C compiler
         if: matrix.target == 'aarch64-linux-android'
         run: |
+          set -euo pipefail
+
           NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$LLVM/aarch64-linux-android21-clang"
+          AR="$LLVM/llvm-ar"
+
+          test -x "$CLANG" || {
+            echo "::error::Android clang not found: $CLANG"
+            exit 1
+          }
+          test -x "$AR" || {
+            echo "::error::Android llvm-ar not found: $AR"
+            exit 1
+          }
+
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG" >> "$GITHUB_ENV"
+
+          # ring/cc-rs looks for CC_<target> before Cargo's linker setting.
+          # Explicitly point it at the NDK clang wrapper instead of the
+          # non-existent aarch64-linux-android-clang name.
+          echo "CC_aarch64_linux_android=$CLANG" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$AR" >> "$GITHUB_ENV"
+          echo "CC_aarch64-linux-android=$CLANG" >> "$GITHUB_ENV"
+          echo "AR_aarch64-linux-android=$AR" >> "$GITHUB_ENV"
 
       - name: Install cross-compiler (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
