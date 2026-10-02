@@ -44,6 +44,50 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets
 
+      - name: Validate Android SDK package allowlist
+        run: |
+          set -euo pipefail
+
+          WORKFLOW=".github/workflows/release-rust.yml"
+          ALLOWED='platform-tools|platforms;android-35|build-tools;35.0.0|ndk;27.2.12479018'
+
+          # The setup action must not receive an SDK package list. In particular,
+          # the obsolete "tools" package must never be passed to sdkmanager.
+          setup_block="$(awk '
+            /uses: android-actions\/setup-android@v3/ { found=1; start=1 }
+            start { print }
+            start && /^[[:space:]]*- name:/ && !/Set up Android SDK\/NDK/ && found { exit }
+          ' "$WORKFLOW")"
+
+          if printf '%s\n' "$setup_block" | grep -Eq 'packages:[[:space:]]*[^[:space:]]'; then
+            echo "::error::android-actions/setup-android must not install SDK packages directly."
+            exit 1
+          fi
+
+          if grep -nE 'sdkmanager([[:space:]].*)?[[:space:]](^|[[:space:]])"?tools"?([[:space:]]|"$)' "$WORKFLOW"; then
+            echo "::error::Obsolete Android SDK package 'tools' is configured."
+            exit 1
+          fi
+
+          # Check every quoted SDK package passed to sdkmanager is in the pinned allowlist.
+          packages="$(grep -oE '"(platform-tools|platforms;[^"]+|build-tools;[^"]+|ndk;[^"]+)"' "$WORKFLOW" | tr -d '"' | sort -u || true)"
+          unexpected="$(printf '%s\n' "$packages" | grep -Ev "^($ALLOWED)$" || true)"
+
+          if [ -n "$unexpected" ]; then
+            echo "::error::Unpinned Android SDK/NDK package(s) configured:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+
+          for required in platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018; do
+            printf '%s\n' "$packages" | grep -Fxq "$required" || {
+              echo "::error::Required pinned Android package is missing: $required"
+              exit 1
+            }
+          done
+
+          echo "Android SDK package allowlist check passed."
+
   build:
     name: Build (${{ matrix.os }} / ${{ matrix.target }})
     needs: verify
