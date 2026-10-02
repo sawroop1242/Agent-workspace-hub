@@ -59,8 +59,9 @@ jobs:
             start && /^[[:space:]]*- name:/ && !/Set up Android SDK\/NDK/ && found { exit }
           ' "$WORKFLOW")"
 
-          if printf '%s\n' "$setup_block" | grep -Eq 'packages:[[:space:]]*[^[:space:]]'; then
-            echo "::error::android-actions/setup-android must not install SDK packages directly."
+          setup_packages="$(printf '%s\n' "$setup_block" | sed -n 's/^[[:space:]]*packages:[[:space:]]*//p' | head -n1)"
+          if [ -n "$setup_packages" ] && [ "$setup_packages" != '""' ]; then
+            echo "::error::android-actions/setup-android must not install SDK packages directly: $setup_packages"
             exit 1
           fi
 
