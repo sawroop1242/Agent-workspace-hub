@@ -32,8 +32,7 @@ jobs:
       - name: Version consistency (tag must match Cargo.toml)
         run: |
           set -euo pipefail
-          EXPECTED="v$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[0].version')"
+          EXPECTED="v$(cargo metadata --no-deps --format-version 1             | jq -r '.packages[0].version')"
           INPUT="${{ github.event.inputs.version }}"
           echo "Cargo.toml version: ${EXPECTED#v}"
           echo "Requested tag:       ${INPUT#v}"
@@ -86,11 +85,12 @@ jobs:
       - name: Set up Android SDK/NDK
         if: matrix.target == 'aarch64-linux-android'
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
+
+      - name: Install Android SDK packages
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Install Android NDK
         if: matrix.target == 'aarch64-linux-android'
@@ -144,10 +144,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "${{ github.event.inputs.version }}" \
-            --repo "${{ github.repository }}" \
-            --dir assets \
-            --clobber
+          gh release download "${{ github.event.inputs.version }}"             --repo "${{ github.repository }}"             --dir assets             --clobber
       - name: Generate SHA-256 checksums
         run: |
           cd assets
