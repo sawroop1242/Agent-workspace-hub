@@ -34,6 +34,8 @@ impl MemoryUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // Append-input owns the keyboard while active.
+    app.ui.capture_input = app.ui.memory_ui.input_active;
     let ui = &mut app.ui.memory_ui;
     let project = app.backend.current_project_hint();
 

@@ -45,6 +45,94 @@ pub struct DashboardSnapshot {
     pub recent_activity: Vec<String>,
 }
 
+// ----- Read-only view models for the premium views (Prompt 30) -----
+
+/// Agent profile as shown in the Agents view. Identifier-only projection
+/// of `models::Agent`; carries no credentials (there are none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentView {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    /// Wire name of `AgentStatus` (`Active`, `Stopped`, …).
+    pub status: String,
+    pub enabled: bool,
+}
+
+/// Runtime session as shown in the Agents view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub session_id: String,
+    pub agent_id: String,
+    /// Wire name of `SessionStatus` (`Active`, `Paused`, …).
+    pub status: String,
+    pub last_activity_at: String,
+}
+
+/// Task as shown in the Tasks view (Prompt 30 task-status vocabulary:
+/// pending/running/completed/failed/cancelled/blocked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskView {
+    pub id: String,
+    pub title: String,
+    /// Wire name of `TaskStatus`.
+    pub status: String,
+    pub assignee: Option<String>,
+    pub updated_at: String,
+}
+
+/// One entry of the git status parsed for the Changes view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    /// Repository-relative path.
+    pub path: String,
+    /// Two-letter porcelain status code.
+    pub status_code: String,
+    pub staged: bool,
+    pub unstaged: bool,
+}
+
+/// One commit from the recent-commits feed (`git log --oneline`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitView {
+    pub hash: String,
+    pub subject: String,
+}
+
+/// One connector as shown on the MCP/Connectors view. Metadata only —
+/// never auth methods' material, never scopes' contents are rendered by
+/// the UI; this projection omits them entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorView {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub enabled: bool,
+}
+
+/// One canonical audit event as shown in the Audit view. Projection of
+/// the ring's `AuditEntry`: identifiers plus correlation ids only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRow {
+    pub ts_ms: u128,
+    pub kind: String,
+    pub action: String,
+    pub subject: String,
+    pub detail: String,
+    pub event_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+    pub edit_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// Error for read paths a backend does not expose. Views render the
+/// documented Unavailable state instead of inventing data.
+pub fn unavailable(what: &'static str) -> anyhow::Error {
+    anyhow::anyhow!("{what} unavailable on this backend")
+}
+
 /// Backend operations available to every TUI screen.
 pub trait WorkspaceBackend {
     fn dashboard(&self) -> Result<DashboardSnapshot>;
@@ -108,6 +196,55 @@ pub trait WorkspaceBackend {
         Ok(Vec::new())
     }
 
+    // ----- Premium-view read paths (Prompt 30). Defaults fail with an
+    // explicit `unavailable` so every backend renders honest states
+    // rather than empty look-alikes. -----
+
+    /// Registered agent profiles (identifier projection only).
+    fn list_agents(&self) -> Result<Vec<AgentView>> {
+        Err(unavailable("agents view"))
+    }
+
+    /// Runtime sessions, optionally filtered to one agent.
+    fn list_sessions(&self, _agent: Option<&str>) -> Result<Vec<SessionView>> {
+        Err(unavailable("sessions view"))
+    }
+
+    /// Starts a registered agent profile (service-owned lifecycle).
+    fn agent_start(&self, _id: &str) -> Result<()> {
+        Err(unavailable("agent start"))
+    }
+
+    /// Stops a running agent (service-owned lifecycle; terminal).
+    fn agent_stop(&self, _id: &str) -> Result<()> {
+        Err(unavailable("agent stop"))
+    }
+
+    /// Tasks for the focused scope (current project, else workspace).
+    fn list_tasks(&self) -> Result<Vec<TaskView>> {
+        Err(unavailable("tasks view"))
+    }
+
+    /// Changed files parsed from `git status --porcelain`.
+    fn list_changed_files(&self) -> Result<Vec<ChangedFile>> {
+        Err(unavailable("changes view"))
+    }
+
+    /// Recent commits parsed from `git log --oneline`.
+    fn recent_commits(&self, _limit: usize) -> Result<Vec<CommitView>> {
+        Err(unavailable("commits view"))
+    }
+
+    /// Registered connectors (metadata projection; no auth material).
+    fn list_connectors(&self) -> Result<Vec<ConnectorView>> {
+        Err(unavailable("connectors view"))
+    }
+
+    /// Canonical audit events, newest first.
+    fn list_audit(&self, _limit: usize) -> Result<Vec<AuditRow>> {
+        Err(unavailable("audit view"))
+    }
+
     /// Where this backend operates: local filesystem or a remote API.
     fn mode(&self) -> BackendMode;
 
@@ -149,6 +286,19 @@ impl LocalBackend {
     /// Absolute workspace root this backend operates on.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Registers an agent profile through the canonical runtime
+    /// service (test/CLI-facing helper; screens use the same path via
+    /// `list_agents`/`agent_start`).
+    pub fn register_profile(
+        &self,
+        id: &str,
+        name: &str,
+        role: &str,
+    ) -> Result<crate::models::Agent> {
+        let runtime = crate::services::agent_runtime::AgentRuntimeService::new(&self.root);
+        runtime.register_profile(id, name, role)
     }
 
     /// Records the project the operator opened, for the dashboard.
@@ -485,6 +635,137 @@ impl WorkspaceBackend for LocalBackend {
                 transport: format!("{:?}", entry.config.transport),
                 enabled: entry.config.enabled,
                 version: entry.version,
+            })
+            .collect())
+    }
+
+    // ----- Premium-view read paths (LocalBackend over canonical services) -----
+
+    fn list_agents(&self) -> Result<Vec<AgentView>> {
+        let runtime = crate::services::agent_runtime::AgentRuntimeService::new(&self.root);
+        Ok(runtime
+            .profiles()?
+            .into_iter()
+            .map(|a| AgentView {
+                id: a.id,
+                name: a.name,
+                role: a.role,
+                status: format!("{:?}", a.status),
+                enabled: a.enabled,
+            })
+            .collect())
+    }
+
+    fn list_sessions(&self, agent: Option<&str>) -> Result<Vec<SessionView>> {
+        let runtime = crate::services::agent_runtime::AgentRuntimeService::new(&self.root);
+        Ok(runtime
+            .sessions_for(agent)?
+            .into_iter()
+            .map(|s| SessionView {
+                session_id: s.session_id,
+                agent_id: s.agent_id,
+                status: format!("{:?}", s.status),
+                last_activity_at: s.last_activity_at,
+            })
+            .collect())
+    }
+
+    fn agent_start(&self, id: &str) -> Result<()> {
+        let runtime = crate::services::agent_runtime::AgentRuntimeService::new(&self.root);
+        runtime.start_agent(id)?;
+        crate::services::audit::record_allow("tui_agent_start", id, "operator");
+        Ok(())
+    }
+
+    fn agent_stop(&self, id: &str) -> Result<()> {
+        let runtime = crate::services::agent_runtime::AgentRuntimeService::new(&self.root);
+        runtime.stop_agent(id)?;
+        crate::services::audit::record_allow("tui_agent_stop", id, "operator");
+        Ok(())
+    }
+
+    fn list_tasks(&self) -> Result<Vec<TaskView>> {
+        let scope = self.current_project.as_deref();
+        let root = self.store_root(scope);
+        let store = crate::core::tasks::TaskStore::new(root)?;
+        Ok(store
+            .list(None)?
+            .into_iter()
+            .map(|t| TaskView {
+                id: t.id,
+                title: t.title,
+                status: t.status.as_str().to_string(),
+                assignee: t.assignee,
+                updated_at: t.updated_at,
+            })
+            .collect())
+    }
+
+    fn list_changed_files(&self) -> Result<Vec<ChangedFile>> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        let status = self.runtime.block_on(git.status())?;
+        Ok(status
+            .porcelain_entries()
+            .into_iter()
+            .map(|e| {
+                let bytes = e.status.as_bytes();
+                let staged = bytes.first().is_some_and(|c| *c != b' ');
+                let unstaged = bytes.get(1).is_some_and(|c| *c != b' ');
+                ChangedFile {
+                    path: e.path,
+                    status_code: e.status,
+                    staged,
+                    unstaged,
+                }
+            })
+            .collect())
+    }
+
+    fn recent_commits(&self, limit: usize) -> Result<Vec<CommitView>> {
+        let git = crate::services::git::GitService::open(&self.root)?;
+        let out = self.runtime.block_on(git.log(limit))?;
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                let mut split = line.splitn(2, ' ');
+                let hash = split.next()?.to_string();
+                let subject = split.next().unwrap_or("").to_string();
+                (!hash.is_empty()).then_some(CommitView { hash, subject })
+            })
+            .collect())
+    }
+
+    fn list_connectors(&self) -> Result<Vec<ConnectorView>> {
+        let store = crate::mcp::ConnectorsMcp::new(&self.root)?;
+        Ok(store
+            .list()?
+            .into_iter()
+            .map(|c| ConnectorView {
+                id: c.id,
+                name: c.name,
+                provider: c.provider,
+                enabled: c.enabled,
+            })
+            .collect())
+    }
+
+    fn list_audit(&self, limit: usize) -> Result<Vec<AuditRow>> {
+        Ok(crate::services::audit::global()
+            .recent(limit)
+            .into_iter()
+            .map(|e| AuditRow {
+                ts_ms: e.ts_ms,
+                kind: e.kind,
+                action: e.action,
+                subject: e.subject,
+                detail: e.detail,
+                event_id: e.event_id,
+                workspace_id: e.workspace_id,
+                agent_id: e.agent_id,
+                session_id: e.session_id,
+                edit_id: e.edit_id,
+                reason: e.reason,
             })
             .collect())
     }

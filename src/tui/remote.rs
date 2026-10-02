@@ -320,6 +320,26 @@ struct AuditWire {
     action: String,
     subject: String,
     detail: String,
+    #[serde(default)]
+    ts_ms: Option<u128>,
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    edit_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Wire envelope of `/api/v1/audit`.
+#[derive(Debug, Clone, Deserialize)]
+struct AuditEntriesResponse {
+    entries: Vec<AuditWire>,
 }
 
 fn err_remote(op: &str, e: anyhow::Error) -> anyhow::Error {
@@ -631,6 +651,70 @@ impl WorkspaceBackend for RemoteBackend {
 
     fn list_mcp_servers(&self) -> Result<Vec<crate::tui::remote::McpInfo>> {
         self.list_mcp()
+    }
+
+    // ----- Premium-view read paths the Control API actually exposes.
+    // Agents/tasks/connectors have no routes; those views render the
+    // documented Unavailable state via the trait defaults. -----
+
+    fn list_audit(&self, limit: usize) -> Result<Vec<crate::tui::backend::AuditRow>> {
+        let resp: AuditEntriesResponse = self
+            .get_json(&format!("/api/v1/audit?limit={limit}"))
+            .map_err(|e| err_remote("audit", e))?;
+        Ok(resp
+            .entries
+            .into_iter()
+            .map(|e| crate::tui::backend::AuditRow {
+                ts_ms: e.ts_ms.unwrap_or(0),
+                kind: e.kind,
+                action: e.action,
+                subject: e.subject,
+                detail: e.detail,
+                event_id: e.event_id,
+                workspace_id: e.workspace_id,
+                agent_id: e.agent_id,
+                session_id: e.session_id,
+                edit_id: e.edit_id,
+                reason: e.reason,
+            })
+            .collect())
+    }
+
+    fn list_changed_files(&self) -> Result<Vec<crate::tui::backend::ChangedFile>> {
+        let status: GitOutput = self
+            .get_json("/api/v1/git/status")
+            .map_err(|e| err_remote("git status", e))?;
+        Ok(status
+            .porcelain_entries()
+            .into_iter()
+            .map(|e| {
+                let bytes = e.status.as_bytes();
+                let staged = bytes.first().is_some_and(|c| *c != b' ');
+                let unstaged = bytes.get(1).is_some_and(|c| *c != b' ');
+                crate::tui::backend::ChangedFile {
+                    path: e.path,
+                    status_code: e.status,
+                    staged,
+                    unstaged,
+                }
+            })
+            .collect())
+    }
+
+    fn recent_commits(&self, limit: usize) -> Result<Vec<crate::tui::backend::CommitView>> {
+        let out: GitOutput = self
+            .get_json(&format!("/api/v1/git/log?limit={limit}"))
+            .map_err(|e| err_remote("git log", e))?;
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                let mut split = line.splitn(2, ' ');
+                let hash = split.next()?.to_string();
+                let subject = split.next().unwrap_or("").to_string();
+                (!hash.is_empty()).then_some(crate::tui::backend::CommitView { hash, subject })
+            })
+            .collect())
     }
 
     fn mode(&self) -> crate::tui::backend::BackendMode {

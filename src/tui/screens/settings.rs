@@ -15,6 +15,7 @@ use crate::tui::app::App;
 use crate::tui::backend::WorkspaceBackend;
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    app.ui.capture_input = false;
     if key.code == KeyCode::Char('r') {
         app.invalidate_dashboard();
         app.set_message("settings refreshed");

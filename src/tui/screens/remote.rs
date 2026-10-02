@@ -29,6 +29,8 @@ pub struct RemoteUi {
 }
 
 pub fn handle_key<B: WorkspaceBackend>(app: &mut App<B>, key: KeyEvent) {
+    // URL/key inputs own the keyboard while active.
+    app.ui.capture_input = app.ui.remote_ui.url_active;
     let ui = &mut app.ui.remote_ui;
     if ui.url_active {
         match key.code {

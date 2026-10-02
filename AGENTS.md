@@ -606,3 +606,31 @@ cheap-to-clone). Tool catalog 53 static.
   session open; task create needs --description or it reads stdin). Suite: 1327 passed /
   0 failed (was 1301 pre-COL-001). Docs updated: CLI.md tree+counts, FEATURES.md.
 - **Prompt 18 build phase (branch master-completion-18, PR #130)**: CI `agent-pipeline-validation` job hard-opens `.github/agent-engine/feature-registry.yml` whenever the PR diff touches `.github/agent-engine/|.github/agent/|scripts/` — the file was REMOVED by 2b1fef5 ("remove external agent infrastructure") so every relevant PR fails; fixed in 4cfd3cb by mirroring the orchestrator-step's file-existence guard. §9 matrix closed in 5e7d990: wedge Phase H (worktree×snapshot = provenance lands under the WORKTREE's own store, main tree untouched; worktree×rollback = confined to the effective root + rollback re-evaluates a CURRENT authorization — foreign principal denied), tasks×sessions (task plane independent of session lifecycle: stop is terminal for execution, tasks survive + terminal session records stay valid assignees since SessionStore.get checks existence, not liveness), context×memory (CLI context plane = ContextEngine, stores under `.agent/context-engine/` — NOT `.agent/context.md` which is the MCP/API ContextStore; there is NO `awh context status` subcommand; nothing ever creates `.agent/memory.json`). Phase H gotchas: (1) wedge fixture must gitignore `/.agent/` before the base commit so the worktree checkout is a clean slate — `initialize_workspace` on a checkout containing a copied manifest fails closed as foreign-root; (2) `WorktreeStore::remove` fails `Dirty(...)` on untracked files in the checkout — tests that write into the checkout must remove their residue before the ownership-removal tail; (3) `initialize_workspace` returns `InitOutcome` (Created/AlreadyInitialized) — use `.manifest()`, no direct `.workspace_id` field. Collaboration (COL-001) lives ONLY on PR #131 branch collaboration-col-001 (c803847 NOT an ancestor of master-completion-18); that branch had ZERO pull_request-triggered CI runs despite ci.yml having `pull_request: branches:[rust]` — dispatched manually via `gh workflow run ci.yml --ref collaboration-col-001` (run 36894154596); base-branch docs (909b703) already document `awh collaboration ...`, so on this branch the CLI docs run ahead of the binary until #131 merges — do not "fix" those docs on this branch (conflicts with #131's file set). §20 verified: 73-tool catalog (61 core + 12 github.*) matches dispatcher.
+
+- **Prompt 30 — Premium TUI (PR #135, branch tui-premium-001)**: layered
+  infra under src/tui/: theme.rs (semantic Role styles + status glyphs +
+  LayoutProfile Compact/Standard/Large), keymap.rs (single source of truth
+  for Help/footer/palette), components.rs (panels, status tags, diff
+  viewer with line numbers + horizontal scroll, empty/unavailable
+  placeholders, dialogs), shell.rs (header + nav rail + status bar),
+  palette.rs (Ctrl+K fuzzy palette; disabled commands carry reasons),
+  operations.rs (Requested->Authorizing->Executing->Confirmed/Failed/
+  Unknown tracker). New screens: agents/tasks/changes/audit (audit
+  replaces logs.rs and reads the canonical ring — NO separate TUI audit
+  store). App: screen stack (goto/back), capture_input contract (screens
+  declare input ownership so global digits/letters never steal keys;
+  Ctrl+K/Ctrl+Q stay global even mid-input), digits jump via
+  shell::PRIMARY_SECTIONS (Dashboard=1, so Git=6), Tab cycles the
+  13-primary ring, 'r' is global refresh (files rename moved to 'm').
+  Backend: view models (TaskView/AgentView/SessionView/CommitView/
+  ChangedFile/AuditRow) on WorkspaceBackend + Local/Remote impls;
+  TaskStore (core/tasks.rs) is the store, TaskService does NOT exist;
+  LocalBackend::register_profile helper wraps AgentRuntimeService.
+  Tests: 1366 green workspace-wide. Gotchas: (1) ratatui Text has no
+  From<Chain<...>> — collect Vec<Line> before Paragraph::new; (2) Role
+  needs #[derive(Default)] + #[default] attr (clippy derivable_impls);
+  (3) fuzzy scoring must weight longest consecutive run > prefix bonus or
+  scattered subqueries outrank coherent ones; (4) format! strings cannot
+  do const field access ({GLYPHS.branch}) — bind a local first; (5)
+  background long test runs need setsid nohup, plain `&` dies when the
+  terminal call times out.
