@@ -399,6 +399,40 @@ jobs:
               ;;
           esac
 
+          echo "Selected pinned NDK directory: $EXPECTED_NDK_ROOT"
+
+          expected_toolchain_prefix="$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/"
+          for name in CC_aarch64_linux_android AR_aarch64_linux_android CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER; do
+            value="${!name:-}"
+            test -n "$value" || {
+              echo "::error::$name is not set"
+              exit 1
+            }
+
+            case "$value" in
+              "$expected_toolchain_prefix"*)
+                ;;
+              *)
+                echo "::error::$name does not resolve to the pinned NDK toolchain: $value"
+                echo "::error::Expected prefix: $expected_toolchain_prefix"
+                exit 1
+                ;;
+            esac
+
+            resolved="$(readlink -f "$value")"
+            case "$resolved" in
+              "$expected_toolchain_prefix"*)
+                ;;
+              *)
+                echo "::error::$name resolves outside the pinned NDK toolchain: $resolved"
+                exit 1
+                ;;
+            esac
+
+            echo "$name -> $value"
+            echo "$name resolved -> $resolved"
+          done
+
           echo "Android environment validation passed."
 
       - name: Build release binary
