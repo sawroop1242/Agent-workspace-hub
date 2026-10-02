@@ -101,6 +101,10 @@ jobs:
 
       - name: Verify Android SDK/NDK installation
         if: matrix.target == 'aarch64-linux-android'
+        env:
+          EXPECTED_PLATFORM: "android-35"
+          EXPECTED_BUILD_TOOLS: "35.0.0"
+          EXPECTED_NDK: "27.2.12479018"
         run: |
           set -euo pipefail
 
@@ -110,16 +114,47 @@ jobs:
           fi
 
           echo "Android SDK root: $ANDROID_SDK_ROOT"
+          echo "Pinned platform: $EXPECTED_PLATFORM"
+          echo "Pinned build-tools: $EXPECTED_BUILD_TOOLS"
+          echo "Pinned NDK: $EXPECTED_NDK"
+
+          installed="$("$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --list_installed)"
           echo "Installed Android SDK packages:"
-          "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --list_installed | grep -E 'platform-tools|platforms;android-35|build-tools;35\.0\.0|ndk;27\.2\.12479018' || true
+          printf '%s\n' "$installed" | grep -E 'platform-tools|platforms;android-|build-tools;|ndk;' || true
 
-          test -d "$ANDROID_SDK_ROOT/platforms/android-35"
-          test -d "$ANDROID_SDK_ROOT/build-tools/35.0.0"
-          test -d "$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          platform_path="$ANDROID_SDK_ROOT/platforms/$EXPECTED_PLATFORM"
+          build_tools_path="$ANDROID_SDK_ROOT/build-tools/$EXPECTED_BUILD_TOOLS"
+          ndk_path="$ANDROID_SDK_ROOT/ndk/$EXPECTED_NDK"
 
-          echo "Platform: android-35"
-          echo "Build-tools: 35.0.0"
-          echo "NDK: 27.2.12479018"
+          test -d "$platform_path" || { echo "::error::Android platform mismatch: expected $EXPECTED_PLATFORM"; exit 1; }
+          test -d "$build_tools_path" || { echo "::error::Android build-tools mismatch: expected $EXPECTED_BUILD_TOOLS"; exit 1; }
+          test -d "$ndk_path" || { echo "::error::Android NDK mismatch: expected $EXPECTED_NDK"; exit 1; }
+
+          actual_platforms="$(find "$ANDROID_SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+          actual_build_tools="$(find "$ANDROID_SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+          actual_ndks="$(find "$ANDROID_SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+
+          echo "Installed platform versions: $actual_platforms"
+          echo "Installed build-tools versions: $actual_build_tools"
+          echo "Installed NDK versions: $actual_ndks"
+
+          printf '%s\n' "$actual_platforms" | grep -Fxq "$EXPECTED_PLATFORM" || {
+            echo "::error::Android platform version mismatch: expected exactly $EXPECTED_PLATFORM"
+            exit 1
+          }
+          printf '%s\n' "$actual_build_tools" | grep -Fxq "$EXPECTED_BUILD_TOOLS" || {
+            echo "::error::Android build-tools version mismatch: expected exactly $EXPECTED_BUILD_TOOLS"
+            exit 1
+          }
+          printf '%s\n' "$actual_ndks" | grep -Fxq "$EXPECTED_NDK" || {
+            echo "::error::Android NDK version mismatch: expected exactly $EXPECTED_NDK"
+            exit 1
+          }
+
+          echo "Android SDK verification passed:"
+          echo "Platform: $EXPECTED_PLATFORM"
+          echo "Build-tools: $EXPECTED_BUILD_TOOLS"
+          echo "NDK: $EXPECTED_NDK"
 
       - name: Configure Android linker
         if: matrix.target == 'aarch64-linux-android'
