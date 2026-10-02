@@ -80,7 +80,14 @@ jobs:
             exit 1
           fi
 
-          for required in platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018; do
+          required_packages=(
+            "platform-tools"
+            "platforms;android-35"
+            "build-tools;35.0.0"
+            "ndk;27.2.12479018"
+          )
+
+          for required in "${required_packages[@]}"; do
             printf '%s\n' "$packages" | grep -Fxq "$required" || {
               echo "::error::Required pinned Android package is missing: $required"
               exit 1
