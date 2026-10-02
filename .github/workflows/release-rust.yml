@@ -339,12 +339,26 @@ jobs:
             echo "::error::ANDROID_NDK_ROOT is not set"
             exit 1
           }
-          test "$ANDROID_NDK_ROOT" = "$EXPECTED_NDK_ROOT" || {
-            echo "::error::ANDROID_NDK_ROOT mismatch: expected $EXPECTED_NDK_ROOT, got $ANDROID_NDK_ROOT"
+
+          # setup-android may expose ANDROID_NDK_ROOT as the runner's installed
+          # NDK (which can differ from our pinned SDK package). The build tools
+          # below are explicitly pinned, so validate the actual pinned NDK path
+          # used by CC/AR/linker rather than requiring the generic environment
+          # variable to equal it.
+          case "$ANDROID_NDK_ROOT" in
+            "$ANDROID_SDK_ROOT/ndk/"*)
+              ;;
+            *)
+              echo "::error::ANDROID_NDK_ROOT is outside ANDROID_SDK_ROOT: $ANDROID_NDK_ROOT"
+              exit 1
+              ;;
+          esac
+          test -d "$ANDROID_NDK_ROOT" || {
+            echo "::error::ANDROID_NDK_ROOT directory is missing: $ANDROID_NDK_ROOT"
             exit 1
           }
-          test -d "$ANDROID_NDK_ROOT" || {
-            echo "::error::Pinned NDK directory is missing: $ANDROID_NDK_ROOT"
+          test -d "$EXPECTED_NDK_ROOT" || {
+            echo "::error::Pinned NDK directory is missing: $EXPECTED_NDK_ROOT"
             exit 1
           }
 
