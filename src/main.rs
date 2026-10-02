@@ -1648,9 +1648,23 @@ fn serve_sse(
     let host = host
         .or_else(|| std::env::var("AWH_HOST").ok())
         .unwrap_or_else(|| "0.0.0.0".to_string());
-    let port = port
-        .or_else(|| std::env::var("AWH_PORT").ok().and_then(|v| v.parse().ok()))
-        .unwrap_or(8443);
+    let port = match port {
+        Some(port) => port,
+        None => match std::env::var("AWH_PORT") {
+            // A set-but-empty value is treated as unset so the common
+            // `AWH_PORT="${SOME_PORT:-}"` / env_file pattern keeps the
+            // documented default instead of aborting startup.
+            Ok(raw) if raw.trim().is_empty() => 8443,
+            // Any other value must parse as u16; a non-numeric (or
+            // out-of-range) value fails closed — invalid configuration is
+            // never silently ignored.
+            Ok(raw) => raw
+                .trim()
+                .parse::<u16>()
+                .with_context(|| format!("invalid value for AWH_PORT: {raw:?}"))?,
+            Err(_) => 8443,
+        },
+    };
     let tls_cert = tls_cert.or_else(|| std::env::var("AWH_TLS_CERT").ok());
     let tls_key = tls_key.or_else(|| std::env::var("AWH_TLS_KEY").ok());
 

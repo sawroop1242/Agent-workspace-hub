@@ -42,6 +42,7 @@ Options:
 
 Environment overrides:
   AWH_REPO, AWH_REF, AWH_SOURCE, AWH_VERSION, AWH_PREFIX
+  AWH_GITHUB_API           Base URL of the GitHub API (default: https://api.github.com)
 EOF
 }
 
@@ -85,6 +86,10 @@ if [ "$INSTALL_SOURCE" != "release" ] && [ "$INSTALL_SOURCE" != "source" ]; then
 fi
 
 log()    { printf '%s\n' "$*"; }
+# For diagnostics emitted from inside a $(...) command substitution: those
+# capture stdout, so a plain log() there would vanish into the captured
+# variable instead of reaching the user's terminal. stderr is never captured.
+log_err() { printf '%s\n' "$*" >&2; }
 fail()   { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 require_cmd() {
@@ -127,17 +132,106 @@ asset_name() {
     esac
 }
 
+# Resolves the release to install and prints "<tag>\n<release_json_body>".
+# The release API is queried exactly ONCE — for "latest" the same response
+# that names the tag also provides the body callers use to extract asset
+# and checksum URLs, so no second fetch of the same release is ever made.
+#
+# A fetch failure here is NOT fatal by itself (this runs in a command
+# substitution, where exit would only end the subshell): the caller
+# decides. download_binary makes a pinned --version that cannot be
+# resolved FATAL — the user asked for a specific release, so silently
+# building from a branch instead would install different code than
+# requested. "latest" failing to resolve (e.g. no releases published
+# yet) keeps the source-build fallback.
 resolve_tag() {
+    local api body tag
     if [ "$VERSION" != "latest" ]; then
-        printf '%s' "$VERSION"
-        return
+        api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/tags/${VERSION}"
+    else
+        api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/latest"
     fi
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
-        sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1
+    if ! body="$(curl -fsSL "$api")"; then
+        log_err "Could not fetch release metadata from: ${api}"
+        return 1
+    fi
+    if [ "$VERSION" = "latest" ]; then
+        tag="$(printf '%s\n' "$body" |
+            sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
+        [ -n "$tag" ] || return 1
+    else
+        tag="$VERSION"
+    fi
+    printf '%s\n%s' "$tag" "$body"
+}
+
+# Maps the release-API base to the web host that serves release downloads:
+# https://api.github.com -> https://github.com, and a GHES-style
+# https://host/api/v3 -> https://host. Keeps the fallback download URL on
+# the same instance the metadata came from when AWH_GITHUB_API is set.
+# A trailing slash (a natural way to spell the override) is normalized
+# away so the derived URL is never malformed with a double slash.
+download_host() {
+    local root="${1:-https://api.github.com}"
+    root="${root%/}"
+    root="${root%/api/v3}"
+    root="${root%/api}"
+    root="${root%/}"
+    if [ "$root" = "https://api.github.com" ]; then
+        root="https://github.com"
+    fi
+    printf '%s' "$root"
+}
+
+verify_checksum() {
+    # Verifies the downloaded asset against the release's published
+    # sha256sums.txt. The checksum file is mandatory for release installs:
+    # a missing or mismatching checksum aborts the whole install (it does
+    # NOT fall back to a source build, which would mask an integrity
+    # failure) — never trust unverified bytes.
+    #
+    # Trust boundary: this proves byte-for-byte integrity against the
+    # publisher's checksum over a TLS connection. It is NOT a signature —
+    # a compromised GitHub account or TLS path could publish matching
+    # malicious bytes. Signature verification is out of scope for v1.
+    # (AWH_TP01: release artifacts and checksums are part of the
+    # distribution contract.)
+    #
+    # $4 is the sha256sums.txt URL already extracted from the single
+    # release-API response — this function must not re-fetch the release.
+    local dest="$1" asset="$2" tag="$3" sum_url="$4"
+    local sums expected actual
+
+    if [ -z "$sum_url" ]; then
+        fail "Release ${tag} does not publish sha256sums.txt; refusing to install unverified bytes. Use --source source to build from source instead."
+    fi
+
+    sums="$(curl -fsSL "$sum_url")" ||
+        fail "Could not download sha256sums.txt from ${sum_url}"
+
+    # `sha256sum` formats entries as "hash  name"; `shasum` on some BSDs
+    # prefixes binary-mode entries with "*name". Normalize before matching
+    # so a "*-prefixed entry still verifies.
+    expected="$(printf '%s\n' "$sums" |
+        awk -v a="$asset" '{ name = $2; sub(/^\*/, "", name); if (name == a) { print $1; exit } }')"
+    [ -n "$expected" ] ||
+        fail "sha256sums.txt does not contain an entry for ${asset}"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$dest" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$dest" | awk '{print $1}')"
+    else
+        fail "Neither sha256sum nor shasum is available to verify the download."
+    fi
+
+    [ "$actual" = "$expected" ] ||
+        fail "Checksum mismatch for ${asset}: expected ${expected}, got ${actual}"
+    log "Checksum verified for ${asset}"
 }
 
 download_binary() {
-    local os arch asset tag release_api url dest final
+    local os arch asset tag resolved release_json url sums_url dest final
 
     os="$(detect_os)"
     arch="$(detect_arch)"
@@ -148,25 +242,45 @@ download_binary() {
         fail "Android prebuilt binaries currently support aarch64/ARM64 only."
     fi
 
-    tag="$(resolve_tag)"
-    if [ -z "$tag" ]; then
+    # resolve_tag emits "<tag>\n<release_json_body>"; the ONE release query
+    # backs both asset-URL resolution and checksum lookup below. A failure
+    # is fatal for a pinned --version (never silently build a branch
+    # instead of the release the user asked for) and falls back to a
+    # source build only for an unresolvable "latest".
+    if ! resolved="$(resolve_tag)"; then
+        if [ "$VERSION" != "latest" ]; then
+            fail "Release ${VERSION} was not found (wrong tag, or unreachable API). Use an existing tag or 'latest'."
+        fi
         return 1
     fi
-
-    release_api="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
-    url="$(curl -fsSL "$release_api" |
+    tag="${resolved%%$'\n'*}"
+    release_json="${resolved#*$'\n'}"
+    if [ -z "$tag" ] || [ -z "$release_json" ]; then
+        return 1
+    fi
+    url="$(printf '%s\n' "$release_json" |
         sed -n "s|.*\"browser_download_url\": \"\([^\"]*${asset}[^\"]*\)\".*|\1|p" | head -n 1)"
+    sums_url="$(printf '%s\n' "$release_json" |
+        sed -n "s|.*\"browser_download_url\": \"\([^\"]*sha256sums.txt[^\"]*\)\".*|\1|p" | head -n 1)"
 
     if [ -z "$url" ]; then
-        url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
+        url="$(download_host "${AWH_GITHUB_API:-https://api.github.com}")/${REPO}/releases/download/${tag}/${asset}"
     fi
 
     log "Detected platform: ${os}/${arch}"
     log "Downloading ${asset} (${tag})..."
-    dest="${PREFIX}/${asset}"
+    # Download to a .part file so a failed verification never leaves the
+    # unverified bytes installed under the real asset name.
+    dest="${PREFIX}/${asset}.part"
     curl -fsSL -o "$dest" "$url"
 
     [ -s "$dest" ] || fail "Downloaded asset is empty: $url"
+
+    verify_checksum "$dest" "$asset" "$tag" "$sums_url"
+
+    # Checksum verified — only now do the bytes earn the real name.
+    mv "$dest" "${PREFIX}/${asset}"
+    dest="${PREFIX}/${asset}"
 
     if [ "$os" != "windows" ]; then
         chmod +x "$dest"
@@ -219,6 +333,14 @@ log "=========================================="
 
 require_cmd curl
 
+# AWH_GITHUB_API redirects where release metadata — and therefore checksum
+# and binary URLs — come from (the fallback download URL is derived from
+# it too). A security-relevant override: make any use of it visible in
+# the transcript instead of silently switching the trust path.
+if [ -n "${AWH_GITHUB_API:-}" ] && [ "$AWH_GITHUB_API" != "https://api.github.com" ]; then
+    log "NOTE: AWH_GITHUB_API is set; release metadata and downloads will be resolved from: ${AWH_GITHUB_API}"
+fi
+
 mkdir -p "$PREFIX"
 
 if [ "$INSTALL_SOURCE" = "source" ]; then
@@ -227,6 +349,10 @@ else
     if download_binary; then
         :
     else
+        # Only an *unavailable* prebuilt binary falls back to a source
+        # build. Integrity failures (missing/mismatching checksums)
+        # already aborted the install inside download_binary — falling
+        # back here would mask a corrupted or tampered download.
         log "Prebuilt binary unavailable; falling back to building from source."
         build_from_source
     fi

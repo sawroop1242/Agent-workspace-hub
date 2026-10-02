@@ -634,3 +634,19 @@ cheap-to-clone). Tool catalog 53 static.
   do const field access ({GLYPHS.branch}) — bind a local first; (5)
   background long test runs need setsid nohup, plain `&` dies when the
   terminal call times out.
+
+- **TP01 CI-failure round (PR #136, 2026-10)**: all-3-OS `cargo test` failures traced via
+  actions/jobs/{id} API (steps[] pinpoints the failing STEP; logs downloadable with a
+  refreshed token when anonymous 403s). Two lessons: (1) `circuit_breaker_config()`'s
+  config_invalid warn only fired inside the custom-MCP loop -> invalid AWH_* limits were
+  SILENTLY IGNORED on machines with zero custom servers (clean CI runners). Fix: parse
+  ResourceLimits once at `McpDispatcher::construct` start. Tests must not depend on
+  machine-local state (user-level custom MCP registries, GITHUB_TOKEN presence);
+  reproduce clean runners with `env -u GITHUB_TOKEN ... cargo test`. (2) `/proc` is NOT
+  portable in tests: Windows resolves it to a WRITABLE `C:\\proc` (test saw init succeed);
+  use a file-as-parent (ENOTDIR) probe for cross-platform "unusable root" and cfg-gate
+  true /proc probes linux-only. Also: `AWH_PORT` set-but-empty is treated as UNSET
+  (common `${VAR:-}` env_file pattern) while non-numeric still fails closed; occupied-port
+  test helpers must HOLD the listener for the child's whole run (bind-drop-re-bind races);
+  drain child stderr on a thread BEFORE wait() (pipe-buffer deadlock); don't pin
+  cross-state output equality (before/after init) in status tests.
