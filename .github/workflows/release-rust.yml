@@ -258,6 +258,10 @@ jobs:
           echo "CC_aarch64-linux-android=$CLANG" >> "$GITHUB_ENV"
           echo "AR_aarch64-linux-android=$AR" >> "$GITHUB_ENV"
 
+          # Put the pinned NDK LLVM toolchain first on PATH. setup-android may
+          # expose a different generic ANDROID_NDK_ROOT version.
+          echo "$LLVM" >> "$GITHUB_PATH"
+
       - name: Install cross-compiler (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -393,8 +397,8 @@ jobs:
             *":$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:"*)
               ;;
             *)
-              echo "::error::NDK LLVM bin directory is missing from PATH"
-              echo "Expected: $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+              echo "::error::Pinned NDK LLVM bin directory is missing from PATH"
+              echo "Expected: $EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
               exit 1
               ;;
           esac
@@ -435,6 +439,11 @@ jobs:
 
           android_validation_failure() {
             status=$?
+            if [ "$status" -eq 0 ]; then
+              return 0
+            fi
+
+            trap - EXIT
             echo "::group::Android toolchain failure diagnostics"
             echo "Exit status: $status"
             echo "Selected pinned NDK directory: ${EXPECTED_NDK_ROOT:-<unset>}"
@@ -467,7 +476,7 @@ jobs:
             echo "::endgroup::"
             exit "$status"
           }
-          trap android_validation_failure ERR
+          trap android_validation_failure EXIT
 
           echo "Android environment validation passed."
           echo "Android validation diagnostics are emitted automatically on failure via the ERR trap."
