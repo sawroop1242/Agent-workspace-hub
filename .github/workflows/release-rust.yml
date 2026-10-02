@@ -85,6 +85,9 @@ jobs:
       - name: Set up Android SDK/NDK
         if: matrix.target == 'aarch64-linux-android'
         uses: android-actions/setup-android@v3
+        with:
+          # Do not pass the obsolete "tools" SDK package to sdkmanager.
+          packages: ""
 
       - name: Install Android SDK packages
         if: matrix.target == 'aarch64-linux-android'
