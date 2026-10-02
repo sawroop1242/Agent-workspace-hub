@@ -145,14 +145,31 @@ jobs:
         if: matrix.target == 'aarch64-linux-android'
         run: |
           set -euo pipefail
-          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
-          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+          # sdkmanager may close stdin after accepting all licenses, which causes
+          # yes(1) to exit with SIGPIPE. Keep pipefail enabled and propagate only
+          # sdkmanager's exit status.
+          set +o pipefail
+          yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -o pipefail
+          test "$sdkmanager_status" -eq 0
+
+          set +o pipefail
+          yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -o pipefail
+          test "$sdkmanager_status" -eq 0
 
       - name: Install Android NDK
         if: matrix.target == 'aarch64-linux-android'
         run: |
           set -euo pipefail
-          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "ndk;27.2.12479018"
+          set +o pipefail
+          yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "ndk;27.2.12479018"
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -o pipefail
+          test "$sdkmanager_status" -eq 0
 
       - name: Verify Android SDK/NDK installation
         if: matrix.target == 'aarch64-linux-android'
