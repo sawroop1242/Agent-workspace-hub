@@ -286,6 +286,15 @@ jobs:
           cargo tree --locked --all-features > artifacts/cargo-tree.txt
           sha256sum Cargo.toml Cargo.lock | tee artifacts/manifest-sha256.txt
 
+      - name: Validate installer against mock GitHub release server
+        # Drives scripts/install.sh end-to-end against tests/installer-mock/
+        # (localhost only, no network): happy paths, BSD *-form checksums,
+        # mismatch/missing-entry/missing-checksum-file failures leaving only
+        # a .part file, fallback-URL derivation from AWH_GITHUB_API, fatal
+        # pinned-tag errors, and exactly one release-API query per install.
+        shell: bash
+        run: bash tests/installer-mock/run.sh
+
       - name: Upload release-readiness artifacts
         if: always()
         uses: actions/upload-artifact@v4

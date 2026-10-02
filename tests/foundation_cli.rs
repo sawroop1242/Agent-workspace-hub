@@ -25,8 +25,11 @@ const SYNTHETIC_SECRET: &str = "ghp_AWHTEST synthetic-LEAKCHECK-0123456789abcdef
 /// Runs `awh <args>` in `dir` with an explicit environment.
 fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BIN);
-    cmd.args(args).current_dir(dir).env_remove("AWH_HOST");
+    cmd.args(args).current_dir(dir);
     for key in SANITIZED_AWH_VARS {
+        cmd.env_remove(key);
+    }
+    for key in SANITIZED_PROVIDER_VARS {
         cmd.env_remove(key);
     }
     for (k, v) in env {
@@ -35,24 +38,54 @@ fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     cmd.output().expect("spawn awh binary")
 }
 
-/// Every `AWH_*` variable the server and dispatcher read from the process
-/// environment. Tests strip all of them from spawned children so
-/// machine-local configuration (developer shells, CI runner envs) can
-/// never change what a test observes; tests that need a value set it
-/// explicitly after the strip.
+/// Every `AWH_*` environment variable the binary reads at runtime
+/// (enumerated from `env::var` call sites in src/, excluding the
+/// `AWH_TEST_*` fixtures that only exist inside unit tests). Tests strip
+/// all of them from spawned children so machine-local configuration
+/// (developer shells, CI runner envs) can never change what a test
+/// observes; tests that need a value set it explicitly after the strip.
 const SANITIZED_AWH_VARS: &[&str] = &[
+    // Control-API / SSE server plane
     "AWH_HOST",
     "AWH_PORT",
     "AWH_TLS_CERT",
     "AWH_TLS_KEY",
     "AWH_API_KEY",
     "AWH_ALLOWED_ORIGINS",
+    // Dispatcher resource limits
     "AWH_MAX_MCP_LINE_BYTES",
     "AWH_MAX_HTTP_BODY_BYTES",
     "AWH_MCP_REQUEST_TIMEOUT_SECS",
     "AWH_HTTP_CLIENT_TIMEOUT_SECS",
     "AWH_CIRCUIT_FAILURE_THRESHOLD",
     "AWH_CIRCUIT_COOLDOWN_SECS",
+    // Context-engine tuning
+    "AWH_CONTEXT_ENABLED",
+    "AWH_CONTEXT_MEMORY_ENABLED",
+    "AWH_CONTEXT_AUTO_COMPRESS",
+    "AWH_CONTEXT_AUTO_OFFLOAD",
+    "AWH_CONTEXT_MAX_INPUT_TOKENS",
+    "AWH_CONTEXT_RESERVED_OUTPUT_TOKENS",
+    "AWH_CONTEXT_SAFETY_MARGIN_TOKENS",
+    // Registry / trust roots
+    "AWH_GLOBAL_SKILLS_ROOT",
+    "AWH_TRUST_DIR",
+    // Sandbox + tunnel helpers
+    "AWH_BWRAP",
+    "AWH_NGROK_AUTHTOKEN",
+];
+
+/// Non-`AWH_*` credentials and provider routing the binary may read.
+/// Stripped alongside the AWH set for the same reason: a developer's or
+/// runner's credentials must not enable provider behavior mid-test.
+const SANITIZED_PROVIDER_VARS: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "GITHUB_API_URL",
+    "GITHUB_DEFAULT_OWNER",
+    "GITHUB_DEFAULT_REPO",
+    "COMPOSIO_API_KEY",
+    "NGROK_AUTHTOKEN",
 ];
 
 fn run(dir: &Path, args: &[&str]) -> Output {
@@ -634,16 +667,14 @@ fn stdio_server_reports_invalid_resource_limit_and_keeps_serving() {
     assert!(run(dir.path(), &["init"]).status.success());
     let mut cmd = Command::new(BIN);
     cmd.args(["mcp", "serve", "--transport", "stdio"])
-        .current_dir(dir.path())
-        // Sanitize the environment the way run_env does, plus the provider
-        // credentials, so no machine-local state (GITHUB_TOKEN, COMPOSIO_API_KEY,
-        // leftover AWH_* values) can change what this test observes. The
-        // full AWH_* resource-limit family is stripped too, then only the
-        // one variable under test is set.
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("COMPOSIO_API_KEY")
-        .env_remove("GITHUB_PERSONAL_ACCESS_TOKEN");
+        .current_dir(dir.path());
+    // Sanitize the environment the way run_env does: no machine-local
+    // AWH_* configuration or provider credentials can change what
+    // this test observes. The one variable under test is set after.
     for key in SANITIZED_AWH_VARS {
+        cmd.env_remove(key);
+    }
+    for key in SANITIZED_PROVIDER_VARS {
         cmd.env_remove(key);
     }
     cmd.env("AWH_MAX_MCP_LINE_BYTES", "not-a-number")

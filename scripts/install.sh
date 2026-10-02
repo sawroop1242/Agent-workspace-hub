@@ -132,6 +132,14 @@ asset_name() {
 # The release API is queried exactly ONCE — for "latest" the same response
 # that names the tag also provides the body callers use to extract asset
 # and checksum URLs, so no second fetch of the same release is ever made.
+#
+# A fetch failure here is NOT fatal by itself (this runs in a command
+# substitution, where exit would only end the subshell): the caller
+# decides. download_binary makes a pinned --version that cannot be
+# resolved FATAL — the user asked for a specific release, so silently
+# building from a branch instead would install different code than
+# requested. "latest" failing to resolve (e.g. no releases published
+# yet) keeps the source-build fallback.
 resolve_tag() {
     local api body tag
     if [ "$VERSION" != "latest" ]; then
@@ -139,7 +147,10 @@ resolve_tag() {
     else
         api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/latest"
     fi
-    body="$(curl -fsSL "$api")" || return 1
+    if ! body="$(curl -fsSL "$api")"; then
+        log "Could not fetch release metadata from: ${api}"
+        return 1
+    fi
     if [ "$VERSION" = "latest" ]; then
         tag="$(printf '%s\n' "$body" |
             sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
@@ -148,6 +159,20 @@ resolve_tag() {
         tag="$VERSION"
     fi
     printf '%s\n%s' "$tag" "$body"
+}
+
+# Maps the release-API base to the web host that serves release downloads:
+# https://api.github.com -> https://github.com, and a GHES-style
+# https://host/api/v3 -> https://host. Keeps the fallback download URL on
+# the same instance the metadata came from when AWH_GITHUB_API is set.
+download_host() {
+    local root="${1:-https://api.github.com}"
+    root="${root%/api/v3}"
+    root="${root%/api}"
+    if [ "$root" = "https://api.github.com" ]; then
+        root="https://github.com"
+    fi
+    printf '%s' "$root"
 }
 
 verify_checksum() {
@@ -198,7 +223,7 @@ verify_checksum() {
 }
 
 download_binary() {
-    local os arch asset tag release_api url dest final
+    local os arch asset tag resolved release_json url sums_url dest final
 
     os="$(detect_os)"
     arch="$(detect_arch)"
@@ -210,8 +235,16 @@ download_binary() {
     fi
 
     # resolve_tag emits "<tag>\n<release_json_body>"; the ONE release query
-    # backs both asset-URL resolution and checksum lookup below.
-    resolved="$(resolve_tag)" || return 1
+    # backs both asset-URL resolution and checksum lookup below. A failure
+    # is fatal for a pinned --version (never silently build a branch
+    # instead of the release the user asked for) and falls back to a
+    # source build only for an unresolvable "latest".
+    if ! resolved="$(resolve_tag)"; then
+        if [ "$VERSION" != "latest" ]; then
+            fail "Release ${VERSION} was not found (wrong tag, or unreachable API). Use an existing tag or 'latest'."
+        fi
+        return 1
+    fi
     tag="${resolved%%$'\n'*}"
     release_json="${resolved#*$'\n'}"
     if [ -z "$tag" ] || [ -z "$release_json" ]; then
@@ -223,7 +256,7 @@ download_binary() {
         sed -n "s|.*\"browser_download_url\": \"\([^\"]*sha256sums.txt[^\"]*\)\".*|\1|p" | head -n 1)"
 
     if [ -z "$url" ]; then
-        url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
+        url="$(download_host "${AWH_GITHUB_API:-https://api.github.com}")/${REPO}/releases/download/${tag}/${asset}"
     fi
 
     log "Detected platform: ${os}/${arch}"
@@ -292,12 +325,12 @@ log "=========================================="
 
 require_cmd curl
 
-# AWH_GITHUB_API redirects where release metadata (and therefore checksum
-# and binary URLs) come from — a security-relevant override. Make any use
-# of it visible in the transcript instead of silently switching the
-# trust path.
+# AWH_GITHUB_API redirects where release metadata — and therefore checksum
+# and binary URLs — come from (the fallback download URL is derived from
+# it too). A security-relevant override: make any use of it visible in
+# the transcript instead of silently switching the trust path.
 if [ -n "${AWH_GITHUB_API:-}" ] && [ "$AWH_GITHUB_API" != "https://api.github.com" ]; then
-    log "NOTE: AWH_GITHUB_API is set; release metadata will be fetched from: ${AWH_GITHUB_API}"
+    log "NOTE: AWH_GITHUB_API is set; release metadata and downloads will be resolved from: ${AWH_GITHUB_API}"
 fi
 
 mkdir -p "$PREFIX"

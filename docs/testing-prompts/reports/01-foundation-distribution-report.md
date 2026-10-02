@@ -215,10 +215,59 @@ all accepted and fixed:
    `curl`, and `download_binary` extracts BOTH the asset URL and the
    sha256sums.txt URL from that one body; `verify_checksum` receives the
    pre-extracted sums URL and never re-fetches the release. Verified
-   against a request-counting mock server: exactly one release-API hit per
-   install.
+   against the committed request-counting mock
+   (`tests/installer-mock/`): exactly one release-API hit per install.
 4. **`AWH_GITHUB_API` override was undocumented** (WARNING-class): it
    redirects where release metadata — and therefore checksum/binary URLs
    — come from. It is now listed in `usage()` output AND the installer
    prints a visible NOTE whenever it is set to anything other than
    `https://api.github.com`, so a redirected trust path is never silent.
+
+### Round 3 (Kilo re-review of the round-2 commit)
+
+Five more findings — all accepted and fixed:
+
+1. **`SANITIZED_AWH_VARS` was still not complete** despite its doc
+   comment claiming so: the context-engine family
+   (`AWH_CONTEXT_ENABLED`, `AWH_CONTEXT_MEMORY_ENABLED`,
+   `AWH_CONTEXT_AUTO_COMPRESS`, `AWH_CONTEXT_AUTO_OFFLOAD`,
+   `AWH_CONTEXT_MAX_INPUT_TOKENS`, `AWH_CONTEXT_RESERVED_OUTPUT_TOKENS`,
+   `AWH_CONTEXT_SAFETY_MARGIN_TOKENS`), the roots
+   (`AWH_GLOBAL_SKILLS_ROOT`, `AWH_TRUST_DIR`) and the helpers
+   (`AWH_BWRAP`, `AWH_NGROK_AUTHTOKEN`) were missing. The list is now
+   generated from the actual `env::var` call sites in `src/` (documented
+   in the constant's comment), and a second constant
+   `SANITIZED_PROVIDER_VARS` covers the non-`AWH_*` credentials/routing
+   the binary reads (`GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`,
+   `GITHUB_API_URL`, `GITHUB_DEFAULT_OWNER`, `GITHUB_DEFAULT_REPO`,
+   `COMPOSIO_API_KEY`, `NGROK_AUTHTOKEN`); both are applied in `run_env`
+   and the stdio test.
+2. **Pinned `--version` metadata failure was silent** (WARNING-class): a
+   typo'd tag 404'd, the installer logged nothing (`curl -fsSL` hides
+   the HTTP error), and the generic "Prebuilt binary unavailable" path
+   silently built from a *branch* — different code than the release the
+   user asked for. Now `resolve_tag` logs the failing URL, and
+   `download_binary` makes an unresolvable pinned version FATAL with
+   "Release <tag> was not found (wrong tag, or unreachable API)". Only
+   an unresolvable `latest` (e.g. zero releases published) keeps the
+   source-build fallback.
+3. **Shell hygiene**: `download_binary` now declares all of its variables
+   `local` (incl. the new `resolved`/`release_json`/`sums_url`) and the
+   dead `release_api` declaration is gone.
+4. **The `AWH_GITHUB_API` NOTE overstated the trust path**: the fallback
+   download URL still hardcoded `https://github.com` even when metadata
+   came from a redirected API. New `download_host()` derives the
+   fallback host from the API base (`https://api.github.com` →
+   `https://github.com`, GHES `https://host/api/v3` → `https://host`),
+   so the fallback stays on the same instance the metadata came from,
+   and the NOTE wording now covers downloads too.
+5. **"Verified against a request-counting mock server" had no committed
+   artifact**: the mock now lives in the repository as
+   `tests/installer-mock/` — `serve.py` (mock GitHub release server with
+   a request counter and tag-suffix-selected failure modes:
+   `-star`/`-mismatch`/`-missing`/`-nosums`/`-noasset`/`-badtag`) and
+   `run.sh`, a self-asserting driver that runs the 8-scenario matrix
+   (exit codes, leftover files, transcript lines, and exactly one
+   release-API hit per install). All 8 checks pass.
+
+
