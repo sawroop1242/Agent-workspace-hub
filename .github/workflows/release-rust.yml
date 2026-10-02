@@ -332,6 +332,47 @@ jobs:
           EXPECTED_CLANG="$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
           EXPECTED_AR="$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 
+          android_validation_failure() {
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              return 0
+            fi
+
+            trap - EXIT
+            echo "::group::Android toolchain failure diagnostics"
+            echo "Exit status: $status"
+            echo "Selected pinned NDK directory: ${EXPECTED_NDK_ROOT:-<unset>}"
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+            echo "ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-<unset>}"
+            echo "PATH=${PATH:-<unset>}"
+            echo "CC_aarch64_linux_android=${CC_aarch64_linux_android:-<unset>}"
+            echo "AR_aarch64_linux_android=${AR_aarch64_linux_android:-<unset>}"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-<unset>}"
+
+            for name in CC_aarch64_linux_android AR_aarch64_linux_android CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER; do
+              value="${!name:-}"
+              if [ -n "$value" ]; then
+                resolved="$(readlink -f "$value" 2>/dev/null || true)"
+                echo "$name configured: $value"
+                echo "$name resolved: ${resolved:-<unresolved>}"
+              else
+                echo "$name configured: <unset>"
+                echo "$name resolved: <unresolved>"
+              fi
+            done
+
+            echo "Expected NDK toolchain prefix: ${EXPECTED_NDK_ROOT:-<unset>}/toolchains/llvm/prebuilt/linux-x86_64/"
+            echo "Selected NDK directory listing:"
+            if [ -d "${EXPECTED_NDK_ROOT:-}" ]; then
+              ls -ld "$EXPECTED_NDK_ROOT"
+            else
+              echo "<missing>"
+            fi
+            echo "::endgroup::"
+            exit "$status"
+          }
+          trap android_validation_failure EXIT
+
           echo "ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-<unset>}"
           echo "Pinned NDK version=$EXPECTED_NDK_VERSION"
           echo "PATH=$PATH"
@@ -394,7 +435,7 @@ jobs:
           }
 
           case ":$PATH:" in
-            *":$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:"*)
+            *":$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:"*)
               ;;
             *)
               echo "::error::Pinned NDK LLVM bin directory is missing from PATH"
@@ -437,46 +478,6 @@ jobs:
             echo "$name resolved -> $resolved"
           done
 
-          android_validation_failure() {
-            status=$?
-            if [ "$status" -eq 0 ]; then
-              return 0
-            fi
-
-            trap - EXIT
-            echo "::group::Android toolchain failure diagnostics"
-            echo "Exit status: $status"
-            echo "Selected pinned NDK directory: ${EXPECTED_NDK_ROOT:-<unset>}"
-            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
-            echo "ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-<unset>}"
-            echo "PATH=${PATH:-<unset>}"
-            echo "CC_aarch64_linux_android=${CC_aarch64_linux_android:-<unset>}"
-            echo "AR_aarch64_linux_android=${AR_aarch64_linux_android:-<unset>}"
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-<unset>}"
-
-            for name in CC_aarch64_linux_android AR_aarch64_linux_android CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER; do
-              value="${!name:-}"
-              if [ -n "$value" ]; then
-                resolved="$(readlink -f "$value" 2>/dev/null || true)"
-                echo "$name configured: $value"
-                echo "$name resolved: ${resolved:-<unresolved>}"
-              else
-                echo "$name configured: <unset>"
-                echo "$name resolved: <unresolved>"
-              fi
-            done
-
-            echo "Expected NDK toolchain prefix: ${EXPECTED_NDK_ROOT:-<unset>}/toolchains/llvm/prebuilt/linux-x86_64/"
-            echo "Selected NDK directory listing:"
-            if [ -d "${EXPECTED_NDK_ROOT:-}" ]; then
-              ls -ld "$EXPECTED_NDK_ROOT"
-            else
-              echo "<missing>"
-            fi
-            echo "::endgroup::"
-            exit "$status"
-          }
-          trap android_validation_failure EXIT
 
           echo "Android environment validation passed."
           echo "Android validation diagnostics are emitted automatically on failure via the ERR trap."
