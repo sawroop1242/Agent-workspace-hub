@@ -127,13 +127,21 @@ asset_name() {
     esac
 }
 
+# Resolves the tag to install. For "latest", queries the release API once
+# and prints both the tag and its release-API URL on two lines so callers
+# reuse the same API response instead of re-fetching it per use.
 resolve_tag() {
     if [ "$VERSION" != "latest" ]; then
-        printf '%s' "$VERSION"
+        printf '%s\n%s\n' "$VERSION" \
+            "${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/tags/${VERSION}"
         return
     fi
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
-        sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1
+    local api tag
+    api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/latest"
+    tag="$(curl -fsSL "$api" |
+        sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
+    [ -n "$tag" ] || return 1
+    printf '%s\n%s\n' "$tag" "$api"
 }
 
 verify_checksum() {
@@ -142,6 +150,11 @@ verify_checksum() {
     # a missing or mismatching checksum aborts the whole install (it does
     # NOT fall back to a source build, which would mask an integrity
     # failure) — never trust unverified bytes.
+    #
+    # Trust boundary: this proves byte-for-byte integrity against the
+    # publisher's checksum over a TLS connection. It is NOT a signature —
+    # a compromised GitHub account or TLS path could publish matching
+    # malicious bytes. Signature verification is out of scope for v1.
     # (AWH_TP01: release artifacts and checksums are part of the
     # distribution contract.)
     local dest="$1" asset="$2" tag="$3" release_api="$4"
@@ -157,7 +170,11 @@ verify_checksum() {
     sums="$(curl -fsSL "$sum_url")" ||
         fail "Could not download sha256sums.txt from ${sum_url}"
 
-    expected="$(printf '%s\n' "$sums" | awk -v a="$asset" '$2 == a {print $1; exit}')"
+    # `sha256sum` formats entries as "hash  name"; `shasum` on some BSDs
+    # prefixes binary-mode entries with "*name". Normalize before matching
+    # so a "*-prefixed entry still verifies.
+    expected="$(printf '%s\n' "$sums" |
+        awk -v a="$asset" '{ name = $2; sub(/^\*/, "", name); if (name == a) { print $1; exit } }')"
     [ -n "$expected" ] ||
         fail "sha256sums.txt does not contain an entry for ${asset}"
 
@@ -186,12 +203,17 @@ download_binary() {
         fail "Android prebuilt binaries currently support aarch64/ARM64 only."
     fi
 
-    tag="$(resolve_tag)"
-    if [ -z "$tag" ]; then
+    # resolve_tag prints "<tag>\n<release_api>" so the same release metadata
+    # backs URL resolution and checksum lookup — one query, one release.
+    resolved="$(resolve_tag)" || return 1
+    if [ -z "$resolved" ]; then
         return 1
     fi
-
-    release_api="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
+    tag="${resolved%%$'\n'*}"
+    release_api="${resolved#*$'\n'}"
+    if [ -z "$tag" ] || [ -z "$release_api" ]; then
+        return 1
+    fi
     url="$(curl -fsSL "$release_api" |
         sed -n "s|.*\"browser_download_url\": \"\([^\"]*${asset}[^\"]*\)\".*|\1|p" | head -n 1)"
 
@@ -201,12 +223,18 @@ download_binary() {
 
     log "Detected platform: ${os}/${arch}"
     log "Downloading ${asset} (${tag})..."
-    dest="${PREFIX}/${asset}"
+    # Download to a .part file so a failed verification never leaves the
+    # unverified bytes installed under the real asset name.
+    dest="${PREFIX}/${asset}.part"
     curl -fsSL -o "$dest" "$url"
 
     [ -s "$dest" ] || fail "Downloaded asset is empty: $url"
 
     verify_checksum "$dest" "$asset" "$tag" "$release_api"
+
+    # Checksum verified — only now do the bytes earn the real name.
+    mv "$dest" "${PREFIX}/${asset}"
+    dest="${PREFIX}/${asset}"
 
     if [ "$os" != "windows" ]; then
         chmod +x "$dest"

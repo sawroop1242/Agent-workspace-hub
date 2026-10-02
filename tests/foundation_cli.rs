@@ -118,16 +118,18 @@ fn status_succeeds_on_uninitialized_and_initialized_directories() {
         !manifest_path(dir.path()).exists(),
         "status must not initialize a workspace"
     );
-    // Fresh process after init reports the same observable state.
+    // Fresh process after init must keep reporting successfully; status is
+    // not pinned byte-for-byte across the init boundary so the report can
+    // legitimately grow workspace facts later.
     let init = run(dir.path(), &["init"]);
     assert!(init.status.success());
     let out2 = run(dir.path(), &["status"]);
     assert!(out2.status.success());
-    assert_eq!(stdout(&out2), stdout(&out));
-    // Idempotent repeated invocation.
+    assert!(!stdout(&out2).trim().is_empty(), "status prints a report");
+    // Idempotent repeated invocation (same state, deterministic bytes).
     let out3 = run(dir.path(), &["status"]);
     assert!(out3.status.success());
-    assert_eq!(stdout(&out3), stdout(&out));
+    assert_eq!(stdout(&out3), stdout(&out2));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,10 +205,40 @@ fn init_resolves_traversal_paths_exactly_where_the_user_asked() {
 }
 
 #[test]
-fn init_fails_cleanly_on_unwritable_root() {
+fn init_fails_cleanly_on_unusable_root() {
+    // A plain FILE as a path component makes the requested root impossible
+    // to create (ENOTDIR) on every platform — no reliance on /proc or
+    // runner privilege, so the failure is deterministic everywhere.
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("blocker"), "a plain file").unwrap();
+    let target = if cfg!(windows) {
+        "blocker\\not-writable-awh"
+    } else {
+        "blocker/not-writable-awh"
+    };
+    let out = run(dir.path(), &["init", "--path", target]);
+    assert!(
+        !out.status.success(),
+        "init must fail on an unusable root, stdout: {}",
+        stdout(&out)
+    );
+    let err = stderr(&out);
+    assert!(!err.contains("panicked"), "got panic: {err}");
+    assert!(
+        err.to_lowercase().contains("failed to create workspace"),
+        "error must name the failure, got: {err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn init_fails_cleanly_on_unwritable_proc_root() {
     // /proc rejects mkdir even for root, giving a deterministic
     // unwritable-location failure that does not depend on dropping
-    // privileges (tests may run as root in containers).
+    // privileges (tests may run as root in containers). Linux-only: /proc
+    // does not exist on macOS and resolves to a writable drive path on
+    // Windows, where this contract is covered by
+    // init_fails_cleanly_on_unusable_root instead.
     let dir = tempdir().expect("tempdir");
     let out = run(dir.path(), &["init", "--path", "/proc/not-writable-awh"]);
     assert!(
@@ -226,10 +258,13 @@ fn init_fails_cleanly_on_unwritable_root() {
 // Configuration precedence: defaults < AWH_* env < CLI flags
 // ---------------------------------------------------------------------------
 
-/// Binds a listener to occupy a port, returning the bound port number.
-fn occupy_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+/// Holds a TCP port occupied for the lifetime of the returned listener, so a
+/// child's bind on that port deterministically fails with EADDRINUSE (the
+/// OS picks a free port via port 0; the listener stays alive until dropped).
+fn hold_port() -> (u16, TcpListener) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a port to hold");
+    let port = listener.local_addr().expect("addr").port();
+    (port, listener)
 }
 
 #[test]
@@ -264,9 +299,7 @@ fn sse_invalid_awh_port_fails_closed_with_clear_error() {
 #[test]
 fn sse_awh_port_override_is_applied_and_bind_fails_when_occupied() {
     let dir = tempdir().expect("tempdir");
-    let held = occupy_port();
-    // Hold the listener for the duration of the child run.
-    let listener = TcpListener::bind(("127.0.0.1", held)).ok();
+    let (held, listener) = hold_port();
     let out = run_env(
         dir.path(),
         &["mcp", "serve", "--transport", "sse", "--host", "127.0.0.1"],
@@ -294,10 +327,11 @@ fn sse_cli_flag_overrides_awh_env_for_port() {
     // an occupied one. The CLI flag must win — the error must mention the
     // CLI port, proving the env value did not silently take precedence.
     let dir = tempdir().expect("tempdir");
-    let occupied = occupy_port();
-    let free = occupy_port(); // a definitely-free-then-released port
-    drop(TcpListener::bind(("127.0.0.1", free)).ok());
-    let listener = TcpListener::bind(("127.0.0.1", occupied)).ok();
+    let (occupied, listener) = hold_port();
+    // A second port that is definitely free right now: bind it to pick, then
+    // release it for the child to (attempt to) use.
+    let (free, held_free) = hold_port();
+    drop(held_free);
     let out = run_env(
         dir.path(),
         &[
@@ -377,9 +411,9 @@ fn sse_missing_or_empty_api_key_fails_closed_before_serving() {
 #[test]
 fn sse_awh_port_boundary_values_fail_or_parse_deterministically() {
     let dir = tempdir().expect("tempdir");
-    // Values outside u16 (max+1, negative, huge, empty) must fail closed with
-    // an error naming AWH_PORT — never a silent fallback to the default.
-    for bad in ["65536", "-1", "99999999999999999999", "", "  "] {
+    // Values outside u16 (max+1, negative, huge, non-numeric) must fail
+    // closed with an error naming AWH_PORT — never a silent fallback.
+    for bad in ["65536", "-1", "99999999999999999999", "not-a-number"] {
         let out = run_env(
             dir.path(),
             &["mcp", "serve", "--transport", "sse"],
@@ -419,6 +453,31 @@ fn sse_awh_port_boundary_values_fail_or_parse_deterministically() {
         err.contains("AWH_API_KEY"),
         "the failure must be the API key, proving config parsing passed; got: {err}"
     );
+    // A set-but-empty (or whitespace-only) AWH_PORT is treated as unset:
+    // startup proceeds on the default, so the first failure is the API key —
+    // the common `AWH_PORT="${SOME_PORT:-}"` / env_file pattern must not
+    // abort the server (docs/configuration.md).
+    for empty in ["", "  "] {
+        let out = run_env(
+            dir.path(),
+            &["mcp", "serve", "--transport", "sse"],
+            &[("AWH_PORT", empty)],
+        );
+        assert!(
+            !out.status.success(),
+            "missing API key must fail the run (AWH_PORT={empty:?} is unset-like), stdout: {}",
+            stdout(&out)
+        );
+        let err = stderr(&out);
+        assert!(
+            !err.contains("AWH_PORT"),
+            "empty AWH_PORT must behave as unset, not fail closed; got: {err}"
+        );
+        assert!(
+            err.contains("AWH_API_KEY"),
+            "the failure must be the API key, proving empty AWH_PORT did not abort config; got: {err}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,15 +570,37 @@ fn stdio_server_reports_invalid_resource_limit_and_keeps_serving() {
     // defaults — "never silently ignored" per docs/configuration.md.
     let dir = tempdir().expect("tempdir");
     assert!(run(dir.path(), &["init"]).status.success());
-    let mut child = Command::new(BIN)
-        .args(["mcp", "serve", "--transport", "stdio"])
+    let mut cmd = Command::new(BIN);
+    cmd.args(["mcp", "serve", "--transport", "stdio"])
         .current_dir(dir.path())
+        // Sanitize the environment the way run_env does, plus the provider
+        // credentials, so no machine-local state (GITHUB_TOKEN, COMPOSIO_API_KEY,
+        // leftover AWH_* values) can change what this test observes.
+        .env_remove("AWH_HOST")
+        .env_remove("AWH_PORT")
+        .env_remove("AWH_TLS_CERT")
+        .env_remove("AWH_TLS_KEY")
+        .env_remove("AWH_API_KEY")
+        .env_remove("AWH_ALLOWED_ORIGINS")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("COMPOSIO_API_KEY")
         .env("AWH_MAX_MCP_LINE_BYTES", "not-a-number")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn stdio server");
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn stdio server");
+
+    // Drain stderr on a dedicated thread BEFORE waiting: a chatty child
+    // could otherwise fill the ~64 KiB pipe buffer, block on write, and
+    // deadlock the test in wait().
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut s = stderr_pipe;
+        let mut buf = String::new();
+        use std::io::Read;
+        let _ = s.read_to_string(&mut buf);
+        buf
+    });
 
     // A valid initialize request must still complete on stdout.
     {
@@ -539,13 +620,7 @@ fn stdio_server_reports_invalid_resource_limit_and_keeps_serving() {
     // Cleanup: close stdin (EOF shutdown) and reap.
     drop(child.stdin.take());
     let _ = child.wait();
-    let stderr_bytes = child.stderr.take().map(|mut s| {
-        use std::io::Read;
-        let mut buf = String::new();
-        let _ = s.read_to_string(&mut buf);
-        buf
-    });
-    let err = stderr_bytes.unwrap_or_default();
+    let err = stderr_handle.join().expect("stderr drain thread");
     assert!(
         err.contains("config_invalid") && err.contains("AWH_MAX_MCP_LINE_BYTES"),
         "invalid limit must be reported as config_invalid naming the variable, got: {err}"

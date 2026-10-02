@@ -515,6 +515,11 @@ impl McpDispatcher {
     async fn construct(project_root: PathBuf) -> Result<Self> {
         let registry = Arc::new(RwLock::new(ProviderRegistry::default()));
 
+        // Parse the runtime resource limits exactly once per dispatcher so
+        // an invalid AWH_* limit is reported (config_invalid) on every
+        // surface, not only when a custom MCP server happens to exist.
+        let breaker_config = circuit_breaker_config();
+
         if std::env::var("COMPOSIO_API_KEY").is_ok() {
             if let Ok(provider) = ComposioProvider::from_env() {
                 registry.write().await.register(Box::new(provider));
@@ -567,7 +572,7 @@ impl McpDispatcher {
                     let guarded = CircuitBreakerMcpClient::new(
                         cfg.id.clone(),
                         Arc::new(client),
-                        circuit_breaker_config(),
+                        breaker_config,
                     );
                     let provider = CustomMcpProvider::new(cfg.id, Arc::new(guarded));
                     registry.write().await.register(Box::new(provider));
@@ -578,7 +583,7 @@ impl McpDispatcher {
                     let guarded = CircuitBreakerMcpClient::new(
                         cfg.id.clone(),
                         Arc::new(client),
-                        circuit_breaker_config(),
+                        breaker_config,
                     );
                     let provider = CustomMcpProvider::new(cfg.id, Arc::new(guarded));
                     registry.write().await.register(Box::new(provider));
@@ -3081,6 +3086,11 @@ fn parse_auth(value: Option<&str>) -> Result<AuthMethod> {
 }
 
 /// Builds the circuit-breaker config from the resolved runtime resource limits.
+///
+/// Called once at dispatcher construction so an invalid `AWH_*` limit is
+/// always reported via the `config_invalid` tracing event on stderr and the
+/// conservative defaults are used — independent of whether any custom MCP
+/// server is registered on this machine.
 fn circuit_breaker_config() -> CircuitBreakerConfig {
     let limits = ResourceLimits::default()
         .with_env_overrides()

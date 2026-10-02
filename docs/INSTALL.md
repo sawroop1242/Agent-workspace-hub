@@ -84,6 +84,10 @@ AWH_PORT="8443" \
 awh mcp serve --transport sse
 ```
 
+`AWH_PORT` must be a valid port number when set: non-numeric values fail
+startup with a clear error (never a silent fallback to `8443`), while a
+set-but-empty value is treated as unset and keeps the `8443` default.
+
 Runs an HTTPS server exposing:
 
 - `GET /health` - liveness probe (unauthenticated).

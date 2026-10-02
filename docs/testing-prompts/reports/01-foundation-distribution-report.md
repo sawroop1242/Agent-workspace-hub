@@ -124,3 +124,63 @@ bash -n scripts/install.sh # clean
 4. `AWH_NGROK_AUTHTOKEN`/`AWH_BWRAP` runtime behavior deferred to their feature families per TP01 §25.
 
 TP01 is complete per README §"Important rule": all current-contract behavior either passed with real evidence or is explicitly classified with reasons.
+
+## PR-review / CI round (PR #136 follow-up)
+
+PR #136's first CI run failed `cargo test --all-targets` on all three OSes
+(check + clippy passed). Job-log analysis plus local reproduction isolated
+two environment-dependent tests and one genuine product defect:
+
+1. **Product defect (fixed)** — `stdio_server_reports_invalid_resource_limit_and_keeps_serving`
+   failed on all CI runners: the `config_invalid` warning for an invalid
+   `AWH_MAX_MCP_LINE_BYTES` was only emitted from `circuit_breaker_config()`,
+   which runs inside the *custom-MCP-server* registration loop. On a clean
+   machine (no custom servers registered) the warning never fired, so an
+   invalid limit was **silently ignored** — violating the documented
+   "never silently ignored" contract. The test had passed locally only
+   because this development container has user-level custom MCP servers
+   registered from earlier phases. Fix: `McpDispatcher::construct` now parses
+   the resource limits once up front (`breaker_config`), reporting
+   `config_invalid` on every surface (stdio, SSE, TUI, Control API)
+   regardless of how many custom servers exist. Verified with
+   `env -u GITHUB_TOKEN cargo test …` (clean-machine simulation).
+2. **Windows: `/proc` portability (fixed)** — `init_fails_cleanly_on_unwritable_root`
+   used `/proc/not-writable-awh`; on Windows that resolves to
+   `\\?\C:\proc\not-writable-awh` on a *writable* drive, so `awh init`
+   succeeded and the test failed (CI log shows `initialized workspace \\?\C:\proc\...`).
+   Replaced with a portable file-as-parent probe (`ENOTDIR` on every platform)
+   and kept the true unwritable-filesystem case as a Linux-only variant
+   (`/proc` does not exist on macOS and is a writable path on Windows).
+3. **Test env hygiene (fixed)** — the stdio server test built the child with
+   the raw parent environment, inheriting machine-local state
+   (`GITHUB_TOKEN`, `COMPOSIO_API_KEY`, stray `AWH_*` values). It now strips
+   those like every other test in the suite.
+4. **Test robustness (fixed)** — child stderr is drained on a dedicated
+   thread before `wait()` (a chatty child could otherwise fill the pipe
+   buffer and deadlock the test); occupied-port helpers hold their listener
+   alive for the whole child run instead of bind-drop-re-bind (racy);
+   `status` is no longer pinned byte-identical across the init boundary
+   (same-state determinism is still asserted).
+5. **`AWH_PORT` set-but-empty (fixed)** — review flagged that
+   `AWH_PORT="${SOME_PORT:-}"` (common CI/env_file pattern) aborted startup.
+   Empty/whitespace-only values are now treated as unset (documented
+   default `8443` applies); non-numeric values still fail closed. Docs
+   updated in `docs/configuration.md`, `docs/security.md`, `docs/INSTALL.md`;
+   boundary test covers both halves.
+6. **`scripts/install.sh` hardening (verified)** — download goes to a
+   `.part` file and only earns the real name after checksum verification
+   (a failed verify never leaves unverified bytes installed);
+   `resolve_tag` resolves the release API URL once and it is reused for both
+   asset-URL and checksum lookup; `sha256sums.txt` entries in BSD `shasum`
+   binary form (`*filename`) are normalized before matching; the trust
+   boundary (integrity ≠ authenticity, no signatures in v1) is documented.
+   All paths verified end-to-end against a mock release server:
+   happy + `*`-form installs succeed; mismatch / missing-entry /
+   missing-checksum-file abort with only the `.part` file left behind.
+
+Review findings addressed: all 11 inline comments from the PR review
+(empty-`AWH_PORT` semantics, env inheritance, stderr drain, port race,
+cross-state equality pin, `/proc` portability, installer trust-boundary
+documentation, checksum-entry normalization, release-API reuse,
+unverified-bytes removal, plus the config_invalid product fix they
+collectively surfaced).

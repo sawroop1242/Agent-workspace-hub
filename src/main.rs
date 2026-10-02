@@ -1651,6 +1651,13 @@ fn serve_sse(
     let port = match port {
         Some(port) => port,
         None => match std::env::var("AWH_PORT") {
+            // A set-but-empty value is treated as unset so the common
+            // `AWH_PORT="${SOME_PORT:-}"` / env_file pattern keeps the
+            // documented default instead of aborting startup.
+            Ok(raw) if raw.trim().is_empty() => 8443,
+            // Any other value must parse as u16; a non-numeric (or
+            // out-of-range) value fails closed — invalid configuration is
+            // never silently ignored.
             Ok(raw) => raw
                 .trim()
                 .parse::<u16>()

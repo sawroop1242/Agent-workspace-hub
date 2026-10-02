@@ -115,7 +115,7 @@ Tunable variables:
 | `AWH_CIRCUIT_COOLDOWN_SECS` | Open-circuit cooldown |
 | `AWH_API_KEY` | Bearer token required for remote (HTTP/SSE) MCP access |
 | `AWH_HOST` | Remote transport bind address (default `0.0.0.0`) |
-| `AWH_PORT` | Remote transport port (default `8443`) |
+| `AWH_PORT` | Remote transport port (default `8443`; non-numeric values fail startup, set-but-empty is treated as unset) |
 | `AWH_TLS_CERT` | Path to PEM certificate chain (enables HTTPS) |
 | `AWH_TLS_KEY` | Path to PEM private key (enables HTTPS) |
 | `AWH_ALLOWED_ORIGINS` | CORS allow-list (empty disables CORS) |
