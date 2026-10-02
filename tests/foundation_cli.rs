@@ -25,19 +25,35 @@ const SYNTHETIC_SECRET: &str = "ghp_AWHTEST synthetic-LEAKCHECK-0123456789abcdef
 /// Runs `awh <args>` in `dir` with an explicit environment.
 fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BIN);
-    cmd.args(args)
-        .current_dir(dir)
-        .env_remove("AWH_HOST")
-        .env_remove("AWH_PORT")
-        .env_remove("AWH_TLS_CERT")
-        .env_remove("AWH_TLS_KEY")
-        .env_remove("AWH_API_KEY")
-        .env_remove("AWH_ALLOWED_ORIGINS");
+    cmd.args(args).current_dir(dir).env_remove("AWH_HOST");
+    for key in SANITIZED_AWH_VARS {
+        cmd.env_remove(key);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
     cmd.output().expect("spawn awh binary")
 }
+
+/// Every `AWH_*` variable the server and dispatcher read from the process
+/// environment. Tests strip all of them from spawned children so
+/// machine-local configuration (developer shells, CI runner envs) can
+/// never change what a test observes; tests that need a value set it
+/// explicitly after the strip.
+const SANITIZED_AWH_VARS: &[&str] = &[
+    "AWH_HOST",
+    "AWH_PORT",
+    "AWH_TLS_CERT",
+    "AWH_TLS_KEY",
+    "AWH_API_KEY",
+    "AWH_ALLOWED_ORIGINS",
+    "AWH_MAX_MCP_LINE_BYTES",
+    "AWH_MAX_HTTP_BODY_BYTES",
+    "AWH_MCP_REQUEST_TIMEOUT_SECS",
+    "AWH_HTTP_CLIENT_TIMEOUT_SECS",
+    "AWH_CIRCUIT_FAILURE_THRESHOLD",
+    "AWH_CIRCUIT_COOLDOWN_SECS",
+];
 
 fn run(dir: &Path, args: &[&str]) -> Output {
     run_env(dir, args, &[])
@@ -480,6 +496,52 @@ fn sse_awh_port_boundary_values_fail_or_parse_deterministically() {
     }
 }
 
+#[test]
+fn sse_default_port_is_8443_when_awh_port_unset_or_empty() {
+    // Pins the documented default (docs/configuration.md: AWH_PORT unset
+    // or empty → 8443) by OBSERVING the chosen port: with the default
+    // already held by this test, a run with a valid API key must fail at
+    // bind and the error must name 8443 — proving the server picked the
+    // default rather than any other value. If the hold fails because the
+    // port is already busy on this machine, the child still cannot bind
+    // 8443 and the same error surfaces, so the assertion stays valid.
+    let dir = tempdir().expect("tempdir");
+    let held = TcpListener::bind("127.0.0.1:8443");
+    for unset_like in [None, Some(""), Some("  ")] {
+        let out = match unset_like {
+            None => run_env(
+                dir.path(),
+                &["mcp", "serve", "--transport", "sse"],
+                &[("AWH_HOST", "127.0.0.1"), ("AWH_API_KEY", SYNTHETIC_SECRET)],
+            ),
+            Some(v) => run_env(
+                dir.path(),
+                &["mcp", "serve", "--transport", "sse"],
+                &[
+                    ("AWH_PORT", v),
+                    ("AWH_HOST", "127.0.0.1"),
+                    ("AWH_API_KEY", SYNTHETIC_SECRET),
+                ],
+            ),
+        };
+        assert!(
+            !out.status.success(),
+            "bind on the held default port must fail, stdout: {}",
+            stdout(&out)
+        );
+        let err = stderr(&out);
+        assert!(
+            err.contains("8443"),
+            "unset-like AWH_PORT (={unset_like:?}) must choose the documented default 8443; got: {err}"
+        );
+        assert!(
+            !err.contains("AWH_PORT"),
+            "an unset-like AWH_PORT must not be reported as a config error; got: {err}"
+        );
+    }
+    drop(held);
+}
+
 // ---------------------------------------------------------------------------
 // TLS half-configuration fails closed
 // ---------------------------------------------------------------------------
@@ -575,16 +637,16 @@ fn stdio_server_reports_invalid_resource_limit_and_keeps_serving() {
         .current_dir(dir.path())
         // Sanitize the environment the way run_env does, plus the provider
         // credentials, so no machine-local state (GITHUB_TOKEN, COMPOSIO_API_KEY,
-        // leftover AWH_* values) can change what this test observes.
-        .env_remove("AWH_HOST")
-        .env_remove("AWH_PORT")
-        .env_remove("AWH_TLS_CERT")
-        .env_remove("AWH_TLS_KEY")
-        .env_remove("AWH_API_KEY")
-        .env_remove("AWH_ALLOWED_ORIGINS")
+        // leftover AWH_* values) can change what this test observes. The
+        // full AWH_* resource-limit family is stripped too, then only the
+        // one variable under test is set.
         .env_remove("GITHUB_TOKEN")
         .env_remove("COMPOSIO_API_KEY")
-        .env("AWH_MAX_MCP_LINE_BYTES", "not-a-number")
+        .env_remove("GITHUB_PERSONAL_ACCESS_TOKEN");
+    for key in SANITIZED_AWH_VARS {
+        cmd.env_remove(key);
+    }
+    cmd.env("AWH_MAX_MCP_LINE_BYTES", "not-a-number")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

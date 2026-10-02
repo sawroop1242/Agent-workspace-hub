@@ -42,6 +42,7 @@ Options:
 
 Environment overrides:
   AWH_REPO, AWH_REF, AWH_SOURCE, AWH_VERSION, AWH_PREFIX
+  AWH_GITHUB_API           Base URL of the GitHub API (default: https://api.github.com)
 EOF
 }
 
@@ -127,21 +128,26 @@ asset_name() {
     esac
 }
 
-# Resolves the tag to install. For "latest", queries the release API once
-# and prints both the tag and its release-API URL on two lines so callers
-# reuse the same API response instead of re-fetching it per use.
+# Resolves the release to install and prints "<tag>\n<release_json_body>".
+# The release API is queried exactly ONCE — for "latest" the same response
+# that names the tag also provides the body callers use to extract asset
+# and checksum URLs, so no second fetch of the same release is ever made.
 resolve_tag() {
+    local api body tag
     if [ "$VERSION" != "latest" ]; then
-        printf '%s\n%s\n' "$VERSION" \
-            "${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/tags/${VERSION}"
-        return
+        api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/tags/${VERSION}"
+    else
+        api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/latest"
     fi
-    local api tag
-    api="${AWH_GITHUB_API:-https://api.github.com}/repos/${REPO}/releases/latest"
-    tag="$(curl -fsSL "$api" |
-        sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
-    [ -n "$tag" ] || return 1
-    printf '%s\n%s\n' "$tag" "$api"
+    body="$(curl -fsSL "$api")" || return 1
+    if [ "$VERSION" = "latest" ]; then
+        tag="$(printf '%s\n' "$body" |
+            sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n 1)"
+        [ -n "$tag" ] || return 1
+    else
+        tag="$VERSION"
+    fi
+    printf '%s\n%s' "$tag" "$body"
 }
 
 verify_checksum() {
@@ -157,11 +163,11 @@ verify_checksum() {
     # malicious bytes. Signature verification is out of scope for v1.
     # (AWH_TP01: release artifacts and checksums are part of the
     # distribution contract.)
-    local dest="$1" asset="$2" tag="$3" release_api="$4"
-    local sums sum_url expected actual
-
-    sum_url="$(curl -fsSL "$release_api" |
-        sed -n "s|.*\"browser_download_url\": \"\([^\"]*sha256sums.txt[^\"]*\)\".*|\1|p" | head -n 1)"
+    #
+    # $4 is the sha256sums.txt URL already extracted from the single
+    # release-API response — this function must not re-fetch the release.
+    local dest="$1" asset="$2" tag="$3" sum_url="$4"
+    local sums expected actual
 
     if [ -z "$sum_url" ]; then
         fail "Release ${tag} does not publish sha256sums.txt; refusing to install unverified bytes. Use --source source to build from source instead."
@@ -203,19 +209,18 @@ download_binary() {
         fail "Android prebuilt binaries currently support aarch64/ARM64 only."
     fi
 
-    # resolve_tag prints "<tag>\n<release_api>" so the same release metadata
-    # backs URL resolution and checksum lookup — one query, one release.
+    # resolve_tag emits "<tag>\n<release_json_body>"; the ONE release query
+    # backs both asset-URL resolution and checksum lookup below.
     resolved="$(resolve_tag)" || return 1
-    if [ -z "$resolved" ]; then
-        return 1
-    fi
     tag="${resolved%%$'\n'*}"
-    release_api="${resolved#*$'\n'}"
-    if [ -z "$tag" ] || [ -z "$release_api" ]; then
+    release_json="${resolved#*$'\n'}"
+    if [ -z "$tag" ] || [ -z "$release_json" ]; then
         return 1
     fi
-    url="$(curl -fsSL "$release_api" |
+    url="$(printf '%s\n' "$release_json" |
         sed -n "s|.*\"browser_download_url\": \"\([^\"]*${asset}[^\"]*\)\".*|\1|p" | head -n 1)"
+    sums_url="$(printf '%s\n' "$release_json" |
+        sed -n "s|.*\"browser_download_url\": \"\([^\"]*sha256sums.txt[^\"]*\)\".*|\1|p" | head -n 1)"
 
     if [ -z "$url" ]; then
         url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
@@ -230,7 +235,7 @@ download_binary() {
 
     [ -s "$dest" ] || fail "Downloaded asset is empty: $url"
 
-    verify_checksum "$dest" "$asset" "$tag" "$release_api"
+    verify_checksum "$dest" "$asset" "$tag" "$sums_url"
 
     # Checksum verified — only now do the bytes earn the real name.
     mv "$dest" "${PREFIX}/${asset}"
@@ -286,6 +291,14 @@ log "  Agent Workspace Hub Installer (Rust)"
 log "=========================================="
 
 require_cmd curl
+
+# AWH_GITHUB_API redirects where release metadata (and therefore checksum
+# and binary URLs) come from — a security-relevant override. Make any use
+# of it visible in the transcript instead of silently switching the
+# trust path.
+if [ -n "${AWH_GITHUB_API:-}" ] && [ "$AWH_GITHUB_API" != "https://api.github.com" ]; then
+    log "NOTE: AWH_GITHUB_API is set; release metadata will be fetched from: ${AWH_GITHUB_API}"
+fi
 
 mkdir -p "$PREFIX"
 

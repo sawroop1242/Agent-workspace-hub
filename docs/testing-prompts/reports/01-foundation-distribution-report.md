@@ -184,3 +184,41 @@ cross-state equality pin, `/proc` portability, installer trust-boundary
 documentation, checksum-entry normalization, release-API reuse,
 unverified-bytes removal, plus the config_invalid product fix they
 collectively surfaced).
+
+### Round 2 (Kilo re-review of the fix commit)
+
+The automated re-review of the fix commit raised 4 more findings —
+all accepted and fixed:
+
+1. **Stdio-test env sanitization was narrower than its comment claimed**
+   (WARNING-class on tests): only the vars the test deliberately sets were
+   stripped; the rest of the `AWH_*` resource-limit family
+   (`AWH_MAX_HTTP_BODY_BYTES`, `AWH_MCP_REQUEST_TIMEOUT_SECS`,
+   `AWH_HTTP_CLIENT_TIMEOUT_SECS`, `AWH_CIRCUIT_FAILURE_THRESHOLD`,
+   `AWH_CIRCUIT_COOLDOWN_SECS`) could still leak machine-local values into
+   the child. Introduced `SANITIZED_AWH_VARS` — the complete list of
+   environment variables the server and dispatcher read — and applied it
+   in both `run_env` (every spawned `awh` child in the suite) and the
+   stdio test, with explicit `env(...)` sets applied after the strip.
+2. **Default port 8443 was never pinned observably** — the empty-`AWH_PORT`
+   loop proved "does not abort" but not "chose 8443". New test
+   `sse_default_port_is_8443_when_awh_port_unset_or_empty` holds
+   `127.0.0.1:8443` and asserts the bind error names `8443` for unset,
+   `""`, and `"  "` — proving the documented default is actually chosen.
+   (Deliberately binds loopback: the default `0.0.0.0` host is rejected by
+   the TLS guard before bind, so the test pins `AWH_HOST=127.0.0.1` to
+   reach the observable bind failure.)
+3. **Installer "one query" claim was not literally true** — `resolve_tag`
+   was still called for the tag, then the release API was re-fetched for
+   the asset URL and again inside `verify_checksum`. Restructured:
+   `resolve_tag` now emits `<tag>\n<release_json_body>` from a single
+   `curl`, and `download_binary` extracts BOTH the asset URL and the
+   sha256sums.txt URL from that one body; `verify_checksum` receives the
+   pre-extracted sums URL and never re-fetches the release. Verified
+   against a request-counting mock server: exactly one release-API hit per
+   install.
+4. **`AWH_GITHUB_API` override was undocumented** (WARNING-class): it
+   redirects where release metadata — and therefore checksum/binary URLs
+   — come from. It is now listed in `usage()` output AND the installer
+   prints a visible NOTE whenever it is set to anything other than
+   `https://api.github.com`, so a redirected trust path is never silent.
