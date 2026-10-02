@@ -1,0 +1,119 @@
+name: Kilo Code Review - NVIDIA NIM
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+  issue_comment:
+    types:
+      - created
+
+  pull_request_review_comment:
+    types:
+      - created
+
+jobs:
+  kilo-review:
+    if: |
+      github.event_name == 'pull_request' ||
+      contains(github.event.comment.body, '/kilo') ||
+      contains(github.event.comment.body, '/kc')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Configure Kilo for NVIDIA NIM
+        shell: bash
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.config/kilo"
+          cat > "$HOME/.config/kilo/kilo.jsonc" <<'EOF'
+          {
+            "$schema": "https://app.kilo.ai/config.json",
+            "model": "nvidia_nim/z-ai/glm-5.3",
+            "provider": {
+              "nvidia_nim": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {
+                  "apiKey": "{env:NVIDIA_NIM_API_KEY}",
+                  "baseURL": "https://integrate.api.nvidia.com/v1",
+                  "timeout": 300000,
+                  "chunkTimeout": 30000
+                },
+                "models": {
+                  "z-ai/glm-5.3": {
+                    "name": "GLM 5.3 via NVIDIA NIM",
+                    "tool_call": true,
+                    "limit": {
+                      "context": 128000,
+                      "output": 128000
+                    }
+                  }
+                }
+              }
+            }
+          }
+          EOF
+          chmod 600 "$HOME/.config/kilo/kilo.jsonc"
+      - name: Verify NVIDIA NIM secret is available
+        shell: bash
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NVIDIA_NIM_API_KEY:-}" ]; then
+            echo "::error::AWH_ROUTINE_NVIDIA_KEY is not configured."
+            exit 1
+          fi
+          echo "NVIDIA NIM API key is present."
+      - name: Run Kilo
+        uses: Kilo-Org/kilocode/github@main
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.AWH_ROUTINE_NVIDIA_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          model: nvidia_nim/z-ai/glm-5.3
+          agent: review
+          use_github_token: "true"
+          mentions: "/kilo,/kc"
+          share: "false"
+          prompt: |
+            Perform a thorough code review of this pull request.
+            Focus on:
+            - correctness and bugs
+            - security and secret exposure
+            - Rust correctness and safety
+            - error handling
+            - async/concurrency correctness
+            - performance and resource handling
+            - tests and missing regression coverage
+            - API/interface compatibility
+            - GitHub Actions and CI security
+            - AWH workspace, capability/policy, audit, provenance,
+              MCP, agent/session, and Git/worktree boundaries
+            Only report substantive findings introduced by this PR.
+            For every finding provide:
+            - severity
+            - file and location
+            - problem
+            - why it matters
+            - concrete remediation
+            Do not modify unrelated files.
+            If no substantive issues are found, explicitly state that.
