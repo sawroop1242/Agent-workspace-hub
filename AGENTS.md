@@ -650,3 +650,40 @@ cheap-to-clone). Tool catalog 53 static.
   test helpers must HOLD the listener for the child's whole run (bind-drop-re-bind races);
   drain child stderr on a thread BEFORE wait() (pipe-buffer deadlock); don't pin
   cross-state output equality (before/after init) in status tests.
+
+
+## Master Test Prompts (2026-09/10, branch rust)
+
+TP01 (Foundation & Distribution) DONE - PR #136 squash-merged as 6c45dd7
+after 5 Kilo review rounds. Deliverables: tests/foundation_cli.rs (21
+black-box CLI tests; SANITIZED_AWH_VARS + SANITIZED_PROVIDER_VARS strip
+both var families in every spawned child), hardened scripts/install.sh
+(single release-API query per install, mandatory sha256sums.txt, fatal
+pinned --version failure - no silent source-build fallback, AWH_GITHUB_API
+documented + startup NOTE, download_host() derives the fallback download
+host and normalizes trailing slashes), committed e2e harness
+tests/installer-mock/{serve.py,run.sh} (8-scenario matrix: exit codes,
+leftover files, transcript lines, one release-API hit per install, and
+failed installs leave NOTHING installable - the 'awh' negative is -e OR -L
+because -e misses a DANGLING symlink from ln -sf), wired into the
+release-readiness CI job. Report: docs/testing-prompts/reports/
+01-foundation-distribution-report.md (rounds 1-5).
+
+Gotchas learned:
+- GITHUB_TOKEN can expire mid-session: git push suddenly prompts for a
+  password. Recover: git remote set-url origin https://${GITHUB_TOKEN}@...
+  in a NEW command (fresh token injection), then push.
+- The required review gate is the 'Kilo Code Review' check. A NEW
+  'kilo-review' workflow (PR-REVIEW.yml, added to rust mid-TP01) may end
+  'cancelled'/'skipped' due to its own concurrency group - that does NOT
+  block the merge if 'Kilo Code Review' is green; mergeable_state can
+  stay 'unstable' yet PUT /pulls/N/merge succeeds.
+- GitHub re-anchors ALL PR inline comments' commit_id to the PR head, so
+  commit_id cannot identify review rounds - use created_at timestamps.
+- The rerequest check-run API returns 403 for this token.
+- install.sh log(): stdout-only helpers vanish inside $(...) command
+  substitutions - use log_err (stderr) for diagnostics emitted from
+  within a substituted call. bash test drivers: bare VAR=$(cmd) aborts
+  under set -e before you can assert; use the if-form to capture rc.
+- rust toolchain was wiped AGAIN mid-session; rustup reinstall recipe in
+  this file works.

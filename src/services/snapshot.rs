@@ -914,10 +914,15 @@ mod tests {
     fn provenance_round_trips_and_never_embeds_file_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let store = store_at(temp.path());
+        // The marker must contain characters outside the hex alphabet:
+        // ids (`snap-<hex nanos>-<pid>-<seq>`) and content hashes are pure
+        // hex, so a hex-only marker like "abc" can collide with them and
+        // flake (observed on macOS CI); "zz9" cannot.
+        let marker = "zz9-provenance-content";
         let manifest = store
             .create(
                 "edit-prov",
-                &[("f.txt".to_string(), b"abc\n".to_vec())],
+                &[("f.txt".to_string(), marker.as_bytes().to_vec())],
                 None,
             )
             .unwrap();
@@ -938,7 +943,7 @@ mod tests {
         assert_eq!(loaded, record);
         let serialised = serde_json::to_string(&loaded).unwrap();
         assert!(
-            !serialised.contains("abc"),
+            !serialised.contains(marker),
             "provenance must never embed file content bytes"
         );
     }
