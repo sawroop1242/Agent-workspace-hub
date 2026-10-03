@@ -126,6 +126,12 @@ type ProviderListing = (
 impl ProviderRegistry {
     /// Registers a provider.
     pub fn register(&mut self, p: Box<dyn ConnectorProvider>) {
+        // An upsert replaces the instance but the last-good cache
+        // must NOT survive it: re-registering an id that is already
+        // live (composio re-registration writes `composio:{label}`
+        // straight into a live registry) must never serve the
+        // previous instance's listing for the new one.
+        self.last_good_guard().remove(p.provider_id());
         self.providers.insert(p.provider_id().to_string(), p);
     }
 
@@ -153,15 +159,21 @@ impl ProviderRegistry {
 
     /// Unregisters a provider by id, returning whether it was present.
     pub fn unregister(&mut self, provider_id: &str) -> bool {
-        // The last-good cache must be purged with the registration:
-        // re-registering the same id (composio re-registration, custom
-        // MCP servers rebuilt from config on every dispatcher
-        // construct) must never serve the PREVIOUS instance's listing
-        // for the new one.
-        if let Ok(mut cache) = self.last_good.lock() {
-            cache.remove(provider_id);
-        }
+        // The last-good cache must be purged with the registration
+        // (see the mirror comment in `register`).
+        self.last_good_guard().remove(provider_id);
         self.providers.remove(provider_id).is_some()
+    }
+
+    /// Access the last-good cache. A poisoned mutex still yields the
+    /// map (it is structurally valid — the guard is never held across
+    /// an await and only HashMap ops run under it), so a panic in one
+    /// caller can never turn cache serve/purge into a silent fail-open
+    /// skip.
+    fn last_good_guard(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<ToolDescriptor>>> {
+        self.last_good
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Returns the sorted list of registered provider ids.
@@ -282,11 +294,7 @@ impl ProviderRegistry {
                 if listed_ids.contains(provider) {
                     continue;
                 }
-                let cached = self
-                    .last_good
-                    .lock()
-                    .ok()
-                    .and_then(|cache| cache.get(provider).cloned());
+                let cached = self.last_good_guard().get(provider).cloned();
                 if let Some(cached) = cached {
                     tracing::warn!(
                         provider = %provider,
@@ -319,9 +327,8 @@ impl ProviderRegistry {
                 Ok(Ok(listed)) => {
                     // Successful listings refresh the per-provider
                     // last-good cache (served on later budget truncation).
-                    if let Ok(mut cache) = self.last_good.lock() {
-                        cache.insert(provider.clone(), listed.clone());
-                    }
+                    self.last_good_guard()
+                        .insert(provider.clone(), listed.clone());
                     listed
                 }
                 Ok(Err(error)) => {
@@ -530,62 +537,52 @@ where
 mod tests {
     use super::*;
 
+    /// Async provider whose listing never resolves (a true hang - a
+    /// sync closure that blocked would freeze the current-thread
+    /// runtime's timer wheel so the per-future cap could never fire).
+    struct HangingProvider(&'static str);
+    #[async_trait]
+    impl ConnectorProvider for HangingProvider {
+        fn provider_id(&self) -> &str {
+            self.0
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn invoke(&self, _tool: &str, _args: Value) -> Result<ToolCallResult> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    /// Async provider that lists one tool instantly.
+    struct InstantProvider {
+        id: &'static str,
+        tool: &'static str,
+    }
+    #[async_trait]
+    impl ConnectorProvider for InstantProvider {
+        fn provider_id(&self) -> &str {
+            self.id
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+            Ok(vec![descriptor(self.tool)])
+        }
+        async fn invoke(&self, _tool: &str, _args: Value) -> Result<ToolCallResult> {
+            Ok(ToolCallResult {
+                content: vec![],
+                is_error: false,
+            })
+        }
+    }
+
     fn descriptor(name: &str) -> ToolDescriptor {
         ToolDescriptor {
             name: name.into(),
             description: String::new(),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
         }
-    }
-
-    /// Unregistering must purge the last-good cache: after
-    /// unregister + re-register of the same id, a budget-truncated
-    /// new instance must NOT be served the previous instance's
-    /// listing. Re-registration is a real path (composio
-    /// re-registration, custom MCP servers rebuilt from config on
-    /// every dispatcher construct).
-    #[tokio::test]
-    async fn unregister_purges_last_good_cache() {
-        let mut registry = ProviderRegistry::default();
-        registry.register(Box::new(GatewayProvider::new(
-            "demo",
-            || Ok(vec![descriptor("old.tool")]),
-            |_t, _a| {
-                Ok(ToolCallResult {
-                    content: vec![],
-                    is_error: false,
-                })
-            },
-        )));
-        // First aggregation caches the old instance's listing.
-        let first = registry.aggregate_tools().await.expect("first listing");
-        assert!(first.iter().any(|t| t.name == "demo.old.tool"));
-
-        // Unregister, then re-register the SAME id whose new
-        // instance fails to list.
-        assert!(registry.unregister("demo"));
-        registry.register(Box::new(GatewayProvider::new(
-            "demo",
-            || Err(anyhow::anyhow!("new instance never lists")),
-            |_t, _a| {
-                Ok(ToolCallResult {
-                    content: vec![],
-                    is_error: false,
-                })
-            },
-        )));
-
-        // The cached listing from the OLD instance must be gone: the
-        // new instance fails, so the tool must be absent — if the
-        // purge regressed, budget-less calls would still see it (the
-        // cache is only consulted on the budget path, so a plain call
-        // proves the purge by absence here).
-        let second = registry.aggregate_tools().await.expect("second listing");
-        assert!(
-            !second.iter().any(|t| t.name == "demo.old.tool"),
-            "unregister must purge the last-good cache; got: {:?}",
-            second.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
-        );
     }
 
     #[tokio::test]
@@ -926,5 +923,122 @@ mod tests {
                     && e.detail.contains("list_stale")
             });
         assert!(stale, "expected a list_stale audit event for 'good'");
+    }
+
+    /// CONTRACT: after unregister + re-register of the same id, the
+    /// old instance's listing is never served - exercised on the
+    /// BUDGET path, the only path that consults the cache. Call 1
+    /// lists the instant provider (wave 1) and caches it; call 2
+    /// rotates the re-registered hanging id into wave 2 where the
+    /// budget truncates it, so a surviving entry WOULD have served
+    /// the old tool (audited list_stale). Mutation note, kept honest:
+    /// re-registering goes through `register`, whose own purge is the
+    /// load-bearing line on this path (see the upsert test); the
+    /// unregister purge's unique job is remove-without-re-add, where
+    /// it prevents the entry from lingering in the map forever
+    /// (unreachable from the listing loop, but an unbounded leak
+    /// under remove/re-add churn).
+    #[tokio::test]
+    async fn unregister_purges_last_good_cache() {
+        let mut registry = ProviderRegistry::with_list_timeout(Duration::from_millis(200));
+        registry.register(Box::new(InstantProvider {
+            id: "rebind",
+            tool: "old",
+        }));
+        for id in [
+            "hang-a", "hang-b", "hang-c", "hang-d", "hang-e", "hang-f", "hang-g", "hang-h",
+            "hang-i",
+        ] {
+            registry.register(Box::new(HangingProvider(id)));
+        }
+
+        let first = registry
+            .aggregate_tools()
+            .await
+            .expect("first aggregation lists the instant provider");
+        assert!(first.iter().any(|t| t.name == "rebind.old"));
+
+        assert!(registry.unregister("rebind"));
+        registry.register(Box::new(HangingProvider("rebind")));
+
+        // Offset 1 rotates `good` to start position 9 (wave 2): the
+        // budget truncates it; the purge (if present) leaves the cache
+        // empty for it.
+        let second = registry
+            .aggregate_tools()
+            .await
+            .expect("second aggregation survives");
+        let names: Vec<&str> = second.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"rebind.old"),
+            "unregister must purge the last-good cache; got: {names:?}"
+        );
+        let (stale, skipped) = crate::services::audit::global()
+            .recent(200)
+            .into_iter()
+            .fold((false, false), |acc, e| {
+                if e.action == "dynamic_provider_rejected" && e.subject == "rebind" {
+                    (
+                        acc.0 || e.detail.contains("list_stale"),
+                        acc.1 || e.detail.contains("list_budget"),
+                    )
+                } else {
+                    acc
+                }
+            });
+        assert!(skipped, "expected a list_budget audit for 'good'");
+        assert!(
+            !stale,
+            "a stale serve means the unregister purge is missing"
+        );
+    }
+
+    /// The OTHER replacement path: register is an UPSERT -
+    /// connector.composio_register writes composio:{label} straight
+    /// into a live registry without unregistering first. The new
+    /// instance must not inherit the previous instance's cache entry.
+    /// Same discriminator, exercised through a bare re-register.
+    #[tokio::test]
+    async fn register_upsert_purges_last_good_cache() {
+        let mut registry = ProviderRegistry::with_list_timeout(Duration::from_millis(200));
+        registry.register(Box::new(InstantProvider {
+            id: "rebind",
+            tool: "old",
+        }));
+        for id in [
+            "hang-a", "hang-b", "hang-c", "hang-d", "hang-e", "hang-f", "hang-g", "hang-h",
+            "hang-i",
+        ] {
+            registry.register(Box::new(HangingProvider(id)));
+        }
+
+        let first = registry
+            .aggregate_tools()
+            .await
+            .expect("first aggregation lists the instant provider");
+        assert!(first.iter().any(|t| t.name == "rebind.old"));
+
+        // Bare re-register (upsert) with a hanging instance - no
+        // unregister call at all.
+        registry.register(Box::new(HangingProvider("rebind")));
+
+        let second = registry
+            .aggregate_tools()
+            .await
+            .expect("second aggregation survives");
+        let names: Vec<&str> = second.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"rebind.old"),
+            "re-register must purge the previous instance's cache entry; got: {names:?}"
+        );
+        let stale = crate::services::audit::global()
+            .recent(200)
+            .into_iter()
+            .any(|e| {
+                e.action == "dynamic_provider_rejected"
+                    && e.subject == "rebind"
+                    && e.detail.contains("list_stale")
+            });
+        assert!(!stale, "a stale serve means the upsert purge is missing");
     }
 }

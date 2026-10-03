@@ -752,7 +752,13 @@ tested create-equivalent (report classifies the surface honestly).
   skipped (list_budget). unregister() PURGES the last_good entry, so a
   re-registered id (composio re-registration, custom MCP servers
   rebuilt from config on every dispatcher construct) can never serve
-  the previous instance's listing (Kilo round 8). Hung/failed
+  the previous instance's listing (Kilo round 8). register() is an
+  UPSERT that purges too - composio re-registration writes
+  composio:{label} straight into a live registry without unregistering
+  first (Kilo round 9). Cache lock is fail-safe on poisoning
+  (unwrap_or_else(into_inner) - the map is structurally valid); NEVER
+  `if let Ok(lock)` on this cache: a poisoned lock must not silently
+  skip serve/purge (round 9). Hung/failed
   providers are STILL dropped -
   truncation is our scheduling artifact, a hang is a provider-health
   signal. Budget slack (100ms fixed) prevents the budget and

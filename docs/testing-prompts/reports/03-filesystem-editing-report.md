@@ -548,3 +548,34 @@ Two findings on the round-6 cache design, both fixed:
   provider-health signals, not scheduling artifacts) and the
   cross-registration guarantee. docs/mcp.md now states all three
   paths precisely, including the purge-on-unregister guarantee.
+
+## 16. Kilo review round 9 — upsert purge, real discriminators, fail-safe lock
+
+Three findings on the round-8 purge, all fixed:
+
+- **(4172602568, WARNING) `register` is an upsert and never purged**:
+  `connector.composio_register` writes `composio:{label}` straight
+  into a live registry (ComposioRegistry::register is itself an
+  upsert), so the previous instance's cache entry survived the
+  swap. Fixed: `register` purges the id's cache entry before the
+  insert. Pinned by `register_upsert_purges_last_good_cache` —
+  **mutation-verified**: deleting the purge line makes both purge
+  tests fail.
+- **(4172602572, WARNING) the round-8 purge test was a tautology**:
+  the replacement instance failed instantly, so the listing future
+  completed on the first poll and the budget never fired — absence
+  of the tool held with or without the purge (the cache is only
+  consulted on the budget path). Rewritten around a genuinely
+  hanging provider (std::future::pending) so the budget path IS
+  reached: call 2 rotates the id into wave 2, truncates it, and the
+  old tool's presence (list_stale) vs absence (list_budget) is the
+  discriminator. Mutation-verified. The comment also states the
+  honest division of labor: on re-register paths `register`'s purge
+  is the load-bearing line; `unregister`'s unique job is
+  remove-without-re-add, where it prevents an unbounded cache leak.
+- **(4172602574, SUGGESTION) poisoned-lock fail-open**: all three
+  cache sites used `if let Ok(lock)`/`.ok()`, silently skipping
+  serve/write/purge on poisoning. Fixed with the shared
+  `last_good_guard()` helper — `unwrap_or_else(into_inner())`, valid
+  because the guard is never held across an await and only HashMap
+  ops run under it.
