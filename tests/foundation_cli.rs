@@ -13,86 +13,27 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use tempfile::tempdir;
 
-const BIN: &str = env!("CARGO_BIN_EXE_awh");
+#[path = "common/mod.rs"]
+mod common;
 
 /// A synthetic token-shaped secret used for leakage checks. Never a real
 /// credential.
 const SYNTHETIC_SECRET: &str = "ghp_AWHTEST synthetic-LEAKCHECK-0123456789abcdef";
 
-/// Runs `awh <args>` in `dir` with an explicit environment.
+/// Runs `awh <args>` in `dir` with an explicit environment. Hermetic:
+/// ambient `AWH_*`/provider variables are stripped first (single source
+/// of the strip list: `tests/common/mod.rs`, shared with the sibling CLI
+/// suites); tests that need a value set it explicitly after the strip.
 fn run_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(BIN);
-    cmd.args(args).current_dir(dir);
-    for key in SANITIZED_AWH_VARS {
-        cmd.env_remove(key);
-    }
-    for key in SANITIZED_PROVIDER_VARS {
-        cmd.env_remove(key);
-    }
+    let mut cmd = common::sanitized_command(dir, args);
     for (k, v) in env {
         cmd.env(k, v);
     }
     cmd.output().expect("spawn awh binary")
 }
-
-/// Every `AWH_*` environment variable the binary reads at runtime
-/// (enumerated from `env::var` call sites in src/, excluding the
-/// `AWH_TEST_*` fixtures that only exist inside unit tests). Tests strip
-/// all of them from spawned children so machine-local configuration
-/// (developer shells, CI runner envs) can never change what a test
-/// observes; tests that need a value set it explicitly after the strip.
-const SANITIZED_AWH_VARS: &[&str] = &[
-    // Control-API / SSE server plane
-    "AWH_HOST",
-    "AWH_PORT",
-    "AWH_TLS_CERT",
-    "AWH_TLS_KEY",
-    "AWH_API_KEY",
-    "AWH_ALLOWED_ORIGINS",
-    // Dispatcher resource limits
-    "AWH_MAX_MCP_LINE_BYTES",
-    "AWH_MAX_HTTP_BODY_BYTES",
-    "AWH_MCP_REQUEST_TIMEOUT_SECS",
-    "AWH_HTTP_CLIENT_TIMEOUT_SECS",
-    "AWH_CIRCUIT_FAILURE_THRESHOLD",
-    "AWH_CIRCUIT_COOLDOWN_SECS",
-    // Context-engine tuning
-    "AWH_CONTEXT_ENABLED",
-    "AWH_CONTEXT_MEMORY_ENABLED",
-    "AWH_CONTEXT_AUTO_COMPRESS",
-    "AWH_CONTEXT_AUTO_OFFLOAD",
-    "AWH_CONTEXT_MAX_INPUT_TOKENS",
-    "AWH_CONTEXT_RESERVED_OUTPUT_TOKENS",
-    "AWH_CONTEXT_SAFETY_MARGIN_TOKENS",
-    // Registry / trust roots
-    "AWH_GLOBAL_SKILLS_ROOT",
-    "AWH_TRUST_DIR",
-    // Sandbox + tunnel helpers
-    "AWH_BWRAP",
-    "AWH_NGROK_AUTHTOKEN",
-];
-
-/// Non-`AWH_*` credentials and provider routing the binary reads.
-/// Stripped alongside the AWH set for the same reason: a developer's or
-/// runner's credentials must not enable provider behavior mid-test.
-/// (Fixed names only — dynamic reads like `--api-key-env` or
-/// registry-driven `${secret:NAME}` expansion are user/registry-named and
-/// cannot be enumerated statically; they are also fail-closed behind
-/// explicit allow-lists in the product.)
-const SANITIZED_PROVIDER_VARS: &[&str] = &[
-    "GITHUB_TOKEN",
-    "GITHUB_PERSONAL_ACCESS_TOKEN",
-    "GITHUB_API_URL",
-    "GITHUB_DEFAULT_OWNER",
-    "GITHUB_DEFAULT_REPO",
-    "COMPOSIO_API_KEY",
-    "COMPOSIO_CONNECTED_ACCOUNT_ID",
-    "COMPOSIO_TOOLKIT",
-    "NGROK_AUTHTOKEN",
-];
 
 fn run(dir: &Path, args: &[&str]) -> Output {
     run_env(dir, args, &[])
@@ -671,18 +612,8 @@ fn stdio_server_reports_invalid_resource_limit_and_keeps_serving() {
     // defaults — "never silently ignored" per docs/configuration.md.
     let dir = tempdir().expect("tempdir");
     assert!(run(dir.path(), &["init"]).status.success());
-    let mut cmd = Command::new(BIN);
-    cmd.args(["mcp", "serve", "--transport", "stdio"])
-        .current_dir(dir.path());
-    // Sanitize the environment the way run_env does: no machine-local
-    // AWH_* configuration or provider credentials can change what
-    // this test observes. The one variable under test is set after.
-    for key in SANITIZED_AWH_VARS {
-        cmd.env_remove(key);
-    }
-    for key in SANITIZED_PROVIDER_VARS {
-        cmd.env_remove(key);
-    }
+    let mut cmd = common::sanitized_command(dir.path(), &["mcp", "serve", "--transport", "stdio"]);
+    // The one variable under test is set after the strip.
     cmd.env("AWH_MAX_MCP_LINE_BYTES", "not-a-number")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

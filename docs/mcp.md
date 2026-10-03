@@ -209,6 +209,27 @@ AWH never relies solely on the provider:
   validator does not support such as `$ref`). The rejection is per-tool —
   one bad advertisement never hides a provider's healthy siblings — and
   each drop is audited (`dynamic_tool_rejected`) and logged.
+* **Listing budget.** Provider listings run under a bounded concurrency
+  window, each listing capped (`list_timeout` on a hang,
+  `list_failed` on an error), and the WHOLE listing phase is wrapped in
+  an aggregate budget of one effective cap plus a small collection
+  slack. When the budget elapses, a provider that never got to answer
+  is served from its last successful listing for the CURRENT
+  registration (`list_stale`) — membership is sticky across budget
+  truncations — and only a provider with no cached listing is omitted
+  (`list_budget`). Unregistering a provider purges its cached listing,
+  so a re-registered id can never serve the previous instance's
+  advertisement. Two skip paths do NOT consult the cache and are
+  deliberate: a provider that answers with an error (`list_failed`) or
+  hangs past its own cap (`list_timeout`) loses its tools from that
+  listing — those are provider-health signals, not scheduling
+  artifacts. All skip/serve outcomes are audited as
+  `dynamic_provider_rejected` with the reason in the detail, so a
+  registry that outgrows the budget is observable in `/api/v1/audit`
+  rather than reading as silently missing tools. The trade-off is
+  deliberate: an unbounded aggregate would let a large registry stall
+  `tools/list` for minutes (stdio has no outer request deadline), so
+  completeness yields to liveness.
 * **Invocation gate.** `tools/call` on a `provider.tool` name — and the
   equivalent generic `connector.invoke` path, which cannot be used to
   bypass the direct path — looks up the advertised schema and validates
