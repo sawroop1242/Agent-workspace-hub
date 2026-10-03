@@ -142,11 +142,7 @@ fn mcp_read_file_returns_exact_bytes_without_normalization() {
     let server = server_over(root);
 
     let read = |path: &str| {
-        let result = tool(
-            &server,
-            "workspace.read_file",
-            json!({"path": path}),
-        );
+        let result = tool(&server, "workspace.read_file", json!({"path": path}));
         content_text(&result)
     };
 
@@ -195,7 +191,11 @@ fn mcp_read_file_handles_empty_large_missing_directory_and_overcap() {
     // The service surfaces the failed operation ("read <path>", the
     // canonical context) — assert the error, not a guessed io wording.
     let error = tool_error(&server, "workspace.read_file", json!({"path": "adir"}));
-    assert_eq!(error["code"], json!(-32603), "directory read must error: {error}");
+    assert_eq!(
+        error["code"],
+        json!(-32603),
+        "directory read must error: {error}"
+    );
     assert!(
         error["message"].as_str().unwrap_or("").contains("read "),
         "directory read error names the failed operation: {error}",
@@ -209,7 +209,10 @@ fn mcp_read_file_handles_empty_large_missing_directory_and_overcap() {
         message.to_lowercase().contains("2 mib"),
         "over-cap read must name the documented 2 MiB limit: {error}"
     );
-    assert!(!message.contains("yyyyy"), "over-cap read must not return file bytes");
+    assert!(
+        !message.contains("yyyyy"),
+        "over-cap read must not return file bytes"
+    );
 }
 
 #[test]
@@ -318,7 +321,10 @@ fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
         "workspace.write_file",
         json!({"path": outside.to_string_lossy(), "content": "escaped"}),
     );
-    assert!(error["code"].as_i64().is_some(), "absolute write refused: {error}");
+    assert!(
+        error["code"].as_i64().is_some(),
+        "absolute write refused: {error}"
+    );
 
     // The protected outside file is byte-for-byte untouched, and no user
     // artifact leaked inside the workspace (`.agent/` is the server's own
@@ -335,10 +341,7 @@ fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
             (name != ".agent").then_some(name)
         })
         .collect();
-    assert!(
-        residue.is_empty(),
-        "no residue inside root: {residue:?}"
-    );
+    assert!(residue.is_empty(), "no residue inside root: {residue:?}");
 }
 
 #[test]
@@ -389,7 +392,10 @@ fn mcp_write_file_directory_target_fails_and_leaves_the_tree_unchanged() {
         "workspace.write_file",
         json!({"path": "pkg", "content": "not a file"}),
     );
-    assert!(error["code"].as_i64().is_some(), "directory write refused: {error}");
+    assert!(
+        error["code"].as_i64().is_some(),
+        "directory write refused: {error}"
+    );
     // The directory still exists, still a directory, contents intact.
     assert!(root.join("pkg").is_dir());
     assert_eq!(real_file_bytes(root, "pkg/keep.txt"), b"keep\n");
@@ -436,7 +442,10 @@ fn mcp_list_files_reports_only_files_sorted_with_sizes() {
     // Missing directory → the canonical error, not an empty success
     // (an empty list would be indistinguishable from an empty dir).
     let error = tool_error(&server, "workspace.list_files", json!({"path": "missing"}));
-    assert!(error["code"].as_i64().is_some(), "missing dir lists as error: {error}");
+    assert!(
+        error["code"].as_i64().is_some(),
+        "missing dir lists as error: {error}"
+    );
 }
 
 #[test]
@@ -471,7 +480,9 @@ fn service_meta_classifies_kind_reports_size_and_tracks_mutation() {
     // the é is two UTF-8 bytes).
     std::fs::create_dir_all(root.join("nested dir")).unwrap();
     std::fs::write(root.join("nested dir/café notes.md"), "café\n").unwrap();
-    let unicode = files.meta("nested dir/café notes.md").expect("unicode meta");
+    let unicode = files
+        .meta("nested dir/café notes.md")
+        .expect("unicode meta");
     assert_eq!(unicode.size, 6);
 }
 
@@ -509,14 +520,25 @@ fn service_search_matrix_zero_one_many_repeated_case_unicode_limit() {
     assert!(files.search("zebra", 100).unwrap().is_empty());
 
     // Many matches across files, nested dirs included, binary skipped,
-    // case-insensitive per the documented substring semantics.
+    // case-insensitive per the documented substring semantics. Paths are
+    // normalized to forward slashes before comparison: the service layer
+    // returns OS-native separators (the portable contract), and this
+    // suite runs on Windows too (§34: never assert raw path strings).
     let hits = files.search("parser", 100).unwrap();
-    let paths: Vec<&str> = hits.iter().map(|hit| hit.path.as_str()).collect();
-    for expected in ["README.md", "src/main.rs", "src/parser.rs", "tests/parser_test.rs"] {
-        assert!(paths.contains(&expected), "missing hit in {expected}: {paths:?}");
+    let paths: Vec<String> = hits.iter().map(|hit| hit.path.replace('\\', "/")).collect();
+    for expected in [
+        "README.md",
+        "src/main.rs",
+        "src/parser.rs",
+        "tests/parser_test.rs",
+    ] {
+        assert!(
+            paths.contains(&expected.to_owned()),
+            "missing hit in {expected}: {paths:?}"
+        );
     }
     assert!(
-        !paths.contains(&"src/parser.bin"),
+        !paths.contains(&"src/parser.bin".to_owned()),
         "binary file must be skipped"
     );
 
@@ -524,7 +546,7 @@ fn service_search_matrix_zero_one_many_repeated_case_unicode_limit() {
     // numbers and the matching line text.
     let parser_hits: Vec<&agent_workspace_hub::services::files::SearchHit> = hits
         .iter()
-        .filter(|hit| hit.path == "src/parser.rs")
+        .filter(|hit| hit.path.replace('\\', "/") == "src/parser.rs")
         .collect();
     assert_eq!(parser_hits.len(), 3, "three 'parser' lines in parser.rs");
     assert_eq!(parser_hits[0].line_number, 1);
@@ -545,7 +567,11 @@ fn service_search_matrix_zero_one_many_repeated_case_unicode_limit() {
     // Unicode needle.
     std::fs::write(root.join("u.txt"), "café au lait\nCafé central\n").unwrap();
     let hits = files.search("café", 100).unwrap();
-    assert_eq!(hits.len(), 2, "unicode matches case-insensitively: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        2,
+        "unicode matches case-insensitively: {hits:?}"
+    );
 
     // Limit bounding: limit=1 returns exactly one hit.
     let hits = files.search("parser", 1).unwrap();
@@ -717,12 +743,18 @@ fn parity_write_produces_identical_bytes_across_mcp_service_and_control_api() {
     // the others read identically (same canonical service under all).
     let via_mcp = {
         let server = server_over(service_dir.path());
-        let result = tool(&server, "workspace.read_file", json!({"path": "shared.txt"}));
+        let result = tool(
+            &server,
+            "workspace.read_file",
+            json!({"path": "shared.txt"}),
+        );
         content_text(&result)
     };
     assert_eq!(via_mcp.as_bytes(), expected);
     assert_eq!(
-        FilesService::new(mcp_dir.path()).read("shared.txt").unwrap(),
+        FilesService::new(mcp_dir.path())
+            .read("shared.txt")
+            .unwrap(),
         content
     );
 }
@@ -737,7 +769,10 @@ fn deep_nesting_and_many_files_stay_bounded_and_correct() {
     let root = dir.path();
 
     // A 12-level nested write/read round trip through the MCP plane.
-    let deep = (0..12).map(|i| format!("level{i}")).collect::<Vec<_>>().join("/");
+    let deep = (0..12)
+        .map(|i| format!("level{i}"))
+        .collect::<Vec<_>>()
+        .join("/");
     let server = server_over(root);
     tool(
         &server,
@@ -755,8 +790,7 @@ fn deep_nesting_and_many_files_stay_bounded_and_correct() {
     // 40 sibling files: list stays complete, sorted, and bounded.
     std::fs::create_dir_all(root.join("many")).unwrap();
     for i in 0..40 {
-        std::fs::write(root.join(format!("many/file{i:02}.txt")), format!("{i}"))
-            .unwrap();
+        std::fs::write(root.join(format!("many/file{i:02}.txt")), format!("{i}")).unwrap();
     }
     let files = FilesService::new(root);
     let entries = files.list("many").expect("list many");
