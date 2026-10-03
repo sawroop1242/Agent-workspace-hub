@@ -136,10 +136,11 @@ cycle and are fixed on the same branch:
   test into a tautology.
 
 One review point on `src/mcp/providers.rs` (hang isolation, not just
-error isolation) is also fixed on this branch: `aggregate_tools` now
-wraps each provider's listing in a 20s per-provider timeout
-(`provider_list_timeout()`; test-only override via
-`AWH_TEST_PROVIDER_LIST_TIMEOUT_MS`), so a black-holed backend is
-skipped and audited (`provider_list_timeout`) instead of stalling the
-whole `tools/list` advertisement. Regression test:
-`aggregate_tools_isolates_hanging_providers`.
+error isolation) is also fixed on this branch: `aggregate_tools` lists
+providers **concurrently**, each wrapped in a 20s per-provider timeout
+(`PROVIDER_LIST_TIMEOUT`), so a black-holed backend is skipped and
+audited (`list_timeout` reason — kept under the audit redaction
+threshold so it persists verbatim) instead of stalling the whole
+`tools/list` advertisement. Regression tests:
+`aggregate_tools_isolates_hanging_providers` and
+`aggregate_tools_bounds_n_hanging_providers_to_one_cap`.

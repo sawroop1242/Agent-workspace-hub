@@ -1,26 +1,36 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Per-provider cap on tool listing inside `aggregate_tools`. The
-/// error-isolation below covers providers that *fail*; this covers
-/// providers that *hang* — without it, one black-holed backend (or N of
-/// them) stalls the whole `tools/list` advertisement for up to N × its
-/// own client timeout on the client's connect path. Timed-out providers
-/// take the same skip path as failing ones; the direct per-provider
-/// listing (`connector.tools`) stays un-timed for diagnosis.
+/// Default per-provider cap on tool listing inside `aggregate_tools`.
+/// The error-isolation below covers providers that *fail*; the timeout
+/// covers providers that *hang*. Listings run concurrently and each is
+/// capped individually, so N hanging backends cost one cap of wall
+/// time, not N. Timed-out providers take the same skip path as
+/// failing ones; the direct per-provider listing (`connector.tools`)
+/// stays un-timed for diagnosis.
+const PROVIDER_LIST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Test-only override for the per-provider cap so the hang-isolation
+/// regression test can run in milliseconds instead of 20s. 0 = default.
+/// An atomic (not an env var) so no release build reads it and parallel
+/// tests cannot race on process-global environment state.
+#[cfg(test)]
+static TEST_LIST_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn provider_list_timeout() -> Duration {
-    // Test-only override so the hang-isolation regression test can run in
-    // milliseconds (unit tests read this per call, in-process).
-    if let Ok(millis) = std::env::var("AWH_TEST_PROVIDER_LIST_TIMEOUT_MS") {
-        if let Ok(millis) = millis.parse::<u64>() {
-            return Duration::from_millis(millis);
+    #[cfg(test)]
+    {
+        let ms = TEST_LIST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return Duration::from_millis(ms);
         }
     }
-    Duration::from_secs(20)
+    PROVIDER_LIST_TIMEOUT
 }
 
 /// Describes a tool exposed by a connector provider.
@@ -120,43 +130,64 @@ impl ProviderRegistry {
     /// Collects tools from all providers, prefixing names with the provider id.
     pub async fn aggregate_tools(&self) -> Result<Vec<ToolDescriptor>> {
         let mut out = Vec::new();
-        for provider in self.providers() {
-            // Fail closed per provider, not per plane: one unhealthy
-            // provider (bad credentials, unreachable backend, or a
-            // backend that simply never answers) must not take down the
-            // whole tools/list advertisement. Its tools are simply
-            // absent; direct per-provider listing (`connector.tools`)
-            // still surfaces the real error for diagnosis.
-            let listed =
-                match tokio::time::timeout(provider_list_timeout(), self.tools(&provider)).await {
-                    Ok(Ok(listed)) => listed,
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            provider = %provider,
-                            error = %error,
-                            "dynamic provider tool listing failed; skipping provider"
-                        );
-                        crate::mcp::audit::audit_deny(
-                            "dynamic_provider_rejected",
-                            "provider_list_failed",
-                            &provider,
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            provider = %provider,
-                            timeout_ms = provider_list_timeout().as_millis(),
-                            "dynamic provider tool listing timed out; skipping provider"
-                        );
-                        crate::mcp::audit::audit_deny(
-                            "dynamic_provider_rejected",
-                            "provider_list_timeout",
-                            &provider,
-                        );
-                        continue;
-                    }
-                };
+        let providers = self.providers();
+        // Fail closed per provider, not per plane: an unhealthy provider
+        // (bad credentials, unreachable backend, or a backend that never
+        // answers) must not take down the whole tools/list advertisement
+        // — and must not stall it either. Listings run CONCURRENTLY,
+        // each under its own cap, so the wall-clock cost is one cap, not
+        // N × cap. Unhealthy providers are skipped; their tools are
+        // simply absent and a deny audit event names them (direct
+        // per-provider listing via `connector.tools` still surfaces the
+        // real error for diagnosis).
+        //
+        // The audit reasons are deliberately SHORT (<16 chars):
+        // `AuditLog::record` runs `redact_token_like` over the detail,
+        // which masks >=16-char base62 runs, so longer slugs
+        // (`provider_list_timeout`) would persist as `[redacted]` and
+        // the ring could not distinguish a hang from a failure.
+        let listings = join_all(providers.iter().map(|provider| {
+            let timeout = provider_list_timeout();
+            async move {
+                (
+                    provider.clone(),
+                    tokio::time::timeout(timeout, self.tools(provider)).await,
+                )
+            }
+        }))
+        .await;
+        for (provider, listed) in listings {
+            // `join_all` yields in input order, so the advertised
+            // catalog keeps a stable provider order.
+            let listed = match listed {
+                Ok(Ok(listed)) => listed,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        provider = %provider,
+                        error = %error,
+                        "dynamic provider tool listing failed; skipping provider"
+                    );
+                    crate::mcp::audit::audit_deny(
+                        "dynamic_provider_rejected",
+                        "list_failed",
+                        &provider,
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider = %provider,
+                        timeout_secs = PROVIDER_LIST_TIMEOUT.as_secs(),
+                        "dynamic provider tool listing timed out; skipping provider"
+                    );
+                    crate::mcp::audit::audit_deny(
+                        "dynamic_provider_rejected",
+                        "list_timeout",
+                        &provider,
+                    );
+                    continue;
+                }
+            };
             for mut tool in listed {
                 tool.name = format!("{}.{}", provider, tool.name);
                 if tool.description.is_empty() {
@@ -406,12 +437,34 @@ mod tests {
         );
         assert!(!names.iter().any(|n| n.starts_with("bad.")), "{names:?}");
 
-        // The skip is observable: a deny audit event names the provider.
+        // The skip is observable: a deny audit event names the provider,
+        // with the `list_failed` reason (kept under the 16-char
+        // redaction threshold so it persists verbatim in the record).
         let denied = crate::services::audit::global()
             .recent(200)
             .into_iter()
-            .any(|e| e.action == "dynamic_provider_rejected" && e.subject == "bad");
+            .any(|e| {
+                e.action == "dynamic_provider_rejected"
+                    && e.subject == "bad"
+                    && e.detail.contains("list_failed")
+            });
         assert!(denied, "expected a dynamic_provider_rejected audit event");
+    }
+
+    /// RAII guard over the test-only timeout override: restores the
+    /// default on drop even if the test panics mid-flight.
+    struct ListTimeoutOverride(u64);
+    impl ListTimeoutOverride {
+        fn millis(ms: u64) -> Self {
+            TEST_LIST_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+            Self(ms)
+        }
+    }
+    impl Drop for ListTimeoutOverride {
+        fn drop(&mut self) {
+            TEST_LIST_TIMEOUT_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.0;
+        }
     }
 
     /// A provider whose backend never answers must be skipped after the
@@ -436,7 +489,9 @@ mod tests {
             }
         }
 
-        std::env::set_var("AWH_TEST_PROVIDER_LIST_TIMEOUT_MS", "250");
+        // 150ms cap per provider (well under the multi-second HTTP
+        // client default), restored on drop even on panic.
+        let _override = ListTimeoutOverride::millis(150);
         let mut registry = ProviderRegistry::default();
         registry.register(Box::new(GatewayProvider::new(
             "good",
@@ -456,7 +511,6 @@ mod tests {
             .await
             .expect("aggregate listing must survive one hanging provider");
         let elapsed = started.elapsed();
-        std::env::remove_var("AWH_TEST_PROVIDER_LIST_TIMEOUT_MS");
 
         // The healthy provider's tools still ship; the hanging one is
         // absent, not fatal.
@@ -466,24 +520,91 @@ mod tests {
             "{names:?}"
         );
         assert!(!names.iter().any(|n| n.starts_with("hung.")), "{names:?}");
-        // Bounded wait: the cap (250ms in this test) plus a small margin —
+        // Bounded wait: the cap (150ms in this test) plus a small margin —
         // certainly not the multi-second HTTP client default.
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "hanging provider bounded to the per-provider cap, took {elapsed:?}"
         );
 
-        // The timeout skip is audited, with the timeout reason.
-        // The skip is observable: a deny audit event names the hung
-        // provider. (The reason string itself is redacted in the record
-        // -- `provider_list_timeout` is a 21-char base62 run, masked by
-        // the documented >=16-char redaction trade-off -- so the event
-        // is asserted by action + subject, like the failing-provider
-        // test above.)
+        // The timeout skip is audited with the `list_timeout` reason
+        // (short enough to survive the redaction pass verbatim, so the
+        // ring can distinguish a hang from a failure).
         let denied = crate::services::audit::global()
             .recent(200)
             .into_iter()
-            .any(|e| e.action == "dynamic_provider_rejected" && e.subject == "hung");
-        assert!(denied, "expected a dynamic_provider_rejected audit event");
+            .any(|e| {
+                e.action == "dynamic_provider_rejected"
+                    && e.subject == "hung"
+                    && e.detail.contains("list_timeout")
+            });
+        assert!(
+            denied,
+            "expected a dynamic_provider_rejected/list_timeout audit event"
+        );
+    }
+
+    /// N hanging providers must cost ONE cap of wall time, not N: the
+    /// listings run concurrently, each under its own per-provider cap.
+    #[tokio::test]
+    async fn aggregate_tools_bounds_n_hanging_providers_to_one_cap() {
+        struct HangingProvider(&'static str);
+        #[async_trait]
+        impl ConnectorProvider for HangingProvider {
+            fn provider_id(&self) -> &str {
+                self.0
+            }
+            async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            async fn invoke(&self, _tool: &str, _args: Value) -> Result<ToolCallResult> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        // 300ms cap per provider: serial execution of 5 hangs would take
+        // ~1.5s and fail this bound; concurrent execution stays ~300ms.
+        let _override = ListTimeoutOverride::millis(300);
+        let mut registry = ProviderRegistry::default();
+        registry.register(Box::new(GatewayProvider::new(
+            "good",
+            || Ok(vec![descriptor("ping")]),
+            |_t, _a| {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            },
+        )));
+        for id in ["hang-a", "hang-b", "hang-c", "hang-d", "hang-e"] {
+            registry.register(Box::new(HangingProvider(id)));
+        }
+
+        let started = std::time::Instant::now();
+        let aggregated = registry
+            .aggregate_tools()
+            .await
+            .expect("aggregate listing must survive five hanging providers");
+        let elapsed = started.elapsed();
+
+        let names: Vec<&str> = aggregated.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"good.ping".to_string().as_str()),
+            "{names:?}"
+        );
+        for id in ["hang-a", "hang-b", "hang-c", "hang-d", "hang-e"] {
+            assert!(
+                !names.iter().any(|n| n.starts_with(&format!("{id}."))),
+                "{names:?}"
+            );
+        }
+        // One cap's worth of wall time plus a small margin — NOT the
+        // serial sum (5 x 300ms) and never the 20s default.
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "concurrent listing must bound N hangs to ~one cap, took {elapsed:?}"
+        );
     }
 }

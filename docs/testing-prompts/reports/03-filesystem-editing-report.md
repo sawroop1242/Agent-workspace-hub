@@ -178,8 +178,27 @@ tests 5/7/11 of the new suite. No test bypasses were introduced.
 
 ## 4. Defects found
 
-**None.** No production defect surfaced in this pass. Two near-miss
-observations worth keeping in the record:
+**One production defect, fixed in this PR (carried from the TP02 Kilo
+review, shipped here because the fix lives on this branch):**
+
+0. **`ProviderRegistry::aggregate_tools` could stall or drop the whole
+   dynamic tool catalog on one unhealthy provider.** Two failure modes:
+   (a) a provider whose listing *errors* poisoned the entire
+   `tools/list` advertisement (the old `?` propagated the first error);
+   (b) a provider whose backend *hangs* stalled the advertisement for
+   the duration of the HTTP client timeout — serially across providers,
+   so N hung backends cost N × timeout. Fix (in `src/mcp/providers.rs`):
+   per-provider isolation — listings run **concurrently** under a 20 s
+   per-provider cap (`PROVIDER_LIST_TIMEOUT`); failing providers are
+   skipped with a `dynamic_provider_rejected`/`list_failed` audit event,
+   hanging ones with `list_timeout` (reasons kept under the 16-char
+   redaction threshold so they persist verbatim in the audit record).
+   Regression tests: `aggregate_tools_isolates_failing_providers`,
+   `aggregate_tools_isolates_hanging_providers`,
+   `aggregate_tools_bounds_n_hanging_providers_to_one_cap` (N hangs cost
+   one cap, not N).
+
+Two near-miss observations worth keeping in the record:
 
 1. **MCP read is text-only by contract** (invalid UTF-8 → error, not
    replacement). This is documented and intentional; the binary-safe
@@ -222,7 +241,9 @@ env -u COMPOSIO_API_KEY cargo test --all-targets
 - Hash evidence uses published FIPS vectors — not the production helper.
 - No mocks of the filesystem; no hard-coded developer paths (all
   `tempfile::tempdir`); no env-var mutation; no unrelated production
-  behavior changed (the only diff outside tests/ is none).
+  behavior changed. Production diffs in this PR are exactly the
+  `src/mcp/providers.rs` provider-isolation fix documented in §4 (plus
+  its regression tests).
 - Ordering assumptions asserted only where the public contract guarantees
   them (MCP list sorts; service list order explicitly not assumed).
 
@@ -249,14 +270,58 @@ this revision:
   `AWH_*` and provider-variable ambient environment via the same
   enumerated set as `tests/foundation_cli.rs`.
 - **Full-digest comparison actually pinned**: the corrupted vector now
-  corrupts the **last** hex character (a prefix-checking guard would
-  still reject a first-character corruption), and a **truncated
-  63-char digest** is asserted rejected (a `starts_with` guard would
-  accept it) — together these pin exact, full-length equality.
+  corrupts the **last** hex character — the value still passes the
+  structural 64-hex gate, so it reaches the digest comparison itself,
+  and a guard comparing fewer than all 64 characters would accept the
+  file (the difference is beyond its cutoff). Only a comparison through
+  the final character rejects it. (An earlier revision also asserted a
+  truncated 63-char digest; review correctly pointed out that case is
+  rejected structurally by `is_valid_hash` *before* any comparison, so
+  it proved nothing about full-length equality and duplicated the
+  in-crate malformed-hash coverage — removed.)
 - **Mis-citation fixed**: the path-normalization comment cited §34;
   the actual rule is the repo's cross-platform path-assertion gotcha.
 - **Prior-suite counts corrected** (16/24/13/26 → 15/8/3/20 = 46).
 
-Two review comments (`src/mcp/providers.rs` provider-hang timeout,
-`tests/workspace_runtime_cli.rs` hermeticity/poisoning) concern files in
-PR #138's diff, not this PR's — flagged there instead.
+## 9. Kilo review round 2 — addressed
+
+All points from the second review round are fixed in this revision:
+
+- **Report honesty (§4/§7)**: "no production defect" and "tests-only
+  diff" were factually wrong — the PR ships the `src/mcp/providers.rs`
+  isolation fix (the base branch still has the old `?`). Both statements
+  corrected to name the defect and its tests.
+- **Truncated-digest case removed**: it was rejected structurally by
+  `is_valid_hash` before any digest comparison, so it added no evidence
+  about full-length equality (§8 bullet rewritten accordingly). The
+  tail-corruption case remains the full-digest pin.
+- **Sentinel cleanup made panic-safe**: the outside sentinel now lives
+  in its own sibling `tempdir()` — cleanup is TempDir's Drop (runs even
+  when a test panics) and an unlink failure can no longer fail a test
+  whose traversal proof already succeeded.
+- **Sanitized-variable triplication removed**: the strip list now has a
+  single source, `tests/common/mod.rs` (`#[path]`-included by
+  `foundation_cli.rs`, `workspace_runtime_cli.rs`, and
+  `fs_basic_boundaries.rs`) — a new `AWH_*` read added to src/ needs one
+  edit, and every suite inherits it.
+- **Test-only env override eliminated from production code**: the
+  `AWH_TEST_PROVIDER_LIST_TIMEOUT_MS` env var (live in release builds,
+  unclamped — a stray `0` would silently empty the dynamic catalog) is
+  gone. The hang-isolation tests now use a `#[cfg(test)]` atomic
+  override with an RAII guard (`ListTimeoutOverride`): no release-build
+  surface, no process-global env mutation, panic-safe restore.
+- **Serial N × cap stall removed**: provider listings now run
+  concurrently (`futures_util::future::join_all`, already a production
+  dependency), each under its own cap — N hanging providers cost one
+  cap of wall time, not N. Pinned by
+  `aggregate_tools_bounds_n_hanging_providers_to_one_cap`.
+- **Audit reasons survive redaction**: `provider_list_failed`/
+  `provider_list_timeout` were ≥16-char base62 runs and persisted as
+  `[redacted]` — the ring could not distinguish a hang from a failure.
+  Reasons shortened to `list_failed`/`list_timeout` (<16 chars, persist
+  verbatim); both provider tests now assert the reason in the record.
+
+The two review comments that landed on PR #138's copy of the shared
+commits (the providers.rs hang timeout and workspace-runtime hermeticity
+points) are addressed HERE, on this branch — nothing is deferred to or
+"belonging to" #138; whichever PR merges first carries the fixes.

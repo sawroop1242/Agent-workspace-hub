@@ -32,60 +32,18 @@ use std::process::Command;
 use tempfile::tempdir;
 use tower::util::ServiceExt;
 
+#[path = "common/mod.rs"]
+mod common;
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
-/// `AWH_*` runtime variables the binary reads (mirrors the enumerated set
-/// in `tests/foundation_cli.rs`). Spawned `awh` children are stripped of
-/// these plus provider credentials so machine-local state can never
-/// change what a test observes.
-const SANITIZED_AWH_VARS: &[&str] = &[
-    "AWH_HOST",
-    "AWH_PORT",
-    "AWH_TLS_CERT",
-    "AWH_TLS_KEY",
-    "AWH_API_KEY",
-    "AWH_ALLOWED_ORIGINS",
-    "AWH_MAX_MCP_LINE_BYTES",
-    "AWH_MAX_HTTP_BODY_BYTES",
-    "AWH_MCP_REQUEST_TIMEOUT_SECS",
-    "AWH_HTTP_CLIENT_TIMEOUT_SECS",
-    "AWH_CIRCUIT_FAILURE_THRESHOLD",
-    "AWH_CIRCUIT_COOLDOWN_SECS",
-    "AWH_CONTEXT_ENABLED",
-    "AWH_CONTEXT_MEMORY_ENABLED",
-    "AWH_CONTEXT_AUTO_COMPRESS",
-    "AWH_CONTEXT_AUTO_OFFLOAD",
-    "AWH_CONTEXT_MAX_INPUT_TOKENS",
-    "AWH_CONTEXT_RESERVED_OUTPUT_TOKENS",
-    "AWH_CONTEXT_SAFETY_MARGIN_TOKENS",
-    "AWH_GLOBAL_SKILLS_ROOT",
-    "AWH_TRUST_DIR",
-    "AWH_BWRAP",
-    "AWH_NGROK_AUTHTOKEN",
-];
-const SANITIZED_PROVIDER_VARS: &[&str] = &[
-    "GITHUB_TOKEN",
-    "GITHUB_PERSONAL_ACCESS_TOKEN",
-    "GITHUB_API_URL",
-    "GITHUB_DEFAULT_OWNER",
-    "GITHUB_DEFAULT_REPO",
-    "COMPOSIO_API_KEY",
-    "COMPOSIO_CONNECTED_ACCOUNT_ID",
-    "COMPOSIO_TOOLKIT",
-    "NGROK_AUTHTOKEN",
-];
-
 /// A hermetic `awh` child: ambient `AWH_*`/provider variables stripped
-/// (same rationale as `tests/foundation_cli.rs`).
+/// (see `tests/common/mod.rs` for why and for the single source of the
+/// strip list).
 fn awh_in(dir: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_awh"));
-    command.args(args).current_dir(dir);
-    for key in SANITIZED_AWH_VARS.iter().chain(SANITIZED_PROVIDER_VARS) {
-        command.env_remove(key);
-    }
-    command
+    common::sanitized_command(dir, args)
 }
 
 /// One MCP tool call against the real in-process stdio server, with the
@@ -354,11 +312,17 @@ fn mcp_write_file_creates_overwrites_and_is_deterministic() {
 fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    // A sentinel OUTSIDE the workspace: the negative proof for §20. The
-    // name is process-unique (the OS temp dir is shared by parallel test
-    // runs and CI jobs) and the file is removed at the end.
+    // A sentinel OUTSIDE the workspace: the negative proof for §20. It
+    // lives in its own sibling tempdir (same shared OS temp area the
+    // workspace was created in, so `../` still reaches it), named
+    // process-unique — the OS temp dir is shared by parallel test runs
+    // and CI jobs. TempDir's own Drop does the cleanup, so the sentinel
+    // disappears even when an assert above panics, and a cleanup failure
+    // (Windows AV/indexer handles, read-only mounts) can never fail this
+    // test after the traversal proof already succeeded.
+    let outside_dir = tempdir().unwrap();
     let sentinel_name = format!("outside-sentinel-{}.txt", std::process::id());
-    let outside = dir.path().parent().unwrap().join(&sentinel_name);
+    let outside = outside_dir.path().join(&sentinel_name);
     std::fs::write(&outside, "do not touch\n").unwrap();
 
     let server = server_over(root);
@@ -415,7 +379,6 @@ fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
         })
         .collect();
     assert!(residue.is_empty(), "no residue inside root: {residue:?}");
-    std::fs::remove_file(&outside).expect("clean up sentinel");
 }
 
 #[test]
@@ -712,9 +675,15 @@ fn cli_expected_hash_guard_matches_independent_published_vectors() {
     assert_eq!(real_file_bytes(root, "vector.txt"), b"xyz");
 
     // LAST hex character corrupted → conflict (exit 4), bytes unchanged.
-    // Corrupting the tail is what pins a full-digest comparison: a
-    // prefix-checking guard would accept every character after its
-    // cutoff, so only comparing through the final character rejects this.
+    // Corrupting the tail is what pins a full-digest comparison: the
+    // value still passes the structural 64-hex-char gate, so it reaches
+    // the digest comparison itself, and a guard that compares fewer
+    // than all 64 characters would accept this file (the difference is
+    // beyond its cutoff) — only a comparison through the final
+    // character rejects it. (A value with fewer/more than 64 chars
+    // would prove nothing here: `is_valid_hash` rejects it structurally
+    // before any digest comparison runs — that path is already covered
+    // in-crate by `services::edit` malformed-hash tests.)
     std::fs::write(root.join("vector.txt"), "abc").unwrap();
     let conflict = awh_in(
         root,
@@ -736,32 +705,6 @@ fn cli_expected_hash_guard_matches_independent_published_vectors() {
         "tail-corrupted hash must exit 4 (conflict): stdout={} stderr={}",
         String::from_utf8_lossy(&conflict.stdout),
         String::from_utf8_lossy(&conflict.stderr)
-    );
-    assert_eq!(real_file_bytes(root, "vector.txt"), b"abc");
-
-    // A TRUNCATED digest (63 chars — the correct digest minus its last
-    // character) must also be rejected: a `starts_with`-style guard would
-    // accept it, so this pins exact full-length equality.
-    std::fs::write(root.join("vector.txt"), "abc").unwrap();
-    let truncated = awh_in(
-        root,
-        &[
-            "fs",
-            "replace",
-            "vector.txt",
-            "abc",
-            "xyz",
-            "--expected-hash",
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a",
-        ],
-    )
-    .output()
-    .expect("replace with truncated vector");
-    assert!(
-        !truncated.status.success(),
-        "truncated digest must be rejected: stdout={} stderr={}",
-        String::from_utf8_lossy(&truncated.stdout),
-        String::from_utf8_lossy(&truncated.stderr)
     );
     assert_eq!(real_file_bytes(root, "vector.txt"), b"abc");
 

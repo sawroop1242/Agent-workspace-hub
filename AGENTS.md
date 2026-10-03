@@ -717,21 +717,31 @@ tested create-equivalent (report classifies the surface honestly).
 
 
 - **Audit-redaction masks long identifiers** (TP03): `redact_token_like`
-  splits on non-base62 chars but treats `_` as part of the run, so any
-  identifier >=16 chars (e.g. `provider_list_timeout`) becomes
-  `[redacted]` in the audit record's subject/detail. Tests asserting on
-  audit detail/reason strings must therefore assert on short strings
-  (action + subject), never on long reason slugs.
-- **Per-provider hang isolation** (TP03 Kilo review): `aggregate_tools`
-  wraps each provider's `list_tools` in a 20s `tokio::time::timeout`
-  (`provider_list_timeout()`, test override
-  `AWH_TEST_PROVIDER_LIST_TIMEOUT_MS`); a hanging backend is skipped and
-  audited (`provider_list_timeout` reason) like a failing one, instead
-  of stalling tools/list. Regression test:
-  `aggregate_tools_isolates_hanging_providers` (needs a real timer; do
-  not pause tokio time for it).
-- **Spawned-awh hermeticity pattern** (TP03): CLI integration suites
-  should strip the ambient `AWH_*` + provider env from every spawned
-  child (copy the `SANITIZED_AWH_VARS`/`SANITIZED_PROVIDER_VARS` sets
-  from `tests/foundation_cli.rs`), like `tests/workspace_runtime_cli.rs`
-  and `tests/fs_basic_boundaries.rs` now do.
+  treats `_` as part of a base62 run, so any identifier >=16 chars
+  becomes `[redacted]` in the audit record's subject/detail. Consequence
+  for PRODUCT code: keep audit `reason` strings SHORT (<16 chars, e.g.
+  `list_failed`/`list_timeout` in providers.rs) so they persist verbatim
+  and the ring can distinguish failure modes. For TESTS: assert on
+  action + subject by default; asserting `detail` is only safe for
+  known-short reason strings.
+- **Per-provider isolation in aggregate_tools** (TP03 Kilo reviews):
+  listings run CONCURRENTLY via `futures_util::future::join_all`, each
+  wrapped in its own 20s `tokio::time::timeout` (const
+  `PROVIDER_LIST_TIMEOUT`) - a failing provider is skipped with reason
+  `list_failed`, a hanging one with `list_timeout`; N unhealthy
+  providers cost ONE cap of wall time, not N, and the catalog keeps a
+  stable provider order (join_all preserves input order). Tests shrink
+  the cap via a `#[cfg(test)]` atomic + RAII guard
+  (`ListTimeoutOverride` in providers.rs tests) - NEVER a test-only env
+  var (an unclamped env override in release code can silently empty the
+  catalog). Regression tests: `aggregate_tools_isolates_{failing,
+  hanging}_providers`, `aggregate_tools_bounds_n_hanging_providers_to_
+  one_cap` (needs a real timer; do not pause tokio time).
+- **Spawned-awh hermeticity** (TP03): the `AWH_*`/provider strip list
+  has ONE source, `tests/common/mod.rs` (`#[path = "common/mod.rs"] mod
+  common;`), consumed by foundation_cli.rs, workspace_runtime_cli.rs,
+  fs_basic_boundaries.rs via `common::sanitized_command(dir, args)`.
+  When src/ grows a new `AWH_*` read, add it THERE (one edit; all suites
+  inherit). Test fixtures that must survive a panic should live in
+  their own `tempdir()` (Drop-based cleanup), not in success-path
+  remove_file calls.
