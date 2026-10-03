@@ -743,11 +743,18 @@ tested create-equivalent (report classifies the surface honestly).
   budget would deterministically truncate the alphabetically-LAST
   providers on every call (Kilo round 5); rotation spreads truncation
   fairly across the id space. Results are re-sorted by provider id
-  (stable catalog order). Budget slack (100ms fixed) prevents the
-  budget and
+  (stable ORDER; membership is sticky via the per-provider last_good
+  cache). On budget truncation a provider with a cached listing is
+  SERVED from cache (audited list_stale - once a tool has been
+  advertised it stays advertised until unregister; MCP clients cache
+  tools/list, so a tool vanishing between identical calls is a
+  correctness break, Kilo round 6); only a never-listed provider is
+  skipped (list_budget). Hung/failed providers are STILL dropped -
+  truncation is our scheduling artifact, a hang is a provider-health
+  signal. Budget slack (100ms fixed) prevents the budget and
   per-future cap from racing: a just-timed-out future is still
   COLLECTED (audited list_timeout), only still-listing ones take
-  list_budget. Tests shrink the cap PER INSTANCE via `#[cfg(test)]
+  list_budget/list_stale. Tests shrink the cap PER INSTANCE via `#[cfg(test)]
   ProviderRegistry::with_list_timeout(cap)` (rejects zero - a zero
   cap silently empties the catalog; field `list_timeout_override:
   Option<Duration>`, `None` under Default) - NEVER a process-global

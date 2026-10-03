@@ -96,6 +96,15 @@ pub struct ProviderRegistry {
     /// rotation comment inside `aggregate_tools`). Per-instance counter,
     /// not security-sensitive.
     start_rotation: std::sync::atomic::AtomicU64,
+    /// Last successful listing per provider id, served when the
+    /// aggregate budget truncates a provider that never got to answer
+    /// (budget truncation is OUR scheduling artifact, not a provider
+    /// health signal — a hung/failed provider is still dropped, only
+    /// budget-truncated ones fall back to cache). Keeps advertised
+    /// tool MEMBERSHIP stable across calls: once a tool has been
+    /// advertised, it stays advertised. Std Mutex, never held across
+    /// an await.
+    last_good: std::sync::Mutex<HashMap<String, Vec<ToolDescriptor>>>,
     /// Per-provider listing timeout for `aggregate_tools`. `None`
     /// selects the default (`PROVIDER_LIST_TIMEOUT`); `Some(cap)` uses
     /// the cap verbatim (the test constructor rejects zero, which
@@ -241,20 +250,48 @@ impl ProviderRegistry {
         let mut results: Vec<ProviderListing> = Vec::new();
         let budget = tokio::time::timeout(cap + PROVIDER_LIST_BUDGET_SLACK, async {
             while let Some((provider, listed)) = listings.next().await {
-                // Results arrive in completion order; re-sort below
-                // keeps the advertised catalog stable.
+                // Results arrive in completion order; the re-sort
+                // below keeps advertised ORDER stable. Membership is
+                // stable too once a provider has succeeded once
+                // (last-good cache on budget truncation) — but a
+                // never-yet-listed provider can be absent from a
+                // given call while the budget is under pressure.
                 results.push((provider, listed));
             }
         })
         .await;
         if let Err(_elapsed) = budget {
-            // Budget exhausted: everything not yet collected is skipped
-            // and audited exactly like a per-future timeout, so the
-            // advertisement still returns — live, bounded, and truthful
-            // about what was skipped.
-            let listed_ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+            // Budget exhausted. A provider that never got to answer is
+            // NOT unhealthy — truncation is our scheduling artifact — so
+            // its LAST GOOD listing is served instead (audited
+            // `list_stale`): advertised tool membership stays stable
+            // across calls, and only a provider with no cached
+            // listing is actually skipped (`list_budget`).
+            // Owned copies: `results` is pushed to inside the loop,
+            // so the id list must not borrow it.
+            let listed_ids: Vec<String> = results.iter().map(|(id, _)| id.clone()).collect();
             for provider in &provider_ids {
-                if !listed_ids.contains(&provider.as_str()) {
+                if listed_ids.contains(provider) {
+                    continue;
+                }
+                let cached = self
+                    .last_good
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.get(provider).cloned());
+                if let Some(cached) = cached {
+                    tracing::warn!(
+                        provider = %provider,
+                        budget_ms = (cap + PROVIDER_LIST_BUDGET_SLACK).as_millis() as u64,
+                        "dynamic provider listing budget exhausted; serving last good listing"
+                    );
+                    crate::mcp::audit::audit_deny(
+                        "dynamic_provider_rejected",
+                        "list_stale",
+                        provider,
+                    );
+                    results.push((provider.clone(), Ok(Ok(cached))));
+                } else {
                     tracing::warn!(
                         provider = %provider,
                         budget_ms = (cap + PROVIDER_LIST_BUDGET_SLACK).as_millis() as u64,
@@ -271,7 +308,14 @@ impl ProviderRegistry {
         results.sort_by(|a, b| a.0.cmp(&b.0));
         for (provider, listed) in results {
             let listed = match listed {
-                Ok(Ok(listed)) => listed,
+                Ok(Ok(listed)) => {
+                    // Successful listings refresh the per-provider
+                    // last-good cache (served on later budget truncation).
+                    if let Ok(mut cache) = self.last_good.lock() {
+                        cache.insert(provider.clone(), listed.clone());
+                    }
+                    listed
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(
                         provider = %provider,
@@ -709,9 +753,12 @@ mod tests {
                 "{names:?}"
             );
         }
-        // The aggregate budget (equal to the per-provider cap here:
-        // 200ms) bounds the WHOLE listing phase regardless of N: one
-        // budget + scheduling margin, not ceil(N/8) caps, not N caps.
+        // The aggregate budget (cap 200ms + 100ms slack = 300ms
+        // here) bounds the WHOLE listing phase regardless of N. This
+        // bound is deliberately loose (it pins the serial-loop
+        // regression, 10 x 200ms = 2s); the DISCRIMINATING pin for
+        // the budget is the `list_budget` audit below — a 2-wave
+        // completion would finish with no `list_budget` event.
         assert!(
             elapsed < std::time::Duration::from_millis(1200),
             "aggregate budget must bound N hangs to one budget, took {elapsed:?}"
@@ -727,5 +774,99 @@ mod tests {
             budget_denied,
             "expected a dynamic_provider_rejected/list_budget audit event"
         );
+    }
+
+    /// Advertised MEMBERSHIP must stay stable across calls: once a
+    /// provider has been successfully listed, a later call whose
+    /// aggregate budget truncates that provider must serve its last
+    /// good listing (`list_stale`) instead of silently dropping the
+    /// tool — an MCP client caches `tools/list` to build its tool
+    /// prompt, so a tool vanishing between identical calls against
+    /// an unchanged registry is a correctness break, not just latency.
+    #[tokio::test]
+    async fn aggregate_tools_serves_last_good_listing_when_budget_truncates() {
+        struct SlowGoodProvider;
+        #[async_trait]
+        impl ConnectorProvider for SlowGoodProvider {
+            fn provider_id(&self) -> &str {
+                "good"
+            }
+            async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+                // Slow enough that it can only finish when it starts
+                // early (wave 1): started late (wave 2 begins ~200ms
+                // in), it would finish at ~350ms — past the 300ms
+                // budget — so truncation, not completion, is the
+                // deterministic outcome for a late start.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok(vec![descriptor("ping")])
+            }
+            async fn invoke(&self, _tool: &str, _args: Value) -> Result<ToolCallResult> {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            }
+        }
+        struct HangingProvider(&'static str);
+        #[async_trait]
+        impl ConnectorProvider for HangingProvider {
+            fn provider_id(&self) -> &str {
+                self.0
+            }
+            async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            async fn invoke(&self, _tool: &str, _args: Value) -> Result<ToolCallResult> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        // "good" sorts first, so call 1 (rotation offset 0) starts it
+        // in wave 1: it completes at ~150ms and enters the last-good
+        // cache. Call 2 (offset 1) rotates it to start position 9 —
+        // wave 2, starting at ~200ms — so the 300ms budget truncates
+        // it and the cache must serve it. Ten providers total keep
+        // the rotation arithmetic (0 and 1) deterministic.
+        let mut registry = ProviderRegistry::with_list_timeout(Duration::from_millis(200));
+        registry.register(Box::new(SlowGoodProvider));
+        for id in [
+            "hang-a", "hang-b", "hang-c", "hang-d", "hang-e", "hang-f", "hang-g", "hang-h",
+            "hang-i",
+        ] {
+            registry.register(Box::new(HangingProvider(id)));
+        }
+
+        // Call 1: good completes (wave 1) and is cached.
+        let first = registry
+            .aggregate_tools()
+            .await
+            .expect("first aggregation must list the slow provider");
+        let names: Vec<&str> = first.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"good.ping"), "{names:?}");
+
+        // Call 2: good is rotated into wave 2 and truncated, but its
+        // cached listing keeps it advertised.
+        let second = registry
+            .aggregate_tools()
+            .await
+            .expect("second aggregation must survive truncation");
+        let names: Vec<&str> = second.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"good.ping"),
+            "budget truncation must serve the last good listing, not drop the tool: {names:?}"
+        );
+        // And the fallback is observable: the provider was NOT
+        // silently dropped — it was audited `list_stale`.
+        let stale = crate::services::audit::global()
+            .recent(200)
+            .into_iter()
+            .any(|e| {
+                e.action == "dynamic_provider_rejected"
+                    && e.subject == "good"
+                    && e.detail.contains("list_stale")
+            });
+        assert!(stale, "expected a list_stale audit event for 'good'");
     }
 }

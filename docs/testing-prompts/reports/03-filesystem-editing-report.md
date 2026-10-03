@@ -311,13 +311,12 @@ All points from the second review round are fixed in this revision:
   gone. The hang-isolation tests now use a `#[cfg(test)]` atomic
   override with an RAII guard (`ListTimeoutOverride`): no release-build
   surface, no process-global env mutation, panic-safe restore.
-- **Serial N × cap stall removed**: provider listings now run
-  concurrently (`futures_util::future::join_all`, already a production
-  dependency), each under its own cap — N hanging providers cost one
-  cap of wall time, not N. (Round 2's join_all was itself replaced in
-  rounds 3–4 by the bounded window + aggregate budget; the regression
-  test is now `aggregate_tools_bounds_n_hanging_providers_to_the_
-  budget`.)
+- **Serial N × cap stall removed**: round 2 ran listings with
+  `futures_util::future::join_all` (already a production dependency),
+  each under its own cap — N hanging providers cost one cap of wall
+  time, not N. (That `join_all` was itself replaced in rounds 3–4 by
+  the bounded window + aggregate budget; the regression test is now
+  `aggregate_tools_bounds_n_hanging_providers_to_the_budget`.)
 - **Audit reasons survive redaction**: `provider_list_failed`/
   `provider_list_timeout` were ≥16-char base62 runs and persisted as
   `[redacted]` — the ring could not distinguish a hang from a failure.
@@ -417,7 +416,10 @@ and left as-is; replied on the PR.
 
 ## 12. Kilo review round 5 — addressed
 
-Six findings on the round-4 code, all fixed:
+Six findings on the round-4 code. Five were fixed complete; the sixth
+(the test-narrative misstatement) was fixed at only ONE of its two
+sites — the second occurrence, at `src/mcp/providers.rs:712-713`, was
+caught by round 6 (§13, finding 4172273839) and fixed there.
 
 - **(4172193269, WARNING) Budget truncation was name-deterministic**:
   `providers()` returns ids sorted, `buffer_unordered` starts futures
@@ -451,3 +453,47 @@ Six findings on the round-4 code, all fixed:
   `…_to_one_cap` name/contract. Updated to `…_to_the_budget` with the
   real N-independent contract; the round-2 history note now flags the
   bound's evolution explicitly.
+
+## 13. Kilo review round 6 — addressed
+
+Five findings on the round-5 code; the substantive one is a design
+fix, the rest are honesty corrections:
+
+- **(4172273831, WARNING) Rotation alone made the advertised catalog
+  call-dependent**: two identical `tools/list` calls against an
+  unchanged registry could advertise different tool sets, and MCP
+  clients cache `tools/list` to build their tool prompt — a cached
+  tool could vanish on the next listing. Accepted the reviewer's
+  suggested fix: `ProviderRegistry` now keeps a per-provider
+  `last_good` listing (std Mutex, never held across an await). On
+  budget truncation the provider's LAST GOOD listing is served and
+  audited with the new reason `list_stale` — only a provider with no
+  cached listing is actually skipped (`list_budget`). Membership is
+  now sticky: once a tool has been advertised, it stays advertised
+  (until unregister). Hung/failed providers are still dropped
+  (`list_timeout`/`list_failed`) — truncation is OUR scheduling
+  artifact, a hang is a provider-health signal, and the distinction
+  is documented at the cache field. Rotation is retained: it gives
+  never-yet-listed providers a fair first shot at the early wave.
+  Pinned by the new
+  `aggregate_tools_serves_last_good_listing_when_budget_truncates`
+  (deterministic rotation arithmetic: call 1 offset 0 → wave 1 →
+  cached; call 2 offset 1 → wave 2 → truncated → served, `list_stale`
+  asserted). The two "stable catalog" comments were reworded to the
+  precise claim: stable ORDER always; stable membership once listed.
+- **(4172273836, WARNING) 02-report still taught the pre-budget cost
+  model** ("N slow providers cost ~⌈N/8⌉ caps") that the aggregate
+  budget invalidated — contradicting this report. Fixed: the cost is
+  now stated as one cap + slack, independent of N, and the new
+  membership-stability test is listed.
+- **(4172193279 second site, 4172273839/4172273843)**: the round-5
+  fix corrected only ONE of two identical "budget = cap" misstatements
+  in the same test; the survivor (`providers.rs:712-713`) is fixed,
+  and §12 above no longer claims the item was fully fixed. The
+  elapsed bound's comment now also says what actually discriminates
+  the budget (the `list_budget` audit event, not the loose 1200 ms
+  wall-clock bound, which only pins the serial-loop regression).
+- **(4172273848)**: the round-2 history bullet was present tense about
+  a `join_all` implementation the tree no longer contains (grep finds
+  nothing) and split the test name across lines. Rewritten in past
+  tense with the identifier on one line.
