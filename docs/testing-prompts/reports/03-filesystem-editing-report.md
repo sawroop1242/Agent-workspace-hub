@@ -497,3 +497,33 @@ fix, the rest are honesty corrections:
   a `join_all` implementation the tree no longer contains (grep finds
   nothing) and split the test name across lines. Rewritten in past
   tense with the identifier on one line.
+
+## 14. Kilo review round 7 — re-anchored re-posts + one new item
+
+Round 7 re-anchored six earlier findings to `974fa23`. Verified against
+the tree, each is stale:
+
+- **4171575922** (traversal proof): already fixed — the escapes assert
+  `message.contains("traversal is not allowed")`, the absolute-path
+  rejection asserts its own reason, and a positive control (benign
+  interior write + read-back) anchors the negatives. `tests/fs_basic_
+  boundaries.rs:331-359`.
+- **4171575939** (`big.bin` unasserted): already fixed — classified
+  `BinaryFile` with `size == 1024` and a comment explaining the NUL
+  boundary. `tests/fs_basic_boundaries.rs:503-509`.
+- **4171575941** (init result discarded): already fixed — the output's
+  `status.success()` is asserted with stderr in the message
+  (`tests/fs_basic_boundaries.rs:641-647`); the env-sanitization
+  sub-point is satisfied too (`awh_in` → `common::sanitized_command`
+  strips `SANITIZED_AWH_VARS`/`SANITIZED_PROVIDER_VARS`).
+- **4172077725 / 4172193269 / 4172273831** (aggregate budget, rotation,
+  call-dependent catalog): all three are superseded by the round-6
+  design — aggregate budget + rotation + last-good cache. The one NEW
+  sub-point inside 4172193269 (operators could misread a budget-pressed
+  registry as broken because `docs/mcp.md` said nothing about the
+  budget) IS real: `docs/mcp.md` now documents the listing budget
+  (window + cap + aggregate budget, the `list_stale`/`list_budget`
+  serve/skip semantics, audit observability, and the explicit
+  completeness-yields-to-liveness trade-off).
+- **4172273843** (report claimed complete fix): already fixed — §12
+  records the one-site-only round-5 fix and §13 the round-6 completion.
