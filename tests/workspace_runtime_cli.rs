@@ -21,13 +21,55 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
+/// `AWH_*` runtime variables the binary reads (mirrors the enumerated
+/// set in `tests/foundation_cli.rs`): stripped from every spawned child
+/// so machine-local configuration (developer shells, CI runner envs)
+/// can never change what a test observes.
+const SANITIZED_AWH_VARS: &[&str] = &[
+    "AWH_HOST",
+    "AWH_PORT",
+    "AWH_TLS_CERT",
+    "AWH_TLS_KEY",
+    "AWH_API_KEY",
+    "AWH_ALLOWED_ORIGINS",
+    "AWH_MAX_MCP_LINE_BYTES",
+    "AWH_MAX_HTTP_BODY_BYTES",
+    "AWH_MCP_REQUEST_TIMEOUT_SECS",
+    "AWH_HTTP_CLIENT_TIMEOUT_SECS",
+    "AWH_CIRCUIT_FAILURE_THRESHOLD",
+    "AWH_CIRCUIT_COOLDOWN_SECS",
+    "AWH_CONTEXT_ENABLED",
+    "AWH_CONTEXT_MEMORY_ENABLED",
+    "AWH_CONTEXT_AUTO_COMPRESS",
+    "AWH_CONTEXT_AUTO_OFFLOAD",
+    "AWH_CONTEXT_MAX_INPUT_TOKENS",
+    "AWH_CONTEXT_RESERVED_OUTPUT_TOKENS",
+    "AWH_CONTEXT_SAFETY_MARGIN_TOKENS",
+    "AWH_GLOBAL_SKILLS_ROOT",
+    "AWH_TRUST_DIR",
+    "AWH_BWRAP",
+    "AWH_NGROK_AUTHTOKEN",
+];
+const SANITIZED_PROVIDER_VARS: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "GITHUB_API_URL",
+    "GITHUB_DEFAULT_OWNER",
+    "GITHUB_DEFAULT_REPO",
+    "COMPOSIO_API_KEY",
+    "COMPOSIO_CONNECTED_ACCOUNT_ID",
+    "COMPOSIO_TOOLKIT",
+    "NGROK_AUTHTOKEN",
+];
+
 /// Runs `awh <args>` inside `dir`, returns (exit-success, stdout, stderr).
 fn run(dir: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_awh"))
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("spawn awh binary");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_awh"));
+    command.args(args).current_dir(dir);
+    for key in SANITIZED_AWH_VARS.iter().chain(SANITIZED_PROVIDER_VARS) {
+        command.env_remove(key);
+    }
+    let output = command.output().expect("spawn awh binary");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -382,9 +424,16 @@ fn wrong_prefix_workspace_id_is_accepted_by_documented_design() {
     let (ok, _, err) = run(root, &["init"]);
     assert!(ok, "{err}");
     let path = manifest_path(root);
-    let edited = fs::read_to_string(&path)
-        .unwrap()
-        .replace("\"workspace_id\": \"ws-", "\"workspace_id\": \"xx-");
+    let original = fs::read_to_string(&path).unwrap();
+    let edited = original.replace("\"workspace_id\": \"ws-", "\"workspace_id\": \"xx-");
+    // The poisoning must actually change the bytes, or the test below
+    // would assert "already initialized" on an untouched manifest and
+    // prove nothing. (Guards against a formatting change — compact
+    // serialization, different spacing — silently no-opping the replace.)
+    assert!(
+        edited != original,
+        "poisoning failed to change the manifest; the test premise is broken:\n{original}"
+    );
     fs::write(&path, edited.clone()).unwrap();
 
     let (ok, out, err) = run(root, &["init"]);

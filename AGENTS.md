@@ -714,3 +714,24 @@ tested create-equivalent (report classifies the surface honestly).
 - Composio key note: upstream rejects test key ck_cNOS...5YZB with 401
   APIKey_InvalidAPIKey - useful only for negative-path tests; unset
   COMPOSIO_API_KEY for full suite runs.
+
+
+- **Audit-redaction masks long identifiers** (TP03): `redact_token_like`
+  splits on non-base62 chars but treats `_` as part of the run, so any
+  identifier >=16 chars (e.g. `provider_list_timeout`) becomes
+  `[redacted]` in the audit record's subject/detail. Tests asserting on
+  audit detail/reason strings must therefore assert on short strings
+  (action + subject), never on long reason slugs.
+- **Per-provider hang isolation** (TP03 Kilo review): `aggregate_tools`
+  wraps each provider's `list_tools` in a 20s `tokio::time::timeout`
+  (`provider_list_timeout()`, test override
+  `AWH_TEST_PROVIDER_LIST_TIMEOUT_MS`); a hanging backend is skipped and
+  audited (`provider_list_timeout` reason) like a failing one, instead
+  of stalling tools/list. Regression test:
+  `aggregate_tools_isolates_hanging_providers` (needs a real timer; do
+  not pause tokio time for it).
+- **Spawned-awh hermeticity pattern** (TP03): CLI integration suites
+  should strip the ambient `AWH_*` + provider env from every spawned
+  child (copy the `SANITIZED_AWH_VARS`/`SANITIZED_PROVIDER_VARS` sets
+  from `tests/foundation_cli.rs`), like `tests/workspace_runtime_cli.rs`
+  and `tests/fs_basic_boundaries.rs` now do.

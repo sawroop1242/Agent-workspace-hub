@@ -114,3 +114,32 @@ cargo test --all-targets                      # full workspace
 ```
 
 Manual opencode↔AWH evidence for the Fixed defect #1 (invalid Composio key in env): before the fix, `tools/list` returned the Composio 401 and `opencode mcp list` reported "awh failed: Failed to get tools"; after the fix, `tools/list` returns the 73-tool catalog (0.4s — it still attempts the provider once) and `opencode mcp list` reports "✓ awh connected" with the same invalid key present, while `connector.tools {provider: "composio"}` still surfaces the real 401 for diagnosis.
+
+
+## 9. Kilo review — addressed (via PR #140, round 1)
+
+Two review points on this report's test suite
+(`tests/workspace_runtime_cli.rs`) were raised during the TP03 review
+cycle and are fixed on the same branch:
+
+- **Hermetic child processes**: the suite's `run()` helper now strips
+  the ambient `AWH_*` and provider-variable environment from every
+  spawned `awh` child (same enumerated `SANITIZED_*` sets as
+  `tests/foundation_cli.rs`), so a developer shell or CI runner can no
+  longer change what these tests observe. The suite header's
+  "no environment mutation" claim now extends to what children
+  *inherit*.
+- **Manifest poisoning made self-verifying**: the wrong-prefix test's
+  string replacement now asserts the manifest bytes actually changed
+  before rewriting (`edited != original`), so a serialization-format
+  change can no longer turn the poisoning into a silent no-op and the
+  test into a tautology.
+
+One review point on `src/mcp/providers.rs` (hang isolation, not just
+error isolation) is also fixed on this branch: `aggregate_tools` now
+wraps each provider's listing in a 20s per-provider timeout
+(`provider_list_timeout()`; test-only override via
+`AWH_TEST_PROVIDER_LIST_TIMEOUT_MS`), so a black-holed backend is
+skipped and audited (`provider_list_timeout`) instead of stalling the
+whole `tools/list` advertisement. Regression test:
+`aggregate_tools_isolates_hanging_providers`.

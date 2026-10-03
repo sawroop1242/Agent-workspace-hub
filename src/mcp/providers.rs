@@ -3,6 +3,25 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Per-provider cap on tool listing inside `aggregate_tools`. The
+/// error-isolation below covers providers that *fail*; this covers
+/// providers that *hang* — without it, one black-holed backend (or N of
+/// them) stalls the whole `tools/list` advertisement for up to N × its
+/// own client timeout on the client's connect path. Timed-out providers
+/// take the same skip path as failing ones; the direct per-provider
+/// listing (`connector.tools`) stays un-timed for diagnosis.
+fn provider_list_timeout() -> Duration {
+    // Test-only override so the hang-isolation regression test can run in
+    // milliseconds (unit tests read this per call, in-process).
+    if let Ok(millis) = std::env::var("AWH_TEST_PROVIDER_LIST_TIMEOUT_MS") {
+        if let Ok(millis) = millis.parse::<u64>() {
+            return Duration::from_millis(millis);
+        }
+    }
+    Duration::from_secs(20)
+}
 
 /// Describes a tool exposed by a connector provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,26 +122,41 @@ impl ProviderRegistry {
         let mut out = Vec::new();
         for provider in self.providers() {
             // Fail closed per provider, not per plane: one unhealthy
-            // provider (bad credentials, unreachable backend) must not
-            // take down the whole tools/list advertisement. Its tools are
-            // simply absent; direct per-provider listing (`connector.tools`)
+            // provider (bad credentials, unreachable backend, or a
+            // backend that simply never answers) must not take down the
+            // whole tools/list advertisement. Its tools are simply
+            // absent; direct per-provider listing (`connector.tools`)
             // still surfaces the real error for diagnosis.
-            let listed = match self.tools(&provider).await {
-                Ok(listed) => listed,
-                Err(error) => {
-                    tracing::warn!(
-                        provider = %provider,
-                        error = %error,
-                        "dynamic provider tool listing failed; skipping provider"
-                    );
-                    crate::mcp::audit::audit_deny(
-                        "dynamic_provider_rejected",
-                        "provider_list_failed",
-                        &provider,
-                    );
-                    continue;
-                }
-            };
+            let listed =
+                match tokio::time::timeout(provider_list_timeout(), self.tools(&provider)).await {
+                    Ok(Ok(listed)) => listed,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            provider = %provider,
+                            error = %error,
+                            "dynamic provider tool listing failed; skipping provider"
+                        );
+                        crate::mcp::audit::audit_deny(
+                            "dynamic_provider_rejected",
+                            "provider_list_failed",
+                            &provider,
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = %provider,
+                            timeout_ms = provider_list_timeout().as_millis(),
+                            "dynamic provider tool listing timed out; skipping provider"
+                        );
+                        crate::mcp::audit::audit_deny(
+                            "dynamic_provider_rejected",
+                            "provider_list_timeout",
+                            &provider,
+                        );
+                        continue;
+                    }
+                };
             for mut tool in listed {
                 tool.name = format!("{}.{}", provider, tool.name);
                 if tool.description.is_empty() {
@@ -377,6 +411,79 @@ mod tests {
             .recent(200)
             .into_iter()
             .any(|e| e.action == "dynamic_provider_rejected" && e.subject == "bad");
+        assert!(denied, "expected a dynamic_provider_rejected audit event");
+    }
+
+    /// A provider whose backend never answers must be skipped after the
+    /// per-provider cap instead of stalling the whole advertisement —
+    /// error isolation alone does not cover hangs (Kilo review finding).
+    #[tokio::test]
+    async fn aggregate_tools_isolates_hanging_providers() {
+        struct HangingProvider;
+        #[async_trait]
+        impl ConnectorProvider for HangingProvider {
+            fn provider_id(&self) -> &str {
+                "hung"
+            }
+            async fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+                // Never resolves: a black-holed backend.
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            async fn invoke(&self, _tool: &str, _args: Value) -> Result<ToolCallResult> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        std::env::set_var("AWH_TEST_PROVIDER_LIST_TIMEOUT_MS", "250");
+        let mut registry = ProviderRegistry::default();
+        registry.register(Box::new(GatewayProvider::new(
+            "good",
+            || Ok(vec![descriptor("ping")]),
+            |_t, _a| {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            },
+        )));
+        registry.register(Box::new(HangingProvider));
+
+        let started = std::time::Instant::now();
+        let aggregated = registry
+            .aggregate_tools()
+            .await
+            .expect("aggregate listing must survive one hanging provider");
+        let elapsed = started.elapsed();
+        std::env::remove_var("AWH_TEST_PROVIDER_LIST_TIMEOUT_MS");
+
+        // The healthy provider's tools still ship; the hanging one is
+        // absent, not fatal.
+        let names: Vec<&str> = aggregated.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"good.ping".to_string().as_str()),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|n| n.starts_with("hung.")), "{names:?}");
+        // Bounded wait: the cap (250ms in this test) plus a small margin —
+        // certainly not the multi-second HTTP client default.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "hanging provider bounded to the per-provider cap, took {elapsed:?}"
+        );
+
+        // The timeout skip is audited, with the timeout reason.
+        // The skip is observable: a deny audit event names the hung
+        // provider. (The reason string itself is redacted in the record
+        // -- `provider_list_timeout` is a 21-char base62 run, masked by
+        // the documented >=16-char redaction trade-off -- so the event
+        // is asserted by action + subject, like the failing-provider
+        // test above.)
+        let denied = crate::services::audit::global()
+            .recent(200)
+            .into_iter()
+            .any(|e| e.action == "dynamic_provider_rejected" && e.subject == "hung");
         assert!(denied, "expected a dynamic_provider_rejected audit event");
     }
 }
