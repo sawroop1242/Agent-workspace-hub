@@ -310,22 +310,23 @@ fn mcp_write_file_creates_overwrites_and_is_deterministic() {
 
 #[test]
 fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
-    let dir = tempdir().unwrap();
-    let root = dir.path();
-    // A sentinel OUTSIDE the workspace: the negative proof for §20. It
-    // lives in its own sibling tempdir (same shared OS temp area the
-    // workspace was created in, so `../` still reaches it), named
-    // process-unique — the OS temp dir is shared by parallel test runs
-    // and CI jobs. TempDir's own Drop does the cleanup, so the sentinel
-    // disappears even when an assert above panics, and a cleanup failure
-    // (Windows AV/indexer handles, read-only mounts) can never fail this
-    // test after the traversal proof already succeeded.
-    let outside_dir = tempdir().unwrap();
+    // Layout: <parent>/ (TempDir, cleaned by Drop)
+    //          ├── <workspace root>/   ← server runs HERE
+    //          └── outside-sentinel-<pid>.txt  ← `../` from the root
+    // The sentinel is EXACTLY the file the escapes target (root's
+    // parent), so the negative proof is real: a traversal regression
+    // would overwrite THIS file. The process-unique name keeps
+    // parallel test runs / CI jobs from colliding in the shared OS
+    // temp area; the parent TempDir's Drop cleans everything up even
+    // when a test panics (no success-path unlink to fail).
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("workspace-root");
+    std::fs::create_dir_all(&root).unwrap();
     let sentinel_name = format!("outside-sentinel-{}.txt", std::process::id());
-    let outside = outside_dir.path().join(&sentinel_name);
+    let outside = parent.path().join(&sentinel_name);
     std::fs::write(&outside, "do not touch\n").unwrap();
 
-    let server = server_over(root);
+    let server = server_over(&root);
     for escape in ["../", "a/../../"] {
         let error = tool_error(
             &server,
@@ -361,7 +362,7 @@ fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
         "workspace.write_file",
         json!({"path": "interior.txt", "content": "fine"}),
     );
-    assert_eq!(real_file_bytes(root, "interior.txt"), b"fine");
+    assert_eq!(real_file_bytes(&root, "interior.txt"), b"fine");
 
     // The protected outside file is byte-for-byte untouched, and no user
     // artifact leaked inside the workspace (`.agent/` is the server's own
@@ -371,7 +372,7 @@ fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
         "do not touch\n",
         "outside sentinel must remain unchanged"
     );
-    let residue: Vec<String> = std::fs::read_dir(root)
+    let residue: Vec<String> = std::fs::read_dir(&root)
         .unwrap()
         .filter_map(|entry| {
             let name = entry.ok()?.file_name().to_string_lossy().into_owned();

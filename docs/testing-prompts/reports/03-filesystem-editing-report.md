@@ -325,3 +325,43 @@ The two review comments that landed on PR #138's copy of the shared
 commits (the providers.rs hang timeout and workspace-runtime hermeticity
 points) are addressed HERE, on this branch — nothing is deferred to or
 "belonging to" #138; whichever PR merges first carries the fixes.
+
+## 10. Kilo review round 3 — addressed
+
+Round 2's own fixes were re-reviewed; four substantive findings, all
+fixed:
+
+- **Unbounded outbound burst** (WARNING-class): round 2's `join_all`
+  started ALL provider listings at once — a registry of N providers
+  burst N simultaneous outbound HTTP requests on every `tools/list`.
+  Now bounded: `futures_util::stream::…buffer_unordered(
+  PROVIDER_LIST_CONCURRENCY)` (window of 8). Still concurrent enough
+  that N slow providers cost ~⌈N/8⌉ caps, not N caps (the serial-loop
+  regression stays pinned: the 10-hang test budget is 2 waves × 200 ms,
+  far under the 2 s serial sum); results re-sorted by provider id so
+  the advertised catalog keeps a stable order.
+- **Process-global test override** (WARNING-class): the round-2
+  `#[cfg(test)]` atomic + RAII guard was still process-global — two
+  parallel hang tests could clobber each other's cap (guard drop
+  zeroes the shared slot mid-test). Replaced by a per-instance
+  override: `ProviderRegistry { list_timeout_override: Option<Duration> }`
+  + `#[cfg(test)] with_list_timeout(cap)` constructor. No global state,
+  no release-build surface (the field is `None` under `Default`), no
+  races; each test's registry carries its own cap.
+- **Timeout log lied under override**: `timeout_secs =
+  PROVIDER_LIST_TIMEOUT.as_secs()` logged the constant even when the
+  effective cap was the test override. Now logs the effective cap.
+- **Sentinel no longer targeted by the escapes** (WARNING-class, my
+  round-2 fix was wrong): moving the sentinel into a *sibling* tempdir
+  broke the proof — the escapes `../<name>` resolve against the
+  workspace root's parent, i.e. the OS temp dir, not that sibling. A
+  traversal regression would have overwritten a file the test never
+  checked. Fixed layout: the workspace root is now `<parent TempDir>/
+  workspace-root/` and the sentinel sits directly in `<parent>/`, so
+  `../sentinel` and `a/../../sentinel` resolve to EXACTLY the asserted
+  sentinel (path math re-verified). Drop-based cleanup retained.
+
+The other round-3 comments were stale re-posts of round-1 items
+(traversal reason pinning + positive control, `big.bin` classification
+asserts, `awh init` success assertion) — already present in the tree;
+verified on the pushed diff and left as-is.

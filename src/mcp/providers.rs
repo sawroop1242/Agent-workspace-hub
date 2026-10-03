@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use futures_util::future::join_all;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -8,30 +8,18 @@ use std::time::Duration;
 
 /// Default per-provider cap on tool listing inside `aggregate_tools`.
 /// The error-isolation below covers providers that *fail*; the timeout
-/// covers providers that *hang*. Listings run concurrently and each is
-/// capped individually, so N hanging backends cost one cap of wall
-/// time, not N. Timed-out providers take the same skip path as
-/// failing ones; the direct per-provider listing (`connector.tools`)
-/// stays un-timed for diagnosis.
+/// covers providers that *hang*. Timed-out providers take the same skip
+/// path as failing ones; the direct per-provider listing
+/// (`connector.tools`) stays un-timed for diagnosis.
 const PROVIDER_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Test-only override for the per-provider cap so the hang-isolation
-/// regression test can run in milliseconds instead of 20s. 0 = default.
-/// An atomic (not an env var) so no release build reads it and parallel
-/// tests cannot race on process-global environment state.
-#[cfg(test)]
-static TEST_LIST_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn provider_list_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        let ms = TEST_LIST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    PROVIDER_LIST_TIMEOUT
-}
+/// At most this many provider listings are in flight at once inside
+/// `aggregate_tools`. Concurrent enough that N slow providers cost one
+/// cap of wall time (not N × cap, as the old serial loop did), bounded
+/// so a registry of N providers does not burst N simultaneous outbound
+/// HTTP requests on every tools/list. 8 covers realistic SaaS/connector
+/// fan-out while keeping per-request resource use flat.
+const PROVIDER_LIST_CONCURRENCY: usize = 8;
 
 /// Describes a tool exposed by a connector provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,11 +75,41 @@ pub trait ConnectorProvider: Send + Sync {
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, Box<dyn ConnectorProvider>>,
+    /// Per-provider listing timeout for `aggregate_tools`. Zero selects
+    /// the default (`PROVIDER_LIST_TIMEOUT`). Instance-scoped (not a
+    /// process-global/env override): test registries can shrink the cap
+    /// without any release-build surface and without racing parallel
+    /// tests, and production always runs with the default.
+    list_timeout_override: Option<Duration>,
 }
+/// One provider's `aggregate_tools` listing outcome: the outer layer
+/// distinguishes cap-timeout (Err) from completion; the inner Result is
+/// the provider's own listing result.
+type ProviderListing = (
+    String,
+    Result<Result<Vec<ToolDescriptor>, anyhow::Error>, tokio::time::error::Elapsed>,
+);
+
 impl ProviderRegistry {
     /// Registers a provider.
     pub fn register(&mut self, p: Box<dyn ConnectorProvider>) {
         self.providers.insert(p.provider_id().to_string(), p);
+    }
+
+    /// Test/bench constructor: a registry with a non-default
+    /// per-provider listing cap. Production code never calls this —
+    /// `Default` keeps the documented 20 s cap.
+    #[cfg(test)]
+    pub fn with_list_timeout(cap: Duration) -> Self {
+        Self {
+            list_timeout_override: Some(cap),
+            ..Default::default()
+        }
+    }
+
+    /// The effective per-provider listing cap for this registry.
+    fn effective_list_timeout(&self) -> Duration {
+        self.list_timeout_override.unwrap_or(PROVIDER_LIST_TIMEOUT)
     }
 
     /// Unregisters a provider by id, returning whether it was present.
@@ -134,31 +152,43 @@ impl ProviderRegistry {
         // Fail closed per provider, not per plane: an unhealthy provider
         // (bad credentials, unreachable backend, or a backend that never
         // answers) must not take down the whole tools/list advertisement
-        // — and must not stall it either. Listings run CONCURRENTLY,
-        // each under its own cap, so the wall-clock cost is one cap, not
-        // N × cap. Unhealthy providers are skipped; their tools are
-        // simply absent and a deny audit event names them (direct
-        // per-provider listing via `connector.tools` still surfaces the
-        // real error for diagnosis).
+        // — and must not stall it either. Listings run concurrently
+        // under a bounded window (each future gets its own cap, at most
+        // PROVIDER_LIST_CONCURRENCY in flight at once), so the
+        // wall-clock cost is one cap, not N × cap, and a registry of N
+        // providers does not burst N simultaneous outbound requests on
+        // every tools/list. Unhealthy providers are skipped; their
+        // tools are simply absent and a deny audit event names them
+        // (direct per-provider listing via `connector.tools` still
+        // surfaces the real error for diagnosis).
         //
         // The audit reasons are deliberately SHORT (<16 chars):
         // `AuditLog::record` runs `redact_token_like` over the detail,
         // which masks >=16-char base62 runs, so longer slugs
         // (`provider_list_timeout`) would persist as `[redacted]` and
         // the ring could not distinguish a hang from a failure.
-        let listings = join_all(providers.iter().map(|provider| {
-            let timeout = provider_list_timeout();
-            async move {
-                (
-                    provider.clone(),
-                    tokio::time::timeout(timeout, self.tools(provider)).await,
-                )
-            }
-        }))
-        .await;
-        for (provider, listed) in listings {
-            // `join_all` yields in input order, so the advertised
-            // catalog keeps a stable provider order.
+        let cap = self.effective_list_timeout();
+        let provider_ids = providers.clone();
+        let mut listings = futures_util::stream::iter(
+            provider_ids
+                .iter()
+                .map(|provider: &String| async move {
+                    (
+                        provider.clone(),
+                        tokio::time::timeout(cap, self.tools(provider)).await,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .buffer_unordered(PROVIDER_LIST_CONCURRENCY);
+        let mut results: Vec<ProviderListing> = Vec::new();
+        while let Some((provider, listed)) = listings.next().await {
+            // Results arrive in completion order; re-sort below keeps
+            // the advertised catalog stable.
+            results.push((provider, listed));
+        }
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        for (provider, listed) in results {
             let listed = match listed {
                 Ok(Ok(listed)) => listed,
                 Ok(Err(error)) => {
@@ -177,7 +207,7 @@ impl ProviderRegistry {
                 Err(_) => {
                     tracing::warn!(
                         provider = %provider,
-                        timeout_secs = PROVIDER_LIST_TIMEOUT.as_secs(),
+                        timeout_secs = cap.as_secs(),
                         "dynamic provider tool listing timed out; skipping provider"
                     );
                     crate::mcp::audit::audit_deny(
@@ -451,22 +481,6 @@ mod tests {
         assert!(denied, "expected a dynamic_provider_rejected audit event");
     }
 
-    /// RAII guard over the test-only timeout override: restores the
-    /// default on drop even if the test panics mid-flight.
-    struct ListTimeoutOverride(u64);
-    impl ListTimeoutOverride {
-        fn millis(ms: u64) -> Self {
-            TEST_LIST_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-            Self(ms)
-        }
-    }
-    impl Drop for ListTimeoutOverride {
-        fn drop(&mut self) {
-            TEST_LIST_TIMEOUT_MS.store(0, std::sync::atomic::Ordering::Relaxed);
-            let _ = self.0;
-        }
-    }
-
     /// A provider whose backend never answers must be skipped after the
     /// per-provider cap instead of stalling the whole advertisement —
     /// error isolation alone does not cover hangs (Kilo review finding).
@@ -490,9 +504,9 @@ mod tests {
         }
 
         // 150ms cap per provider (well under the multi-second HTTP
-        // client default), restored on drop even on panic.
-        let _override = ListTimeoutOverride::millis(150);
-        let mut registry = ProviderRegistry::default();
+        // client default) — set on THIS registry instance, so no
+        // process-global state can race parallel tests.
+        let mut registry = ProviderRegistry::with_list_timeout(Duration::from_millis(150));
         registry.register(Box::new(GatewayProvider::new(
             "good",
             || Ok(vec![descriptor("ping")]),
@@ -564,10 +578,14 @@ mod tests {
             }
         }
 
-        // 300ms cap per provider: serial execution of 5 hangs would take
-        // ~1.5s and fail this bound; concurrent execution stays ~300ms.
-        let _override = ListTimeoutOverride::millis(300);
-        let mut registry = ProviderRegistry::default();
+        // 10 hanging providers under a 200ms cap with a concurrency
+        // window of 8 (PROVIDER_LIST_CONCURRENCY): the first wave of 8
+        // hangs costs one cap; the remaining 2 start as wave-1 futures
+        // resolve. Total ~= 2 caps (~400ms). The OLD serial loop would
+        // cost 10 x 200ms = 2s; an unbounded join would still be one
+        // cap. The bound below admits a generous scheduling margin but
+        // stays far under the serial sum.
+        let mut registry = ProviderRegistry::with_list_timeout(Duration::from_millis(200));
         registry.register(Box::new(GatewayProvider::new(
             "good",
             || Ok(vec![descriptor("ping")]),
@@ -578,7 +596,10 @@ mod tests {
                 })
             },
         )));
-        for id in ["hang-a", "hang-b", "hang-c", "hang-d", "hang-e"] {
+        for id in [
+            "hang-a", "hang-b", "hang-c", "hang-d", "hang-e", "hang-f", "hang-g", "hang-h",
+            "hang-i", "hang-j",
+        ] {
             registry.register(Box::new(HangingProvider(id)));
         }
 
@@ -594,17 +615,20 @@ mod tests {
             names.contains(&"good.ping".to_string().as_str()),
             "{names:?}"
         );
-        for id in ["hang-a", "hang-b", "hang-c", "hang-d", "hang-e"] {
+        for id in [
+            "hang-a", "hang-b", "hang-c", "hang-d", "hang-e", "hang-f", "hang-g", "hang-h",
+            "hang-i", "hang-j",
+        ] {
             assert!(
                 !names.iter().any(|n| n.starts_with(&format!("{id}."))),
                 "{names:?}"
             );
         }
-        // One cap's worth of wall time plus a small margin — NOT the
-        // serial sum (5 x 300ms) and never the 20s default.
+        // ceil(10/8) = 2 waves x 200ms cap + margin — NOT the serial sum
+        // (10 x 200ms = 2s) and never the 20s default.
         assert!(
-            elapsed < std::time::Duration::from_millis(900),
-            "concurrent listing must bound N hangs to ~one cap, took {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(1200),
+            "bounded-concurrent listing must cost ~2 caps for 10 hangs, took {elapsed:?}"
         );
     }
 }

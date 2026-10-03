@@ -137,10 +137,12 @@ cycle and are fixed on the same branch:
 
 One review point on `src/mcp/providers.rs` (hang isolation, not just
 error isolation) is also fixed on this branch: `aggregate_tools` lists
-providers **concurrently**, each wrapped in a 20s per-provider timeout
-(`PROVIDER_LIST_TIMEOUT`), so a black-holed backend is skipped and
+providers concurrently under a bounded window
+(`buffer_unordered(PROVIDER_LIST_CONCURRENCY)`), each listing wrapped
+in its own cap (default 20 s), so a black-holed backend is skipped and
 audited (`list_timeout` reason — kept under the audit redaction
 threshold so it persists verbatim) instead of stalling the whole
-`tools/list` advertisement. Regression tests:
+`tools/list` advertisement, and N slow providers cost ~⌈N/8⌉ caps,
+not N caps. Regression tests:
 `aggregate_tools_isolates_hanging_providers` and
 `aggregate_tools_bounds_n_hanging_providers_to_one_cap`.

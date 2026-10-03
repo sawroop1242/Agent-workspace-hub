@@ -725,18 +725,32 @@ tested create-equivalent (report classifies the surface honestly).
   action + subject by default; asserting `detail` is only safe for
   known-short reason strings.
 - **Per-provider isolation in aggregate_tools** (TP03 Kilo reviews):
-  listings run CONCURRENTLY via `futures_util::future::join_all`, each
-  wrapped in its own 20s `tokio::time::timeout` (const
-  `PROVIDER_LIST_TIMEOUT`) - a failing provider is skipped with reason
-  `list_failed`, a hanging one with `list_timeout`; N unhealthy
-  providers cost ONE cap of wall time, not N, and the catalog keeps a
-  stable provider order (join_all preserves input order). Tests shrink
-  the cap via a `#[cfg(test)]` atomic + RAII guard
-  (`ListTimeoutOverride` in providers.rs tests) - NEVER a test-only env
-  var (an unclamped env override in release code can silently empty the
-  catalog). Regression tests: `aggregate_tools_isolates_{failing,
-  hanging}_providers`, `aggregate_tools_bounds_n_hanging_providers_to_
-  one_cap` (needs a real timer; do not pause tokio time).
+  listings run concurrently under a BOUNDED window -
+  `stream::iter(...).buffer_unordered(PROVIDER_LIST_CONCURRENCY)` (8) -
+  each future wrapped in its own cap (default const
+  `PROVIDER_LIST_TIMEOUT` = 20s; a failing provider is skipped with
+  reason `list_failed`, a hanging one with `list_timeout`; results are
+  re-sorted by provider id so the catalog order is stable). N slow
+  providers cost ~ceil(N/8) caps, not N caps (serial loop pinned by the
+  10-hang test: budget 2 waves x 200ms, serial sum would be 2s), and a
+  registry of N providers never bursts N simultaneous outbound
+  requests. Tests shrink the cap PER INSTANCE via `#[cfg(test)]
+  ProviderRegistry::with_list_timeout(cap)` (field
+  `list_timeout_override: Option<Duration>`, `None` under Default) -
+  NEVER a process-global atomic/env override (parallel tests clobber
+  each other; env overrides leak into release builds).
+- **buffer_unordered + async closures**: `stream::iter(...).map(|
+  x| async move {...}).buffer_unordered(n)` hits the rustc
+  "implementation of FnOnce is not general enough" inference bug
+  unless the closure param is explicitly typed (`|p: &String|`) AND
+  the futures are collected into a Vec first (`.collect::<Vec<_>>()`
+  before `stream::iter`) - see aggregate_tools.
+- **Traversal-proof sentinel layout** (fs_basic_boundaries.rs): the
+  escapes `../<name>` resolve against the workspace ROOT'S PARENT, so
+  the sentinel must sit DIRECTLY in the parent TempDir with the root as
+  its sibling child (`parent.join("workspace-root")`), or the negative
+  proof asserts a file no escape actually targets. Keep the
+  process-unique name (shared OS temp area).
 - **Spawned-awh hermeticity** (TP03): the `AWH_*`/provider strip list
   has ONE source, `tests/common/mod.rs` (`#[path = "common/mod.rs"] mod
   common;`), consumed by foundation_cli.rs, workspace_runtime_cli.rs,
