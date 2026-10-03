@@ -92,6 +92,10 @@ pub trait ConnectorProvider: Send + Sync {
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, Box<dyn ConnectorProvider>>,
+    /// Round-robin start offset for `aggregate_tools` listings (see the
+    /// rotation comment inside `aggregate_tools`). Per-instance counter,
+    /// not security-sensitive.
+    start_rotation: std::sync::atomic::AtomicU64,
     /// Per-provider listing timeout for `aggregate_tools`. `None`
     /// selects the default (`PROVIDER_LIST_TIMEOUT`); `Some(cap)` uses
     /// the cap verbatim (the test constructor rejects zero, which
@@ -195,8 +199,30 @@ impl ProviderRegistry {
         // the ring could not distinguish a hang from a failure.
         let cap = self.effective_list_timeout();
         let provider_ids = providers;
+        // The budget truncates whatever has not finished when it fires;
+        // starting futures in the registry's sorted id order would
+        // deterministically pre-empt the alphabetically LAST providers
+        // on EVERY call. Rotate the START order by a per-call counter
+        // (round-robin) so, over successive calls, every provider gets
+        // an early slot equally often — budget truncation is spread
+        // fairly across the id space instead of always falling on the
+        // same names. Results are re-sorted below; the audit loop still
+        // walks the sorted list.
+        // (An empty registry would make `% n` a division by zero;
+        // an empty rotation list is simply empty — nothing to rotate.)
+        let n = provider_ids.len();
+        let offset = if n == 0 {
+            0
+        } else {
+            self.start_rotation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize
+                % n
+        };
+        let start_order: Vec<String> = (0..n)
+            .map(|i| provider_ids[(i + offset) % n].clone())
+            .collect();
         let mut listings = futures_util::stream::iter(
-            provider_ids
+            start_order
                 .iter()
                 .map(|provider: &String| async move {
                     (
@@ -231,7 +257,7 @@ impl ProviderRegistry {
                 if !listed_ids.contains(&provider.as_str()) {
                     tracing::warn!(
                         provider = %provider,
-                        budget_ms = cap.as_millis() as u64,
+                        budget_ms = (cap + PROVIDER_LIST_BUDGET_SLACK).as_millis() as u64,
                         "dynamic provider listing budget exhausted; skipping provider"
                     );
                     crate::mcp::audit::audit_deny(
@@ -636,14 +662,14 @@ mod tests {
         }
 
         // 10 hanging providers under a 200ms per-provider cap with a
-        // concurrency window of 8: wave 1 (8 hangs) hits its cap at
-        // ~200ms, wave 2 (2 hangs) starts and would hit its own cap at
-        // ~400ms — BUT the aggregate budget is also 200ms, so the
-        // budget fires first: wave-2 providers never get listed and
-        // are skipped+audited (`list_budget`). Total ~one budget
-        // (~200ms), INDEPENDENT of N. (The old serial loop: 10 x 200ms
-        // = 2s. Unbounded concurrency: one cap. Neither bound is
-        // sufficient alone — that is why both exist.)
+        // concurrency window of 8: wave 1 (8 hangs) resolves at its cap
+        // (~200ms) and is collected as `list_timeout`; wave 2 (2 hangs)
+        // starts next and would resolve at ~400ms — BUT the aggregate
+        // budget fires first (cap 200ms + 100ms slack = 300ms), so the
+        // wave-2 providers are skipped and audited `list_budget`.
+        // Total ~300ms, INDEPENDENT of N. (The old serial loop: 10 x
+        // 200ms = 2s. Neither bound alone is sufficient — that is why
+        // both exist.)
         let mut registry = ProviderRegistry::with_list_timeout(Duration::from_millis(200));
         registry.register(Box::new(GatewayProvider::new(
             "good",
@@ -666,7 +692,7 @@ mod tests {
         let aggregated = registry
             .aggregate_tools()
             .await
-            .expect("aggregate listing must survive five hanging providers");
+            .expect("aggregate listing must survive ten hanging providers");
         let elapsed = started.elapsed();
 
         let names: Vec<&str> = aggregated.iter().map(|t| t.name.as_str()).collect();

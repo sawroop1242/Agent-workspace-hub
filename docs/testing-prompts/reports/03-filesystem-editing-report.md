@@ -195,8 +195,9 @@ review, shipped here because the fix lives on this branch):**
    redaction threshold so they persist verbatim in the audit record).
    Regression tests: `aggregate_tools_isolates_failing_providers`,
    `aggregate_tools_isolates_hanging_providers`,
-   `aggregate_tools_bounds_n_hanging_providers_to_one_cap` (N hangs cost
-   one cap, not N).
+   `aggregate_tools_bounds_n_hanging_providers_to_the_budget` (the
+   whole listing phase is bounded by the aggregate budget — one cap +
+   slack — whatever N is; see §11 for the evolution of this bound).
 
 Two near-miss observations worth keeping in the record:
 
@@ -313,8 +314,10 @@ All points from the second review round are fixed in this revision:
 - **Serial N × cap stall removed**: provider listings now run
   concurrently (`futures_util::future::join_all`, already a production
   dependency), each under its own cap — N hanging providers cost one
-  cap of wall time, not N. Pinned by
-  `aggregate_tools_bounds_n_hanging_providers_to_one_cap`.
+  cap of wall time, not N. (Round 2's join_all was itself replaced in
+  rounds 3–4 by the bounded window + aggregate budget; the regression
+  test is now `aggregate_tools_bounds_n_hanging_providers_to_the_
+  budget`.)
 - **Audit reasons survive redaction**: `provider_list_failed`/
   `provider_list_timeout` were ≥16-char base62 runs and persisted as
   `[redacted]` — the ring could not distinguish a hang from a failure.
@@ -407,10 +410,44 @@ Round 4 reviewed the round-3 code itself; five new findings, all fixed:
   the test additionally asserts the `list_budget` audit reason.
 
 The remaining round-4 comments (4171575922/5939/5941) are stale
-re-posts of already-addressed round-1 items — see §10; replied on the
-PR.
+re-posts of already-addressed round-1 items (traversal reason pinning +
+positive control, `big.bin` classification asserts, `awh init` success
+assertion) — already present in the tree, verified on the pushed diff,
+and left as-is; replied on the PR.
 
+## 12. Kilo review round 5 — addressed
 
-(traversal reason pinning + positive control, `big.bin` classification
-asserts, `awh init` success assertion) — already present in the tree;
-verified on the pushed diff and left as-is.
+Six findings on the round-4 code, all fixed:
+
+- **(4172193269, WARNING) Budget truncation was name-deterministic**:
+  `providers()` returns ids sorted, `buffer_unordered` starts futures
+  in that order, and the budget pre-empts whatever has not finished —
+  so with N > window, the alphabetically LAST ids were deterministically
+  starved on EVERY call. Fixed with a per-instance round-robin start
+  rotation (`start_rotation: AtomicU64`): each call rotates the start
+  order by one, so over N calls every provider gets an early slot
+  exactly once — budget truncation is spread fairly across the id
+  space instead of always falling on the same names. Empty-registry
+  division-by-zero guarded; results still re-sorted (stable catalog);
+  the audit loop still walks the sorted list.
+- **(4172193280, WARNING) Claimed fixed but wasn't — "five"** in the
+  10-hang test's `.expect` message (a leftover from the round-2
+  5-provider version). Now says ten.
+- **(4172193271) `budget_ms` under-reported the deadline**: it logged
+  the cap, not the budget that actually fired (cap + slack) — the same
+  misreport class as the round-3 `timeout_secs` bug. Now logs
+  `cap + PROVIDER_LIST_BUDGET_SLACK`.
+- **(4172193279) Test narrative misstated the budget**: "the aggregate
+  budget is also 200ms" was wrong — it fires at cap+slack = 300 ms;
+  wave 2 is skipped at 300 ms, not left to resolve at 400 ms. Comment
+  corrected (and it now explains why wave 1 is *collected* as
+  `list_timeout` while wave 2 is *skipped* as `list_budget`).
+- **(4172193282) Orphaned fragment** in this report: §11's insertion
+  consumed the subject sentence of the §10 closing paragraph, leaving
+  a dangling "(traversal reason pinning + …)" fragment. Merged back
+  into one sentence.
+- **(4172193284) Stale test name** in the defect table (§4) and the
+  02-report: both cited the pre-rename
+  `…_to_one_cap` name/contract. Updated to `…_to_the_budget` with the
+  real N-independent contract; the round-2 history note now flags the
+  bound's evolution explicitly.

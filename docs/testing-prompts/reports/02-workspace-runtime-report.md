@@ -145,4 +145,4 @@ threshold so it persists verbatim) instead of stalling the whole
 `tools/list` advertisement, and N slow providers cost ~⌈N/8⌉ caps,
 not N caps. Regression tests:
 `aggregate_tools_isolates_hanging_providers` and
-`aggregate_tools_bounds_n_hanging_providers_to_one_cap`.
+`aggregate_tools_bounds_n_hanging_providers_to_the_budget`.

@@ -738,8 +738,13 @@ tested create-equivalent (report classifies the surface honestly).
   providers) and stdio `handle()` has NO outer request deadline (the
   HTTP plane's 30s TimeoutLayer never sees stdio). The dispatcher
   awaits aggregate_tools holding the registry read guard - keep that
-  window ~one cap. Results are re-sorted by provider id (stable
-  catalog order). Budget slack (100ms fixed) prevents the budget and
+  window ~one cap. START order is ROTATED by a per-instance AtomicU64
+  round-robin (`start_rotation`): with a sorted start order the
+  budget would deterministically truncate the alphabetically-LAST
+  providers on every call (Kilo round 5); rotation spreads truncation
+  fairly across the id space. Results are re-sorted by provider id
+  (stable catalog order). Budget slack (100ms fixed) prevents the
+  budget and
   per-future cap from racing: a just-timed-out future is still
   COLLECTED (audited list_timeout), only still-listing ones take
   list_budget. Tests shrink the cap PER INSTANCE via `#[cfg(test)]
