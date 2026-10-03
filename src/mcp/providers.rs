@@ -14,12 +14,29 @@ use std::time::Duration;
 const PROVIDER_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// At most this many provider listings are in flight at once inside
-/// `aggregate_tools`. Concurrent enough that N slow providers cost one
-/// cap of wall time (not N × cap, as the old serial loop did), bounded
-/// so a registry of N providers does not burst N simultaneous outbound
-/// HTTP requests on every tools/list. 8 covers realistic SaaS/connector
-/// fan-out while keeping per-request resource use flat.
+/// `aggregate_tools`. Bounded so a registry of N providers does not
+/// burst N simultaneous outbound HTTP requests on every `tools/list`;
+/// 8 covers realistic SaaS/connector fan-out. Together with the
+/// aggregate budget (the effective cap + `PROVIDER_LIST_BUDGET_SLACK`,
+/// see below) the wall-clock cost of a full aggregation stays ~one cap
+/// regardless of N.
 const PROVIDER_LIST_CONCURRENCY: usize = 8;
+
+/// The aggregate budget is the effective per-provider cap
+/// (`effective_list_timeout`) plus a small fixed collection slack: the
+/// whole listing phase — not each future — must fit inside ONE cap.
+/// Without an aggregate bound, ceil(N/8) hung providers under the
+/// concurrency window would stretch a single `tools/list` to
+/// ceil(N/8) x cap (about 140 s at 50 providers) — and stdio
+/// `handle()` has NO outer request deadline to clip it (the HTTP
+/// plane's `TimeoutLayer` never sees stdio). The slack keeps the two
+/// timeouts from racing: a provider whose own cap just fired is
+/// still COLLECTED (and audited `list_timeout`) instead of losing to
+/// the budget; only providers still listing when the slack elapses
+/// take the `list_budget` skip path. Either way the advertisement
+/// stays live, the ring records why, and total aggregation latency
+/// is bounded by one cap + slack, whatever N is.
+const PROVIDER_LIST_BUDGET_SLACK: Duration = Duration::from_millis(100);
 
 /// Describes a tool exposed by a connector provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,11 +92,14 @@ pub trait ConnectorProvider: Send + Sync {
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, Box<dyn ConnectorProvider>>,
-    /// Per-provider listing timeout for `aggregate_tools`. Zero selects
-    /// the default (`PROVIDER_LIST_TIMEOUT`). Instance-scoped (not a
-    /// process-global/env override): test registries can shrink the cap
-    /// without any release-build surface and without racing parallel
-    /// tests, and production always runs with the default.
+    /// Per-provider listing timeout for `aggregate_tools`. `None`
+    /// selects the default (`PROVIDER_LIST_TIMEOUT`); `Some(cap)` uses
+    /// the cap verbatim (the test constructor rejects zero, which
+    /// would time every provider out instantly and silently empty the
+    /// catalog). Instance-scoped (not a process-global/env override):
+    /// test registries can shrink the cap without any release-build
+    /// surface and without racing parallel tests; production always
+    /// runs the default.
     list_timeout_override: Option<Duration>,
 }
 /// One provider's `aggregate_tools` listing outcome: the outer layer
@@ -97,10 +117,16 @@ impl ProviderRegistry {
     }
 
     /// Test/bench constructor: a registry with a non-default
-    /// per-provider listing cap. Production code never calls this —
-    /// `Default` keeps the documented 20 s cap.
+    /// per-provider listing cap (non-zero — a zero cap would skip
+    /// every provider and silently empty the dynamic catalog).
+    /// Production code never calls this — `Default` keeps the
+    /// documented 20 s cap.
     #[cfg(test)]
     pub fn with_list_timeout(cap: Duration) -> Self {
+        assert!(
+            !cap.is_zero(),
+            "test listing cap must be non-zero (zero empties the catalog)"
+        );
         Self {
             list_timeout_override: Some(cap),
             ..Default::default()
@@ -168,7 +194,7 @@ impl ProviderRegistry {
         // (`provider_list_timeout`) would persist as `[redacted]` and
         // the ring could not distinguish a hang from a failure.
         let cap = self.effective_list_timeout();
-        let provider_ids = providers.clone();
+        let provider_ids = providers;
         let mut listings = futures_util::stream::iter(
             provider_ids
                 .iter()
@@ -181,11 +207,40 @@ impl ProviderRegistry {
                 .collect::<Vec<_>>(),
         )
         .buffer_unordered(PROVIDER_LIST_CONCURRENCY);
+        // Aggregate budget: the whole listing phase — not each future —
+        // must fit inside ONE effective cap (see the const doc above),
+        // so a registry of N hung providers can never stretch one
+        // tools/list to ceil(N/window) caps (stdio has no outer request
+        // deadline).
         let mut results: Vec<ProviderListing> = Vec::new();
-        while let Some((provider, listed)) = listings.next().await {
-            // Results arrive in completion order; re-sort below keeps
-            // the advertised catalog stable.
-            results.push((provider, listed));
+        let budget = tokio::time::timeout(cap + PROVIDER_LIST_BUDGET_SLACK, async {
+            while let Some((provider, listed)) = listings.next().await {
+                // Results arrive in completion order; re-sort below
+                // keeps the advertised catalog stable.
+                results.push((provider, listed));
+            }
+        })
+        .await;
+        if let Err(_elapsed) = budget {
+            // Budget exhausted: everything not yet collected is skipped
+            // and audited exactly like a per-future timeout, so the
+            // advertisement still returns — live, bounded, and truthful
+            // about what was skipped.
+            let listed_ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+            for provider in &provider_ids {
+                if !listed_ids.contains(&provider.as_str()) {
+                    tracing::warn!(
+                        provider = %provider,
+                        budget_ms = cap.as_millis() as u64,
+                        "dynamic provider listing budget exhausted; skipping provider"
+                    );
+                    crate::mcp::audit::audit_deny(
+                        "dynamic_provider_rejected",
+                        "list_budget",
+                        provider,
+                    );
+                }
+            }
         }
         results.sort_by(|a, b| a.0.cmp(&b.0));
         for (provider, listed) in results {
@@ -558,10 +613,12 @@ mod tests {
         );
     }
 
-    /// N hanging providers must cost ONE cap of wall time, not N: the
-    /// listings run concurrently, each under its own per-provider cap.
+    /// N hanging providers must never stretch ONE aggregation past the
+    /// aggregate budget: listings run under a bounded window
+    /// (PROVIDER_LIST_CONCURRENCY) and the whole listing phase is
+    /// capped by the effective cap + budget slack, whatever N is.
     #[tokio::test]
-    async fn aggregate_tools_bounds_n_hanging_providers_to_one_cap() {
+    async fn aggregate_tools_bounds_n_hanging_providers_to_the_budget() {
         struct HangingProvider(&'static str);
         #[async_trait]
         impl ConnectorProvider for HangingProvider {
@@ -578,13 +635,15 @@ mod tests {
             }
         }
 
-        // 10 hanging providers under a 200ms cap with a concurrency
-        // window of 8 (PROVIDER_LIST_CONCURRENCY): the first wave of 8
-        // hangs costs one cap; the remaining 2 start as wave-1 futures
-        // resolve. Total ~= 2 caps (~400ms). The OLD serial loop would
-        // cost 10 x 200ms = 2s; an unbounded join would still be one
-        // cap. The bound below admits a generous scheduling margin but
-        // stays far under the serial sum.
+        // 10 hanging providers under a 200ms per-provider cap with a
+        // concurrency window of 8: wave 1 (8 hangs) hits its cap at
+        // ~200ms, wave 2 (2 hangs) starts and would hit its own cap at
+        // ~400ms — BUT the aggregate budget is also 200ms, so the
+        // budget fires first: wave-2 providers never get listed and
+        // are skipped+audited (`list_budget`). Total ~one budget
+        // (~200ms), INDEPENDENT of N. (The old serial loop: 10 x 200ms
+        // = 2s. Unbounded concurrency: one cap. Neither bound is
+        // sufficient alone — that is why both exist.)
         let mut registry = ProviderRegistry::with_list_timeout(Duration::from_millis(200));
         registry.register(Box::new(GatewayProvider::new(
             "good",
@@ -624,11 +683,23 @@ mod tests {
                 "{names:?}"
             );
         }
-        // ceil(10/8) = 2 waves x 200ms cap + margin — NOT the serial sum
-        // (10 x 200ms = 2s) and never the 20s default.
+        // The aggregate budget (equal to the per-provider cap here:
+        // 200ms) bounds the WHOLE listing phase regardless of N: one
+        // budget + scheduling margin, not ceil(N/8) caps, not N caps.
         assert!(
             elapsed < std::time::Duration::from_millis(1200),
-            "bounded-concurrent listing must cost ~2 caps for 10 hangs, took {elapsed:?}"
+            "aggregate budget must bound N hangs to one budget, took {elapsed:?}"
+        );
+        // Wave-2 providers hit the budget path specifically: they are
+        // audited with `list_budget`, distinct from wave-1's
+        // `list_timeout`.
+        let budget_denied = crate::services::audit::global()
+            .recent(200)
+            .into_iter()
+            .any(|e| e.action == "dynamic_provider_rejected" && e.detail.contains("list_budget"));
+        assert!(
+            budget_denied,
+            "expected a dynamic_provider_rejected/list_budget audit event"
         );
     }
 }

@@ -725,20 +725,29 @@ tested create-equivalent (report classifies the surface honestly).
   action + subject by default; asserting `detail` is only safe for
   known-short reason strings.
 - **Per-provider isolation in aggregate_tools** (TP03 Kilo reviews):
-  listings run concurrently under a BOUNDED window -
-  `stream::iter(...).buffer_unordered(PROVIDER_LIST_CONCURRENCY)` (8) -
-  each future wrapped in its own cap (default const
-  `PROVIDER_LIST_TIMEOUT` = 20s; a failing provider is skipped with
-  reason `list_failed`, a hanging one with `list_timeout`; results are
-  re-sorted by provider id so the catalog order is stable). N slow
-  providers cost ~ceil(N/8) caps, not N caps (serial loop pinned by the
-  10-hang test: budget 2 waves x 200ms, serial sum would be 2s), and a
-  registry of N providers never bursts N simultaneous outbound
-  requests. Tests shrink the cap PER INSTANCE via `#[cfg(test)]
-  ProviderRegistry::with_list_timeout(cap)` (field
-  `list_timeout_override: Option<Duration>`, `None` under Default) -
-  NEVER a process-global atomic/env override (parallel tests clobber
-  each other; env overrides leak into release builds).
+  TWO bounds, both required. (1) Bounded concurrency window:
+  `stream::iter(...).buffer_unordered(PROVIDER_LIST_CONCURRENCY)` (8)
+  so N providers never burst N simultaneous outbound HTTP requests.
+  (2) Aggregate budget: the WHOLE listing phase is wrapped in
+  `tokio::time::timeout(effective_cap + PROVIDER_LIST_BUDGET_SLACK,
+  ...)` - on exhaustion providers not yet listed are skipped+audited
+  with the DISTINCT reason `list_budget` (per-future cap gives
+  `list_timeout`, failure gives `list_failed`), so one tools/list
+  completes in ~one cap regardless of N. Without (2), ceil(N/8)
+  hung providers stretch tools/list to ceil(N/8) x 20s (~140s at 50
+  providers) and stdio `handle()` has NO outer request deadline (the
+  HTTP plane's 30s TimeoutLayer never sees stdio). The dispatcher
+  awaits aggregate_tools holding the registry read guard - keep that
+  window ~one cap. Results are re-sorted by provider id (stable
+  catalog order). Budget slack (100ms fixed) prevents the budget and
+  per-future cap from racing: a just-timed-out future is still
+  COLLECTED (audited list_timeout), only still-listing ones take
+  list_budget. Tests shrink the cap PER INSTANCE via `#[cfg(test)]
+  ProviderRegistry::with_list_timeout(cap)` (rejects zero - a zero
+  cap silently empties the catalog; field `list_timeout_override:
+  Option<Duration>`, `None` under Default) - NEVER a process-global
+  atomic/env override (parallel tests clobber each other; env
+  overrides leak into release builds).
 - **buffer_unordered + async closures**: `stream::iter(...).map(|
   x| async move {...}).buffer_unordered(n)` hits the rustc
   "implementation of FnOnce is not general enough" inference bug

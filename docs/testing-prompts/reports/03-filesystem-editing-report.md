@@ -335,11 +335,14 @@ fixed:
   started ALL provider listings at once — a registry of N providers
   burst N simultaneous outbound HTTP requests on every `tools/list`.
   Now bounded: `futures_util::stream::…buffer_unordered(
-  PROVIDER_LIST_CONCURRENCY)` (window of 8). Still concurrent enough
-  that N slow providers cost ~⌈N/8⌉ caps, not N caps (the serial-loop
-  regression stays pinned: the 10-hang test budget is 2 waves × 200 ms,
-  far under the 2 s serial sum); results re-sorted by provider id so
-  the advertised catalog keeps a stable order.
+  PROVIDER_LIST_CONCURRENCY)` (window of 8). The window alone would
+  still allow ⌈N/8⌉ sequential waves of hangs, so the listing phase is
+  ALSO wrapped in an aggregate budget (the effective per-provider cap
+  plus a small collection slack): when the budget fires, providers
+  not yet listed are skipped and audited with the distinct reason
+  `list_budget`, so the total cost of a full aggregation is ~one cap
+  regardless of N. Results are re-sorted by provider id so the
+  advertised catalog keeps a stable order.
 - **Process-global test override** (WARNING-class): the round-2
   `#[cfg(test)]` atomic + RAII guard was still process-global — two
   parallel hang tests could clobber each other's cap (guard drop
@@ -361,7 +364,53 @@ fixed:
   `../sentinel` and `a/../../sentinel` resolve to EXACTLY the asserted
   sentinel (path math re-verified). Drop-based cleanup retained.
 
-The other round-3 comments were stale re-posts of round-1 items
+## 11. Kilo review round 4 — addressed
+
+Round 4 reviewed the round-3 code itself; five new findings, all fixed:
+
+- **(4172077715, WARNING) stale invariant doc**: the `PROVIDER_LIST_
+  CONCURRENCY` doc still claimed "N slow providers cost one cap", which
+  the round-3 change itself made false (a window of 8 turns N hangs
+  into ⌈N/8⌉ waves). Doc rewritten to state the window's actual
+  purpose (outbound-request bounding) and to reference the aggregate
+  budget for the latency bound.
+- **(4172077725, SUGGESTION) unbounded aggregate worst case**: the
+  bounded window reintroduced a multiplicative worst case — ⌈N/8⌉ ×
+  20 s ≈ 140 s at 50 providers — and nothing bounded the aggregate
+  (`dispatcher.rs` awaits it holding the registry read guard; stdio
+  `handle()` has no outer request deadline, unlike the HTTP plane's
+  30 s `TimeoutLayer`). Fixed structurally in `aggregate_tools`: the
+  whole listing phase is now wrapped in `tokio::time::timeout(
+  effective_cap + slack, …)`; on exhaustion, providers not yet listed
+  are skipped and audited `list_budget` (distinct from `list_timeout`),
+  so `tools/list` always completes in ~one cap regardless of N. The
+  N-hangs test now pins exactly this: 10 hangs under a 200 ms cap
+  finish in ~one budget (not 2 waves ≈ 400 ms, not the 2 s serial
+  sum) and leave a `list_budget` audit event.
+- **(4172077717, SUGGESTION) "Zero selects the default" was wrong**:
+  `effective_list_timeout()` is `unwrap_or`, so `Some(ZERO)` honors
+  zero (instant timeout for every provider — empty catalog), not the
+  default. The field doc now states the real semantics (`None` =
+  default, `Some` used verbatim) and the `#[cfg(test)]
+  with_list_timeout` constructor now rejects a zero cap with an
+  explicit assert so no test can silently empty the catalog.
+- **(4172077722, SUGGESTION) redundant clone**: `providers` (an owned
+  `Vec<String>` returned by `self.providers()`) was cloned into
+  `provider_ids` although nothing borrows it past the
+  `stream::iter` collect. Clone removed — the Vec is moved.
+- **(4172077730, SUGGESTION) stale test name/docs/messages**: the
+  10-hang test still promised "ONE cap" (round-2 contract) while
+  asserting a 2-wave budget, and its doc/messages described the old
+  serial loop. Test renamed to `aggregate_tools_bounds_n_hanging_
+  providers_to_the_budget`, comments and the failure message now
+  describe the real contract (aggregate budget, N-independent), and
+  the test additionally asserts the `list_budget` audit reason.
+
+The remaining round-4 comments (4171575922/5939/5941) are stale
+re-posts of already-addressed round-1 items — see §10; replied on the
+PR.
+
+
 (traversal reason pinning + positive control, `big.bin` classification
 asserts, `awh init` success assertion) — already present in the tree;
 verified on the pushed diff and left as-is.
