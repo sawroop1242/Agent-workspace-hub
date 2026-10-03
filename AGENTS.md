@@ -755,7 +755,13 @@ tested create-equivalent (report classifies the surface honestly).
   the previous instance's listing (Kilo round 8). register() is an
   UPSERT that purges too - composio re-registration writes
   composio:{label} straight into a live registry without unregistering
-  first (Kilo round 9). Cache lock is fail-safe on poisoning
+  first (Kilo round 9; round 10: capture the id ONCE in register so
+  the purge key and the insert key can never diverge). unregister's
+  purge is pinned only by the #[cfg(test)] cached_listing_count()
+  inspector - a lingering entry after remove-without-re-add is
+  observable as memory alone, never behaviorally (it cannot be
+  served and any future register purges it). Cache lock is fail-safe
+  on poisoning
   (unwrap_or_else(into_inner) - the map is structurally valid); NEVER
   `if let Ok(lock)` on this cache: a poisoned lock must not silently
   skip serve/purge (round 9). Hung/failed

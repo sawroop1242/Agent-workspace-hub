@@ -579,3 +579,53 @@ Three findings on the round-8 purge, all fixed:
   `last_good_guard()` helper — `unwrap_or_else(into_inner())`, valid
   because the guard is never held across an await and only HashMap
   ops run under it.
+
+## 17. Kilo review round 10 — making each purge line independently load-bearing
+
+Five findings on the round-9 fix itself, all valid, all fixed:
+
+- **(4173925401) purge/insert key divergence**: `register` called
+  `provider_id()` twice — once to pick the cache key to purge, once
+  to pick the providers-map key to insert under. Latent today (every
+  in-tree impl returns `&self.id`), but a non-stable impl would
+  silently split the keys. Fixed: the id is captured once into a
+  `String` and both sites use it.
+- **(4173925409) `HangingProvider` triplication**: three
+  byte-identical local definitions (two `(&'static str)` + one
+  unit-struct) were a drift hazard for exactly the distinction a true
+  hang encodes (`std::future::pending`, not a blocking closure that
+  would freeze a current-thread runtime's timer wheel). Consolidated
+  to ONE module-level definition (including re-pointing the
+  unit-struct use).
+- **(4173925412) unregister test not load-bearing on its own line**:
+  the re-register in the round-9 version meant `register`'s purge
+  masked `unregister`'s. Root cause: a lingering entry after
+  remove-without-re-add is observable ONLY as memory (the id is out
+  of the providers map, so it can never be served; any future
+  register purges it first). Fixed with a `#[cfg(test)]` cache
+  inspector `cached_listing_count()` (same pattern as the existing
+  `with_list_timeout` test ctor) asserting the entry is gone
+  immediately after unregister — before any re-register exists to
+  mask it.
+- **(4173925414) cross-test audit contamination**: both round-9
+  tests registered victim id `rebind`, so a sibling run's
+  `list_budget`/`list_stale` audit events could satisfy either
+  test's ring-based discriminators. Fixed: unique victim ids
+  (`purgee` / `upsertee`) and unique filler prefixes (`ag-fill-*` /
+  `up-fill-*`) keep every audit assertion attributable to exactly
+  one test run.
+- **(4173925421) copy-paste residue**: comments and failure messages
+  still named the `good` provider that exists only in the sibling
+  budget-truncation fixture. All rewritten to name the actual victim
+  id and the actual rotation arithmetic.
+
+**Independent mutation verification** (post-fix):
+- delete `register`'s purge → `register_upsert_purges_last_good_cache`
+  fails, `unregister_purges_last_good_cache` passes (its behavioral
+  asserts hold with either purge; the inspector pin targets
+  unregister only);
+- delete `unregister`'s purge → `unregister_purges_last_good_cache`
+  fails, the upsert test passes.
+
+Gates: 1417 passed / 0 failed (`--all-targets`), clippy `-D warnings`
+clean, fmt clean.
