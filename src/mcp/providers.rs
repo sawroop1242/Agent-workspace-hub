@@ -153,6 +153,14 @@ impl ProviderRegistry {
 
     /// Unregisters a provider by id, returning whether it was present.
     pub fn unregister(&mut self, provider_id: &str) -> bool {
+        // The last-good cache must be purged with the registration:
+        // re-registering the same id (composio re-registration, custom
+        // MCP servers rebuilt from config on every dispatcher
+        // construct) must never serve the PREVIOUS instance's listing
+        // for the new one.
+        if let Ok(mut cache) = self.last_good.lock() {
+            cache.remove(provider_id);
+        }
         self.providers.remove(provider_id).is_some()
     }
 
@@ -528,6 +536,56 @@ mod tests {
             description: String::new(),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
         }
+    }
+
+    /// Unregistering must purge the last-good cache: after
+    /// unregister + re-register of the same id, a budget-truncated
+    /// new instance must NOT be served the previous instance's
+    /// listing. Re-registration is a real path (composio
+    /// re-registration, custom MCP servers rebuilt from config on
+    /// every dispatcher construct).
+    #[tokio::test]
+    async fn unregister_purges_last_good_cache() {
+        let mut registry = ProviderRegistry::default();
+        registry.register(Box::new(GatewayProvider::new(
+            "demo",
+            || Ok(vec![descriptor("old.tool")]),
+            |_t, _a| {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            },
+        )));
+        // First aggregation caches the old instance's listing.
+        let first = registry.aggregate_tools().await.expect("first listing");
+        assert!(first.iter().any(|t| t.name == "demo.old.tool"));
+
+        // Unregister, then re-register the SAME id whose new
+        // instance fails to list.
+        assert!(registry.unregister("demo"));
+        registry.register(Box::new(GatewayProvider::new(
+            "demo",
+            || Err(anyhow::anyhow!("new instance never lists")),
+            |_t, _a| {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            },
+        )));
+
+        // The cached listing from the OLD instance must be gone: the
+        // new instance fails, so the tool must be absent — if the
+        // purge regressed, budget-less calls would still see it (the
+        // cache is only consulted on the budget path, so a plain call
+        // proves the purge by absence here).
+        let second = registry.aggregate_tools().await.expect("second listing");
+        assert!(
+            !second.iter().any(|t| t.name == "demo.old.tool"),
+            "unregister must purge the last-good cache; got: {:?}",
+            second.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

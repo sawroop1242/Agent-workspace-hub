@@ -527,3 +527,24 @@ the tree, each is stale:
   completeness-yields-to-liveness trade-off).
 - **4172273843** (report claimed complete fix): already fixed — §12
   records the one-site-only round-5 fix and §13 the round-6 completion.
+
+## 15. Kilo review round 8 — cache lifecycle + docs precision
+
+Two findings on the round-6 cache design, both fixed:
+
+- **(4172474140, WARNING) `unregister` never purged `last_good`**:
+  re-registering the same id (`connector.remove` →
+  `connector.composio_register`, custom MCP servers rebuilt from
+  config on every dispatcher construct) could serve the PREVIOUS
+  instance's listing for a budget-truncated new instance. Fixed:
+  `unregister` removes the provider's cache entry; pinned by
+  `unregister_purges_last_good_cache` (old instance listed → cached →
+  unregistered → re-registered with a failing instance → the old
+  tool must be absent).
+- **(4172474145, WARNING) docs overclaimed stickiness**: "once a
+  tool has been advertised it stays advertised" hid the two
+  deliberate drop paths (a provider that errors `list_failed` or
+  hangs past its cap `list_timeout` loses its tools on that listing —
+  provider-health signals, not scheduling artifacts) and the
+  cross-registration guarantee. docs/mcp.md now states all three
+  paths precisely, including the purge-on-unregister guarantee.

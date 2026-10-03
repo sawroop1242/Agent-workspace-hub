@@ -745,11 +745,15 @@ tested create-equivalent (report classifies the surface honestly).
   fairly across the id space. Results are re-sorted by provider id
   (stable ORDER; membership is sticky via the per-provider last_good
   cache). On budget truncation a provider with a cached listing is
-  SERVED from cache (audited list_stale - once a tool has been
-  advertised it stays advertised until unregister; MCP clients cache
+  SERVED from cache (audited list_stale - membership is sticky
+  across budget truncations until unregister; MCP clients cache
   tools/list, so a tool vanishing between identical calls is a
   correctness break, Kilo round 6); only a never-listed provider is
-  skipped (list_budget). Hung/failed providers are STILL dropped -
+  skipped (list_budget). unregister() PURGES the last_good entry, so a
+  re-registered id (composio re-registration, custom MCP servers
+  rebuilt from config on every dispatcher construct) can never serve
+  the previous instance's listing (Kilo round 8). Hung/failed
+  providers are STILL dropped -
   truncation is our scheduling artifact, a hang is a provider-health
   signal. Budget slack (100ms fixed) prevents the budget and
   per-future cap from racing: a just-timed-out future is still
