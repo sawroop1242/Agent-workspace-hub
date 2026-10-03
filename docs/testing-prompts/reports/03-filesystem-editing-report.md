@@ -24,8 +24,8 @@
 | **`awh fs hash`** | **Not implemented** (SHA-256 hashing is exercised as the edit plane's `--expected-hash` stale guard and in `FileState`) |
 
 Prior suites already covering the edit family (inspected, reused, not duplicated):
-`tests/cli_fs_edit.rs` (16 CLI tests), `tests/acceptance_editing.rs` (24),
-`tests/acceptance_edit_gates.rs` (13), `tests/fs_coordination.rs` (26),
+`tests/cli_fs_edit.rs` (15 CLI tests), `tests/acceptance_editing.rs` (8),
+`tests/acceptance_edit_gates.rs` (3), `tests/fs_coordination.rs` (20),
 plus `src/services/edit.rs` unit tests and `src/mcp/workspace.rs` unit tests.
 
 ## 2. New evidence suite
@@ -129,7 +129,7 @@ including rollback-after-restart chains via
 semantics, ambiguous-match refusal, UTF-8 line boundaries, multi-hunk
 transactional failure, stale expected-state (hash/size/lines/context)
 rejection, crash/recovery, rollback idempotence + conflict: covered by the
-four prior suites listed in §1 (76 tests total), re-run green in this
+four prior suites listed in §1 (46 tests total), re-run green in this
 session as part of the full `--all-targets` gate (1412 passed / 0 failed).
 
 ### §20 Path safety — **Passed**
@@ -167,7 +167,7 @@ asserted (what one boundary wrote, the others read identically).
   `failed_coordinated_write_leaves_no_leftovers`.
 - **D (restart)**: prior `fs_state_survives_process_restart`,
   `mcp_restart_before_and_after_rollback`.
-- **E (concurrent)**: prior `fs_coordination.rs` (26 tests: interleave-free
+- **E (concurrent)**: prior `fs_coordination.rs` (20 tests: interleave-free
   concurrent writes, torn-state prevention, lock timeout fail-closed,
   deadlock-freedom for overlapping multi-file sets).
 
@@ -225,3 +225,38 @@ env -u COMPOSIO_API_KEY cargo test --all-targets
   behavior changed (the only diff outside tests/ is none).
 - Ordering assumptions asserted only where the public contract guarantees
   them (MCP list sorts; service list order explicitly not assumed).
+
+
+## 8. Kilo review round 1 — addressed
+
+The first Kilo review of this PR raised test-hardening points, all fixed in
+this revision:
+
+- **Unique sentinel + cleanup** (was: fixed `/tmp/outside-sentinel.txt`
+  shared by parallel runs): the outside sentinel is now
+  `outside-sentinel-<pid>.txt` and is removed at test end.
+- **Traversal rejects now pin the failure reason** ("path traversal is not
+  allowed" / "absolute paths are not allowed") instead of any-error, plus
+  a **positive control**: a benign interior write through the same tool
+  and session proves the rejects are containment, not blanket denial.
+- **Over-cap leak check now inspects the whole serialized JSON-RPC error**
+  (code/message/data) for file-byte canaries, not just `message`.
+- **`big.bin` now asserted**: the NUL-byte boundary — a 1024-byte NUL
+  file is valid UTF-8 yet classifies `BinaryFile` with exact size 1024
+  (the honest boundary next to `blob.bin`).
+- **`awh init` output asserted** (success + stderr), not discarded.
+- **Hermetic child processes**: all spawned `awh` children strip the
+  `AWH_*` and provider-variable ambient environment via the same
+  enumerated set as `tests/foundation_cli.rs`.
+- **Full-digest comparison actually pinned**: the corrupted vector now
+  corrupts the **last** hex character (a prefix-checking guard would
+  still reject a first-character corruption), and a **truncated
+  63-char digest** is asserted rejected (a `starts_with` guard would
+  accept it) — together these pin exact, full-length equality.
+- **Mis-citation fixed**: the path-normalization comment cited §34;
+  the actual rule is the repo's cross-platform path-assertion gotcha.
+- **Prior-suite counts corrected** (16/24/13/26 → 15/8/3/20 = 46).
+
+Two review comments (`src/mcp/providers.rs` provider-hang timeout,
+`tests/workspace_runtime_cli.rs` hermeticity/poisoning) concern files in
+PR #138's diff, not this PR's — flagged there instead.

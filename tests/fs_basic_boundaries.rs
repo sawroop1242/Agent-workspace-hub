@@ -36,6 +36,58 @@ use tower::util::ServiceExt;
 // Harness
 // ---------------------------------------------------------------------------
 
+/// `AWH_*` runtime variables the binary reads (mirrors the enumerated set
+/// in `tests/foundation_cli.rs`). Spawned `awh` children are stripped of
+/// these plus provider credentials so machine-local state can never
+/// change what a test observes.
+const SANITIZED_AWH_VARS: &[&str] = &[
+    "AWH_HOST",
+    "AWH_PORT",
+    "AWH_TLS_CERT",
+    "AWH_TLS_KEY",
+    "AWH_API_KEY",
+    "AWH_ALLOWED_ORIGINS",
+    "AWH_MAX_MCP_LINE_BYTES",
+    "AWH_MAX_HTTP_BODY_BYTES",
+    "AWH_MCP_REQUEST_TIMEOUT_SECS",
+    "AWH_HTTP_CLIENT_TIMEOUT_SECS",
+    "AWH_CIRCUIT_FAILURE_THRESHOLD",
+    "AWH_CIRCUIT_COOLDOWN_SECS",
+    "AWH_CONTEXT_ENABLED",
+    "AWH_CONTEXT_MEMORY_ENABLED",
+    "AWH_CONTEXT_AUTO_COMPRESS",
+    "AWH_CONTEXT_AUTO_OFFLOAD",
+    "AWH_CONTEXT_MAX_INPUT_TOKENS",
+    "AWH_CONTEXT_RESERVED_OUTPUT_TOKENS",
+    "AWH_CONTEXT_SAFETY_MARGIN_TOKENS",
+    "AWH_GLOBAL_SKILLS_ROOT",
+    "AWH_TRUST_DIR",
+    "AWH_BWRAP",
+    "AWH_NGROK_AUTHTOKEN",
+];
+const SANITIZED_PROVIDER_VARS: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "GITHUB_API_URL",
+    "GITHUB_DEFAULT_OWNER",
+    "GITHUB_DEFAULT_REPO",
+    "COMPOSIO_API_KEY",
+    "COMPOSIO_CONNECTED_ACCOUNT_ID",
+    "COMPOSIO_TOOLKIT",
+    "NGROK_AUTHTOKEN",
+];
+
+/// A hermetic `awh` child: ambient `AWH_*`/provider variables stripped
+/// (same rationale as `tests/foundation_cli.rs`).
+fn awh_in(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_awh"));
+    command.args(args).current_dir(dir);
+    for key in SANITIZED_AWH_VARS.iter().chain(SANITIZED_PROVIDER_VARS) {
+        command.env_remove(key);
+    }
+    command
+}
+
 /// One MCP tool call against the real in-process stdio server, with the
 /// session initialized exactly like a real client would.
 fn tool(server: &StdioMcpServer, name: &str, args: Value) -> Value {
@@ -202,16 +254,19 @@ fn mcp_read_file_handles_empty_large_missing_directory_and_overcap() {
     );
 
     // Over-cap read → the documented size error, and the response must
-    // not smuggle any of the file body back.
+    // not smuggle any of the file body back — checked against the whole
+    // serialized error object (code, message, and any data field), not
+    // just the message string.
     let error = tool_error(&server, "workspace.read_file", json!({"path": "over.txt"}));
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
         message.to_lowercase().contains("2 mib"),
         "over-cap read must name the documented 2 MiB limit: {error}"
     );
+    let serialized = error.to_string();
     assert!(
-        !message.contains("yyyyy"),
-        "over-cap read must not return file bytes"
+        !serialized.contains("yyyy"),
+        "over-cap read must not return file bytes anywhere in the response: {serialized}"
     );
 }
 
@@ -299,32 +354,50 @@ fn mcp_write_file_creates_overwrites_and_is_deterministic() {
 fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    // A sentinel OUTSIDE the workspace: the negative proof for §20.
-    let outside = dir.path().parent().unwrap().join("outside-sentinel.txt");
+    // A sentinel OUTSIDE the workspace: the negative proof for §20. The
+    // name is process-unique (the OS temp dir is shared by parallel test
+    // runs and CI jobs) and the file is removed at the end.
+    let sentinel_name = format!("outside-sentinel-{}.txt", std::process::id());
+    let outside = dir.path().parent().unwrap().join(&sentinel_name);
     std::fs::write(&outside, "do not touch\n").unwrap();
 
     let server = server_over(root);
-    for escape in ["../outside-sentinel.txt", "a/../../outside-sentinel.txt"] {
+    for escape in ["../", "a/../../"] {
         let error = tool_error(
             &server,
             "workspace.write_file",
-            json!({"path": escape, "content": "escaped"}),
+            json!({"path": format!("{escape}{sentinel_name}"), "content": "escaped"}),
         );
+        // Failure reason pinned: the containment error, not a generic
+        // refusal (a schema/policy regression would produce a different
+        // reason and fail this assert).
+        let message = error["message"].as_str().unwrap_or_default();
         assert!(
-            error["code"].as_i64().is_some(),
-            "traversal write must fail: {escape} → {error}"
+            message.contains("traversal is not allowed"),
+            "traversal write must fail with the containment error: {escape} → {error}"
         );
     }
-    // Absolute paths are also refused.
+    // Absolute paths are also refused, with their own documented reason.
     let error = tool_error(
         &server,
         "workspace.write_file",
         json!({"path": outside.to_string_lossy(), "content": "escaped"}),
     );
+    let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        error["code"].as_i64().is_some(),
-        "absolute write refused: {error}"
+        message.contains("absolute paths are not allowed"),
+        "absolute write refused with the documented reason: {error}"
     );
+
+    // Positive control: the same tool, same session, accepts a benign
+    // interior write — so the rejects above prove containment, not a
+    // blanket-denial regression.
+    tool(
+        &server,
+        "workspace.write_file",
+        json!({"path": "interior.txt", "content": "fine"}),
+    );
+    assert_eq!(real_file_bytes(root, "interior.txt"), b"fine");
 
     // The protected outside file is byte-for-byte untouched, and no user
     // artifact leaked inside the workspace (`.agent/` is the server's own
@@ -338,10 +411,11 @@ fn mcp_write_file_rejects_traversal_without_touching_the_outside_file() {
         .unwrap()
         .filter_map(|entry| {
             let name = entry.ok()?.file_name().to_string_lossy().into_owned();
-            (name != ".agent").then_some(name)
+            (name != ".agent" && name != "interior.txt").then_some(name)
         })
         .collect();
     assert!(residue.is_empty(), "no residue inside root: {residue:?}");
+    std::fs::remove_file(&outside).expect("clean up sentinel");
 }
 
 #[test]
@@ -468,6 +542,16 @@ fn service_meta_classifies_kind_reports_size_and_tracks_mutation() {
     let binary = files.meta("blob.bin").expect("binary meta");
     assert!(binary.kind == agent_workspace_hub::services::files::PathKind::BinaryFile);
 
+    // The NUL-byte boundary: a 1024-byte NUL-filled file is valid UTF-8,
+    // yet the binary heuristic classifies it BinaryFile (a NUL byte in
+    // the head is the documented binary marker) — with the exact size.
+    let big = files.meta("big.bin").expect("big meta");
+    assert!(
+        big.kind == agent_workspace_hub::services::files::PathKind::BinaryFile,
+        "NUL-filled file must classify as binary: {big:?}"
+    );
+    assert_eq!(big.size, 1024);
+
     // §8 "changed file after mutation": size must track the new state.
     std::fs::write(root.join("text.txt"), "hello world, longer now\n").unwrap();
     let changed = files.meta("text.txt").expect("changed meta");
@@ -522,8 +606,8 @@ fn service_search_matrix_zero_one_many_repeated_case_unicode_limit() {
     // Many matches across files, nested dirs included, binary skipped,
     // case-insensitive per the documented substring semantics. Paths are
     // normalized to forward slashes before comparison: the service layer
-    // returns OS-native separators (the portable contract), and this
-    // suite runs on Windows too (§34: never assert raw path strings).
+    // returns OS-native separators, and this suite runs on Windows too
+    // (the repo's cross-platform rule: never assert raw path strings).
     let hits = files.search("parser", 100).unwrap();
     let paths: Vec<String> = hits.iter().map(|hit| hit.path.replace('\\', "/")).collect();
     for expected in [
@@ -591,19 +675,23 @@ fn service_search_matrix_zero_one_many_repeated_case_unicode_limit() {
 fn cli_expected_hash_guard_matches_independent_published_vectors() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    Command::new(env!("CARGO_BIN_EXE_awh"))
-        .args(["init", "--path", "."])
-        .current_dir(root)
+    let init = awh_in(root, &["init", "--path", "."])
         .output()
         .expect("init workspace");
+    assert!(
+        init.status.success(),
+        "awh init must succeed (later assertions depend on it): {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
 
     // sha256("abc") = ba7816bf... (FIPS 180-4 example). File content is
     // exactly "abc" — no trailing newline, so the hash of the file IS
     // the published vector.
     std::fs::write(root.join("vector.txt"), "abc").unwrap();
 
-    let ok = Command::new(env!("CARGO_BIN_EXE_awh"))
-        .args([
+    let ok = awh_in(
+        root,
+        &[
             "fs",
             "replace",
             "vector.txt",
@@ -612,10 +700,10 @@ fn cli_expected_hash_guard_matches_independent_published_vectors() {
             "--expected-hash",
             // sha256("abc"), lowercase hex — the documented format.
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        ])
-        .current_dir(root)
-        .output()
-        .expect("replace with correct vector");
+        ],
+    )
+    .output()
+    .expect("replace with correct vector");
     assert!(
         ok.status.success(),
         "published-vector hash must authorize the edit: {}",
@@ -623,36 +711,66 @@ fn cli_expected_hash_guard_matches_independent_published_vectors() {
     );
     assert_eq!(real_file_bytes(root, "vector.txt"), b"xyz");
 
-    // One hex character off → conflict (exit 4), bytes unchanged. This
-    // pins that the guard compares the FULL digest, not a prefix.
+    // LAST hex character corrupted → conflict (exit 4), bytes unchanged.
+    // Corrupting the tail is what pins a full-digest comparison: a
+    // prefix-checking guard would accept every character after its
+    // cutoff, so only comparing through the final character rejects this.
     std::fs::write(root.join("vector.txt"), "abc").unwrap();
-    let conflict = Command::new(env!("CARGO_BIN_EXE_awh"))
-        .args([
+    let conflict = awh_in(
+        root,
+        &[
             "fs",
             "replace",
             "vector.txt",
             "abc",
             "xyz",
             "--expected-hash",
-            "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        ])
-        .current_dir(root)
-        .output()
-        .expect("replace with corrupted vector");
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ac",
+        ],
+    )
+    .output()
+    .expect("replace with tail-corrupted vector");
     assert_eq!(
         conflict.status.code(),
         Some(4),
-        "stale hash must exit 4 (conflict): stdout={} stderr={}",
+        "tail-corrupted hash must exit 4 (conflict): stdout={} stderr={}",
         String::from_utf8_lossy(&conflict.stdout),
         String::from_utf8_lossy(&conflict.stderr)
+    );
+    assert_eq!(real_file_bytes(root, "vector.txt"), b"abc");
+
+    // A TRUNCATED digest (63 chars — the correct digest minus its last
+    // character) must also be rejected: a `starts_with`-style guard would
+    // accept it, so this pins exact full-length equality.
+    std::fs::write(root.join("vector.txt"), "abc").unwrap();
+    let truncated = awh_in(
+        root,
+        &[
+            "fs",
+            "replace",
+            "vector.txt",
+            "abc",
+            "xyz",
+            "--expected-hash",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a",
+        ],
+    )
+    .output()
+    .expect("replace with truncated vector");
+    assert!(
+        !truncated.status.success(),
+        "truncated digest must be rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&truncated.stdout),
+        String::from_utf8_lossy(&truncated.stderr)
     );
     assert_eq!(real_file_bytes(root, "vector.txt"), b"abc");
 
     // The empty-file vector (sha256("") = e3b0c442...) authorizes an
     // insert into a genuinely empty file.
     std::fs::write(root.join("empty.txt"), b"").unwrap();
-    let ok = Command::new(env!("CARGO_BIN_EXE_awh"))
-        .args([
+    let ok = awh_in(
+        root,
+        &[
             "fs",
             "insert",
             "empty.txt",
@@ -660,10 +778,10 @@ fn cli_expected_hash_guard_matches_independent_published_vectors() {
             "seeded",
             "--expected-hash",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        ])
-        .current_dir(root)
-        .output()
-        .expect("insert with empty vector");
+        ],
+    )
+    .output()
+    .expect("insert with empty vector");
     assert!(
         ok.status.success(),
         "empty-file vector must authorize the insert: {}",
