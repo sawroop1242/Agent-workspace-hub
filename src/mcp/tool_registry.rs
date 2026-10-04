@@ -309,7 +309,7 @@ static REGISTRY: &[ToolDefinition] = &[
     // ---- git.* ----
     awh_tool!(
         "git.branch",
-        "Create or switch a git branch",
+        "Show the current git branch name",
         "git",
         Medium,
         [Filesystem]
