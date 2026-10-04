@@ -50,6 +50,9 @@ impl GitWorkspace {
         // through the awh CLI (which has no git subcommand).
         for args in [
             &["init", "--quiet"][..],
+            // Windows runners ship machine-wide core.autocrlf=true — pin
+            // repo-local to keep checkouts byte-exact (PR #129 lesson).
+            &["config", "core.autocrlf", "false"][..],
             &["config", "user.email", "tp04-wt@example.invalid"][..],
             &["config", "user.name", "TP04 WT"][..],
         ] {
@@ -254,9 +257,23 @@ fn worktree_identity_persists_across_independent_processes() {
     }
 
     // Git itself (the ultimate oracle) lists the checkout on the branch.
+    // NOTE: git reports CANONICALIZED paths (macOS resolves /var →
+    // /private/var), so compare canonical-to-canonical, never raw-to-
+    // canonical (PR #129 lesson).
     let porcelain = git_ok(&ws.root, &["worktree", "list", "--porcelain"]);
-    let checkout_line = format!("worktree {}", ws.checkout(&id).display());
-    let listed = porcelain.lines().any(|l| l == checkout_line);
+    let listed = porcelain.lines().any(|l| {
+        if let Some(listed_path) = l.strip_prefix("worktree ") {
+            let a = std::fs::canonicalize(listed_path);
+            let b = std::fs::canonicalize(ws.checkout(&id));
+            match (a, b) {
+                (Ok(a), Ok(b)) => a == b,
+                // Both must fail identically for a fall-through raw match.
+                _ => listed_path == ws.checkout(&id).display().to_string(),
+            }
+        } else {
+            false
+        }
+    });
     assert!(listed, "git lists the managed checkout:\n{porcelain}");
     let branch_line = format!("branch refs/heads/{branch}");
     assert!(

@@ -70,6 +70,11 @@ impl Repo {
         let dir = tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         git(&root, &["init", "--quiet"]);
+        // Pin newline handling: Windows runners ship machine-wide
+        // core.autocrlf=true, which would smudge every checkout to CRLF
+        // and break byte-exact content assertions. Repo-local scope beats
+        // system/global config (PR #129 lesson).
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "user.email", "tp04@example.invalid"]);
         git(&root, &["config", "user.name", "TP04"]);
         std::fs::write(root.join("README.md"), "base\n").unwrap();
@@ -792,6 +797,8 @@ impl McpWorkspace {
             .output()
             .expect("awh init");
         git(&root, &["init", "--quiet"]);
+        // Same autocrlf pin as Repo::new — Windows runner smudge guard.
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "user.email", "tp04-mcp@example.invalid"]);
         git(&root, &["config", "user.name", "TP04 MCP"]);
         std::fs::write(root.join("README.md"), "base\n").unwrap();
@@ -1006,6 +1013,8 @@ impl ApiWorkspace {
         let dir = tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         git(&root, &["init", "--quiet"]);
+        // Same autocrlf pin as Repo::new — Windows runner smudge guard.
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "user.email", "tp04-api@example.invalid"]);
         git(&root, &["config", "user.name", "TP04 API"]);
         std::fs::write(root.join("README.md"), "base\n").unwrap();
