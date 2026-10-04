@@ -18,15 +18,23 @@ on:
 
 jobs:
   kilo-review:
-    if: |
+    if: >-
       github.event_name == 'pull_request' ||
-      contains(github.event.comment.body, '/kilo') ||
-      contains(github.event.comment.body, '/kc')
+      (github.event_name == 'pull_request_review_comment' &&
+       (contains(github.event.comment.body, '/kilo') || contains(github.event.comment.body, '/kc'))) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       (contains(github.event.comment.body, '/kilo') || contains(github.event.comment.body, '/kc')))
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # pull-requests/issues write only - this job reviews and comments, it
+    # never needs to modify repository content. contents: write was removed;
+    # if a real run proves Kilo's action needs it for something internal,
+    # that's a one-line, easy-to-justify revert - starting from least
+    # privilege instead of granting it preemptively.
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
       issues: write
 
