@@ -714,3 +714,85 @@ tested create-equivalent (report classifies the surface honestly).
 - Composio key note: upstream rejects test key ck_cNOS...5YZB with 401
   APIKey_InvalidAPIKey - useful only for negative-path tests; unset
   COMPOSIO_API_KEY for full suite runs.
+
+
+- **Audit-redaction masks long identifiers** (TP03): `redact_token_like`
+  treats `_` as part of a base62 run, so any identifier >=16 chars
+  becomes `[redacted]` in the audit record's subject/detail. Consequence
+  for PRODUCT code: keep audit `reason` strings SHORT (<16 chars, e.g.
+  `list_failed`/`list_timeout` in providers.rs) so they persist verbatim
+  and the ring can distinguish failure modes. For TESTS: assert on
+  action + subject by default; asserting `detail` is only safe for
+  known-short reason strings.
+- **Per-provider isolation in aggregate_tools** (TP03 Kilo reviews):
+  TWO bounds, both required. (1) Bounded concurrency window:
+  `stream::iter(...).buffer_unordered(PROVIDER_LIST_CONCURRENCY)` (8)
+  so N providers never burst N simultaneous outbound HTTP requests.
+  (2) Aggregate budget: the WHOLE listing phase is wrapped in
+  `tokio::time::timeout(effective_cap + PROVIDER_LIST_BUDGET_SLACK,
+  ...)` - on exhaustion providers not yet listed are skipped+audited
+  with the DISTINCT reason `list_budget` (per-future cap gives
+  `list_timeout`, failure gives `list_failed`), so one tools/list
+  completes in ~one cap regardless of N. Without (2), ceil(N/8)
+  hung providers stretch tools/list to ceil(N/8) x 20s (~140s at 50
+  providers) and stdio `handle()` has NO outer request deadline (the
+  HTTP plane's 30s TimeoutLayer never sees stdio). The dispatcher
+  awaits aggregate_tools holding the registry read guard - keep that
+  window ~one cap. START order is ROTATED by a per-instance AtomicU64
+  round-robin (`start_rotation`): with a sorted start order the
+  budget would deterministically truncate the alphabetically-LAST
+  providers on every call (Kilo round 5); rotation spreads truncation
+  fairly across the id space. Results are re-sorted by provider id
+  (stable ORDER; membership is sticky via the per-provider last_good
+  cache). On budget truncation a provider with a cached listing is
+  SERVED from cache (audited list_stale - membership is sticky
+  across budget truncations until unregister; MCP clients cache
+  tools/list, so a tool vanishing between identical calls is a
+  correctness break, Kilo round 6); only a never-listed provider is
+  skipped (list_budget). unregister() PURGES the last_good entry, so a
+  re-registered id (composio re-registration, custom MCP servers
+  rebuilt from config on every dispatcher construct) can never serve
+  the previous instance's listing (Kilo round 8). register() is an
+  UPSERT that purges too - composio re-registration writes
+  composio:{label} straight into a live registry without unregistering
+  first (Kilo round 9; round 10: capture the id ONCE in register so
+  the purge key and the insert key can never diverge). unregister's
+  purge is pinned only by the #[cfg(test)] cached_listing_count()
+  inspector - a lingering entry after remove-without-re-add is
+  observable as memory alone, never behaviorally (it cannot be
+  served and any future register purges it). Cache lock is fail-safe
+  on poisoning
+  (unwrap_or_else(into_inner) - the map is structurally valid); NEVER
+  `if let Ok(lock)` on this cache: a poisoned lock must not silently
+  skip serve/purge (round 9). Hung/failed
+  providers are STILL dropped -
+  truncation is our scheduling artifact, a hang is a provider-health
+  signal. Budget slack (100ms fixed) prevents the budget and
+  per-future cap from racing: a just-timed-out future is still
+  COLLECTED (audited list_timeout), only still-listing ones take
+  list_budget/list_stale. Tests shrink the cap PER INSTANCE via `#[cfg(test)]
+  ProviderRegistry::with_list_timeout(cap)` (rejects zero - a zero
+  cap silently empties the catalog; field `list_timeout_override:
+  Option<Duration>`, `None` under Default) - NEVER a process-global
+  atomic/env override (parallel tests clobber each other; env
+  overrides leak into release builds).
+- **buffer_unordered + async closures**: `stream::iter(...).map(|
+  x| async move {...}).buffer_unordered(n)` hits the rustc
+  "implementation of FnOnce is not general enough" inference bug
+  unless the closure param is explicitly typed (`|p: &String|`) AND
+  the futures are collected into a Vec first (`.collect::<Vec<_>>()`
+  before `stream::iter`) - see aggregate_tools.
+- **Traversal-proof sentinel layout** (fs_basic_boundaries.rs): the
+  escapes `../<name>` resolve against the workspace ROOT'S PARENT, so
+  the sentinel must sit DIRECTLY in the parent TempDir with the root as
+  its sibling child (`parent.join("workspace-root")`), or the negative
+  proof asserts a file no escape actually targets. Keep the
+  process-unique name (shared OS temp area).
+- **Spawned-awh hermeticity** (TP03): the `AWH_*`/provider strip list
+  has ONE source, `tests/common/mod.rs` (`#[path = "common/mod.rs"] mod
+  common;`), consumed by foundation_cli.rs, workspace_runtime_cli.rs,
+  fs_basic_boundaries.rs via `common::sanitized_command(dir, args)`.
+  When src/ grows a new `AWH_*` read, add it THERE (one edit; all suites
+  inherit). Test fixtures that must survive a panic should live in
+  their own `tempdir()` (Drop-based cleanup), not in success-path
+  remove_file calls.

@@ -18,14 +18,17 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tempfile::tempdir;
 
+#[path = "common/mod.rs"]
+mod common;
+
 /// Runs `awh <args>` inside `dir`, returns (exit-success, stdout, stderr).
+/// Hermetic: ambient `AWH_*`/provider variables are stripped from the
+/// child (see `tests/common/mod.rs` — the single source of the strip
+/// list, shared with the sibling CLI suites).
 fn run(dir: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_awh"))
-        .args(args)
-        .current_dir(dir)
+    let output = common::sanitized_command(dir, args)
         .output()
         .expect("spawn awh binary");
     (
@@ -382,9 +385,16 @@ fn wrong_prefix_workspace_id_is_accepted_by_documented_design() {
     let (ok, _, err) = run(root, &["init"]);
     assert!(ok, "{err}");
     let path = manifest_path(root);
-    let edited = fs::read_to_string(&path)
-        .unwrap()
-        .replace("\"workspace_id\": \"ws-", "\"workspace_id\": \"xx-");
+    let original = fs::read_to_string(&path).unwrap();
+    let edited = original.replace("\"workspace_id\": \"ws-", "\"workspace_id\": \"xx-");
+    // The poisoning must actually change the bytes, or the test below
+    // would assert "already initialized" on an untouched manifest and
+    // prove nothing. (Guards against a formatting change — compact
+    // serialization, different spacing — silently no-opping the replace.)
+    assert!(
+        edited != original,
+        "poisoning failed to change the manifest; the test premise is broken:\n{original}"
+    );
     fs::write(&path, edited.clone()).unwrap();
 
     let (ok, out, err) = run(root, &["init"]);
