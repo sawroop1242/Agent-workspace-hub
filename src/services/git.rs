@@ -111,10 +111,19 @@ impl GitService {
 
     /// Runs `git <args>` in the repository with an argument vector,
     /// failing on a non-zero exit so git errors are never mistaken for
-    /// success.
+    /// success. Some git failures print their diagnostics to stdout with
+    /// an EMPTY stderr (e.g. `git commit` with nothing staged exits 1 and
+    /// prints "nothing to commit, working tree clean" to stdout), so the
+    /// exit code alone — not stderr emptiness — decides failure; the
+    /// message falls back to stdout when stderr carries nothing.
     async fn run(&self, args: &[&str]) -> Result<GitOutput> {
         let output = self.run_raw(args).await?;
-        if !output.stderr.is_empty() && output.exit_code != Some(0) {
+        if output.exit_code != Some(0) {
+            let detail = if output.stderr.trim().is_empty() {
+                output.stdout.trim()
+            } else {
+                output.stderr.trim()
+            };
             bail!(
                 "git {} failed ({}): {}",
                 args.first().unwrap_or(&""),
@@ -122,7 +131,7 @@ impl GitService {
                     .exit_code
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "no exit".into()),
-                output.stderr.trim()
+                detail
             );
         }
         Ok(output)
