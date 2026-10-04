@@ -687,3 +687,30 @@ Gotchas learned:
   under set -e before you can assert; use the if-form to capture rc.
 - rust toolchain was wiped AGAIN mid-session; rustup reinstall recipe in
   this file works.
+
+**TP02: workspace runtime verification (PR #138, branch testing-tp02-workspace-runtime, 2026-09/10)**:
+suite tests/workspace_runtime_cli.rs (11 executable tests, real binary) + report
+docs/testing-prompts/reports/02-workspace-runtime-report.md. Final-target
+`awh workspace list|open|info|remove` do NOT exist; `awh init [--path]` is the
+tested create-equivalent (report classifies the surface honestly).
+- **Defect found+fixed (src/mcp/providers.rs)**: `aggregate_tools()` propagated
+  one provider's list_tools failure via `?`, so an invalid COMPOSIO_API_KEY
+  removed ALL 73 tools from tools/list (opencode: "Failed to get tools"). Now
+  isolates per provider (warn + audit dynamic_provider_rejected + skip);
+  regression test `aggregate_tools_isolates_failing_providers`. connector.tools
+  {provider} still surfaces the real upstream error.
+- **NEW Windows gotcha (extends the canonicalize one)**: manifest
+  `workspace_root` on Windows is the verbatim `\\?\C:\...` canonical form AND
+  its backslashes are JSON-escaped in the file BYTES, so raw-text
+  `manifest.contains(canonical_path_str)` ALWAYS fails on Windows CI while
+  passing on Linux/macOS. Assert by parsing the manifest and comparing the
+  VALUE: `serde_json::from_str(...)["workspace_root"] == canonicalize()`.
+- **Kilo PR-REVIEW infra**: the kilo-review job (timeout-minutes: 10,
+  nvidia_nim/z-ai/glm-5.3) can hang and be cancelled at exactly 10m with ZERO
+  findings posted (no reviews/comments) - that is an infra timeout, not a
+  review verdict; branch protection requires no checks. TP01 saw the same
+  pattern. Rerun via `gh run rerun <id> --failed`; if it re-times out, note it
+  in the PR and proceed.
+- Composio key note: upstream rejects test key ck_cNOS...5YZB with 401
+  APIKey_InvalidAPIKey - useful only for negative-path tests; unset
+  COMPOSIO_API_KEY for full suite runs.

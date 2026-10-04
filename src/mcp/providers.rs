@@ -102,7 +102,28 @@ impl ProviderRegistry {
     pub async fn aggregate_tools(&self) -> Result<Vec<ToolDescriptor>> {
         let mut out = Vec::new();
         for provider in self.providers() {
-            for mut tool in self.tools(&provider).await? {
+            // Fail closed per provider, not per plane: one unhealthy
+            // provider (bad credentials, unreachable backend) must not
+            // take down the whole tools/list advertisement. Its tools are
+            // simply absent; direct per-provider listing (`connector.tools`)
+            // still surfaces the real error for diagnosis.
+            let listed = match self.tools(&provider).await {
+                Ok(listed) => listed,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %provider,
+                        error = %error,
+                        "dynamic provider tool listing failed; skipping provider"
+                    );
+                    crate::mcp::audit::audit_deny(
+                        "dynamic_provider_rejected",
+                        "provider_list_failed",
+                        &provider,
+                    );
+                    continue;
+                }
+            };
+            for mut tool in listed {
                 tool.name = format!("{}.{}", provider, tool.name);
                 if tool.description.is_empty() {
                     tool.description = format!("Tool provided by {provider}");
@@ -311,5 +332,51 @@ mod tests {
         // Unregistering an id that was never (or no longer) present reports
         // false rather than erroring, mirroring the *Mcp stores' remove().
         assert!(!registry.unregister("demo"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_tools_isolates_failing_providers() {
+        // Regression: an unhealthy provider (bad credentials / unreachable
+        // backend) used to poison the WHOLE tools/list advertisement via `?`.
+        // One external SaaS outage must not hide the 73 static tools.
+        let mut registry = ProviderRegistry::default();
+        registry.register(Box::new(GatewayProvider::new(
+            "good",
+            || Ok(vec![descriptor("ping")]),
+            |_t, _a| {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            },
+        )));
+        registry.register(Box::new(GatewayProvider::new(
+            "bad",
+            || Err(anyhow::anyhow!("Composio API returned 401 Unauthorized")),
+            |_t, _a| {
+                Ok(ToolCallResult {
+                    content: vec![],
+                    is_error: false,
+                })
+            },
+        )));
+
+        let aggregated = registry
+            .aggregate_tools()
+            .await
+            .expect("aggregate listing must survive one failing provider");
+        let names: Vec<&str> = aggregated.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"good.ping".to_string().as_str()),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|n| n.starts_with("bad.")), "{names:?}");
+
+        // The skip is observable: a deny audit event names the provider.
+        let denied = crate::services::audit::global()
+            .recent(200)
+            .into_iter()
+            .any(|e| e.action == "dynamic_provider_rejected" && e.subject == "bad");
+        assert!(denied, "expected a dynamic_provider_rejected audit event");
     }
 }
