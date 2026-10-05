@@ -796,3 +796,38 @@ tested create-equivalent (report classifies the surface honestly).
   inherit). Test fixtures that must survive a panic should live in
   their own `tempdir()` (Drop-based cleanup), not in success-path
   remove_file calls.
+
+- **TP05 (capability-and-policy) — branch tp05-capability-policy-verification**:
+  new suite tests/capability_policy_boundaries.rs (12 tests, 1456 workspace-wide
+  green). Fills the cross-surface gaps the per-layer suites leave open; NO
+  production defects found this round. Key facts pinned: (1) CLI/enforcement
+  coherence — `awh agent grant --permission filesystem --scope src` (LONG FLAG,
+  not positional) writes the SAME CapabilityGrantStore record the dispatcher gate
+  reads; revoke takes the DERIVED id `{agent}-{permission}` (e.g.
+  alpha-filesystem), and a fresh dispatcher over the root honors it. (2) `agent
+  revoke` of a MISSING grant exits 0 + "grant not found: <id>" on stdout —
+  deliberately idempotent, pinned by tests/agent_cli.rs; the ghost-id bail!
+  discipline list in this file deliberately EXCLUDES agent revoke. Re-granting
+  the same pair OVERWRITES (store keyed by id) — one record, latest scope wins,
+  deterministic. (3) grant_is_expired is `expiry <= now` (boundary instant
+  already expired); expiry is enforced LIVE on every call — a grant 2s ahead
+  authorizes, 2.5s later the identical call from the SAME session is -32005
+  (bounded sleep is the prompt-sanctioned way to observe temporal transitions; no
+  injectable clock exists). (4) tools/list FAILS CLOSED to the empty static
+  catalog when the grant store is unreadable (listing can never advertise more
+  than it can authorize) — in addition to tools/call erroring. (5) Precedence
+  cell pinned on the wire: no-capability + matching deny rule → -32005
+  (capability), NOT -32004; policy is never consulted for a no-cap caller. (6)
+  Policy path patterns are COMPONENT-boundary prefixes: deny "src/foo" denies
+  src/foo/x.txt and src/foo itself but ALLOWS sibling src/foobar.txt; empty
+  pattern denies nothing; traversal-shaped patterns never match legitimate
+  paths. Not implemented (honestly classified): `awh capability *` family,
+  `awh policy show|check|validate|explain`, fine-grained
+  filesystem.read/write resource model, PolicyEngine allow rules. Permission
+  vocabulary = 5 categories (network, filesystem, environment, process,
+  secrets) shared between grants and tool required_permissions.
+  Test-engineering: bound sessions constructed exactly as /{agent}/sse does
+  (resolve_route_agent → to_session_identity → write-once set_caller);
+  ManuallyDrop<TempDir> workspaces (durable audit store holds first root);
+  full-grant awh.builtin injected via with_trust_store so capability+policy are
+  the deciding layers; hermetic CLI children via common::sanitized_command.
