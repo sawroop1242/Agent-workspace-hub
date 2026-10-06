@@ -701,22 +701,29 @@ fn rollback_authorization_denial_leaves_filesystem_untouched() {
         "fn edited() {}\n"
     );
 
-    // Resolve the durable edit id from the provenance store.
-    let edit_id = {
-        let dir_listing =
-            std::fs::read_dir(root.join(".agent/provenance")).expect("provenance dir");
-        let mut ids: Vec<String> = dir_listing
-            .filter_map(|entry| entry.ok().map(|e| e.path().to_string_lossy().to_string()))
-            .collect();
-        assert_eq!(ids.len(), 1, "exactly one edit in this workspace");
-        ids.pop()
-            .unwrap()
-            .trim_end_matches(".json")
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_owned()
-    };
+    // The caller holds the exact id the edit result handed back — the
+    // production contract for a later rollback request. (Extracting it
+    // from a directory listing would depend on the platform's path
+    // separator; the returned id is the authoritative durable identity.)
+    let edit_id = service
+        .replace_as(
+            &operator,
+            EditTransaction::new(vec![
+                agent_workspace_hub::services::edit::EditOperation::Replace {
+                    path: "src/main.rs".to_owned(),
+                    old: "edited".to_owned(),
+                    new: "edited2".to_owned(),
+                    occurrence: None,
+                },
+            ]),
+        )
+        .expect("second operator edit lands")
+        .id
+        .to_string();
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
+        "fn edited2() {}\n"
+    );
 
     // Agent WITHOUT any capability grant → denial before any mutation.
     register_agent(root, "agent-none");
@@ -733,7 +740,7 @@ fn rollback_authorization_denial_leaves_filesystem_untouched() {
     );
     assert_eq!(
         std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
-        "fn edited() {}\n",
+        "fn edited2() {}\n",
         "denied rollback mutates nothing"
     );
 
@@ -757,18 +764,19 @@ fn rollback_authorization_denial_leaves_filesystem_untouched() {
     );
     assert_eq!(
         std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
-        "fn edited() {}\n"
+        "fn edited2() {}\n"
     );
 
     // A denied history never corrupts the recovery chain: the trusted
-    // operator still restores the edit exactly.
+    // operator still restores the edit exactly (to edit_two's pre-edit
+    // state).
     let status = service
         .rollback_edit(&operator, &edit_id)
         .expect("operator rollback after denials");
     assert!(matches!(status, EditRollbackStatus::Restored), "{status:?}");
     assert_eq!(
         std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
-        "fn original() {}\n"
+        "fn edited() {}\n"
     );
 }
 
