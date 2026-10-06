@@ -414,11 +414,14 @@ fn run_inner(command: FsCommand, root: &Path) -> Result<(), FsError> {
                 }
                 other => FsError::Recovery(other.to_string()),
             })?;
-            // Read-only integrity check of the whole recovery chain:
-            // the manifest load verifies schema, ids, sequence, and every
-            // content blob's length + SHA-256 without mutating anything.
-            store
-                .load(&provenance.snapshot_id)
+            // Read-only integrity check of the WHOLE recovery chain
+            // through the canonical recovery boundary: provenance →
+            // manifest (schema, ids, every content blob's length +
+            // SHA-256) → the edit→snapshot binding — a record whose
+            // snapshot belongs to a different edit is NOT verified
+            // recovery material, even when its bytes are intact.
+            let view = store
+                .recovery_view(&edit_id)
                 .map_err(|error| FsError::Recovery(error.to_string()))?;
             if json {
                 println!(
@@ -428,13 +431,13 @@ fn run_inner(command: FsCommand, root: &Path) -> Result<(), FsError> {
                         "status": "verified",
                         "edit_id": edit_id,
                         "snapshot_id": provenance.snapshot_id.to_string().as_str(),
-                        "entries": provenance.paths.len(),
+                        "entries": view.len(),
                     })
                 );
             } else {
                 println!(
                     "edit {edit_id} recovery material verified ({} path(s))",
-                    provenance.paths.len()
+                    view.len()
                 );
             }
             Ok(())
