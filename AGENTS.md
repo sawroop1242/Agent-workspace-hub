@@ -871,3 +871,49 @@ tested create-equivalent (report classifies the surface honestly).
   `as_chunks::<64>()` over `chunks_exact(64)`; giant Vec-equality
   asserts on byte fixtures produce unusable failure output — compare
   per-path with path-tagged messages instead.
+
+- **TP07 (rollback & recovery) — branch tp07-rollback-recovery-verification**:
+  suite tests/rollback_recovery_boundaries.rs (14 tests) — ZERO production
+  defects found; three sharp behaviors PINNED AS CONTRACTS: (1) repeat
+  rollback after success with NEWER content on the same file → Conflict
+  exit 4 (bytes matching NEITHER produced state NOR pre-edit state are
+  an external change; only an exact pre-edit match yields the
+  already_rolled_back no-op); (2) AWE-010 record-surface repeat
+  (rollback_edits_as on a deleted created file) → Conflict "target
+  disappeared" (one-shot execution material; the edit-id surface owns
+  idempotent triage); (3) malformed edit ids → CLI exit 1 via
+  PatchValidationFailure (map_edit_error maps PatchPreparationFailure
+  to 5 but ValidationFailure falls to the generic catch-all) while
+  unknown-but-well-formed ids → exit 5. Key pinned flows: multi-file
+  patch via `fs patch <file.json>` ({"operations":[{path,old,new},...]})
+  gives ONE edit id across files; complete preflight blocks every
+  restoration on a single conflicted file; mixed-state retry (§K) —
+  after a partial restore, the retry SKIPS already-restored targets
+  (byte-identical, never re-restored, never a conflict on them),
+  refuses while any target conflicts, then completes only pending
+  files after the conflict clears. Created-file semantics are exercised
+  via capture_rollback_records + rollback_edits_as because NO
+  production executor creates files (durable created-file derivation —
+  provenance path ∉ manifest — is implemented but unreachable);
+  created files delete ONLY while still the exact produced state; an
+  externally-changed created file is never deleted. Authorization:
+  EditAuthorizer evaluates CapabilityGrant{permission: Filesystem,
+  scope prefix} — agent w/o grant and out-of-scope grant both →
+  AuthorizationDenied with ZERO filesystem mutation, and the operator
+  can still roll back after denials. Identity: provenance records
+  editor agent/session; a DIFFERENT granted agent may roll back
+  (capability is authority) and the correlation never rewrites the
+  original editor identity. Concurrency: two real processes racing the
+  same edit id — at most one restored, loser ∈ {already_rolled_back,
+  conflict}, final bytes exact. Audit durable log lives at
+  .agent/audit/audit.log (NOT .agent/audit.log). Test gotchas: (a)
+  fs insert CLI args are POSITIONAL (`fs insert <PATH> <LINE>
+  <CONTENT>`), no --line/--content flags; (b) std::fs::write to a
+  nested path panics NotFound — create_dir_all the parent first;
+  (c) an 8 MiB file edited with a length-CHANGING replace exceeds
+  MAX_FILE_BYTES on the write (prepared content grows past limit) —
+  use an equal-length token for boundary fixtures; (d) Permission is
+  exported from mcp::permissions, not services::authorization;
+  EditResult's edit id field is `id` (not edit_id); (e) moving a
+  String into a thread closure for a spawned racer requires a clone
+  for the second use.
