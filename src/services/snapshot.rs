@@ -399,11 +399,20 @@ impl SnapshotStore {
         // Canonical workspace-relative path validation (§6.3): reject
         // absolute/traversal/ambiguous/unsafe paths BEFORE persistence,
         // reusing the edit model's validator rather than a second
-        // normalization.
+        // normalization. §7: one logical path may also appear exactly
+        // once — a manifest must never carry two ambiguous
+        // representations of the same resource.
+        let mut seen_paths = std::collections::HashSet::with_capacity(files.len());
         for file in files {
             crate::services::edit::validate_path(file.path()).map_err(|e| {
                 SnapshotError::InvalidId(format!("snapshot path {:?}: {e}", file.path()))
             })?;
+            if !seen_paths.insert(file.path().to_owned()) {
+                return Err(SnapshotError::InvalidId(format!(
+                    "duplicate snapshot path {:?}: a snapshot may reference a path once",
+                    file.path()
+                )));
+            }
         }
         // Integrity + size limit checks first. No single existing file may
         // exceed the canonical file limit; the total is additionally

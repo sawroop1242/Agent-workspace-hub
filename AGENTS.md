@@ -831,3 +831,43 @@ tested create-equivalent (report classifies the surface honestly).
   ManuallyDrop<TempDir> workspaces (durable audit store holds first root);
   full-grant awh.builtin injected via with_trust_store so capability+policy are
   the deciding layers; hermetic CLI children via common::sanitized_command.
+
+- **TP06 (snapshots & provenance) — branch tp06-snapshot-provenance-verification**:
+  suite tests/snapshot_provenance_boundaries.rs (13 tests, 1469 workspace-wide
+  green) + TWO production fixes. (1) DEFECT FIXED: `awh fs verify` called
+  `SnapshotStore::load(provenance.snapshot_id)` which checks manifest/blob
+  integrity but NOT the edit→snapshot binding — a valid-JSON swap of two real
+  edits' snapshot_id values still printed "recovery material verified".
+  Fix: verify now routes through the canonical `recovery_view(edit_id)`
+  (provenance → load → binding → per-entry hash); exit codes and the
+  unknown-id hint message unchanged; `entries` now reports the manifest
+  count (authoritative) instead of provenance.paths.len(). Pinned by
+  provenance_snapshot_swap_between_real_edits_fails_closed (swap → verify
+  AND rollback exit 5 for both edits, bytes never cross). (2) BOUNDARY
+  HARDENING: `SnapshotStore::create_snapshot` silently accepted duplicate
+  logical paths (ambiguous manifest — §7 forbids); now rejects with
+  InvalidId BEFORE any FS mutation (production callers dedup upstream —
+  `affected` is path-keyed in edit.rs — so no legitimate path affected).
+  Key facts pinned: identical edit ids + identical paths in two workspace
+  roots never collide (lookup is root-relative; cross-root load = NotFound);
+  orphan blob dirs (crash before manifest) are never listed/loadable/
+  recoverable; a manifest copied verbatim under another id fails the
+  declared-id check (Corruption); provenance pointing at an unpublished
+  snapshot fails closed; the recovery blob is the ONLY durable file that
+  may carry file content (manifests/provenance carry ids/hashes/sizes
+  only — pinned by sentinel scan of the whole .agent tree); rollback
+  rewrites the durable outcome Committed → {"rolled_back":{"reason":
+  "restored"}} and fs history --json renders the transition; all three
+  ProvenanceOutcome variants round-trip and serialize DISTINCTLY in
+  snake_case ("committed", {"rolled_back":{...}}, {"failed":{...}}) —
+  Failed is vocabulary-only, never written by current production code;
+  fs history is bounded and newest-first (edit ids have a monotonic
+  prefix); exactly MAX_SNAPSHOT_CONTENT_BYTES (8 MiB) round-trips
+  byte-exact, +1 byte fails LimitExceeded with nothing published; entry
+  order is path-ascending ASCII (emoji.txt < empty.txt — 'o' < 'p'!).
+  Test-engineering: the §25 independent SHA-256 oracle lives in the test
+  file (self-checked against FIPS "abc" vector first — trust it only
+  after the vector test passes); rustc 1.99 clippy demands
+  `as_chunks::<64>()` over `chunks_exact(64)`; giant Vec-equality
+  asserts on byte fixtures produce unusable failure output — compare
+  per-path with path-tagged messages instead.
