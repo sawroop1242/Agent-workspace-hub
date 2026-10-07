@@ -712,6 +712,11 @@ fn main() -> Result<()> {
                 }
             }
             SkillCommand::Uninstall { name } => {
+                // Validate before the join: an unvalidated name would let
+                // `awh skill uninstall ../../x` delete a directory outside
+                // the global skills root (the same boundary `get`/`create`
+                // already enforce inside the registry).
+                agent_workspace_hub::skills::validate_name(&name)?;
                 let path = global.skills_dir().join(&name);
                 if path.exists() {
                     std::fs::remove_dir_all(path)?;

@@ -36,7 +36,7 @@ impl GlobalSkillRegistry {
 
     /// Creates a new global skill with a starter `SKILL.md` template.
     pub fn create(&self, name: &str, description: &str) -> Result<Skill> {
-        validate_name(name)?;
+        validate_skill_name(name)?;
         fs::create_dir_all(&self.root)?;
         let dir = self.root.join(name);
         if dir.exists() {
@@ -49,7 +49,7 @@ impl GlobalSkillRegistry {
 
     /// Returns the global skill named `name`, if installed.
     pub fn get(&self, name: &str) -> Result<Option<Skill>> {
-        validate_name(name)?;
+        validate_skill_name(name)?;
         let dir = self.root.join(name);
         if !dir.is_dir() {
             return Ok(None);
@@ -74,7 +74,7 @@ impl GlobalSkillRegistry {
     }
 }
 
-fn validate_name(name: &str) -> Result<()> {
+fn validate_skill_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 100
         || !name
@@ -84,4 +84,53 @@ fn validate_name(name: &str) -> Result<()> {
         bail!("invalid skill name: {name}");
     }
     Ok(())
+}
+
+/// Validates a skill name for any path join under the canonical skills
+/// root. This is the boundary that keeps a caller-supplied or
+/// registry-advertised name from escaping the registry: `..`, path
+/// separators, absolute paths, and drive prefixes are all rejected before
+/// any `join`, so no mutation can address a directory outside the skills
+/// root. Public so install/uninstall paths share the registry's own
+/// validation instead of trusting their caller.
+pub fn validate_name(name: &str) -> Result<()> {
+    validate_skill_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_name_rejects_path_shapes_and_accepts_safe_names() {
+        for evil in [
+            "",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "C:\\windows",
+            "UPPER",
+            "with space",
+            "d\u{f6}t",
+        ] {
+            assert!(validate_name(evil).is_err(), "{evil:?} must be rejected");
+        }
+        for ok in ["alpha", "my-skill", "a_b", "s1", &"a".repeat(100)] {
+            assert!(validate_name(ok).is_ok(), "{ok:?} must be accepted");
+        }
+        // one over the length limit is rejected
+        assert!(validate_name(&"a".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn registry_get_and_create_share_the_same_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let reg = GlobalSkillRegistry::new(temp.path());
+        assert!(reg.get("../escape").is_err());
+        assert!(reg.create("../escape", "d").is_err());
+        // neither touched the filesystem above the root
+        assert!(!temp.path().join("escape").exists());
+    }
 }
