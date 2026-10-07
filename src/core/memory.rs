@@ -842,4 +842,36 @@ mod tests {
             .is_err());
         assert!(store.update_partial("m1", None, None, None).is_err());
     }
+
+    #[test]
+    fn updates_remain_possible_at_the_entry_count_limit() {
+        // §21: the entry-count cap gates only NEW ids; updates to existing
+        // entries must keep working at the boundary (a full store is not a
+        // read-only store).
+        let (store, _dir) = temp_store();
+        let entries: Vec<MemoryEntry> = (0..MAX_MEMORY_ENTRIES as u64)
+            .map(|i| MemoryEntry {
+                id: format!("entry-{i}"),
+                scope: MemoryScope::Project,
+                content: "c".into(),
+                tags: vec![],
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
+        fs::write(
+            store.path.clone(),
+            serde_json::to_string(&MemoryFile { entries }).unwrap(),
+        )
+        .unwrap();
+
+        let updated = store
+            .update_partial("entry-0", Some("new".into()), None, None)
+            .unwrap();
+        assert_eq!(updated.content, "new");
+        // and a genuinely new id is still refused
+        assert!(store
+            .store("overflow".into(), "x".into(), MemoryScope::Project, vec![])
+            .is_err());
+    }
 }
