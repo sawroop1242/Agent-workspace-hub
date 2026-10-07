@@ -120,6 +120,21 @@ root; a valid registry install still succeeds.
 with positive controls), `package_validation_rejects_unsafe_layouts_without_partial_install`,
 and the `registry::tests` unit tests.
 
+### Follow-up: a TP10 defect surfaced by TP11 CI (fixed)
+
+The TP11 CI run exposed a **pre-existing TP10 defect**, not a TP11
+regression: `tests/memory_boundaries.rs::concurrent_cross_process_writers_keep_store_valid`
+failed on macOS with 40 of 41 adds persisted (a lost update). Root cause
+is in `src/core/memory.rs::MemoryStore::generate_id`: ids were
+`mem-<nanos>-<in-process-counter>`, so two sibling processes reading the
+same coarse clock tick (macOS/Windows granularity) each minted
+`mem-<nanos>-0000`, and the store's id-keyed upsert silently collapsed
+them into one record. The id now embeds the process id
+(`mem-<nanos>-<pid>-<seq>`), unique across concurrently-live processes,
+while the atomic counter still separates threads. Fixed here because
+TP11 must merge with green cross-platform CI; regression pinned by
+`generated_ids_embed_the_process_id_for_cross_process_uniqueness`.
+
 ### Non-defects / gaps verified and classified honestly
 
 - **Lockfile (`LockfileStore`) is not wired to any lifecycle path** —
