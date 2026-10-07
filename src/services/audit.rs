@@ -311,19 +311,68 @@ impl DurableStore {
     /// any auxiliary management entry produced by the append (the
     /// rotation marker when this append triggered a rotation), so
     /// callers can mirror both into the read cache in order.
+    ///
+    /// The allocator state is derived from the durable file *under the
+    /// append lock*: another process may have appended since this
+    /// store was opened, and the startup snapshot alone can allocate a
+    /// sequence that is already on disk. Sequences are strictly
+    /// increasing in file order, so the last valid line's sequence is
+    /// the allocator base; the rotated generation is consulted too so
+    /// a rotation marker never regresses below it.
     fn append(
         &mut self,
-        mut entry: AuditEntry,
+        entry: AuditEntry,
     ) -> Result<(AuditEntry, Option<AuditEntry>), AuditError> {
-        // Retention at the ingestion boundary: rotate before the file
-        // exceeds the documented cap.
-        let mut marker = None;
-        if self.line_count >= MAX_PERSISTED_EVENTS {
-            marker = Some(self.rotate()?);
-        }
         let _lock = StoreLock::acquire(&self.lock_path)
             .map_err(|e| AuditError::Storage(format!("audit append lock: {e}")))?;
-        let sequence = self.next_sequence;
+        let dir = self
+            .log_path
+            .parent()
+            .expect("log path has a parent")
+            .to_path_buf();
+        // Allocation derives from the durable tail under the lock: a
+        // fresh tail read is O(1) per append (bounded window), and the
+        // rotated generation is consulted so a rotation marker can
+        // never regress below it.
+        let last_sequence = tail_sequence(&self.log_path);
+        let rotated_sequence = tail_sequence(&dir.join("audit.log.1"));
+        let next_sequence = last_sequence.max(rotated_sequence) + 1;
+        // Retention at the ingestion boundary: rotate before the file
+        // exceeds the documented cap. The counter is this process's
+        // view (refreshed at open, advanced per append); concurrent
+        // foreign appends can overshoot it by a bounded margin, never
+        // unboundedly — the cap bounds the generation, not the exact
+        // instant.
+        let mut marker = None;
+        if self.line_count >= MAX_PERSISTED_EVENTS {
+            marker = Some(self.rotate_locked(next_sequence)?);
+        }
+        let sequence = if marker.is_some() {
+            next_sequence + 1
+        } else {
+            next_sequence
+        };
+        let persisted = self.append_locked(entry, sequence)?;
+        // The durability point is the write+flush inside
+        // `append_locked`. The cached counters are advisory only —
+        // allocation always re-derives from the file — so a failed
+        // append never burns a sequence number and can be retried.
+        self.next_sequence = sequence + 1;
+        self.line_count = if marker.is_some() {
+            2 // rotation marker + this event start the fresh generation
+        } else {
+            self.line_count + 1
+        };
+        Ok((persisted, marker))
+    }
+
+    /// Serializes and writes one event with an already-allocated
+    /// sequence, assuming the append lock is held by the caller.
+    fn append_locked(
+        &mut self,
+        mut entry: AuditEntry,
+        sequence: u64,
+    ) -> Result<AuditEntry, AuditError> {
         entry.sequence = Some(sequence);
         entry.event_id = Some(format!(
             "audit-{:016x}-{}-{}",
@@ -352,12 +401,7 @@ impl DurableStore {
             .and_then(|_| file.write_all(b"\n"))
             .and_then(|_| file.flush())
             .map_err(|e| AuditError::Storage(format!("append audit event: {e}")))?;
-        // The durability point is the write+flush above. The in-memory
-        // sequence advances only after it — a failed append never burns
-        // a sequence number and can be retried safely.
-        self.next_sequence = sequence + 1;
-        self.line_count += 1;
-        Ok((entry, marker))
+        Ok(entry)
     }
 
     /// Rotates the active log to `audit.log.1` (dropping the previous
@@ -365,7 +409,10 @@ impl DurableStore {
     /// marker (the one deliberate audit-on-audit exception: a bounded
     /// management event, never a recursive writer). Returns the
     /// persisted marker so callers can mirror it into the read cache.
-    fn rotate(&mut self) -> Result<AuditEntry, AuditError> {
+    /// The append lock must already be held: the rename and the marker
+    /// are one serialized unit, and `first_sequence` continues past the
+    /// rotated generation so the marker can never regress.
+    fn rotate_locked(&mut self, first_sequence: u64) -> Result<AuditEntry, AuditError> {
         let previous = self
             .log_path
             .parent()
@@ -377,7 +424,6 @@ impl DurableStore {
         }
         std::fs::rename(&self.log_path, &previous)
             .map_err(|e| AuditError::Storage(format!("rotate audit log: {e}")))?;
-        self.line_count = 0;
         let marker = AuditEntry {
             ts_ms: now_ms(),
             kind: "allow".into(),
@@ -397,7 +443,7 @@ impl DurableStore {
             snapshot_id: None,
             reason: Some("retention_rotation".into()),
         };
-        self.append(marker).map(|(persisted, _)| persisted)
+        self.append_locked(marker, first_sequence)
     }
 
     /// The workspace identity of this store's root when the workspace
@@ -446,6 +492,87 @@ fn serialize_line(entry: &AuditEntry) -> Result<String, AuditError> {
     Ok(format!(
         "{{\"checksum\":\"{checksum}\",\"event\":{payload}}}"
     ))
+}
+
+/// Fresh allocator state derived from one durable generation: the last
+/// valid sequence and the valid line count. Sequences are strictly
+/// increasing in file order (the lock-scoped writer guarantees it), so
+/// the last valid line's sequence is the true allocation base. A torn
+/// tail keeps the last values seen before it — the startup repair
+/// truncates it before the next append lands. Missing/unreadable file
+/// reads as an empty generation `(0, 0)`.
+fn scan_state(path: &Path) -> (u64, usize) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return (0, 0),
+    };
+    let mut last_sequence = 0u64;
+    let mut line_count = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_line(line) {
+            Ok(entry) => {
+                if let Some(sequence) = entry.sequence {
+                    last_sequence = last_sequence.max(sequence);
+                }
+                line_count += 1;
+            }
+            // Stop at the first invalid line: only a torn tail can
+            // appear there (middle corruption would have failed
+            // `open`), and the values before it are the safe base.
+            Err(_) => break,
+        }
+    }
+    (last_sequence, line_count)
+}
+
+/// O(1) tail read for sequence allocation: the last valid sequence in
+/// one durable generation, read from a bounded end-of-file window
+/// instead of scanning the whole file. Larger than any single record
+/// (each field is bounded at `MAX_TEXT_CHARS`, so a line is < 32 KiB;
+/// the 64 KiB window always covers the last complete line). Walks
+/// backwards past a torn final record (an interrupted append), and
+/// falls back to a full scan only in the pathological case of no valid
+/// line inside the window. Missing/unreadable file reads as `0`.
+fn tail_sequence(path: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    if len == 0 {
+        return 0;
+    }
+    const WINDOW: u64 = 64 * 1024;
+    let window = len.min(WINDOW);
+    let start = len - window;
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return 0;
+    }
+    let mut buf = vec![0u8; window as usize];
+    if file.read_exact(&mut buf).is_err() {
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = parse_line(line) {
+            if let Some(sequence) = entry.sequence {
+                return sequence;
+            }
+        }
+        // Invalid line at the physical end (torn tail): keep walking
+        // backwards to the last valid record.
+    }
+    // No valid record in the window (e.g. a single oversized line):
+    // fall back to the full scan.
+    scan_state(path).0
 }
 
 /// Parses and integrity-checks one persisted line. The checksum binds
@@ -1162,6 +1289,58 @@ mod persistent_audit_tests {
         assert!(
             sequences.windows(2).all(|w| w[1] == w[0] + 1),
             "sequences are contiguous and strictly increasing"
+        );
+    }
+
+    /// TP08 §26 regression: two independent store handles on the same
+    /// root — the in-process stand-in for two processes that each
+    /// snapshotted the allocator state at startup. Each handle must
+    /// still allocate from the *current* durable tail, so their
+    /// interleaved appends can never publish a duplicate sequence
+    /// (which would brick the store as a `sequence regression`
+    /// corruption at the next open). Pre-fix, both handles carried
+    /// the same startup snapshot and both first appends wrote
+    /// `sequence: 1`.
+    #[test]
+    fn independent_store_handles_never_duplicate_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = AuditLog::open(dir.path()).unwrap();
+        let b = AuditLog::open(dir.path()).unwrap();
+
+        for round in 0..3 {
+            a.record("allow", "from-a", "s", &format!("round {round}"));
+            b.record("allow", "from-b", "s", &format!("round {round}"));
+        }
+        drop(a);
+        drop(b);
+
+        // The file on disk is the oracle: unique, strictly increasing
+        // sequences in write order.
+        let text = fs::read_to_string(log_path(&dir)).unwrap();
+        let mut seen_sequences = std::collections::HashSet::new();
+        let mut previous = 0u64;
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let entry = parse_line(line).expect("every line parses and checksums");
+            let sequence = entry.sequence.expect("persisted sequence");
+            assert!(
+                sequence > previous,
+                "sequence {sequence} must strictly increase past {previous}"
+            );
+            assert!(
+                seen_sequences.insert(sequence),
+                "duplicate sequence {sequence} published"
+            );
+            previous = sequence;
+        }
+        assert_eq!(previous, 6, "all six interleaved appends landed");
+
+        // The store must still open cleanly afterwards — duplicate
+        // sequences are a hard corruption at startup, so a clean
+        // reopen is the bricked-vs-healthy discriminator.
+        let reopened = AuditLog::open(dir.path());
+        assert!(
+            reopened.is_ok(),
+            "store must not be corrupted: {reopened:?}"
         );
     }
 
