@@ -269,10 +269,12 @@ fn cli_list_limit_clamping_and_bounded_output() {
     let (ok, out, _) = run(root.path(), &["memory", "list", "--limit", "100000000"]);
     assert!(ok, "oversized --limit must clamp, not fail: {out}");
     assert_eq!(out.lines().count(), 5);
-    // huge search query: bounded behavior, no match fabrication.
+    // huge search query: bounded behavior, no match fabrication. Kept to
+    // 20 KiB so the command line stays under the Windows CreateProcess
+    // limit (~32K) while still being far larger than any fixture content.
     let (ok, out, _) = run(
         root.path(),
-        &["memory", "search", "--query", &"z".repeat(100_000)],
+        &["memory", "search", "--query", &"z".repeat(20_000)],
     );
     assert!(ok);
     assert!(out.trim().is_empty(), "no hits for a giant query: {out}");
