@@ -107,10 +107,12 @@ impl OffloadStore {
         )?))
     }
 
-    /// Deletes an offload record *only after it has been restored*: this is
-    /// the exclusive deletion path, and callers must only invoke it when the
-    /// item is active again. Keeps offloaded content from leaking after
-    /// restore while guaranteeing it was recoverable the whole time.
+    /// Deletes an offload record. This is the exclusive deletion path, with
+    /// exactly two legitimate callers: after a successful restore (the
+    /// record's recoverability purpose is served) and after the engine
+    /// removes the item entirely (an explicit discard — a surviving record
+    /// would let `restore` resurrect removed content). It must never be
+    /// called while offloaded content is still meant to be recoverable.
     pub fn remove_restored(&self, id: &str) -> Result<bool> {
         if !crate::context::item::is_valid_item_id(id) {
             return Ok(false);

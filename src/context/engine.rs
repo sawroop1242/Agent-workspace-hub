@@ -268,6 +268,12 @@ impl ContextEngine {
         if !is_valid_item_id(&item.id) {
             bail!("invalid context item id: {:?}", item.id);
         }
+        // Recount FIRST and gate on the recounted value: the budget cap
+        // must reflect the content, not a caller-supplied (possibly zero
+        // or stale) token_count — both real callers construct items with
+        // token_count = 0, and a pre-recount gate let oversized content
+        // through the budget unchecked (TP09 D2).
+        item.token_count = self.counter.count(&item.content);
         if item.token_count > self.config.budget.max_input_tokens {
             bail!(
                 "item token count {} exceeds max input tokens {}",
@@ -279,8 +285,6 @@ impl ContextEngine {
         if items.len() >= MAX_ACTIVE_ITEMS && !items.iter().any(|i| i.id == item.id) {
             bail!("active context is full (max {MAX_ACTIVE_ITEMS} items)");
         }
-        // Recount defensively: token_count must always reflect content.
-        item.token_count = self.counter.count(&item.content);
         let mut next: Vec<ContextItem> = items.clone();
         next.retain(|i| i.id != item.id);
         next.push(item.clone());
@@ -368,6 +372,11 @@ impl ContextEngine {
                 return false;
             }
             *items = next;
+            // Removal is the engine's explicit discard: retire any durable
+            // offload record for the id too, or `restore` could resurrect
+            // the removed content later (probe-verified pre-fix). Best-effort
+            // on I/O failure — the window removal already stood.
+            let _ = self.offloads.remove_restored(id);
         }
         removed
     }
@@ -694,7 +703,13 @@ impl ContextEngine {
         // Try the in-memory record first (covers offloaded-but-loaded items).
         if let Some(item) = self.get_item(id) {
             if item.state == ContextState::Offloaded {
-                return self.restore_item_to_active(item);
+                let restored = self.restore_item_to_active(item)?;
+                // The item is active again, so the durable offload record
+                // has served its purpose; retire it or it would linger as
+                // a ghost (status counts it, and a later remove + restore
+                // could resurrect already-removed content from it).
+                self.offloads.remove_restored(&restored.id)?;
+                return Ok(restored);
             }
             if item.state.is_active() {
                 bail!("item {id} is already active");
@@ -973,15 +988,18 @@ mod tests {
     use super::*;
 
     fn engine_in(temp: &tempfile::TempDir) -> ContextEngine {
-        let config = ContextEngineConfig {
+        ContextEngine::new(temp.path(), engine_config()).unwrap()
+    }
+
+    fn engine_config() -> ContextEngineConfig {
+        ContextEngineConfig {
             budget: ContextBudget {
                 max_input_tokens: 1_000,
                 reserved_output_tokens: 100,
                 safety_margin_tokens: 100,
             },
             ..ContextEngineConfig::default()
-        };
-        ContextEngine::new(temp.path(), config).unwrap()
+        }
     }
 
     fn active_item(id: &str, content: &str, relevance: f32) -> ContextItem {
@@ -1009,10 +1027,32 @@ mod tests {
         let engine = engine_in(&temp);
         assert!(engine.insert(active_item("../evil", "c", 0.5)).is_err());
         assert!(engine.insert(active_item("", "c", 0.5)).is_err());
-        let huge = active_item("huge", "c", 0.5);
-        let mut huge = huge;
-        huge.token_count = 999_999;
-        assert!(engine.insert(huge).is_err());
+        // Oversized CONTENT (recounted tokens) is what the budget gate
+        // rejects; a caller-supplied token_count is never trusted (TP09 D2).
+        let big_content = "word ".repeat(1_200); // 1200 tokens > 1000 max
+        assert!(engine
+            .insert(active_item("huge", &big_content, 0.5))
+            .is_err());
+    }
+
+    #[test]
+    fn budget_gate_uses_recounted_tokens_not_caller_count() {
+        // Regression (TP09 D2): both real callers (CLI, MCP) construct
+        // items with token_count = 0; the pre-recount budget gate let
+        // oversized content through unchecked. The gate must use the
+        // engine's own recount of the content.
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(&temp);
+        let oversized = ContextItem::new("big", ContextSource::Tool, "word ".repeat(1_100), 0);
+        let err = engine.insert(oversized).unwrap_err().to_string();
+        assert!(err.contains("exceeds max input tokens"), "{err}");
+        assert!(engine.get_item("big").is_none());
+        // A lying token_count on small content is normalized (token_count
+        // must always reflect content), never amplified into a rejection
+        // or a false budget read.
+        let lying = ContextItem::new("small", ContextSource::Tool, "tiny", 999_999);
+        let saved = engine.insert(lying).unwrap();
+        assert_eq!(saved.token_count, 1);
     }
 
     #[test]
@@ -1046,21 +1086,69 @@ mod tests {
         engine
             .insert(active_item("x", "precious tool output with details", 0.5))
             .unwrap();
+        // While offloaded, content is durable and recoverable.
         engine.offload("x", "low relevance").unwrap();
-        // Content recoverable from the durable store.
         let offloaded = engine.offloads.get("x").unwrap().unwrap();
         assert_eq!(offloaded.content, "precious tool output with details");
         let restored = engine.restore("x").unwrap();
         assert_eq!(restored.content, "precious tool output with details");
         assert!(restored.state.is_active());
         assert_eq!(restored.recency, 1.0);
-        // The item is active again; the durable record kept during the
-        // in-memory-restore path is cleaned up on the next explicit restore
-        // from the store (or by remove_restored). It must still be readable
-        // right now — never a window where content is unrecoverable.
-        assert!(engine.offloads.get("x").unwrap().is_some());
-        engine.offloads.remove_restored("x").unwrap();
+        // The restore is complete: the item is durably active (persisted
+        // before the record is retired, so there is never an unrecoverable
+        // window), and the offload record must NOT linger as a ghost —
+        // a surviving record resurrects removed content through a later
+        // `restore` (probe-verified production defect, fixed with it).
+        let window = std::fs::read_to_string(
+            temp.path()
+                .join(".agent")
+                .join("context-engine")
+                .join("active.json"),
+        )
+        .unwrap();
+        assert!(window.contains("precious tool output with details"));
         assert!(engine.offloads.get("x").unwrap().is_none());
+        assert_eq!(engine.status().unwrap().offloaded_items, 0);
+    }
+
+    #[test]
+    fn restore_from_memory_retires_the_durable_record() {
+        // Regression (TP09 D1): the in-memory restore branch used to skip
+        // `remove_restored`, so the durable record outlived the restore and
+        // a later remove + restore resurrected the removed item.
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(&temp);
+        engine
+            .insert(active_item("ghost", "gone but not forgotten", 0.5))
+            .unwrap();
+        engine.offload("ghost", "probe").unwrap();
+        assert!(engine.restore("ghost").is_ok());
+        assert!(!engine
+            .offloads
+            .list_ids()
+            .unwrap()
+            .contains(&"ghost".to_string()));
+        // A fresh engine over the same root must not observe a ghost either.
+        let engine2 = ContextEngine::new(temp.path(), engine_config()).unwrap();
+        assert_eq!(engine2.status().unwrap().offloaded_items, 0);
+    }
+
+    #[test]
+    fn remove_item_retires_offload_records_and_never_resurrects() {
+        // Regression (TP09 D1): removing an item (explicit discard) must
+        // delete its offload record; `restore` after removal is an error,
+        // never a resurrection of the removed content.
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(&temp);
+        engine
+            .insert(active_item("dead", "content that must stay deleted", 0.5))
+            .unwrap();
+        engine.offload("dead", "probe").unwrap();
+        assert!(engine.remove_item("dead"));
+        assert!(engine.offloads.get("dead").unwrap().is_none());
+        let err = engine.restore("dead").unwrap_err().to_string();
+        assert!(err.contains("offloaded context item not found"), "{err}");
+        assert!(engine.get_item("dead").is_none());
     }
 
     #[test]
@@ -1146,8 +1234,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = ContextEngineConfig {
             budget: ContextBudget {
-                max_input_tokens: 100,
-                reserved_output_tokens: 0,
+                // Insert's hard cap is max_input_tokens; the usable budget
+                // (max - reserved) is what selection enforces. The 150-token
+                // fixture must pass the insert cap and lose in selection.
+                max_input_tokens: 250,
+                reserved_output_tokens: 100,
                 safety_margin_tokens: 0,
             },
             ..ContextEngineConfig::default()
@@ -1248,8 +1339,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = ContextEngineConfig {
             budget: ContextBudget {
-                max_input_tokens: 50,
-                reserved_output_tokens: 0,
+                // The 60-token item passes the 100-token insert cap but
+                // exceeds the 50-token usable budget, so a snapshot restore
+                // must report it as skipped.
+                max_input_tokens: 100,
+                reserved_output_tokens: 50,
                 safety_margin_tokens: 0,
             },
             ..ContextEngineConfig::default()
