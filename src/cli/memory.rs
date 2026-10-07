@@ -57,7 +57,7 @@ pub enum MemoryCommand {
     Update {
         #[arg(long)]
         id: String,
-        /// New content; read from stdin when omitted.
+        /// New content; omit for a scope/tags-only partial update.
         #[arg(
             long,
             required_unless_present_any = ["scope", "tags"]

@@ -2101,20 +2101,25 @@ impl McpDispatcher {
             }
             "memory.update" => {
                 self.authorize_tool("memory.update", &arguments, caller)?;
-                // Updating must not silently create: the entry has to
-                // exist, otherwise the caller gets a clear error. The
-                // existence check and the write happen under one lock hold
-                // inside `update_existing`, so a concurrent delete from
-                // another agent can't race a separate get+store into
-                // resurrecting the entry.
+                // Partial-update semantics, identical to the CLI's
+                // `awh memory update`: `content` changes the content (the
+                // schema requires it), while `scope`/`tags` replace their
+                // fields ONLY when present. A content-only call must never
+                // silently reset an entry's scope to the default or wipe
+                // its tags — the store's `update_partial` enforces that
+                // under one lock hold, so a concurrent delete from another
+                // agent can't race a separate get+store into resurrecting
+                // the entry either.
                 let id = strval(&arguments, "id")?;
-                let scope = parse_scope(arguments.get("scope").and_then(Value::as_str))?;
-                let entry = self.memory.update_existing(
-                    id,
-                    strval(&arguments, "content")?,
-                    scope,
-                    strings(&arguments, "tags"),
-                )?;
+                let content = strval(&arguments, "content")?;
+                let scope = match arguments.get("scope") {
+                    Some(value) => Some(parse_scope(value.as_str())?),
+                    None => None,
+                };
+                let tags = arguments.get("tags").map(|_| strings(&arguments, "tags"));
+                let entry = self
+                    .memory
+                    .update_partial(&id, Some(content), scope, tags)?;
                 serde_json::to_value(entry)?
             }
             "tasks.create" => {
