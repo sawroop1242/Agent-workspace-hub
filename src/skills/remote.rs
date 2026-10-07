@@ -70,6 +70,19 @@ impl RemoteSkillRegistry {
         skill_name: &str,
         global: &GlobalSkillRegistry,
     ) -> Result<Skill> {
+        // `skill_name` and `reference` come from the caller/CLI: validate
+        // both before joining them to the cache or install paths so a
+        // crafted name cannot escape the cache directory or the skills
+        // root (`repository` is already `owner/repo`-shaped from `parse`).
+        crate::skills::validate_name(skill_name)?;
+        if reference.is_empty()
+            || reference.contains("..")
+            || reference.contains('/')
+            || reference.contains('\\')
+            || reference.chars().any(char::is_control)
+        {
+            bail!("invalid git reference: {reference}");
+        }
         let target = self
             .cache_dir
             .join("github")

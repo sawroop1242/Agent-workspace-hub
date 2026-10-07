@@ -38,6 +38,7 @@ pub use package::{safe_package_path, sha256_file, validate_skill_package};
 pub use parser::parse_skill;
 pub use project::{ProjectSkillReferences, SkillRefState, SkillReferences};
 pub use registries::{RegistryConfig, RegistryStore};
+pub use registry::validate_name;
 pub use registry::GlobalSkillRegistry;
 pub use registry_client::RegistryClient;
 pub use registry_manifest::{RegistryManifest, RegistrySkill};

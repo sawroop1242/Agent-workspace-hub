@@ -1,5 +1,6 @@
 use crate::skills::{
-    validate_sha256, validate_skill_package, GlobalSkillRegistry, RegistryClient, RegistrySkill,
+    validate_name, validate_sha256, validate_skill_package, GlobalSkillRegistry, RegistryClient,
+    RegistrySkill,
 };
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -34,6 +35,11 @@ impl SkillInstaller {
             .into_iter()
             .find(|s| s.name == skill_name)
             .context("skill not found in registry")?;
+
+        // The registry is untrusted input: validate the advertised name
+        // before it is ever joined to a filesystem path, so a malicious
+        // manifest cannot install outside the canonical skills root.
+        validate_name(&entry.name)?;
 
         if entry.path.starts_with('/') || entry.path.contains("..") {
             bail!("registry returned unsafe skill path");
@@ -75,6 +81,7 @@ impl SkillInstaller {
         name: &str,
     ) -> Result<()> {
         let source = source.as_ref();
+        validate_name(name)?;
         validate_skill_package(source)?;
         let installed = registry.skills_dir().join(name);
         if installed.exists() {

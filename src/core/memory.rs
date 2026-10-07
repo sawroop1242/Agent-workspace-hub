@@ -342,16 +342,22 @@ impl MemoryStore {
         Ok(true)
     }
 
-    /// Id for [`Self::append`]: time-ordered and collision-resistant without
-    /// a central counter, so two concurrent appenders cannot mint the same
-    /// id (the StoreLock serialization makes even a same-nanosecond
-    /// collision impossible in practice).
+    /// Id for [`Self::append`]: time-ordered and collision-resistant across
+    /// both threads AND processes. The nanosecond timestamp plus an
+    /// in-process atomic counter are not sufficient on their own — two
+    /// sibling processes can read the same coarse clock tick (macOS/Windows
+    /// clock granularity) and each mint `<nanos>-0000`, which the store's
+    /// upsert would then silently collapse into one record. Mixing in the
+    /// process id makes concurrent sibling processes mint distinct ids
+    /// (live processes always have distinct pids), while the atomic counter
+    /// separates threads within one process.
     fn generate_id(&self) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("mem-{nanos:016x}-{seq:04x}")
+        let pid = std::process::id();
+        format!("mem-{nanos:016x}-{pid:08x}-{seq:04x}")
     }
 
     /// Migrates a legacy `.agent/memory.jsonl` file into the canonical
@@ -493,6 +499,26 @@ mod tests {
         assert_eq!(entries.len(), 80);
         let ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids.len(), entries.len(), "append ids must be unique");
+    }
+
+    #[test]
+    fn generated_ids_embed_the_process_id_for_cross_process_uniqueness() {
+        // Regression: two sibling processes on a coarse clock (macOS/Windows)
+        // can read the same nanosecond tick; without a process-unique
+        // component they mint the same id and the store's upsert silently
+        // drops one record. The pid must be part of every generated id.
+        let (store, _dir) = temp_store();
+        let pid = format!("{:08x}", std::process::id());
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = store.generate_id();
+            assert!(id.starts_with("mem-"), "{id}");
+            assert!(
+                id.contains(&format!("-{pid}-")),
+                "generated id must embed the pid: {id}"
+            );
+            assert!(ids.insert(id), "generated ids must be unique");
+        }
     }
 
     #[test]
