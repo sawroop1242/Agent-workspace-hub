@@ -1,0 +1,174 @@
+//! Structured audit logging for the MCP security boundaries.
+//!
+//! Every fail-closed denial in the trust/permission/sandbox/transport chain
+//! emits a structured audit event so unattended agent operation can be
+//! reconstructed and audited. Audit events never include secret values.
+
+/// Emits a structured audit event for a denied security decision.
+///
+/// `reason` is a stable machine-readable slug; `subject` identifies the
+/// affected actor (MCP id, tool name, path, etc.). No secret values are logged.
+pub fn audit_deny(action: &str, reason: &str, subject: &str) {
+    tracing::warn!(event = "mcp_security_denied", action, reason, subject,);
+    crate::services::audit::record_deny(action, reason, subject);
+}
+
+/// Emits a structured audit event for a secret-resolution denial, logging only
+/// the secret *name* (never its value).
+pub fn audit_secret_deny(reason: &str, name: &str) {
+    tracing::warn!(event = "mcp_secret_denied", reason, name,);
+    crate::services::audit::record_deny("secret_resolve", reason, name);
+}
+
+/// Emits a structured audit event for a circuit-breaker trip.
+pub fn audit_circuit_open(provider: &str) {
+    tracing::warn!(event = "mcp_circuit_open", provider,);
+    crate::services::audit::record_deny("circuit_open", "open", provider);
+}
+
+/// Emits a structured audit event for a successful security-relevant action
+/// (authentication success, session creation, tool invocation). `subject`
+/// identifies the actor or resource; `detail` is free-form, non-secret context.
+///
+/// Info-level because allow-side events are not violations, but they are
+/// still required for incident reconstruction (who did what, when).
+pub fn audit_allow(action: &str, subject: &str, detail: &str) {
+    tracing::info!(event = "mcp_audit", action, subject, detail,);
+    crate::services::audit::record_allow(action, subject, detail);
+}
+
+/// [`audit_deny`] with correlation metadata: the workspace/agent/session
+/// ids of the bound caller, when the event happens inside an agent-scoped
+/// session. Identity fields are redacted at the audit choke point like
+/// every other subject/detail string; unbound sessions simply carry no
+/// identity (absent fields stay absent — never invented).
+pub fn audit_deny_as(
+    action: &str,
+    reason: &str,
+    subject: &str,
+    correlation: &crate::services::audit::AuditCorrelation,
+) {
+    tracing::warn!(event = "mcp_security_denied", action, reason, subject,);
+    crate::services::audit::global().record_correlated(
+        "deny",
+        action,
+        subject,
+        reason,
+        correlation,
+    );
+}
+
+/// [`audit_allow`] with correlation metadata: the workspace/agent/session
+/// ids of the bound caller, when the event happens inside an agent-scoped
+/// session. Used so consequential MCP-plane events are attributable to
+/// the agent that produced them, not just to the tool name.
+pub fn audit_allow_as(
+    action: &str,
+    subject: &str,
+    detail: &str,
+    correlation: &crate::services::audit::AuditCorrelation,
+) {
+    tracing::info!(event = "mcp_audit", action, subject, detail,);
+    crate::services::audit::global().record_correlated(
+        "allow",
+        action,
+        subject,
+        detail,
+        correlation,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn audit_helpers_do_not_panic() {
+        audit_deny("authorize", "no_approval", "mcp-1");
+        audit_secret_deny("not_approved", "my_secret");
+        audit_circuit_open("provider-1");
+        audit_allow("tool_invoke", "memory.store", "tools/call");
+    }
+
+    /// Extracts the value of the `event` field from an audit event.
+    struct EventNameVisitor(Option<String>);
+
+    impl tracing::field::Visit for EventNameVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "event" {
+                self.0 = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// A [`tracing_subscriber::Layer`] that records `event` field values.
+    #[derive(Clone, Default)]
+    struct EventRecorder(Arc<Mutex<Vec<String>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for EventRecorder
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = EventNameVisitor(None);
+            event.record(&mut visitor);
+            if let Some(name) = visitor.0 {
+                self.0.lock().unwrap().push(name);
+            }
+        }
+    }
+
+    /// Proves audit events actually reach an installed subscriber: the audit
+    /// helpers are not compiled-out no-ops and carry the right event names.
+    #[test]
+    fn audit_events_reach_the_subscriber() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let recorder = EventRecorder::default();
+        // `set_default` is scoped to this thread (guard on drop), so it cannot
+        // leak into other tests running on their own threads.
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Warm-up + interest rebuild. First-time callsite registration is
+        // process-global and its cached Interest is computed against the
+        // *registering thread's* dispatcher when any scoped dispatcher is
+        // live anywhere in the process. So a sibling test first-touching
+        // these same warn callsites while our guard is held on this thread
+        // resolves to no dispatcher at all and permanently caches
+        // Interest::never for them (observed as a CI flake on Windows).
+        // Emitting once here guarantees the callsites are registered
+        // already, and rebuilding the cache while our guard is held
+        // re-caches every callsite against this recorder.
+        audit_allow("session_create", "sid-1", "/sse");
+        audit_deny("http_auth", "invalid_or_missing_token", "remote");
+        audit_secret_deny("not_approved", "my_secret");
+        audit_circuit_open("provider-1");
+        audit_allow("tool_invoke", "memory.store", "tools/call");
+        tracing::callsite::rebuild_interest_cache();
+        recorder.0.lock().unwrap().clear();
+
+        audit_allow("session_create", "sid-1", "/sse");
+        audit_deny("http_auth", "invalid_or_missing_token", "remote");
+        audit_secret_deny("not_approved", "my_secret");
+        audit_circuit_open("provider-1");
+        audit_allow("tool_invoke", "memory.store", "tools/call");
+
+        let recorded = recorder.0.lock().unwrap().clone();
+        let count = |name: &str| recorded.iter().filter(|e| e.as_str() == name).count();
+        // Every helper must land exactly once, with the right event name:
+        // this also catches double-emission and level mix-ups.
+        assert_eq!(count("mcp_audit"), 2, "{recorded:?}");
+        assert_eq!(count("mcp_security_denied"), 1, "{recorded:?}");
+        assert_eq!(count("mcp_secret_denied"), 1, "{recorded:?}");
+        assert_eq!(count("mcp_circuit_open"), 1, "{recorded:?}");
+        assert_eq!(recorded.len(), 5, "{recorded:?}");
+    }
+}

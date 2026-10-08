@@ -1,0 +1,533 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Version consistency (tag must match Cargo.toml)
+        run: |
+          set -euo pipefail
+          EXPECTED="v$(cargo metadata --no-deps --format-version 1             | jq -r '.packages[0].version')"
+          INPUT="${{ github.event.inputs.version }}"
+          echo "Cargo.toml version: ${EXPECTED#v}"
+          echo "Requested tag:       ${INPUT#v}"
+          if [ "$EXPECTED" != "$INPUT" ]; then
+            echo "::error::Release tag $INPUT does not match Cargo.toml version $EXPECTED. Bump Cargo.toml first, then re-run."
+            exit 1
+          fi
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+
+      - name: Validate Android SDK package allowlist
+        run: |
+          set -euo pipefail
+
+          WORKFLOW=".github/workflows/release-rust.yml"
+          ALLOWED='platform-tools|platforms;android-35|build-tools;35.0.0|ndk;27.2.12479018'
+
+          # The setup action must not receive an SDK package list. In particular,
+          # the obsolete "tools" package must never be passed to sdkmanager.
+          setup_block="$(awk '
+            /uses: android-actions\/setup-android@v3/ { found=1; start=1 }
+            start { print }
+            start && /^[[:space:]]*- name:/ && !/Set up Android SDK\/NDK/ && found { exit }
+          ' "$WORKFLOW")"
+
+          setup_packages="$(printf '%s\n' "$setup_block" | sed -n 's/^[[:space:]]*packages:[[:space:]]*//p' | head -n1)"
+          if [ -n "$setup_packages" ] && [ "$setup_packages" != '""' ]; then
+            echo "::error::android-actions/setup-android must not install SDK packages directly: $setup_packages"
+            exit 1
+          fi
+
+          if grep -nE 'sdkmanager([[:space:]].*)?[[:space:]](^|[[:space:]])"?tools"?([[:space:]]|"$)' "$WORKFLOW"; then
+            echo "::error::Obsolete Android SDK package 'tools' is configured."
+            exit 1
+          fi
+
+          # Check every quoted SDK package passed to sdkmanager is in the pinned allowlist.
+          packages="$(grep -oE '"(platform-tools|platforms;[^"]+|build-tools;[^"]+|ndk;[^"]+)"' "$WORKFLOW" | tr -d '"' | sort -u || true)"
+          unexpected="$(printf '%s\n' "$packages" | grep -Ev "^($ALLOWED)$" || true)"
+
+          if [ -n "$unexpected" ]; then
+            echo "::error::Unpinned Android SDK/NDK package(s) configured:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+
+          required_packages=(
+            "platform-tools"
+            "platforms;android-35"
+            "build-tools;35.0.0"
+            "ndk;27.2.12479018"
+          )
+
+          for required in "${required_packages[@]}"; do
+            printf '%s\n' "$packages" | grep -Fxq "$required" || {
+              echo "::error::Required pinned Android package is missing: $required"
+              exit 1
+            }
+          done
+
+          echo "Android SDK package allowlist check passed."
+
+  build:
+    name: Build (${{ matrix.os }} / ${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: awh-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset_name: awh-linux-aarch64
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            asset_name: awh-android-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_name: awh-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: awh-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: awh-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set up Android SDK/NDK
+        if: matrix.target == 'aarch64-linux-android'
+        uses: android-actions/setup-android@v3
+        with:
+          # Do not pass the obsolete "tools" SDK package to sdkmanager.
+          packages: ""
+
+      - name: Install Android SDK packages
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+
+          # sdkmanager may close stdin after accepting all licenses, which causes
+          # yes(1) to exit with SIGPIPE. Keep pipefail enabled and propagate only
+          # sdkmanager's exit status.
+          set +o pipefail
+          yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -o pipefail
+          test "$sdkmanager_status" -eq 0
+
+          set +o pipefail
+          yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -o pipefail
+          test "$sdkmanager_status" -eq 0
+
+      - name: Install Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+          set +o pipefail
+          yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "ndk;27.2.12479018"
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -o pipefail
+          test "$sdkmanager_status" -eq 0
+
+      - name: Verify Android SDK/NDK installation
+        if: matrix.target == 'aarch64-linux-android'
+        env:
+          EXPECTED_PLATFORM: "android-35"
+          EXPECTED_BUILD_TOOLS: "35.0.0"
+          EXPECTED_NDK: "27.2.12479018"
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+
+          echo "Android SDK root: $ANDROID_SDK_ROOT"
+          echo "Pinned platform: $EXPECTED_PLATFORM"
+          echo "Pinned build-tools: $EXPECTED_BUILD_TOOLS"
+          echo "Pinned NDK: $EXPECTED_NDK"
+
+          installed="$("$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --list_installed)"
+          echo "Installed Android SDK packages:"
+          printf '%s\n' "$installed" | grep -E 'platform-tools|platforms;android-|build-tools;|ndk;' || true
+
+          platform_path="$ANDROID_SDK_ROOT/platforms/$EXPECTED_PLATFORM"
+          build_tools_path="$ANDROID_SDK_ROOT/build-tools/$EXPECTED_BUILD_TOOLS"
+          ndk_path="$ANDROID_SDK_ROOT/ndk/$EXPECTED_NDK"
+
+          test -d "$platform_path" || { echo "::error::Android platform mismatch: expected $EXPECTED_PLATFORM"; exit 1; }
+          test -d "$build_tools_path" || { echo "::error::Android build-tools mismatch: expected $EXPECTED_BUILD_TOOLS"; exit 1; }
+          test -d "$ndk_path" || { echo "::error::Android NDK mismatch: expected $EXPECTED_NDK"; exit 1; }
+
+          actual_platforms="$(find "$ANDROID_SDK_ROOT/platforms" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+          actual_build_tools="$(find "$ANDROID_SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+          actual_ndks="$(find "$ANDROID_SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+
+          echo "Installed platform versions: $actual_platforms"
+          echo "Installed build-tools versions: $actual_build_tools"
+          echo "Installed NDK versions: $actual_ndks"
+
+          printf '%s\n' "$actual_platforms" | grep -Fxq "$EXPECTED_PLATFORM" || {
+            echo "::error::Android platform version mismatch: expected exactly $EXPECTED_PLATFORM"
+            exit 1
+          }
+          printf '%s\n' "$actual_build_tools" | grep -Fxq "$EXPECTED_BUILD_TOOLS" || {
+            echo "::error::Android build-tools version mismatch: expected exactly $EXPECTED_BUILD_TOOLS"
+            exit 1
+          }
+          printf '%s\n' "$actual_ndks" | grep -Fxq "$EXPECTED_NDK" || {
+            echo "::error::Android NDK version mismatch: expected exactly $EXPECTED_NDK"
+            exit 1
+          }
+
+          echo "Android SDK verification passed:"
+          echo "Platform: $EXPECTED_PLATFORM"
+          echo "Build-tools: $EXPECTED_BUILD_TOOLS"
+          echo "NDK: $EXPECTED_NDK"
+
+      - name: Configure Android linker and C compiler
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$LLVM/aarch64-linux-android21-clang"
+          AR="$LLVM/llvm-ar"
+
+          test -x "$CLANG" || {
+            echo "::error::Android clang not found: $CLANG"
+            exit 1
+          }
+          test -x "$AR" || {
+            echo "::error::Android llvm-ar not found: $AR"
+            exit 1
+          }
+
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG" >> "$GITHUB_ENV"
+
+          # ring/cc-rs looks for CC_<target> before Cargo's linker setting.
+          # Explicitly point it at the NDK clang wrapper instead of the
+          # non-existent aarch64-linux-android-clang name.
+          echo "CC_aarch64_linux_android=$CLANG" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$AR" >> "$GITHUB_ENV"
+          echo "CC_aarch64-linux-android=$CLANG" >> "$GITHUB_ENV"
+          echo "AR_aarch64-linux-android=$AR" >> "$GITHUB_ENV"
+
+          # Put the pinned NDK LLVM toolchain first on PATH. setup-android may
+          # expose a different generic ANDROID_NDK_ROOT version.
+          echo "$LLVM" >> "$GITHUB_PATH"
+
+      - name: Install cross-compiler (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Validate Android NDK toolchain
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$LLVM/aarch64-linux-android21-clang"
+          AR="$LLVM/llvm-ar"
+          LINKER="$CLANG"
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+
+          for executable in "$CLANG" "$AR" "$LINKER"; do
+            test -f "$executable" || {
+              echo "::error::Pinned Android NDK executable is missing: $executable"
+              exit 1
+            }
+            test -x "$executable" || {
+              echo "::error::Pinned Android NDK executable is not executable: $executable"
+              exit 1
+            }
+          done
+
+          test -d "$SYSROOT" || {
+            echo "::error::Pinned Android NDK target sysroot is missing: $SYSROOT"
+            exit 1
+          }
+
+          test -d "$SYSROOT/usr/include" || {
+            echo "::error::Android NDK target sysroot headers are missing: $SYSROOT/usr/include"
+            exit 1
+          }
+
+          test -x "$CLANG" || {
+            echo "::error::Android clang validation failed: $CLANG"
+            exit 1
+          }
+
+          test -x "$AR" || {
+            echo "::error::Android llvm-ar validation failed: $AR"
+            exit 1
+          }
+
+          "$CLANG" --version
+          "$AR" --version | head -n 1
+
+          echo "Android NDK toolchain validation passed."
+          echo "NDK: $NDK"
+          echo "Clang: $CLANG"
+          echo "llvm-ar: $AR"
+          echo "Linker: $LINKER"
+          echo "Target sysroot: $SYSROOT"
+
+      - name: Validate Android environment
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          set -euo pipefail
+
+          EXPECTED_NDK_VERSION="27.2.12479018"
+          EXPECTED_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$EXPECTED_NDK_VERSION"
+          EXPECTED_CLANG="$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          EXPECTED_AR="$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+
+          android_validation_failure() {
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              return 0
+            fi
+
+            trap - EXIT
+            echo "::group::Android toolchain failure diagnostics"
+            echo "Exit status: $status"
+            echo "Selected pinned NDK directory: ${EXPECTED_NDK_ROOT:-<unset>}"
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+            echo "ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-<unset>}"
+            echo "PATH=${PATH:-<unset>}"
+            echo "CC_aarch64_linux_android=${CC_aarch64_linux_android:-<unset>}"
+            echo "AR_aarch64_linux_android=${AR_aarch64_linux_android:-<unset>}"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-<unset>}"
+
+            for name in CC_aarch64_linux_android AR_aarch64_linux_android CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER; do
+              value="${!name:-}"
+              if [ -n "$value" ]; then
+                resolved="$(readlink -f "$value" 2>/dev/null || true)"
+                echo "$name configured: $value"
+                echo "$name resolved: ${resolved:-<unresolved>}"
+              else
+                echo "$name configured: <unset>"
+                echo "$name resolved: <unresolved>"
+              fi
+            done
+
+            echo "Expected NDK toolchain prefix: ${EXPECTED_NDK_ROOT:-<unset>}/toolchains/llvm/prebuilt/linux-x86_64/"
+            echo "Selected NDK directory listing:"
+            if [ -d "${EXPECTED_NDK_ROOT:-}" ]; then
+              ls -ld "$EXPECTED_NDK_ROOT"
+            else
+              echo "<missing>"
+            fi
+            echo "::endgroup::"
+            exit "$status"
+          }
+          trap android_validation_failure EXIT
+
+          echo "ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-<unset>}"
+          echo "Pinned NDK version=$EXPECTED_NDK_VERSION"
+          echo "PATH=$PATH"
+          echo "CC_aarch64_linux_android=${CC_aarch64_linux_android:-<unset>}"
+          echo "AR_aarch64_linux_android=${AR_aarch64_linux_android:-<unset>}"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-<unset>}"
+
+          test -n "${ANDROID_NDK_ROOT:-}" || {
+            echo "::error::ANDROID_NDK_ROOT is not set"
+            exit 1
+          }
+
+          # setup-android may expose ANDROID_NDK_ROOT as the runner's installed
+          # NDK (which can differ from our pinned SDK package). The build tools
+          # below are explicitly pinned, so validate the actual pinned NDK path
+          # used by CC/AR/linker rather than requiring the generic environment
+          # variable to equal it.
+          case "$ANDROID_NDK_ROOT" in
+            "$ANDROID_SDK_ROOT/ndk/"*)
+              ;;
+            *)
+              echo "::error::ANDROID_NDK_ROOT is outside ANDROID_SDK_ROOT: $ANDROID_NDK_ROOT"
+              exit 1
+              ;;
+          esac
+          test -d "$ANDROID_NDK_ROOT" || {
+            echo "::error::ANDROID_NDK_ROOT directory is missing: $ANDROID_NDK_ROOT"
+            exit 1
+          }
+          test -d "$EXPECTED_NDK_ROOT" || {
+            echo "::error::Pinned NDK directory is missing: $EXPECTED_NDK_ROOT"
+            exit 1
+          }
+
+          test "${CC_aarch64_linux_android:-}" = "$EXPECTED_CLANG" || {
+            echo "::error::CC_aarch64_linux_android mismatch: expected $EXPECTED_CLANG, got ${CC_aarch64_linux_android:-<unset>}"
+            exit 1
+          }
+          test -x "$CC_aarch64_linux_android" || {
+            echo "::error::CC_aarch64_linux_android is not executable: $CC_aarch64_linux_android"
+            exit 1
+          }
+
+          test "${AR_aarch64_linux_android:-}" = "$EXPECTED_AR" || {
+            echo "::error::AR_aarch64_linux_android mismatch: expected $EXPECTED_AR, got ${AR_aarch64_linux_android:-<unset>}"
+            exit 1
+          }
+          test -x "$AR_aarch64_linux_android" || {
+            echo "::error::AR_aarch64_linux_android is not executable: $AR_aarch64_linux_android"
+            exit 1
+          }
+
+          test "${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-}" = "$EXPECTED_CLANG" || {
+            echo "::error::CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER mismatch: expected $EXPECTED_CLANG, got ${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-<unset>}"
+            exit 1
+          }
+          test -x "$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" || {
+            echo "::error::Android linker is not executable: $CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+            exit 1
+          }
+
+          case ":$PATH:" in
+            *":$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:"*)
+              ;;
+            *)
+              echo "::error::Pinned NDK LLVM bin directory is missing from PATH"
+              echo "Expected: $EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+              exit 1
+              ;;
+          esac
+
+          echo "Selected pinned NDK directory: $EXPECTED_NDK_ROOT"
+
+          expected_toolchain_prefix="$EXPECTED_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/"
+          for name in CC_aarch64_linux_android AR_aarch64_linux_android CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER; do
+            value="${!name:-}"
+            test -n "$value" || {
+              echo "::error::$name is not set"
+              exit 1
+            }
+
+            case "$value" in
+              "$expected_toolchain_prefix"*)
+                ;;
+              *)
+                echo "::error::$name does not resolve to the pinned NDK toolchain: $value"
+                echo "::error::Expected prefix: $expected_toolchain_prefix"
+                exit 1
+                ;;
+            esac
+
+            resolved="$(readlink -f "$value")"
+            case "$resolved" in
+              "$expected_toolchain_prefix"*)
+                ;;
+              *)
+                echo "::error::$name resolves outside the pinned NDK toolchain: $resolved"
+                exit 1
+                ;;
+            esac
+
+            echo "$name -> $value"
+            echo "$name resolved -> $resolved"
+          done
+
+
+          echo "Android environment validation passed."
+          echo "Android validation diagnostics are emitted automatically on failure via the ERR trap."
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT="target/${{ matrix.target }}/release/awh"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            ARTIFACT="${ARTIFACT}.exe"
+          fi
+          test -s "$ARTIFACT"
+          cp "$ARTIFACT" "${{ matrix.asset_name }}"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: ${{ matrix.asset_name }}
+          fail_on_unmatched_files: true
+
+  checksums:
+    name: Generate checksums
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.inputs.version }}"             --repo "${{ github.repository }}"             --dir assets             --clobber
+      - name: Generate SHA-256 checksums
+        run: |
+          cd assets
+          sha256sum * > ../sha256sums.txt
+          cat ../sha256sums.txt
+      - name: Attach checksums and installer
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: |
+            sha256sums.txt
+            scripts/install.sh
+          fail_on_unmatched_files: true

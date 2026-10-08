@@ -1,0 +1,1738 @@
+use agent_workspace_hub::core::capability_grants::CapabilityGrantStore;
+use agent_workspace_hub::core::policy::PolicyStore;
+use agent_workspace_hub::mcp::{
+    auth::load_api_key, CommunityMcpRegistryClient, CustomMcpRegistry, CustomMcpServerConfig,
+    GlobalMcpRegistry, HttpServerConfig, McpDispatcher, McpPermissions, McpTransport, Permission,
+    PersistentTrustStore, ProjectMcpReferences, ResourceLimits, StdioMcpServer, TlsConfig,
+    TrustLevel, BUILTIN_TOOL_TRUST_ID,
+};
+use agent_workspace_hub::models::{CapabilityGrant, PolicyRule};
+use agent_workspace_hub::services::agent_runtime::AgentRuntimeService;
+use agent_workspace_hub::skills::{
+    GlobalSkillRegistry, ProjectSkillReferences, RegistryClient, RegistryStore, SkillInstaller,
+};
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use std::sync::Arc;
+
+const DEFAULT_MCP_REGISTRY: &str = "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/mcps/index.json";
+const DEFAULT_SKILL_REGISTRY: &str =
+    "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/skills";
+
+#[derive(Debug, Parser)]
+#[command(name = "awh", version, about = "Agent Workspace Hub")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Initialize the current directory as an AWH workspace (idempotent).
+    Init {
+        /// Workspace root to initialize (defaults to the current directory).
+        #[arg(long, default_value = ".")]
+        path: String,
+    },
+    Status,
+    /// Interactive terminal UI.
+    Tui {
+        /// Run against a remote AWH Control API (e.g. https://host:8080)
+        /// instead of the local workspace.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Bearer API key for the remote server. Prefer `--api-key-env`
+        /// so the key never appears in shell history or process listings.
+        #[arg(long, conflicts_with = "api_key_env")]
+        api_key: Option<String>,
+        /// Environment variable holding the remote API key (default
+        /// AWH_API_KEY).
+        #[arg(long, default_value = "AWH_API_KEY")]
+        api_key_env: String,
+    },
+    /// Serve the versioned HTTP Control API (`/api/v1`).
+    Serve {
+        /// Bind address for the HTTP server.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port for the HTTP server.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Environment variable holding the API key (required).
+        #[arg(long, default_value = "AWH_API_KEY")]
+        api_key_env: String,
+    },
+    #[command(name = "mcp")]
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+    /// Manage agent identities and their capability grants.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Agent worktree isolation (GIT-001): managed Git worktrees bound
+    /// to one agent session — thin adapters over the canonical
+    /// WorktreeStore lifecycle (containment, ownership, reconciliation,
+    /// audit).
+    #[command(name = "worktree")]
+    Worktree {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::worktree::WorktreeCommand,
+    },
+    /// Manage workspace-local DENY-only policy rules.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    /// Agent-grade filesystem editing and recovery (AWE-014): thin
+    /// adapters over the canonical EditService — every mutation flows
+    /// through the authorization boundary, durable snapshots, provenance,
+    /// and correlated audit.
+    #[command(name = "fs")]
+    Fs {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::fs_edit::FsCommand,
+    },
+    /// Context Engine (CTX-001): thin adapter over the canonical
+    /// ContextEngine — scoped items, budgets, deterministic scoring,
+    /// soft offloading and snapshots. Offloaded items are never lost
+    /// and source files are never modified.
+    Context {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::context::ContextCommand,
+    },
+    /// Memory (MEM-001): thin adapter over the canonical MemoryStore —
+    /// the same authority MCP, the Control API, the TUI, and the Context
+    /// Engine use. Mutations are validated, lock-guarded, atomically
+    /// published, and audited.
+    Memory {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::memory::MemoryCommand,
+    },
+    /// Tasks (TSK-001): thin adapter over the canonical TaskStore —
+    /// the same authority the MCP task tools use. Status changes run
+    /// through the canonical state machine, assignment targets must
+    /// exist in this workspace, and mutations are audited.
+    Task {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::tasks::TaskCommand,
+    },
+    /// Collaboration (COL-001): thin adapter over the canonical
+    /// CollaborationService — assignment, handoff, release, and
+    /// evidence-based conflict reporting over canonical agent, task,
+    /// and worktree identities. Ownership mutations are revision-checked
+    /// and audited; possession of an id is never authority.
+    Collaboration {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::collaboration::CollaborationCommand,
+    },
+    /// Terminal (TRM-001): thin adapter over the canonical
+    /// TerminalService — the same authority the MCP `terminal.run`
+    /// tool, the Control API `/terminal/run` route, and the TUI
+    /// terminal screen use. argv-only (never a shell), bounded by a
+    /// wall-clock timeout and a 256 KiB capture cap, and audited.
+    /// Lifecycle is ephemeral: runs complete within the command.
+    Terminal {
+        #[command(subcommand)]
+        command: agent_workspace_hub::cli::terminal::TerminalCommand,
+    },
+    Tunnel {
+        #[command(subcommand)]
+        command: TunnelCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    Serve {
+        /// Transport to serve MCP over (defaults to stdio for backwards compatibility).
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+
+        /// HTTP bind address for the remote (`sse`) transport.
+        #[arg(long)]
+        host: Option<String>,
+
+        /// HTTP port for the remote (`sse`) transport.
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Path to a PEM TLS certificate (enables HTTPS).
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// Path to a PEM TLS private key (enables HTTPS).
+        #[arg(long)]
+        tls_key: Option<String>,
+
+        /// Environment variable holding the API key for remote access.
+        #[arg(long, default_value = "AWH_API_KEY")]
+        api_key_env: String,
+    },
+    List,
+    Add {
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Extra HTTP header sent on every request (HTTP transport), as NAME=VALUE.
+        /// Prefer `--header 'Authorization=${secret:NAME}'` with `--secret NAME`
+        /// over pasting raw API keys into the registry file.
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Secret (env var name) this server may resolve via `${secret:NAME}`
+        /// header/env references. Grants read permission at serve time; the
+        /// value is only ever read from the serving process environment.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+    },
+    Remove {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value = DEFAULT_MCP_REGISTRY)]
+        registry: String,
+    },
+    Install {
+        id: String,
+        #[arg(long, default_value = DEFAULT_MCP_REGISTRY)]
+        registry: String,
+        #[arg(long)]
+        add: bool,
+    },
+    Update {
+        id: String,
+        #[arg(long, default_value = DEFAULT_MCP_REGISTRY)]
+        registry: String,
+    },
+    Uninstall {
+        id: String,
+    },
+    Trust {
+        id: String,
+        #[arg(long, default_value = "local")]
+        version: String,
+        /// Grant the built-in tool surface the network capability (only
+        /// valid for the reserved `awh.builtin` id).
+        #[arg(long)]
+        network: bool,
+        /// Grant the built-in tool surface the process capability (only
+        /// valid for the reserved `awh.builtin` id).
+        #[arg(long)]
+        process: bool,
+        /// Grant the built-in tool surface the filesystem capability (only
+        /// valid for the reserved `awh.builtin` id).
+        #[arg(long)]
+        filesystem: bool,
+    },
+    Block {
+        id: String,
+        #[arg(long, default_value = "local")]
+        version: String,
+    },
+    Revoke {
+        id: String,
+    },
+    Status {
+        id: String,
+    },
+    Permissions {
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    Create {
+        name: String,
+        #[arg(short, long)]
+        description: String,
+    },
+    List,
+    Show {
+        name: String,
+    },
+    Read {
+        name: String,
+    },
+    Add {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
+    Project,
+    Search {
+        query: String,
+        #[arg(long, default_value = DEFAULT_SKILL_REGISTRY)]
+        registry: String,
+    },
+    Install {
+        name: String,
+        #[arg(long, default_value = DEFAULT_SKILL_REGISTRY)]
+        registry: String,
+        #[arg(long)]
+        add: bool,
+    },
+    Uninstall {
+        name: String,
+    },
+}
+#[derive(Debug, Subcommand)]
+enum RegistryCommand {
+    Add { url: String },
+    List,
+    Remove { url: String },
+    Search { query: String, url: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum TunnelCommand {
+    /// Start a tunnel exposing a local port (runs in the foreground).
+    Start {
+        /// Local address the tunnel forwards to.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Local port the tunnel forwards to.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Tunnel provider implementation.
+        #[arg(long, default_value = "ngrok")]
+        provider: String,
+        /// Path to the ngrok binary.
+        #[arg(long, default_value = "ngrok")]
+        ngrok_path: String,
+        /// ngrok authtoken (prefer AWH_NGROK_AUTHTOKEN over pasting
+        /// tokens into shell history or exposing them in `ps` output).
+        #[arg(long)]
+        ngrok_authtoken: Option<String>,
+        /// ngrok region.
+        #[arg(long)]
+        ngrok_region: Option<String>,
+    },
+    /// Report the status of any tunnel the local ngrok agent exposes.
+    Status {
+        /// Tunnel provider implementation.
+        #[arg(long, default_value = "ngrok")]
+        provider: String,
+        /// Path to the ngrok binary (used to spawn a status probe).
+        #[arg(long, default_value = "ngrok")]
+        ngrok_path: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Create a new agent identity (initial status: created).
+    Create {
+        /// Unique agent id.
+        id: String,
+        /// Human-readable agent name.
+        name: String,
+        /// The agent's role (e.g. researcher).
+        #[arg(long)]
+        role: String,
+    },
+    /// List agents (one per line).
+    List,
+    /// Show an agent and its capability grants.
+    Inspect {
+        /// Agent id.
+        id: String,
+    },
+    /// Grant a capability to an agent.
+    Grant {
+        /// Agent id.
+        id: String,
+        /// Capability category: network|filesystem|environment|process|secrets.
+        #[arg(long)]
+        permission: String,
+        /// Optional resource scope (e.g. a filesystem path prefix).
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Revoke a capability grant.
+    Revoke {
+        /// Grant id.
+        grant_id: String,
+    },
+    /// Show an agent's profile (lifecycle + enabled + grants).
+    Show {
+        /// Agent id.
+        id: String,
+    },
+    /// Activate an agent (status: active).
+    Start {
+        /// Agent id(s) to activate.
+        #[arg(conflicts_with = "all")]
+        ids: Vec<String>,
+        /// Activate every enabled agent instead of named ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Deactivate an agent (status: stopped).
+    Stop {
+        /// Agent id.
+        id: String,
+    },
+    /// Stop then start an agent.
+    Restart {
+        /// Agent id.
+        id: String,
+    },
+    /// Report the runtime status of agents and their sessions.
+    Status,
+    /// Enable or disable an agent profile (resolution fails closed while disabled).
+    Enable {
+        /// Agent id.
+        id: String,
+    },
+    Disable {
+        /// Agent id.
+        id: String,
+    },
+    /// Manage AWH runtime sessions for this workspace.
+    #[command(subcommand)]
+    Session(SessionCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Open a new runtime session for an active agent.
+    Open {
+        /// Agent id the session belongs to.
+        agent_id: String,
+    },
+    /// List sessions (optionally for one agent).
+    List {
+        /// Only list sessions of this agent.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Show one session.
+    Show {
+        /// Session id.
+        session_id: String,
+    },
+    /// Verify a claimed (agent, session) pair resolves to a usable caller.
+    Resolve {
+        /// Agent id claimed by the caller.
+        agent_id: String,
+        /// Session id presented by the caller.
+        session_id: String,
+    },
+    /// Pause an active session.
+    Pause {
+        /// Agent id that owns the session.
+        agent_id: String,
+        /// Session id.
+        session_id: String,
+    },
+    /// Resume a paused session.
+    Resume {
+        /// Agent id that owns the session.
+        agent_id: String,
+        /// Session id.
+        session_id: String,
+    },
+    /// Stop a session (terminal; a new session must be opened afterwards).
+    Stop {
+        /// Agent id that owns the session.
+        agent_id: String,
+        /// Session id.
+        session_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Add a DENY-only policy rule for a specific tool + resource.
+    Deny {
+        /// The tool to restrict: workspace.write_file, workspace.delete_file,
+        /// or terminal.run.
+        tool: String,
+        /// The deny pattern: a path prefix for the workspace.* tools, or an
+        /// exact program name for terminal.run.
+        pattern: String,
+        /// Optional human-readable reason for the denial.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional rule id; auto-generated (tool + pattern hash) when absent.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// List all policy rules (one per line).
+    List,
+    /// Remove a policy rule by id.
+    Remove {
+        /// Rule id.
+        id: String,
+    },
+}
+
+fn main() -> Result<()> {
+    // JSON-RPC responses are written to stdout; keep all diagnostics on stderr
+    // so they never corrupt the protocol stream consumed by MCP clients.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+    let cli = Cli::parse();
+    if let Some(Command::Mcp {
+        command:
+            McpCommand::Serve {
+                transport,
+                host,
+                port,
+                tls_cert,
+                tls_key,
+                api_key_env,
+            },
+    }) = cli.command
+    {
+        match transport.to_ascii_lowercase().as_str() {
+            "stdio" => serve_stdio()?,
+            "sse" | "http" | "streamable-http" | "streamablehttp" => {
+                serve_sse(host, port, tls_cert, tls_key, api_key_env)?
+            }
+            other => {
+                anyhow::bail!("unsupported MCP transport: {other} (expected 'stdio' or 'sse')")
+            }
+        }
+        return Ok(());
+    }
+    let global = GlobalSkillRegistry::discover()?;
+    let project = ProjectSkillReferences::new(std::env::current_dir()?);
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    let registry_store = RegistryStore::new(home.join(".agent-workspace-hub"));
+    // Skill mutations audit like every other mutating surface: switch the
+    // shared audit store to durable persistence (cwd workspace) first;
+    // buffered startup events replay into it. Degraded mode stays
+    // explicit — keep going on failure, the ring still records.
+    if let Err(error) = agent_workspace_hub::services::audit::init_global(std::env::current_dir()?)
+    {
+        tracing::error!(event = "audit_init_failed", error = %error);
+    }
+    match cli.command {
+        Some(Command::Init { path }) => {
+            use agent_workspace_hub::services::init::{initialize_workspace, InitOutcome};
+            // initialize_workspace canonicalizes `path`; manifest.workspace_root
+            // is the resolved root that was actually initialized.
+            let outcome = initialize_workspace(std::path::Path::new(&path))?;
+            let manifest = outcome.manifest();
+            let label = match outcome {
+                InitOutcome::Created(_) => "initialized workspace",
+                InitOutcome::AlreadyInitialized(_) => "workspace already initialized",
+            };
+            println!(
+                "{label} {}\nworkspace id: {}",
+                manifest.workspace_root, manifest.workspace_id
+            );
+        }
+        Some(Command::Status) => println!("Agent Workspace Hub — Rust\nstatus: bootstrap complete"),
+        Some(Command::Tui {
+            remote,
+            api_key,
+            api_key_env,
+        }) => match remote {
+            Some(base) => {
+                let key = api_key
+                    .or_else(|| std::env::var(&api_key_env).ok())
+                    .filter(|k| !k.is_empty())
+                    .with_context(|| {
+                        format!("remote mode needs an API key: pass --api-key or set {api_key_env}")
+                    })?;
+                agent_workspace_hub::tui::run_remote(&base, &key)?
+            }
+            None => agent_workspace_hub::tui::run_local(std::env::current_dir()?)?,
+        },
+        Some(Command::Serve {
+            host,
+            port,
+            api_key_env,
+        }) => serve_control_api(host, port, api_key_env)?,
+        Some(Command::Mcp { command }) => handle_mcp_cli(command)?,
+        Some(Command::Skill { command }) => match command {
+            SkillCommand::Create { name, description } => {
+                let s = global.create(&name, &description)?;
+                audit_skill_mutation("cli_skill_create", &s.name, "created global skill");
+                println!(
+                    "created global skill: {}\npath: {}",
+                    s.name,
+                    s.path.display()
+                );
+            }
+            SkillCommand::List => {
+                // One view distinguishing the three contract states:
+                // every listed skill is installed; the suffix says
+                // whether this project references it, and whether that
+                // reference is enabled for runtime exposure.
+                let referenced: std::collections::HashMap<String, bool> = project
+                    .states()?
+                    .into_iter()
+                    .map(|state| (state.name, state.enabled))
+                    .collect();
+                for s in global.list()? {
+                    match referenced.get(&s.name) {
+                        Some(true) => println!(
+                            "{} — {} [installed; referenced; enabled]",
+                            s.name, s.description
+                        ),
+                        Some(false) => println!(
+                            "{} — {} [installed; referenced; disabled]",
+                            s.name, s.description
+                        ),
+                        None => {
+                            println!("{} — {} [installed; not referenced]", s.name, s.description)
+                        }
+                    }
+                }
+            }
+            SkillCommand::Show { name } => {
+                let s = global
+                    .get(&name)?
+                    .ok_or_else(|| anyhow::anyhow!("skill not found: {name}"))?;
+                let state = project.states()?;
+                let referenced = state.iter().find(|st| st.name == name);
+                println!(
+                    "name: {}\ndescription: {}\nversion: {}\npath: {}\ninstalled: yes\nreferenced: {}\nenabled: {}",
+                    s.name,
+                    s.description,
+                    s.version.as_deref().unwrap_or("unknown"),
+                    s.path.display(),
+                    referenced.is_some(),
+                    referenced.is_some_and(|st| st.enabled),
+                );
+            }
+            SkillCommand::Read { name } => match global.get(&name)? {
+                Some(s) => println!(
+                    "name: {}\ndescription: {}\nversion: {}\npath: {}",
+                    s.name,
+                    s.description,
+                    s.version.as_deref().unwrap_or("unknown"),
+                    s.path.display()
+                ),
+                None => bail!("skill not found: {name}"),
+            },
+            SkillCommand::Add { name } => {
+                project.add(&name, &global)?;
+                audit_skill_mutation("cli_skill_add", &name, "added project skill reference");
+                println!("added project skill reference: {name}")
+            }
+            SkillCommand::Remove { name } => {
+                if project.remove(&name)? {
+                    audit_skill_mutation(
+                        "cli_skill_remove",
+                        &name,
+                        "removed project skill reference",
+                    );
+                    println!("removed project skill reference: {name}")
+                } else {
+                    bail!("skill reference not found: {name}")
+                }
+            }
+            SkillCommand::Enable { name } => {
+                project.enable(&name)?;
+                audit_skill_mutation("cli_skill_enable", &name, "enabled project skill reference");
+                println!("enabled project skill reference: {name}")
+            }
+            SkillCommand::Disable { name } => {
+                project.disable(&name)?;
+                audit_skill_mutation(
+                    "cli_skill_disable",
+                    &name,
+                    "disabled project skill reference",
+                );
+                println!("disabled project skill reference: {name}")
+            }
+            SkillCommand::Project => {
+                for s in project.resolve(&global)? {
+                    println!("{} — {}", s.name, s.description)
+                }
+            }
+            SkillCommand::Search {
+                query,
+                registry: url,
+            } => search_registry(&url, &query)?,
+            SkillCommand::Install {
+                name,
+                registry: url,
+                add,
+            } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                let client = RegistryClient::new(url.clone());
+                let cache = home
+                    .join(".agent-workspace-hub")
+                    .join("cache")
+                    .join("skills");
+                rt.block_on(
+                    SkillInstaller::new(cache).install_from_registry(&client, &name, &global),
+                )?;
+                audit_skill_mutation(
+                    "cli_skill_install",
+                    &name,
+                    "installed global skill from registry",
+                );
+                println!("installed global skill: {name}");
+                if add {
+                    project.add(&name, &global)?;
+                    audit_skill_mutation("cli_skill_add", &name, "added project skill reference");
+                    println!("added project reference: {name}")
+                }
+            }
+            SkillCommand::Uninstall { name } => {
+                // Validate before the join: an unvalidated name would let
+                // `awh skill uninstall ../../x` delete a directory outside
+                // the global skills root (the same boundary `get`/`create`
+                // already enforce inside the registry).
+                agent_workspace_hub::skills::validate_name(&name)?;
+                let path = global.skills_dir().join(&name);
+                if path.exists() {
+                    std::fs::remove_dir_all(path)?;
+                    audit_skill_mutation("cli_skill_uninstall", &name, "uninstalled global skill");
+                    println!("uninstalled global skill: {name}")
+                } else {
+                    bail!("skill not installed: {name}")
+                }
+            }
+        },
+        Some(Command::Registry { command }) => match command {
+            RegistryCommand::Add { url } => {
+                if registry_store.add(&url)? {
+                    println!("registry added: {url}")
+                } else {
+                    bail!("registry already exists: {url}")
+                }
+            }
+            RegistryCommand::List => {
+                for url in registry_store.load()?.registries {
+                    println!("{url}")
+                }
+            }
+            RegistryCommand::Remove { url } => {
+                if registry_store.remove(&url)? {
+                    println!("registry removed: {url}")
+                } else {
+                    bail!("registry not found: {url}")
+                }
+            }
+            RegistryCommand::Search { query, url } => search_registry(&url, &query)?,
+        },
+        Some(Command::Agent { command }) => handle_agent_cli(command)?,
+        Some(Command::Worktree { command }) => {
+            // The worktree family returns its own stable exit codes
+            // (GIT-001 §19); propagate them as the process status.
+            let root = std::env::current_dir()?;
+            std::process::exit(agent_workspace_hub::cli::worktree::run(command, &root));
+        }
+        Some(Command::Policy { command }) => handle_policy_cli(command)?,
+        Some(Command::Memory { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // MEM-001: mutations must land in the durable audit log, not
+            // die with the process ring — same treatment as the fs arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::memory::handle_memory_cli(&root, command)?;
+        }
+        Some(Command::Task { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // TSK-001: mutations must land in the durable audit log, not
+            // die with the process ring — same treatment as the fs arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::tasks::handle_task_cli(&root, command)?;
+        }
+        Some(Command::Collaboration { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // COL-001: ownership transitions must land in the durable
+            // audit log, not die with the process ring — same treatment
+            // as the task arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::collaboration::handle_collaboration_cli(&root, command)?;
+        }
+        Some(Command::Terminal { command }) => {
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            // TRM-001: terminal execution is high-risk, so runs must land
+            // in the durable audit log — same treatment as the task arm.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::terminal::handle_terminal_cli(&root, command)?;
+        }
+        Some(Command::Context { command }) => {
+            // CTX-001: the CLI mirrors the MCP dispatcher's construction
+            // path (same root, same AWH_CONTEXT_* env overrides) so both
+            // interfaces observe identical engine semantics. Context
+            // mutations audit identifiers/outcomes, so switch the store
+            // to durable persistence before the run — same treatment
+            // as the task arm.
+            let root =
+                std::env::current_dir().context("could not determine the workspace directory")?;
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            agent_workspace_hub::cli::context::handle_context_cli(&root, command)?;
+        }
+        Some(Command::Fs { command }) => {
+            // The fs family returns its own stable exit codes (AWE-014
+            // §23); propagate them as the process status.
+            let root = std::env::current_dir()?;
+            // AWE-013: fs edits emit correlated audit events; switch the
+            // canonical store to durable persistence before the run so
+            // those events land in `.agent/audit/audit.log` instead of
+            // dying with the process ring. Degraded mode is explicit:
+            // keep running (the buffered store still records) and
+            // surface the condition, exactly like the serve arms.
+            if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+                tracing::error!(event = "audit_init_failed", error = %error);
+            }
+            std::process::exit(agent_workspace_hub::cli::fs_edit::run(command, &root));
+        }
+        Some(Command::Tunnel { command }) => handle_tunnel_cli(command)?,
+        None => println!("Agent Workspace Hub — Rust\nRun `awh --help` for commands."),
+    }
+    Ok(())
+}
+
+/// Conservative heuristic for "this looks like a pasted credential": a
+/// long, dense base62/base64-style token. Used only to warn the operator
+/// toward the `${secret:...}` indirection — never to block a header.
+fn looks_like_secret(value: &str) -> bool {
+    value.len() >= 20
+        && !value.starts_with("${secret:")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && value.chars().any(|c| c.is_ascii_digit())
+}
+
+fn trust_dir() -> Result<std::path::PathBuf> {
+    agent_workspace_hub::mcp::trust_data_dir()
+        .context("could not determine the trust data directory (set AWH_TRUST_DIR)")
+}
+
+fn handle_mcp_cli(command: McpCommand) -> Result<()> {
+    let registry = CustomMcpRegistry::new(std::env::current_dir()?)?;
+    match command {
+        McpCommand::List => {
+            for s in registry.list()? {
+                println!(
+                    "{} — {} [{:?}] {}",
+                    s.id,
+                    s.name,
+                    s.transport,
+                    if s.enabled { "enabled" } else { "disabled" }
+                )
+            }
+        }
+        McpCommand::Add {
+            id,
+            name,
+            transport,
+            command,
+            args,
+            url,
+            env,
+            headers,
+            secrets,
+        } => {
+            let transport = match transport.to_ascii_lowercase().as_str() {
+                "stdio" => McpTransport::Stdio,
+                "streamablehttp" | "streamable-http" | "http" => McpTransport::StreamableHttp,
+                other => anyhow::bail!("unsupported MCP transport: {other}"),
+            };
+            let mut environment = std::collections::HashMap::new();
+            for item in env {
+                let mut parts = item.splitn(2, '=');
+                let k = parts.next().unwrap_or("");
+                let v = parts.next().unwrap_or("");
+                if k.is_empty() {
+                    anyhow::bail!("--env must be KEY=VALUE")
+                }
+                environment.insert(k.to_string(), v.to_string());
+            }
+            let mut header_map = std::collections::HashMap::new();
+            for item in headers {
+                let mut parts = item.splitn(2, '=');
+                let k = parts.next().unwrap_or("");
+                let v = parts.next().unwrap_or("");
+                if k.is_empty() {
+                    anyhow::bail!("--header must be NAME=VALUE")
+                }
+                header_map.insert(k.to_string(), v.to_string());
+            }
+            let mut permissions = McpPermissions::default();
+            for secret in &secrets {
+                if agent_workspace_hub::mcp::permissions::is_valid_env_name(secret)
+                    && !agent_workspace_hub::mcp::permissions::is_blocked_environment(secret)
+                {
+                    // Secret-read permission implies environment-read for the
+                    // same name (`McpPermissions::validate` enforces this).
+                    permissions.environment.push(secret.clone());
+                    permissions.secrets.push(secret.clone());
+                } else {
+                    anyhow::bail!("--secret must be a safe environment variable name: {secret}");
+                }
+            }
+            for value in header_map.values() {
+                if looks_like_secret(value) {
+                    eprintln!(
+                        "warning: --header value looks like a raw credential. Prefer \
+                         --header 'NAME=${{secret:ENV_VAR}}' with --secret ENV_VAR so the \
+                         key is read from the environment and never stored in .agent/mcps.json"
+                    );
+                }
+            }
+            let s = registry.add(CustomMcpServerConfig {
+                id,
+                name,
+                transport,
+                command,
+                args,
+                url,
+                env: environment,
+                headers: header_map,
+                permissions,
+                enabled: true,
+            })?;
+            println!("added MCP: {}", s.id);
+        }
+        McpCommand::Remove { id } => {
+            if registry.remove(&id)? {
+                println!("removed MCP: {id}")
+            } else {
+                bail!("MCP not found: {id}")
+            }
+        }
+        McpCommand::Enable { id } => {
+            if registry.set_enabled(&id, true)?.is_some() {
+                println!("enabled MCP: {id}")
+            } else {
+                bail!("MCP not found: {id}")
+            }
+        }
+        McpCommand::Disable { id } => {
+            if registry.set_enabled(&id, false)?.is_some() {
+                println!("disabled MCP: {id}")
+            } else {
+                bail!("MCP not found: {id}")
+            }
+        }
+        McpCommand::Search {
+            query,
+            registry: url,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            for m in rt.block_on(CommunityMcpRegistryClient::new(url)?.search(&query))? {
+                println!(
+                    "{} v{} — {}",
+                    m.id,
+                    if m.version.is_empty() {
+                        "unknown"
+                    } else {
+                        &m.version
+                    },
+                    m.description
+                );
+            }
+        }
+        McpCommand::Install {
+            id,
+            registry: url,
+            add,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let global = GlobalMcpRegistry::new()?;
+            let project = ProjectMcpReferences::new(std::env::current_dir()?)?;
+            let entry = rt.block_on(CommunityMcpRegistryClient::new(url)?.install(&global, &id))?;
+            println!(
+                "installed global MCP: {} v{}",
+                entry.config.id, entry.version
+            );
+            if add {
+                project.add(&id)?;
+                println!("added project MCP reference: {id}")
+            }
+        }
+        McpCommand::Update { id, registry: url } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let global = GlobalMcpRegistry::new()?;
+            let entry = rt.block_on(CommunityMcpRegistryClient::new(url)?.update(&global, &id))?;
+            println!("updated MCP: {} v{}", entry.config.id, entry.version);
+        }
+        McpCommand::Uninstall { id } => {
+            let global = GlobalMcpRegistry::new()?;
+            if global.remove(&id)? {
+                println!("uninstalled global MCP: {id}")
+            } else {
+                bail!("global MCP not found: {id}")
+            }
+        }
+        McpCommand::Trust {
+            id,
+            version,
+            network,
+            process,
+            filesystem,
+        } => {
+            // The reserved built-in identity is not a registered custom
+            // server, so its permissions are declared by the capability
+            // flags instead of a server config. No flags means a Reviewed
+            // record granting nothing — the least-privilege starting point;
+            // `awh mcp trust awh.builtin --network --process --filesystem`
+            // grants the full built-in surface.
+            let permissions = if id == BUILTIN_TOOL_TRUST_ID {
+                McpPermissions {
+                    network,
+                    process,
+                    filesystem: if filesystem {
+                        vec![BUILTIN_TOOL_TRUST_ID.to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..McpPermissions::default()
+                }
+            } else {
+                if network || process || filesystem {
+                    bail!(
+                        "capability flags are only valid for the reserved id {}",
+                        BUILTIN_TOOL_TRUST_ID
+                    );
+                }
+                registry.get(&id)?.context("MCP not found")?.permissions
+            };
+            let dir = trust_dir()?;
+            let mut store = PersistentTrustStore::new(&dir)?;
+            store.approve(id.clone(), TrustLevel::Reviewed, permissions, version)?;
+            store.save(&dir)?;
+            println!("trusted MCP: {id}");
+        }
+        McpCommand::Block { id, version } => {
+            let dir = trust_dir()?;
+            let mut store = PersistentTrustStore::new(&dir)?;
+            store.approve(
+                id.clone(),
+                TrustLevel::Blocked,
+                McpPermissions::default(),
+                version,
+            )?;
+            store.save(&dir)?;
+            println!("blocked MCP: {id}");
+        }
+        McpCommand::Revoke { id } => {
+            let dir = trust_dir()?;
+            let mut store = PersistentTrustStore::new(&dir)?;
+            if !store.revoke(&id) {
+                anyhow::bail!("no trust record found for {id}")
+            }
+            store.save(&dir)?;
+            println!("revoked MCP trust: {id}");
+        }
+        McpCommand::Status { id } => {
+            let dir = trust_dir()?;
+            let store = PersistentTrustStore::new(&dir)?;
+            let config = registry.get(&id)?;
+            match store.approvals.iter().find(|a| a.id == id) {
+                Some(a) => {
+                    println!(
+                        "MCP: {id}\ntrust: {:?}\napproved version: {}",
+                        a.level,
+                        if a.approved_version.is_empty() {
+                            "any"
+                        } else {
+                            &a.approved_version
+                        }
+                    );
+                }
+                None => println!("MCP: {id}\ntrust: unknown"),
+            }
+            if let Some(c) = config {
+                println!("enabled: {}\ntransport: {:?}", c.enabled, c.transport);
+            }
+        }
+        McpCommand::Permissions { id } => {
+            // The reserved built-in identity has no registered server config;
+            // report the granted capabilities straight from its trust record.
+            let p = if id == BUILTIN_TOOL_TRUST_ID {
+                let dir = trust_dir()?;
+                let store = PersistentTrustStore::new(&dir)?;
+                store
+                    .approvals
+                    .iter()
+                    .find(|a| a.id == BUILTIN_TOOL_TRUST_ID)
+                    .map(|a| a.approved_permissions.clone())
+                    .context("no trust record found for the built-in tool surface (every built-in tool is unrestricted)")?
+            } else {
+                registry.get(&id)?.context("MCP not found")?.permissions
+            };
+            println!(
+                "MCP: {id}\nnetwork: {}\nprocess: {}\nfilesystem: {}\nenvironment: {}\nsecrets: {}",
+                p.network,
+                p.process,
+                if p.filesystem.is_empty() {
+                    "none".into()
+                } else {
+                    p.filesystem.join(", ")
+                },
+                if p.environment.is_empty() {
+                    "none".into()
+                } else {
+                    p.environment.join(", ")
+                },
+                if p.secrets.is_empty() {
+                    "none".into()
+                } else {
+                    p.secrets.join(", ")
+                }
+            );
+        }
+        McpCommand::Serve { .. } => unreachable!(),
+    }
+    Ok(())
+}
+fn search_registry(url: &str, query: &str) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    for s in rt.block_on(RegistryClient::new(url).search(query))? {
+        println!("{} v{} — {}", s.name, s.version, s.description)
+    }
+    Ok(())
+}
+
+/// Records a skill mutation in the shared audit store (durable when
+/// `init_global` switched it, ring-only otherwise). Skill names only —
+/// never registry URLs, tokens, or skill content.
+fn audit_skill_mutation(action: &str, name: &str, detail: &str) {
+    agent_workspace_hub::services::audit::global().record("allow", action, name, detail);
+}
+
+/// Builds and runs the versioned HTTP Control API (`/api/v1`).
+fn serve_control_api(host: String, port: u16, api_key_env: String) -> Result<()> {
+    let api_key = load_api_key(&api_key_env)
+        .with_context(|| format!("control API requires a bearer token; set {api_key_env}"))?;
+
+    let root = std::env::current_dir()?;
+    // AWE-013: the Control API audit reads (/audit, /logs) must serve
+    // durable history, so initialize the persistent store first.
+    agent_workspace_hub::services::audit::init_global(&root)?;
+    let state = Arc::new(agent_workspace_hub::api::control::ControlState::new(
+        &root, api_key,
+    ));
+    let app = agent_workspace_hub::api::control::build_router(state);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let addr = format!("{host}:{port}");
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        eprintln!("control API listening on http://{addr}/api/v1 (health: /api/v1/healthz)");
+        axum::serve(listener, app).await
+    })?;
+    Ok(())
+}
+
+/// Handles `awh agent *`: registration, lifecycle, and runtime sessions.
+/// All logic is delegated to the shared [`AgentRuntimeService`] so the CLI
+/// cannot diverge from other surfaces (TW-002 §19). Capability grants remain
+/// recorded-but-not-enforced until the policy phase.
+fn handle_agent_cli(command: AgentCommand) -> Result<()> {
+    // Agents are workspace-local: they live in the `.agent` directory of the
+    // project the command runs against. All lifecycle logic lives in the
+    // shared AgentRuntimeService so every surface (CLI/MCP/TUI/API)
+    // behaves identically (TW-002 §19).
+    let root = std::env::current_dir().context("could not determine workspace directory")?;
+    let runtime = AgentRuntimeService::new(&root);
+    let grants = CapabilityGrantStore::new(&root);
+
+    match command {
+        AgentCommand::Create { id, name, role } => {
+            let agent = runtime.register_profile(&id, &name, &role)?;
+            println!(
+                "created agent {} ({}) role: {} status: created",
+                agent.id, agent.name, agent.role
+            );
+        }
+        AgentCommand::List => {
+            for agent in runtime.profiles()? {
+                println!(
+                    "{} {} {} {}",
+                    agent.id,
+                    agent.name,
+                    agent.role,
+                    agent.status.label()
+                );
+            }
+        }
+        AgentCommand::Inspect { id } => {
+            let Some(agent) = runtime.profile(&id)? else {
+                bail!("agent not found: {id}");
+            };
+            println!(
+                "id: {}\nname: {}\nrole: {}\nstatus: {}\ncreated: {}",
+                agent.id,
+                agent.name,
+                agent.role,
+                agent.status.label(),
+                agent.created_at
+            );
+            print_grants(&grants, &id)?;
+        }
+        AgentCommand::Show { id } => {
+            let agent = runtime
+                .profile(&id)?
+                .with_context(|| format!("agent not found: {id}"))?;
+            println!(
+                "id: {}\nname: {}\nrole: {}\nstatus: {}\nenabled: {}\ncreated: {}",
+                agent.id,
+                agent.name,
+                agent.role,
+                agent.status.label(),
+                if agent.enabled { "true" } else { "false" },
+                agent.created_at
+            );
+            print_grants(&grants, &id)?;
+        }
+        AgentCommand::Start { ids, all } => {
+            let targets: Vec<String> = if all {
+                let enabled: Vec<String> = runtime
+                    .profiles()?
+                    .into_iter()
+                    .filter(|a| a.enabled)
+                    .map(|a| a.id)
+                    .collect();
+                if enabled.is_empty() {
+                    println!("no enabled agents to start");
+                    return Ok(());
+                }
+                enabled
+            } else {
+                if ids.is_empty() {
+                    bail!("no agent id given (or use --all)");
+                }
+                ids
+            };
+            for id in targets {
+                let agent = runtime.start_agent(&id)?;
+                println!("started agent {} status: active", agent.id);
+            }
+        }
+        AgentCommand::Stop { id } => {
+            let agent = runtime.stop_agent(&id)?;
+            println!("stopped agent {} status: stopped", agent.id);
+        }
+        AgentCommand::Restart { id } => {
+            let agent = runtime.restart_agent(&id)?;
+            println!("restarted agent {} status: active", agent.id);
+        }
+        AgentCommand::Status => {
+            let agents = runtime.profiles()?;
+            if agents.is_empty() {
+                println!("no agents registered");
+                return Ok(());
+            }
+            for agent in &agents {
+                let sessions = runtime.sessions_for(Some(&agent.id))?;
+                let usable = sessions.iter().filter(|s| s.status.is_usable()).count();
+                println!(
+                    "{} {} status: {} enabled: {} usable-sessions: {}",
+                    agent.id,
+                    agent.name,
+                    agent.status.label(),
+                    if agent.enabled { "true" } else { "false" },
+                    usable
+                );
+            }
+        }
+        AgentCommand::Enable { id } => {
+            let agent = runtime.set_profile_enabled(&id, true)?;
+            println!("enabled agent {}", agent.id);
+        }
+        AgentCommand::Disable { id } => {
+            let agent = runtime.set_profile_enabled(&id, false)?;
+            println!(
+                "disabled agent {} (sessions will no longer resolve)",
+                agent.id
+            );
+        }
+        AgentCommand::Grant {
+            id,
+            permission,
+            scope,
+        } => {
+            if runtime.profile(&id)?.is_none() {
+                bail!("agent not found: {id}");
+            }
+            let permission = parse_permission(&permission)?;
+            // Grant ids are derived from the agent id and permission so they
+            // are unique per agent/permission pair and predictable for
+            // `agent revoke`.
+            let grant_id = format!("{}-{}", id, permission.as_str());
+            let grant = CapabilityGrant {
+                id: grant_id.clone(),
+                agent_id: id.clone(),
+                permission,
+                scope,
+                granted_at: chrono::Utc::now().to_rfc3339(),
+                expires_at: None,
+            };
+            grants.create(&grant)?;
+            println!("granted {} to {id} (grant {grant_id})", permission.as_str());
+        }
+        AgentCommand::Revoke { grant_id } => {
+            if grants.revoke(&grant_id)? {
+                println!("revoked grant: {grant_id}");
+            } else {
+                println!("grant not found: {grant_id}");
+            }
+        }
+        AgentCommand::Session(command) => handle_session_cli(&runtime, command)?,
+    }
+    Ok(())
+}
+
+/// Shared grant rendering for `agent inspect` / `agent show`.
+fn print_grants(grants: &CapabilityGrantStore, id: &str) -> Result<()> {
+    let agent_grants = grants.list_for_agent(id)?;
+    if agent_grants.is_empty() {
+        println!("grants: none");
+    } else {
+        println!("grants ({}):", agent_grants.len());
+        for grant in agent_grants {
+            println!(
+                "  {} {} scope: {}",
+                grant.id,
+                grant.permission.as_str(),
+                grant.scope.as_deref().unwrap_or("unscoped")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Handles `awh agent session *`: the AWH-native runtime session surface.
+/// Thin handlers only — every operation is the canonical
+/// `AgentRuntimeService` operation (TW-002 §19: no duplicate lifecycle
+/// logic in CLI handlers).
+fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) -> Result<()> {
+    match command {
+        SessionCommand::Open { agent_id } => {
+            let session = runtime.open_session(&agent_id)?;
+            println!(
+                "opened session {} for agent {} status: active",
+                session.session_id, session.agent_id
+            );
+        }
+        SessionCommand::List { agent } => {
+            for session in runtime.sessions_for(agent.as_deref())? {
+                println!(
+                    "{} agent: {} status: {}",
+                    session.session_id,
+                    session.agent_id,
+                    session.status.label()
+                );
+            }
+        }
+        SessionCommand::Show { session_id } => {
+            let Some(session) = runtime.session(&session_id)? else {
+                bail!("session not found: {session_id}");
+            };
+            println!(
+                "session: {}\nagent: {}\nworkspace: {}\nstatus: {}\ncreated: {}\nlast-activity: {}",
+                session.session_id,
+                session.agent_id,
+                session.workspace_id,
+                session.status.label(),
+                session.created_at,
+                session.last_activity_at
+            );
+        }
+        SessionCommand::Resolve {
+            agent_id,
+            session_id,
+        } => {
+            let caller = runtime.resolve_session(&agent_id, &session_id)?;
+            println!(
+                "resolved session {} agent: {} workspace: {} status: {}",
+                caller.session_id,
+                caller.agent_id,
+                caller.workspace_id,
+                caller.status.label()
+            );
+        }
+        SessionCommand::Pause {
+            agent_id,
+            session_id,
+        } => {
+            let session = runtime.transition_session(
+                &agent_id,
+                &session_id,
+                agent_workspace_hub::models::SessionStatus::Paused,
+            )?;
+            println!("paused session {} status: paused", session.session_id);
+        }
+        SessionCommand::Resume {
+            agent_id,
+            session_id,
+        } => {
+            let session = runtime.transition_session(
+                &agent_id,
+                &session_id,
+                agent_workspace_hub::models::SessionStatus::Active,
+            )?;
+            println!("resumed session {} status: active", session.session_id);
+        }
+        SessionCommand::Stop {
+            agent_id,
+            session_id,
+        } => {
+            let session = runtime.transition_session(
+                &agent_id,
+                &session_id,
+                agent_workspace_hub::models::SessionStatus::Stopped,
+            )?;
+            println!(
+                "stopped session {} (terminal — open a new session to continue)",
+                session.session_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Handles `awh policy deny|list|remove`. Policy rules are workspace-local
+/// (persisted under the current working directory's `.agent/policy.json`) and
+/// DENY-only: they narrow the coarse built-in tool gate for exactly three
+/// tools. Adding a rule does not enable any tool — it can only further
+/// restrict one that Phase 2's gate has already allowed.
+fn handle_policy_cli(command: PolicyCommand) -> Result<()> {
+    let root = std::env::current_dir().context("could not determine workspace directory")?;
+    let policy = PolicyStore::new(&root);
+
+    // The supported tool set is validated here (before anything is written)
+    // so an unsupported `tool` is rejected with a clear error.
+    const SUPPORTED_TOOLS: [&str; 3] = [
+        "workspace.write_file",
+        "workspace.delete_file",
+        "terminal.run",
+    ];
+
+    match command {
+        PolicyCommand::Deny {
+            tool,
+            pattern,
+            reason,
+            id,
+        } => {
+            if !SUPPORTED_TOOLS.contains(&tool.as_str()) {
+                bail!(
+                    "unsupported policy tool: {tool:?} (supported: {})",
+                    SUPPORTED_TOOLS.join(", ")
+                );
+            }
+            let id = id.unwrap_or_else(|| derive_policy_id(&tool, &pattern));
+            let rule = PolicyRule {
+                id,
+                tool,
+                pattern,
+                reason,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            policy.add(&rule)?;
+            println!(
+                "added policy rule {} for {} ({})",
+                rule.id, rule.tool, rule.pattern
+            );
+        }
+        PolicyCommand::List => {
+            for rule in policy.list()? {
+                println!(
+                    "{} {} {} {}",
+                    rule.id,
+                    rule.tool,
+                    rule.pattern,
+                    rule.reason.as_deref().unwrap_or("none")
+                );
+            }
+        }
+        PolicyCommand::Remove { id } => {
+            if policy.remove(&id)? {
+                println!("removed policy rule: {id}");
+            } else {
+                println!("policy rule not found: {id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derives a stable, collision-resistant default rule id from a tool + pattern
+/// pair (a short hex prefix of their SHA-256) when the caller does not supply
+/// one. Deterministic so re-running `deny` with the same arguments reports a
+/// duplicate-id error rather than silently duplicating the rule.
+fn derive_policy_id(tool: &str, pattern: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tool.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(pattern.as_bytes());
+    let digest = hasher.finalize();
+    format!("policy-{}", hex(&digest[..8]))
+}
+
+/// Lowercase hex encoding of a byte slice (local to avoid an extra crate).
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Maps a permission label from the CLI to the shared [`Permission`] enum.
+fn parse_permission(value: &str) -> Result<Permission> {
+    match value {
+        "network" => Ok(Permission::Network),
+        "filesystem" => Ok(Permission::Filesystem),
+        "environment" => Ok(Permission::Environment),
+        "process" => Ok(Permission::Process),
+        "secrets" => Ok(Permission::Secrets),
+        other => bail!(
+            "invalid permission {other:?} — expected one of: network, filesystem, environment, process, secrets"
+        ),
+    }
+}
+
+/// Handles `awh tunnel start|status`. `start` runs in the foreground:
+/// the tunnel lives exactly as long as the command, Ctrl-C stops it and
+/// the ngrok child is killed on drop.
+fn handle_tunnel_cli(command: TunnelCommand) -> Result<()> {
+    use agent_workspace_hub::tunnel::{provider_by_name, TunnelStatus};
+
+    match command {
+        TunnelCommand::Start {
+            host,
+            port,
+            provider,
+            ngrok_path,
+            ngrok_authtoken,
+            ngrok_region,
+        } => {
+            if host != "127.0.0.1" && host != "localhost" {
+                eprintln!(
+                    "warning: forwarding to {host}. The Control API behind this tunnel must \
+                     still require its bearer token; the tunnel is transport, not auth."
+                );
+            }
+            let mut p = provider_by_name(&provider)?;
+            if p.name() == "ngrok" {
+                // Only the ngrok provider understands these options;
+                // the CLI stays provider-agnostic by rebuilding from
+                // name + typed options instead of matching elsewhere.
+                // The authtoken prefers the CLI flag but falls back to
+                // AWH_NGROK_AUTHTOKEN so the secret never needs to
+                // appear in `awh`'s own (world-readable) argv.
+                let authtoken = ngrok_authtoken.or_else(|| {
+                    std::env::var("AWH_NGROK_AUTHTOKEN")
+                        .ok()
+                        .filter(|t| !t.is_empty())
+                });
+                p = Box::new(
+                    agent_workspace_hub::tunnel::NgrokProvider::new(&ngrok_path)
+                        .with_authtoken(authtoken)
+                        .with_region(ngrok_region),
+                );
+            }
+
+            let target = format!("{host}:{port}");
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                println!("starting {provider} tunnel to {target}…");
+                let url = p.start(&target).await?;
+                println!("public URL: {url}");
+                eprintln!("tunnel is up — Ctrl-C to stop");
+                tokio::signal::ctrl_c().await?;
+                p.stop().await?;
+                println!("tunnel stopped");
+                Ok::<(), anyhow::Error>(())
+            })
+        }
+        TunnelCommand::Status { provider, .. } => {
+            let p = provider_by_name(&provider)?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                match p.status().await {
+                    Ok(TunnelStatus::Running { public_url }) => {
+                        println!("running\npublic URL: {public_url}")
+                    }
+                    Ok(TunnelStatus::Starting) => println!("starting"),
+                    Ok(TunnelStatus::Stopped) => println!("stopped"),
+                    Err(e) => {
+                        eprintln!("status probe failed (is the ngrok agent running?): {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+        }
+    }
+}
+
+/// Runs the standard stdio MCP serve loop (the original `awh mcp serve` path).
+fn serve_stdio() -> Result<()> {
+    let root = std::env::current_dir()?;
+    // AWE-013: switch the canonical audit store to durable persistence
+    // before any request is served; buffered startup events replay in.
+    agent_workspace_hub::services::audit::init_global(&root)?;
+    let server = StdioMcpServer::new(root)?;
+    agent_workspace_hub::mcp::audit_allow("server_start", "stdio", "mcp");
+    use std::io::{self, BufRead, Write};
+    for line in io::stdin().lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = server.handle_response(&line);
+        if !response.is_empty() {
+            println!("{response}");
+            io::stdout().flush()?;
+        }
+    }
+    // Deterministic shutdown: the client closed stdin (EOF), so the session
+    // is closed and the server stops cleanly.
+    server.close();
+    agent_workspace_hub::mcp::audit_allow("server_stop", "stdio", "eof");
+    Ok(())
+}
+
+/// Builds and runs the remote HTTP/SSE MCP server.
+fn serve_sse(
+    host: Option<String>,
+    port: Option<u16>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    api_key_env: String,
+) -> Result<()> {
+    // Precedence: explicit CLI flag > `AWH_*` environment variable > default.
+    let host = host
+        .or_else(|| std::env::var("AWH_HOST").ok())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let port = match port {
+        Some(port) => port,
+        None => match std::env::var("AWH_PORT") {
+            // A set-but-empty value is treated as unset so the common
+            // `AWH_PORT="${SOME_PORT:-}"` / env_file pattern keeps the
+            // documented default instead of aborting startup.
+            Ok(raw) if raw.trim().is_empty() => 8443,
+            // Any other value must parse as u16; a non-numeric (or
+            // out-of-range) value fails closed — invalid configuration is
+            // never silently ignored.
+            Ok(raw) => raw
+                .trim()
+                .parse::<u16>()
+                .with_context(|| format!("invalid value for AWH_PORT: {raw:?}"))?,
+            Err(_) => 8443,
+        },
+    };
+    let tls_cert = tls_cert.or_else(|| std::env::var("AWH_TLS_CERT").ok());
+    let tls_key = tls_key.or_else(|| std::env::var("AWH_TLS_KEY").ok());
+
+    let allowed_origins = parse_allowed_origins();
+
+    let api_key = load_api_key(&api_key_env).with_context(|| {
+        format!("remote MCP requires a bearer token; set {api_key_env} or use --transport stdio")
+    })?;
+
+    let limits = ResourceLimits::default()
+        .with_env_overrides()
+        .unwrap_or_else(|e| {
+            tracing::warn!(event = "config_invalid", error = %e);
+            ResourceLimits::default()
+        });
+
+    let config = HttpServerConfig {
+        host,
+        port,
+        tls: TlsConfig {
+            cert: tls_cert,
+            key: tls_key,
+        },
+        api_key,
+        allowed_origins,
+        max_body_bytes: limits.max_http_body_bytes,
+        max_sessions: 100,
+        request_timeout: limits.mcp_request_timeout,
+        ..HttpServerConfig::default()
+    };
+    config.tls.validate()?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        // AWE-013: switch the canonical audit store to durable
+        // persistence before any session is served; buffered startup
+        // events replay into the durable history.
+        let root = std::env::current_dir()?;
+        if let Err(error) = agent_workspace_hub::services::audit::init_global(&root) {
+            // Degraded mode is explicit: keep serving (the buffered
+            // store continues to record) and surface the condition.
+            tracing::error!(event = "audit_init_failed", error = %error);
+        }
+        // Build the dispatcher on the runtime it will serve (no nested
+        // runtime; see McpDispatcher::new_async).
+        let dispatcher = Arc::new(McpDispatcher::new_async(root).await.map_err(|e| {
+            tracing::error!("dispatcher construction failed: {e:#}");
+            e
+        })?);
+        agent_workspace_hub::mcp::http::serve(config, dispatcher).await
+    })
+}
+
+/// Parses the `AWH_ALLOWED_ORIGINS` comma-separated allow-list.
+fn parse_allowed_origins() -> Vec<String> {
+    std::env::var("AWH_ALLOWED_ORIGINS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}

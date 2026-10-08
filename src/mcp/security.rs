@@ -1,0 +1,270 @@
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Expected SHA-256 digest used to integrity-check downloaded packages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageIntegrity {
+    /// Expected lowercase hex SHA-256 digest.
+    pub sha256: String,
+}
+
+/// Validates an MCP id: 1-128 chars of `[A-Za-z0-9._-]`.
+pub fn validate_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 128 {
+        bail!("MCP id must contain 1-128 characters");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("MCP id contains unsupported characters");
+    }
+    Ok(())
+}
+
+/// Validates an MCP command string: non-empty and free of control characters.
+pub fn validate_command(command: Option<&str>) -> Result<()> {
+    if let Some(command) = command {
+        let command = command.trim();
+        if command.is_empty() {
+            bail!("MCP command cannot be empty");
+        }
+        if command.contains(['\n', '\r', '\0']) {
+            bail!("MCP command contains invalid control characters");
+        }
+    }
+    Ok(())
+}
+
+/// Validates an MCP URL, permitting only `http`/`https` schemes.
+pub fn validate_url(url: Option<&str>) -> Result<()> {
+    if let Some(url) = url {
+        let parsed = reqwest::Url::parse(url)?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => bail!("unsupported MCP URL scheme: {other}"),
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a user-controlled path beneath `base` without allowing traversal or symlink escape.
+pub fn secure_path(base: impl AsRef<Path>, candidate: impl AsRef<Path>) -> Result<PathBuf> {
+    let base = fs::canonicalize(base.as_ref()).context("failed to canonicalize security base")?;
+    let candidate = candidate.as_ref();
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    let resolved = if joined.exists() {
+        fs::canonicalize(&joined).context("failed to canonicalize target path")?
+    } else {
+        let parent = joined.parent().context("target has no parent directory")?;
+        let parent = fs::canonicalize(parent).context("failed to canonicalize target parent")?;
+        parent.join(joined.file_name().context("target has no file name")?)
+    };
+    if !resolved.starts_with(&base) {
+        bail!("path escapes allowed security directory");
+    }
+    Ok(resolved)
+}
+
+/// Validate a destination beneath `base`, including canonicalization of its parent.
+pub fn secure_destination(
+    base: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    let base = fs::canonicalize(base.as_ref()).context("failed to canonicalize security base")?;
+    let resolved = secure_path(&base, destination)?;
+    if let Some(parent) = resolved.parent() {
+        let parent =
+            fs::canonicalize(parent).context("failed to canonicalize destination parent")?;
+        if !parent.starts_with(&base) {
+            bail!("destination parent escapes allowed security directory");
+        }
+    }
+    Ok(resolved)
+}
+
+/// Atomically write a file inside `base` using a temporary file in the validated parent.
+pub fn atomic_write(
+    base: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    contents: &[u8],
+) -> Result<()> {
+    let target = secure_destination(&base, destination)?;
+    let parent = target.parent().context("destination has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temp =
+        tempfile::NamedTempFile::new_in(parent).context("failed to create temporary file")?;
+    std::io::Write::write_all(&mut temp, contents)?;
+    temp.as_file().sync_all()?;
+    temp.persist(&target)
+        .map_err(|error| error.error)
+        .context("failed to atomically install file")?;
+    Ok(())
+}
+
+/// Computes the lowercase hex SHA-256 digest of a file's contents.
+pub fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
+    let bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Verifies a file's SHA-256 digest matches `expected` (case-insensitive).
+pub fn verify_sha256(path: impl AsRef<Path>, expected: &str) -> Result<()> {
+    let actual = sha256_file(path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("MCP integrity check failed: SHA-256 mismatch");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn rejects_parent_traversal() {
+        let dir = tempdir().unwrap();
+        assert!(secure_path(dir.path(), "../outside.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(secure_path(dir.path(), link.join("secret.txt")).is_err());
+    }
+
+    #[test]
+    fn allows_nested_destination_and_writes_atomically() {
+        let dir = tempdir().unwrap();
+        let destination = dir.path().join("skills/example/SKILL.md");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        atomic_write(dir.path(), "skills/example/SKILL.md", b"safe").unwrap();
+        assert_eq!(fs::read_to_string(destination).unwrap(), "safe");
+    }
+
+    #[test]
+    fn secure_path_rejects_absolute_escape() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // An absolute path pointing outside `dir` must be rejected.
+        assert!(secure_path(dir.path(), outside.path().join("x")).is_err());
+    }
+
+    #[test]
+    fn secure_destination_rejects_escape_via_missing_parent() {
+        let dir = tempdir().unwrap();
+        assert!(secure_destination(dir.path(), "sub/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn validate_id_accepts_common_forms() {
+        assert!(validate_id("github").is_ok());
+        assert!(validate_id("my-server_1.0").is_ok());
+        assert!(validate_id(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn validate_id_rejects_bad_input() {
+        assert!(validate_id("").is_err());
+        assert!(validate_id(&"a".repeat(129)).is_err());
+        assert!(validate_id("bad/id").is_err());
+        assert!(validate_id("has space").is_err());
+    }
+
+    #[test]
+    fn validate_command_rejects_control_characters() {
+        assert!(validate_command(Some("echo hi")).is_ok());
+        assert!(validate_command(None).is_ok());
+        assert!(validate_command(Some("  ")).is_err());
+        assert!(validate_command(Some("echo\nhi")).is_err());
+        assert!(validate_command(Some("echo\0")).is_err());
+    }
+
+    #[test]
+    fn validate_url_allows_only_http_schemes() {
+        assert!(validate_url(Some("https://example.com")).is_ok());
+        assert!(validate_url(Some("http://example.com")).is_ok());
+        assert!(validate_url(None).is_ok());
+        assert!(validate_url(Some("file:///etc/passwd")).is_err());
+        assert!(validate_url(Some("not-a-url")).is_err());
+    }
+
+    #[test]
+    fn sha256_and_verify_round_trip() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("data.bin");
+        fs::write(&file, b"hello world").unwrap();
+        let digest = sha256_file(&file).unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(verify_sha256(&file, &digest).is_ok());
+        // Uppercase form and a mismatched value.
+        assert!(verify_sha256(&file, &digest.to_uppercase()).is_ok());
+        assert!(verify_sha256(&file, &"0".repeat(64)).is_err());
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Security invariant: for any candidate path, a successful resolution
+        // must stay within `base`; failures must simply be `Err` (never panic).
+        proptest! {
+            #[test]
+            fn secure_path_never_escapes_base(
+                base_name in "[a-z]{1,16}",
+                candidate in "[a-zA-Z0-9._/\\\\-]{0,64}",
+            ) {
+                let base = tempdir().unwrap();
+                // Compare against the canonicalized base: `secure_path` operates
+                // on the canonical base, and on macOS `/var` is a symlink to
+                // `/private/var`, so the raw `base.path()` differs from the
+                // canonical form.
+                let base_canonical = fs::canonicalize(base.path()).unwrap();
+                let base_sub = base_canonical.join(&base_name);
+                fs::create_dir_all(&base_sub).unwrap();
+
+                if let Ok(resolved) = secure_path(&base_canonical, &candidate) {
+                    prop_assert!(
+                        resolved.starts_with(&base_canonical),
+                        "resolved {:?} escaped base {:?} for candidate {:?}",
+                        resolved,
+                        base_canonical,
+                        candidate
+                    );
+                }
+            }
+
+            #[test]
+            fn secure_destination_never_escapes_base(
+                candidate in "[a-zA-Z0-9._/\\\\-]{0,64}",
+            ) {
+                let base = tempdir().unwrap();
+                let base_canonical = fs::canonicalize(base.path()).unwrap();
+                if let Ok(resolved) = secure_destination(&base_canonical, &candidate) {
+                    prop_assert!(resolved.starts_with(&base_canonical));
+                }
+            }
+
+            #[test]
+            fn validate_id_never_panics(id in "[a-zA-Z0-9._/\\\\ -]{0,256}") {
+                let _ = validate_id(&id);
+                let _ = validate_command(Some(&id));
+            }
+        }
+    }
+}
