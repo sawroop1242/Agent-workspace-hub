@@ -178,8 +178,11 @@ fn is_executable(path: &Path) -> bool {
         // spawn; accepting any file here would be wrong, so require a
         // known executable suffix.
         matches!(
-            path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()),
-            Some(ref e) if ["exe", "cmd", "bat", "com"].contains(e)
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some(e) if ["exe", "cmd", "bat", "com"].contains(&e)
         )
     }
 }
