@@ -318,13 +318,14 @@ impl ContextEngine {
         if !is_valid_item_id(id) {
             return false;
         }
+        // Lock order is items -> protected everywhere (see insert /
+        // remove_item / replace_item); taking them in the opposite order
+        // here let a concurrent insert + unprotect deadlock (CWE-833).
         let items = self.items.read().expect("context item lock poisoned");
         let exists = items.iter().any(|i| i.id == id);
-        drop(items);
         if exists {
             let mut protected = self.protected.write().expect("protected lock poisoned");
             protected.insert(id.to_string());
-            let items = self.items.read().expect("context item lock poisoned");
             // Protection is part of the durable window; on a failed write
             // the set is rolled back so memory never diverges from disk.
             if self.persist_window(&items, &protected).is_err() {
@@ -336,13 +337,13 @@ impl ContextEngine {
 
     /// Removes protection for an item.
     pub fn unprotect(&self, id: &str) -> bool {
+        // items-first lock order, matching protect/insert/remove_item so the
+        // two guards can never be acquired in opposite orders (CWE-833).
+        let items = self.items.read().expect("context item lock poisoned");
         let mut protected = self.protected.write().expect("protected lock poisoned");
         let removed = protected.remove(id);
-        if removed {
-            let items = self.items.read().expect("context item lock poisoned");
-            if self.persist_window(&items, &protected).is_err() {
-                protected.insert(id.to_string());
-            }
+        if removed && self.persist_window(&items, &protected).is_err() {
+            protected.insert(id.to_string());
         }
         removed
     }
@@ -1551,5 +1552,40 @@ mod tests {
         assert!(third.get_item("shared").is_none());
         let hits = third.search("find me", 10).unwrap();
         assert!(hits.is_empty(), "removed item must not surface in search");
+    }
+
+    // Regression (CWE-833): protect/unprotect once acquired `protected`
+    // before `items`, while insert/remove_item acquired `items` before
+    // `protected`. Two threads could then hold one guard each and wait
+    // forever. Every path must take items -> protected; this drives the
+    // exact interleaving that used to hang.
+    #[test]
+    fn concurrent_insert_and_protection_flip_do_not_deadlock() {
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine_in(&temp));
+        engine
+            .insert(active_item("victim", "content", 0.5))
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = e.insert(active_item("victim", "content", 0.5));
+                }
+            }));
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = e.unprotect("victim");
+                    let _ = e.protect("victim");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("no worker may deadlock or panic");
+        }
     }
 }

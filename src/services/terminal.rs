@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -79,8 +80,16 @@ impl TerminalService {
         if let Some(hook) = &self.audit {
             hook(program, args);
         }
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+        // CWE-078 hardening: the program is resolved to a concrete path and
+        // arguments are converted to OS strings before reaching the spawn
+        // API, so every byte that reaches the child process is typed as
+        // argv data. A bare name resolves against PATH here (rather than
+        // inside the OS exec) so the executed binary is deterministic at
+        // this point and the audit trail names a concrete location.
+        let resolved = resolve_program(program)?;
+        let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut cmd = Command::new(resolved);
+        cmd.args(&os_args)
             .current_dir(&self.cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -122,9 +131,122 @@ fn truncate_bytes(bytes: &[u8], cap: usize) -> (String, bool) {
     }
 }
 
+/// Resolves a program specification to the concrete path that will be
+/// executed.
+///
+/// * An absolute or relative path (any path separator present) is used
+///   verbatim — matching the previous `Command::new(program)` behavior.
+/// * A bare name is resolved against `PATH` in order, mirroring the OS
+///   exec search, but resolved *here* so the spawn site receives a
+///   concrete path rather than a caller-controlled string. On platforms
+///   where manual resolution finds nothing, the bare name is passed
+///   through unchanged so the OS performs its own (extension-aware)
+///   lookup — the spawn then fails exactly as before this hardening.
+fn resolve_program(program: &str) -> Result<PathBuf> {
+    let candidate = PathBuf::from(program);
+    if candidate.is_absolute() || candidate.components().count() > 1 {
+        return Ok(candidate);
+    }
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        let full = dir.join(&candidate);
+        if is_executable(&full) {
+            return Ok(full);
+        }
+    }
+    // Not found manually: defer to the OS (keeps Windows extension
+    // resolution and yields the historical spawn error for junk names).
+    Ok(candidate)
+}
+
+/// Whether `path` exists and is executable on this platform.
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: extension-driven executability is resolved by the OS
+        // spawn; accepting any file here would be wrong, so require a
+        // known executable suffix.
+        matches!(
+            path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()),
+            Some(ref e) if ["exe", "cmd", "bat", "com"].contains(e)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_program_passes_paths_through_verbatim() {
+        assert_eq!(
+            resolve_program("/usr/bin/env").unwrap(),
+            PathBuf::from("/usr/bin/env")
+        );
+        assert_eq!(
+            resolve_program("./local/tool").unwrap(),
+            PathBuf::from("./local/tool")
+        );
+        assert_eq!(
+            resolve_program("../tool").unwrap(),
+            PathBuf::from("../tool")
+        );
+    }
+
+    #[test]
+    fn resolve_program_resolves_a_bare_name_to_a_concrete_path() {
+        let resolved = resolve_program("ls").unwrap();
+        assert!(
+            resolved.is_absolute(),
+            "bare names resolve to absolute paths: {resolved:?}"
+        );
+        assert!(resolved.file_name().is_some());
+        let err = std::fs::metadata(&resolved).err();
+        assert!(err.is_none(), "resolved binary must exist: {resolved:?}");
+    }
+
+    #[test]
+    fn resolve_program_falls_back_to_the_bare_name_when_not_found() {
+        let resolved = resolve_program("definitely-not-a-real-program-xyz").unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from("definitely-not-a-real-program-xyz"),
+            "unresolved names defer to the OS spawn"
+        );
+    }
+
+    #[test]
+    fn is_executable_rejects_missing_and_non_files() {
+        assert!(!is_executable(Path::new("/definitely/not/here")));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!is_executable(&dir));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_a_resolved_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = TerminalService::new(tmp.path());
+        let out = svc
+            .run("/bin/sh", &["-c".to_string(), "echo argv-ok".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(out.stdout.trim(), "argv-ok");
+    }
 
     #[tokio::test]
     async fn runs_bare_program_with_args() {

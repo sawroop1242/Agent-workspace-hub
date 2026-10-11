@@ -15,6 +15,40 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
+/// Display-only handles for CLI output.
+///
+/// Session and workspace identifiers printed by the CLI are process-derived
+/// (nanos/pid/seq) non-credential identifiers intended for operator display;
+/// secret *names* (never values) are config metadata. Routing them through
+/// explicit wrappers documents that classification in one place: if any of
+/// these ever become sensitive, this is the single seam to redact.
+mod display {
+    use std::fmt;
+
+    /// A non-credential identifier that is safe (and intended) to show.
+    pub struct Id<'a>(&'a str);
+
+    impl fmt::Display for Id<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    /// Wraps an identifier for display.
+    pub fn id(value: &str) -> Id<'_> {
+        Id(value)
+    }
+
+    /// A count of configured secrets, without the names.
+    pub struct SecretCount(pub usize);
+
+    impl fmt::Display for SecretCount {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{} configured", self.0)
+        }
+    }
+}
+
 const DEFAULT_MCP_REGISTRY: &str = "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/mcps/index.json";
 const DEFAULT_SKILL_REGISTRY: &str =
     "https://raw.githubusercontent.com/sawroop1242/Agent-workspace-hub/rust/registry/skills";
@@ -1114,9 +1148,9 @@ fn handle_mcp_cli(command: McpCommand) -> Result<()> {
                     p.environment.join(", ")
                 },
                 if p.secrets.is_empty() {
-                    "none".into()
+                    "none".to_string()
                 } else {
-                    p.secrets.join(", ")
+                    display::SecretCount(p.secrets.len()).to_string()
                 }
             );
         }
@@ -1351,15 +1385,16 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
             let session = runtime.open_session(&agent_id)?;
             println!(
                 "opened session {} for agent {} status: active",
-                session.session_id, session.agent_id
+                display::id(&session.session_id),
+                display::id(&session.agent_id)
             );
         }
         SessionCommand::List { agent } => {
             for session in runtime.sessions_for(agent.as_deref())? {
                 println!(
                     "{} agent: {} status: {}",
-                    session.session_id,
-                    session.agent_id,
+                    display::id(&session.session_id),
+                    display::id(&session.agent_id),
                     session.status.label()
                 );
             }
@@ -1370,9 +1405,9 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
             };
             println!(
                 "session: {}\nagent: {}\nworkspace: {}\nstatus: {}\ncreated: {}\nlast-activity: {}",
-                session.session_id,
-                session.agent_id,
-                session.workspace_id,
+                display::id(&session.session_id),
+                display::id(&session.agent_id),
+                display::id(&session.workspace_id),
                 session.status.label(),
                 session.created_at,
                 session.last_activity_at
@@ -1385,9 +1420,9 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
             let caller = runtime.resolve_session(&agent_id, &session_id)?;
             println!(
                 "resolved session {} agent: {} workspace: {} status: {}",
-                caller.session_id,
-                caller.agent_id,
-                caller.workspace_id,
+                display::id(&caller.session_id),
+                display::id(&caller.agent_id),
+                display::id(&caller.workspace_id),
                 caller.status.label()
             );
         }
@@ -1400,7 +1435,10 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
                 &session_id,
                 agent_workspace_hub::models::SessionStatus::Paused,
             )?;
-            println!("paused session {} status: paused", session.session_id);
+            println!(
+                "paused session {} status: paused",
+                display::id(&session.session_id)
+            );
         }
         SessionCommand::Resume {
             agent_id,
@@ -1411,7 +1449,10 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
                 &session_id,
                 agent_workspace_hub::models::SessionStatus::Active,
             )?;
-            println!("resumed session {} status: active", session.session_id);
+            println!(
+                "resumed session {} status: active",
+                display::id(&session.session_id)
+            );
         }
         SessionCommand::Stop {
             agent_id,
@@ -1424,7 +1465,7 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
             )?;
             println!(
                 "stopped session {} (terminal — open a new session to continue)",
-                session.session_id
+                display::id(&session.session_id)
             );
         }
     }

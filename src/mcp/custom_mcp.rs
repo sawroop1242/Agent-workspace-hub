@@ -11,7 +11,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use super::audit::audit_secret_deny;
+use super::audit::{audit_deny, audit_secret_deny};
 use super::config::ResourceLimits;
 use super::permissions::{is_blocked_environment, is_valid_env_name, McpPermissions};
 #[cfg(windows)]
@@ -165,6 +165,40 @@ fn expand_secret_ref(value: &str, permissions: &McpPermissions) -> Result<String
     Ok(value.to_string())
 }
 
+/// Validates a header value's `${secret:NAME}` reference *without*
+/// materializing the secret: same fail-closed checks as
+/// [`expand_secret_ref`] (well-formed name, not blocked, permission
+/// granted) minus the environment read. Registration-time enforcement
+/// keeps unpermitted references from ever constructing a client while
+/// leaving the sensitive value to be resolved per request.
+fn check_header_reference(value: &str, permissions: &McpPermissions) -> Result<()> {
+    if let Some(key) = value
+        .strip_prefix("${secret:")
+        .and_then(|v| v.strip_suffix('}'))
+    {
+        if !is_valid_env_name(key) {
+            audit_secret_deny("invalid_name", "");
+            bail!("invalid secret environment variable name");
+        }
+        if is_blocked_environment(key) {
+            audit_secret_deny("blocked_name", key);
+            bail!("dangerous secret environment variable is blocked: {key}");
+        }
+        if !permissions.allows_secret(key) {
+            audit_secret_deny("not_approved", key);
+            bail!("secret environment variable is not approved: {key}");
+        }
+    }
+    Ok(())
+}
+
+/// Whether a header value carries secret material (a `${secret:...}`
+/// reference). Used by the transport check that refuses to send secret
+/// material over plaintext connections.
+fn is_secret_reference(value: &str) -> bool {
+    value.starts_with("${secret:")
+}
+
 fn validate_server(server: &CustomMcpServerConfig) -> Result<()> {
     if server.id.trim().is_empty() || server.name.trim().is_empty() {
         bail!("MCP id and name are required");
@@ -223,6 +257,41 @@ fn validate_server(server: &CustomMcpServerConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Client-side SEC-002 parity: refuses to construct a client that would
+/// send secret material (`${secret:...}`-derived headers) over a
+/// plaintext connection to a non-loopback host. TLS-protected endpoints
+/// and loopback plaintext (local development servers) remain allowed.
+fn enforce_tls_transport_policy(url: &str, carries_env_material: bool) -> Result<()> {
+    if !carries_env_material {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).context("invalid MCP HTTP URL")?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    // Only literal loopback addresses qualify — a hostname that merely
+    // resolves to loopback cannot be proven safe without a network probe,
+    // so it fails closed.
+    let host = parsed.host_str().unwrap_or("");
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if is_loopback {
+        return Ok(());
+    }
+    audit_deny(
+        "sec_002_client_guard",
+        "plaintext_secret_transport_rejected",
+        host,
+    );
+    bail!(
+        "SEC-002 violation: secret-derived headers require HTTPS (or a loopback endpoint); \
+         refusing to send secret material in cleartext to '{host}'. Use an https:// URL."
+    );
 }
 
 /// Persistent per-project store for custom MCP server configs.
@@ -459,27 +528,42 @@ pub struct StreamableHttpMcpClient {
     url: String,
     next_id: Mutex<u64>,
     session_id: Mutex<Option<String>>,
-    headers: HashMap<String, String>,
+    /// Raw header templates; `${secret:NAME}` values are resolved per
+    /// request (see [`StreamableHttpMcpClient::request`]), never stored.
+    raw_headers: HashMap<String, String>,
+    /// Permissions snapshot used to authorize per-request expansion.
+    permissions: McpPermissions,
     limits: ResourceLimits,
 }
 
 impl StreamableHttpMcpClient {
-    /// Creates a client from a server config, deriving headers from the
-    /// configured `headers` map (first) and permitted env vars (legacy
-    /// path). Every value runs through `expand_secret_ref`, so
-    /// `${secret:NAME}` references resolve only when the server was
-    /// granted that secret — a reference without permission fails closed
-    /// instead of sending a literal `${secret:...}` string upstream.
+    /// Creates a client from a server config, deriving header templates
+    /// from the configured `headers` map (first) and permitted env vars
+    /// (legacy path).
+    ///
+    /// Fail-closed at registration: every `${secret:NAME}` reference is
+    /// validated for permission *before* a client exists, and secret
+    /// material is refused outright on plaintext non-loopback transports
+    /// (client-side parity with the SEC-002 TLS guard that governs AWH's
+    /// own binds) — a token must never travel on an unencrypted wire.
+    /// Values are resolved per request so the secret lives only for the
+    /// lifetime of one HTTP call.
     pub fn new(cfg: &CustomMcpServerConfig) -> Result<Self> {
         validate_server(cfg)?;
         let url = cfg.url.clone().context("missing streamable HTTP MCP url")?;
-        let mut headers = HashMap::new();
+        let mut raw_headers = HashMap::new();
+        let mut carries_env_material = false;
         for (key, value) in &cfg.headers {
-            headers.insert(key.clone(), expand_secret_ref(value, &cfg.permissions)?);
+            check_header_reference(value, &cfg.permissions)?;
+            carries_env_material |= is_secret_reference(value);
+            raw_headers.insert(key.clone(), value.clone());
         }
         for (key, value) in filter_env(cfg) {
-            headers.insert(key.clone(), expand_secret_ref(value, &cfg.permissions)?);
+            check_header_reference(value, &cfg.permissions)?;
+            carries_env_material |= is_secret_reference(value);
+            raw_headers.insert(key.clone(), value.clone());
         }
+        enforce_tls_transport_policy(&url, carries_env_material)?;
         Ok(Self {
             client: Client::builder()
                 .timeout(resolve_limits().http_client_timeout)
@@ -487,7 +571,8 @@ impl StreamableHttpMcpClient {
             url,
             next_id: Mutex::new(1),
             session_id: Mutex::new(None),
-            headers,
+            raw_headers,
+            permissions: cfg.permissions.clone(),
             limits: resolve_limits(),
         })
     }
@@ -510,8 +595,12 @@ impl StreamableHttpMcpClient {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .json(&body);
-        for (key, value) in &self.headers {
-            request = request.header(key, value);
+        // Per-request resolution: an approved reference reads the secret
+        // here (and only here) so the value never outlives the call, and a
+        // reference whose permission was revoked or env var disappeared
+        // fails closed instead of sending the literal `${secret:...}`.
+        for (key, template) in &self.raw_headers {
+            request = request.header(key, expand_secret_ref(template, &self.permissions)?);
         }
         if let Some(session) = self.session_id.lock().await.clone() {
             request = request.header("Mcp-Session-Id", session);
@@ -694,13 +783,16 @@ mod tests {
 
     #[test]
     fn streamable_client_carries_configured_headers_and_resolves_secrets() {
-        // A plain header value is carried verbatim.
+        // A plain header value is carried verbatim as a template.
         let mut headers = HashMap::new();
         headers.insert("x-consumer-api-key".into(), "plain-token".into());
         let client =
             StreamableHttpMcpClient::new(&http_config(headers, McpPermissions::default())).unwrap();
         assert_eq!(
-            client.headers.get("x-consumer-api-key").map(String::as_str),
+            client
+                .raw_headers
+                .get("x-consumer-api-key")
+                .map(String::as_str),
             Some("plain-token")
         );
 
@@ -720,6 +812,9 @@ mod tests {
         };
         assert!(err.to_string().contains("not approved"), "{err}");
 
+        // With permission the reference is stored as a template and the
+        // per-request expansion resolves the value; an unset variable
+        // fails at that point instead of leaking the literal reference.
         std::env::set_var("AWH_TEST_HEADER_SECRET", "resolved-value");
         let mut permissions = McpPermissions::default();
         permissions
@@ -728,9 +823,69 @@ mod tests {
         permissions.secrets.push("AWH_TEST_HEADER_SECRET".into());
         let client = StreamableHttpMcpClient::new(&http_config(headers, permissions)).unwrap();
         assert_eq!(
-            client.headers.get("authorization").map(String::as_str),
-            Some("resolved-value")
+            client.raw_headers.get("authorization").map(String::as_str),
+            Some("${secret:AWH_TEST_HEADER_SECRET}")
         );
         std::env::remove_var("AWH_TEST_HEADER_SECRET");
+    }
+
+    #[test]
+    fn plaintext_endpoints_refuse_secret_derived_headers() {
+        // A secret-carrying header over a plaintext non-loopback endpoint
+        // must fail closed at construction (client-side SEC-002 parity).
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".into(),
+            "${secret:AWH_TEST_HEADER_SECRET}".into(),
+        );
+        let mut permissions = McpPermissions::default();
+        permissions
+            .environment
+            .push("AWH_TEST_HEADER_SECRET".into());
+        permissions.secrets.push("AWH_TEST_HEADER_SECRET".into());
+
+        let mut cfg = http_config(headers, permissions);
+        cfg.url = Some("http://example.invalid/mcp".into());
+        let err = match StreamableHttpMcpClient::new(&cfg) {
+            Err(err) => err,
+            Ok(_) => panic!("plaintext non-loopback transport must refuse secret headers"),
+        };
+        assert!(
+            err.to_string().contains("HTTPS") && err.to_string().contains("example.invalid"),
+            "must name the transport and host: {err}"
+        );
+
+        // Loopback plaintext stays allowed for local development servers.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".into(),
+            "${secret:AWH_TEST_HEADER_SECRET}".into(),
+        );
+        let mut permissions = McpPermissions::default();
+        permissions
+            .environment
+            .push("AWH_TEST_HEADER_SECRET".into());
+        permissions.secrets.push("AWH_TEST_HEADER_SECRET".into());
+        let mut cfg = http_config(headers, permissions);
+        cfg.url = Some("http://127.0.0.1:9/mcp".into());
+        assert!(StreamableHttpMcpClient::new(&cfg).is_ok());
+
+        // Plain literal headers over plaintext remain a user choice.
+        let mut headers = HashMap::new();
+        headers.insert("x-literal".into(), "not-a-secret".into());
+        let mut cfg = http_config(headers, McpPermissions::default());
+        cfg.url = Some("http://example.invalid/mcp".into());
+        assert!(StreamableHttpMcpClient::new(&cfg).is_ok());
+    }
+
+    #[test]
+    fn secret_reference_env_read_fails_closed_when_unset() {
+        // Approved but unset: expansion (per request) refuses to send the
+        // literal reference upstream.
+        let mut permissions = McpPermissions::default();
+        permissions.environment.push("AWH_TEST_UNSET_SECRET".into());
+        permissions.secrets.push("AWH_TEST_UNSET_SECRET".into());
+        let err = expand_secret_ref("${secret:AWH_TEST_UNSET_SECRET}", &permissions).unwrap_err();
+        assert!(err.to_string().contains("unset"), "{err}");
     }
 }

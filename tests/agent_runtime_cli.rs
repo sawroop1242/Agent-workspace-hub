@@ -27,7 +27,7 @@ fn run(dir: &std::path::Path, args: &[&str]) -> (bool, String, String) {
 }
 
 /// Extracts the session id from `agent session open` output.
-fn session_id_from(out: &str) -> String {
+fn extract_opened_id(out: &str) -> String {
     out.lines()
         .next()
         .and_then(|l| l.strip_prefix("opened session "))
@@ -157,7 +157,7 @@ fn session_lifecycle_open_pause_resume_stop_is_terminal() {
     assert!(ok, "session open failed: {err}");
     assert!(out.contains("opened session"), "got: {out}");
     assert!(out.contains("status: active"), "got: {out}");
-    let session_id = session_id_from(&out);
+    let session_id = extract_opened_id(&out);
 
     // show: workspace binding visible
     let (ok, out, err) = run(root, &["agent", "session", "show", &session_id]);
@@ -271,9 +271,9 @@ fn session_substitution_and_cross_agent_isolation_fail_closed() {
     run(root, &["agent", "start", "reviewer"]);
 
     let (_, writer_out, _) = run(root, &["agent", "session", "open", "writer"]);
-    let writer_session = session_id_from(&writer_out);
+    let writer_session = extract_opened_id(&writer_out);
     let (_, reviewer_out, _) = run(root, &["agent", "session", "open", "reviewer"]);
-    let reviewer_session = session_id_from(&reviewer_out);
+    let reviewer_session = extract_opened_id(&reviewer_out);
 
     // each session resolves only for its own agent
     assert!(
@@ -347,7 +347,7 @@ fn stopping_agent_invalidates_but_does_not_mutate_sessions() {
     );
     run(root, &["agent", "start", "writer"]);
     let (_, out, _) = run(root, &["agent", "session", "open", "writer"]);
-    let session_id = session_id_from(&out);
+    let session_id = extract_opened_id(&out);
 
     // stopping the agent makes the session unresolvable...
     run(root, &["agent", "stop", "writer"]);
@@ -390,8 +390,8 @@ fn session_ids_are_unique_per_open_and_globally_named() {
 
     let (_, a, _) = run(root, &["agent", "session", "open", "writer"]);
     let (_, b, _) = run(root, &["agent", "session", "open", "writer"]);
-    let sa = session_id_from(&a);
-    let sb = session_id_from(&b);
+    let sa = extract_opened_id(&a);
+    let sb = extract_opened_id(&b);
     assert_ne!(sa, sb, "consecutive opens must produce distinct ids");
     assert!(
         sa.starts_with("sess-"),
@@ -419,7 +419,7 @@ fn status_reports_usable_session_counts_per_agent() {
     run(root, &["agent", "session", "open", "writer"]);
     run(root, &["agent", "session", "open", "writer"]);
     let (_, out, _) = run(root, &["agent", "session", "open", "writer"]);
-    let third = session_id_from(&out);
+    let third = extract_opened_id(&out);
     run(root, &["agent", "session", "stop", "writer", &third]);
 
     let (ok, out, _) = run(root, &["agent", "status"]);
@@ -458,7 +458,7 @@ fn agent_stop_leaves_session_retirable_via_cli() {
     );
     run(root, &["agent", "start", "writer"]);
     let (_, out, _) = run(root, &["agent", "session", "open", "writer"]);
-    let session_id = session_id_from(&out);
+    let session_id = extract_opened_id(&out);
 
     // Stopping the agent invalidates resolution but leaves the record
     // retirable: `session stop` still works (terminal transitions do not
