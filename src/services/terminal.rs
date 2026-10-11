@@ -209,7 +209,12 @@ mod tests {
 
     #[test]
     fn resolve_program_resolves_a_bare_name_to_a_concrete_path() {
-        let resolved = resolve_program("ls").unwrap();
+        // A name guaranteed to be on PATH on each platform.
+        #[cfg(unix)]
+        let name = "ls";
+        #[cfg(windows)]
+        let name = "cmd.exe";
+        let resolved = resolve_program(name).unwrap();
         assert!(
             resolved.is_absolute(),
             "bare names resolve to absolute paths: {resolved:?}"

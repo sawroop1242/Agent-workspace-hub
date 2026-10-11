@@ -917,3 +917,38 @@ tested create-equivalent (report classifies the surface honestly).
   EditResult's edit id field is `id` (not edit_id); (e) moving a
   String into a thread closure for a spawned racer requires a clone
   for the second use.
+
+
+- **Security remediation (CodeQL, 2026-10) — branch security/codeql-remediation**:
+  three real defect classes fixed on top of the existing hardening.
+  (1) **CWE-078 argument injection in `services::git`**: even with `--`
+  present, user-controlled values (paths, branch/remote names) reached
+  `Command::args` as `&str`. All such sites now pass `OsString` after a `--`
+  separator: stage/unstage/diff/diff_staged/discard_file/delete_branch[_quiet]/
+  worktree_add/worktree_remove/force_push/remote_url. `is_valid_ref` is the ONE
+  exception — `git check-ref-format` does NOT accept `--` (exits 129 with a
+  usage error, verified empirically); it keeps no separator and relies on git's
+  own rejection of option-shaped refs (fail-closed). Do not "fix" it back to
+  adding `--`; that breaks `awh worktree` (`tests/worktree_cli.rs`). Empirically
+  verified safe-with-`--`: `push --force-with-lease --`, `reset HEAD --`,
+  `checkout --`, `branch -D --`, `worktree add -b B --`, `worktree remove --`,
+  `remote get-url --`. NOTE: `worktree add -b <branch> --` does NOT guard a
+  branch beginning with `-` (git consumes it as the `-b` value); the ref is
+  separately validated upstream.
+  (2) **CWE-833 ABBA deadlock in `context::engine`**: `protect`/`unprotect`
+  took `protected` BEFORE `items`; `insert`/`remove_item`/`replace_item` took
+  `items` BEFORE `protected`. Two threads could hold one guard each and wait
+  forever (DoM). ALL paths now take items -> protected. Regression test
+  `concurrent_insert_and_protection_flip_do_not_deadlock` in the module.
+  (3) **CWE-275 missing workflow permissions**: `.github/workflows/rust.yml`
+  declares `permissions: contents: read`.
+  CodeQL verification recipe (no `gh` needed, container may wipe tooling):
+  download `codeql-bundle-linux64.tar.gz`, `codeql database create --language=rust
+  --build-mode=none`, then `database analyze` the CWE-078/311/312/117 queries
+  from `qlpacks/codeql/rust-queries/<ver>/queries/security/` — 0 rows = clean.
+  For Actions, the extractor OOMs on the full tree (target/); scope it: copy
+  `.github` to a temp dir and use that as `--source-root`, query
+  `actions-queries/<ver>/Security/CWE-275/MissingActionsPermissions.ql`.
+  Gotcha: the `cfg(not(unix))` Windows branch is NOT type-checked on Linux;
+  `["exe","cmd","bat","com"].contains(e)` with `e: String` fails E0308 on
+  windows-latest. Use `.map(str::to_ascii_lowercase).as_deref()` + `contains(&e)`.
