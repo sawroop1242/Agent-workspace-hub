@@ -12,6 +12,12 @@ on:
         required: true
         type: string
 
+# Least privilege: every job here only reads the repository. Declaring the
+# permission explicitly stops the job from inheriting the repository/org
+# default (which may be read-write) — CodeQL `actions/missing-workflow-permissions`.
+permissions:
+  contents: read
+
 jobs:
   fmt:
     runs-on: ubuntu-latest

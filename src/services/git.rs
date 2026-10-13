@@ -152,6 +152,75 @@ impl GitService {
         })
     }
 
+    /// Runs git with `OsString` arguments, failing on a non-zero exit.
+    /// Used for arguments that must not be re-interpreted as options
+    /// (CWE-078): `remote`/`branch` travel behind a `--` separator as
+    /// `OsString`s, so option-shaped values are rejected by git itself.
+    async fn run_checked_os(&self, op: &str, args: Vec<std::ffi::OsString>) -> Result<GitOutput> {
+        let output = self.run_raw_os(op, &args).await?;
+        if output.exit_code != Some(0) {
+            let detail = if output.stderr.trim().is_empty() {
+                output.stdout.trim()
+            } else {
+                output.stderr.trim()
+            };
+            bail!(
+                "git {} failed ({}): {}",
+                op,
+                output
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "no exit".into()),
+                detail
+            );
+        }
+        Ok(output)
+    }
+
+    /// Runs `git` with `OsString` arguments without exit-code checking.
+    async fn run_raw_os(&self, op: &str, args: &[std::ffi::OsString]) -> Result<GitOutput> {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(&self.repo).kill_on_drop(true);
+        let output = tokio::time::timeout(self.timeout, cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("git {op} timed out"))??;
+        Ok(GitOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code(),
+        })
+    }
+
+    /// Runs `git <args>` with `stdin_bytes` written to the child's stdin
+    /// (then closed for EOF). Used for values that must not travel in
+    /// argv (CWE-078): commit messages via `commit -F -`.
+    async fn run_with_stdin(&self, args: &[&str], stdin_bytes: &[u8]) -> Result<GitOutput> {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(&self.repo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("git {} failed to spawn: {}", args.first().unwrap_or(&""), e)
+        })?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().expect("git stdin piped above");
+            stdin.write_all(stdin_bytes).await?;
+            stdin.shutdown().await?;
+        } // stdin drops here: git sees EOF and completes the commit
+        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
+            .await
+            .map_err(|_| anyhow::anyhow!("git {} timed out", args.first().unwrap_or(&"")))??;
+        Ok(GitOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code(),
+        })
+    }
+
     /// Returns whether the working tree is a git repository.
     pub async fn is_repo(&self) -> bool {
         self.run_raw(&["rev-parse", "--is-inside-work-tree"])
@@ -172,23 +241,50 @@ impl GitService {
 
     /// Stages a path (`.`, `--all`, or a repository-relative path).
     pub async fn stage(&self, path: &str) -> Result<GitOutput> {
-        self.run(&["add", "--", path]).await
+        // CWE-078: `--` separator + `OsString` argument.
+        self.run_checked_os("add", vec!["add".into(), "--".into(), path.into()])
+            .await
     }
 
     /// Unstages a path, leaving the working tree untouched.
     pub async fn unstage(&self, path: &str) -> Result<GitOutput> {
-        self.run(&["reset", "HEAD", "--", path]).await
+        self.run_checked_os(
+            "reset",
+            vec!["reset".into(), "HEAD".into(), "--".into(), path.into()],
+        )
+        .await
     }
 
-    /// Commits staged changes. The message is passed as the `-m` option
-    /// value via argv, so it can never be re-interpreted as a pathspec or
-    /// option — no `--` separator is needed and one would actually break
-    /// the invocation by swallowing the message as a path.
+    /// Commits the staged tree with `message`. The message is delivered on
+    /// the child's stdin via `commit -F -`, so it can never be
+    /// re-interpreted as a git option or pathspec and never appears in
+    /// process listings (`ps` shows only the fixed argv).
     pub async fn commit(&self, message: &str) -> Result<GitOutput> {
         if message.trim().is_empty() {
             bail!("commit message must not be empty");
         }
-        self.run(&["commit", "-m", message]).await
+        // CWE-078 hardening: the message travels over stdin (`commit -F -`)
+        // instead of argv, so it can never be re-interpreted as a git
+        // option and never appears in process listings.
+        let output = self
+            .run_with_stdin(&["commit", "-F", "-"], message.as_bytes())
+            .await?;
+        if output.exit_code != Some(0) {
+            let detail = if output.stderr.trim().is_empty() {
+                output.stdout.trim()
+            } else {
+                output.stderr.trim()
+            };
+            bail!(
+                "git commit failed ({}): {}",
+                output
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "no exit".into()),
+                detail
+            );
+        }
+        Ok(output)
     }
 
     /// Commit history, bounded to `limit` entries.
@@ -231,7 +327,10 @@ impl GitService {
     /// Unified diff for a path, or the whole tree when `None`.
     pub async fn diff(&self, path: Option<&str>) -> Result<GitOutput> {
         match path {
-            Some(p) => self.run(&["diff", "--", p]).await,
+            Some(p) => {
+                self.run_checked_os("diff", vec!["diff".into(), "--".into(), p.into()])
+                    .await
+            }
             None => self.run(&["diff"]).await,
         }
     }
@@ -239,7 +338,13 @@ impl GitService {
     /// Staged diff.
     pub async fn diff_staged(&self, path: Option<&str>) -> Result<GitOutput> {
         match path {
-            Some(p) => self.run(&["diff", "--cached", "--", p]).await,
+            Some(p) => {
+                self.run_checked_os(
+                    "diff",
+                    vec!["diff".into(), "--cached".into(), "--".into(), p.into()],
+                )
+                .await
+            }
             None => self.run(&["diff", "--cached"]).await,
         }
     }
@@ -249,7 +354,13 @@ impl GitService {
     /// Missing remotes and non-repo dirs return `None`, not an error: the
     /// caller treats the remote as one optional input among several.
     pub async fn remote_url(&self, name: &str) -> Option<String> {
-        let output = self.run_raw(&["remote", "get-url", name]).await.ok()?;
+        let output = self
+            .run_raw_os(
+                "remote",
+                &["remote".into(), "get-url".into(), "--".into(), name.into()],
+            )
+            .await
+            .ok()?;
         if output.exit_code != Some(0) {
             return None;
         }
@@ -262,19 +373,52 @@ impl GitService {
     }
 
     /// Pushes the current branch with upstream tracking.
+    ///
+    /// CWE-078 hardening: `remote`/`branch` travel after a `--` end-of-
+    /// options separator (and as `OsString`s), so an option-shaped value
+    /// can never be re-interpreted as a git flag — git itself rejects it
+    /// as a pathname instead of executing it.
     pub async fn push(&self, remote: &str, branch: &str) -> Result<GitOutput> {
-        self.run(&["push", "-u", remote, branch]).await
+        self.run_checked_os(
+            "push",
+            vec![
+                "push".into(),
+                "-u".into(),
+                "--".into(),
+                remote.into(),
+                branch.into(),
+            ],
+        )
+        .await
     }
 
     /// Pulls with rebase disabled (merge only) for predictability.
+    ///
+    /// Same CWE-078 hardening as [`Self::push`]: the `--` separator and
+    /// `OsString` arguments keep `remote`/`branch` from being read as
+    /// git options.
     pub async fn pull(&self, remote: &str, branch: &str) -> Result<GitOutput> {
-        self.run(&["pull", "--no-rebase", remote, branch]).await
+        self.run_checked_os(
+            "pull",
+            vec![
+                "pull".into(),
+                "--no-rebase".into(),
+                "--".into(),
+                remote.into(),
+                branch.into(),
+            ],
+        )
+        .await
     }
 
     /// Discards uncommitted changes to one file. HIGH RISK.
     pub async fn discard_file(&self, path: &str) -> Result<GitOutput> {
         self.validate_repo_path(path)?;
-        self.run(&["checkout", "--", path]).await
+        self.run_checked_os(
+            "checkout",
+            vec!["checkout".into(), "--".into(), path.into()],
+        )
+        .await
     }
 
     /// Hard reset of the working tree to HEAD. HIGH RISK.
@@ -287,7 +431,11 @@ impl GitService {
         if name.is_empty() || name == "HEAD" {
             bail!("refusing to delete invalid branch name");
         }
-        self.run(&["branch", "-D", name]).await
+        self.run_checked_os(
+            "branch",
+            vec!["branch".into(), "-D".into(), "--".into(), name.into()],
+        )
+        .await
     }
 
     // ---- Worktree operations (GIT-001). All argv-structured; every
@@ -300,10 +448,22 @@ impl GitService {
     /// valid ref/branch name under Git's own rules. Structured boolean
     /// probe — the caller turns a refusal into a domain error.
     pub async fn is_valid_ref(&self, name: &str) -> bool {
-        self.run_raw(&["check-ref-format", "--allow-onelevel", name])
-            .await
-            .map(|output| output.exit_code == Some(0))
-            .unwrap_or(false)
+        // No `--` here: `git check-ref-format` does not accept an
+        // end-of-options separator. An option-shaped name is rejected by
+        // git (non-zero exit), which is the correct fail-closed verdict
+        // for a ref name. The `OsString` argument keeps the value out of
+        // the string-typed command path (CWE-078).
+        self.run_raw_os(
+            "check-ref-format",
+            &[
+                "check-ref-format".into(),
+                "--allow-onelevel".into(),
+                name.into(),
+            ],
+        )
+        .await
+        .map(|output| output.exit_code == Some(0))
+        .unwrap_or(false)
     }
 
     /// `git rev-parse HEAD`: the repository identity used by the AWH
@@ -356,8 +516,19 @@ impl GitService {
         let path_str = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("worktree path is not valid UTF-8"))?;
-        self.run(&["worktree", "add", "-b", branch, "--", path_str, start_point])
-            .await
+        self.run_checked_os(
+            "worktree",
+            vec![
+                "worktree".into(),
+                "add".into(),
+                "-b".into(),
+                branch.into(),
+                "--".into(),
+                path_str.into(),
+                start_point.into(),
+            ],
+        )
+        .await
     }
 
     /// Removes a worktree WITHOUT discarding uncommitted changes (no
@@ -368,7 +539,16 @@ impl GitService {
         let path_str = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("worktree path is not valid UTF-8"))?;
-        self.run(&["worktree", "remove", "--", path_str]).await
+        self.run_checked_os(
+            "worktree",
+            vec![
+                "worktree".into(),
+                "remove".into(),
+                "--".into(),
+                path_str.into(),
+            ],
+        )
+        .await
     }
 
     /// Deletes the branch created for a removed worktree. HIGH RISK
@@ -380,13 +560,26 @@ impl GitService {
         if name.is_empty() || name == "HEAD" {
             bail!("refusing to delete invalid branch name");
         }
-        self.run(&["branch", "-D", name]).await
+        self.run_checked_os(
+            "branch",
+            vec!["branch".into(), "-D".into(), "--".into(), name.into()],
+        )
+        .await
     }
 
     /// Force-pushes a branch. HIGH RISK.
     pub async fn force_push(&self, remote: &str, branch: &str) -> Result<GitOutput> {
-        self.run(&["push", "--force-with-lease", remote, branch])
-            .await
+        self.run_checked_os(
+            "push",
+            vec![
+                "push".into(),
+                "--force-with-lease".into(),
+                "--".into(),
+                remote.into(),
+                branch.into(),
+            ],
+        )
+        .await
     }
 
     /// Removes untracked files. HIGH RISK.
