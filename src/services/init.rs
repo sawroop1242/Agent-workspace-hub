@@ -185,7 +185,8 @@ fn ensure_agent_gitignored(root: &Path) -> Result<()> {
         file.write_all(b"\n")?;
     }
     file.write_all(b"# Agent Workspace Hub runtime state\n/.agent/\n")?;
-    file.sync_all().context("failed to sync workspace .gitignore")?;
+    file.sync_all()
+        .context("failed to sync workspace .gitignore")?;
     Ok(())
 }
 
@@ -292,7 +293,13 @@ mod tests {
         initialize_workspace(&root).unwrap();
         let ignore_again = fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(ignore_again, ignore);
-        assert_eq!(ignore_again.lines().filter(|line| *line == "/.agent/").count(), 1);
+        assert_eq!(
+            ignore_again
+                .lines()
+                .filter(|line| *line == "/.agent/")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -305,7 +312,10 @@ mod tests {
 
         initialize_workspace(&root).unwrap();
 
-        assert_eq!(fs::read_to_string(root.join(".gitignore")).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(root.join(".gitignore")).unwrap(),
+            original
+        );
     }
 
     #[test]
