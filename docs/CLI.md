@@ -222,6 +222,26 @@ Behavior:
 - the `--path` root is canonicalized before use, so `awh init --path ws`
   creates state only under `ws/` and never in the process CWD.
 
+## `awh doctor`
+
+Runs read-only diagnostics for an existing workspace. The command does not
+initialize missing state or write audit events.
+
+```text
+awh doctor [--path <dir>]   # default --path .
+```
+
+It validates the workspace manifest and policy store, rejects a symlinked
+`.agent` state directory, and checks that `.agent` is ignored and not already
+tracked when the workspace is inside a Git repository. A workspace outside
+Git is valid; Git and worktree checks are reported as informational. Missing
+or unavailable Git is a warning because local workspace and MCP features do
+not require Git. The command exits non-zero when a required workspace or state
+check fails and prints the next step for common setup problems.
+
+`doctor` does not inspect editor-specific MCP configuration. Configure the
+agent to launch `awh mcp serve` with the workspace as its working directory.
+
 ## `awh agent` — agent runtime identity (TW-002)
 
 Registers and manages agent profiles and their AWH-native runtime

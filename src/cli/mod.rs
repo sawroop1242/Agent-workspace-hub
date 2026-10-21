@@ -4,6 +4,7 @@
 
 pub mod collaboration;
 pub mod context;
+pub mod doctor;
 pub mod fs_edit;
 pub mod memory;
 pub mod tasks;

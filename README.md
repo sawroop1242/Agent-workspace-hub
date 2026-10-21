@@ -47,6 +47,7 @@ Initialize a workspace, then serve MCP over stdio for a local agent:
 ```bash
 mkdir my-project && cd my-project
 awh init
+awh doctor
 awh mcp serve
 ```
 
@@ -54,8 +55,8 @@ See the [Installation and upgrade guide](docs/INSTALL.md) for upgrading, and the
 
 ## Current CLI surface
 
-The implemented CLI includes workspace initialization and status, MCP server
-and registry management, skills, agent identities and runtime sessions,
+The implemented CLI includes workspace initialization, diagnostics, and status,
+MCP server and registry management, skills, agent identities and runtime sessions,
 deny-only policy rules, filesystem editing and recovery, context, memory, tasks,
 collaboration, terminal execution, worktrees, and tunnels.
 
