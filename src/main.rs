@@ -69,6 +69,12 @@ enum Command {
         path: String,
     },
     Status,
+    /// Check workspace state and whether AWH runtime data is protected by Git ignore rules.
+    Doctor {
+        /// Workspace root to inspect (defaults to the current directory).
+        #[arg(long, default_value = ".")]
+        path: String,
+    },
     /// Interactive terminal UI.
     Tui {
         /// Run against a remote AWH Control API (e.g. https://host:8080)
@@ -566,6 +572,13 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // Diagnostics must be read-only. Run before CLI startup discovers user
+    // registries or initializes the durable audit store.
+    if let Some(Command::Doctor { path }) = &cli.command {
+        std::process::exit(agent_workspace_hub::cli::doctor::run(std::path::Path::new(
+            &path,
+        )));
+    }
     let global = GlobalSkillRegistry::discover()?;
     let project = ProjectSkillReferences::new(std::env::current_dir()?);
     let home = dirs::home_dir().context("could not determine home directory")?;
@@ -595,6 +608,11 @@ fn main() -> Result<()> {
             );
         }
         Some(Command::Status) => println!("Agent Workspace Hub — Rust\nstatus: bootstrap complete"),
+        Some(Command::Doctor { path }) => {
+            std::process::exit(agent_workspace_hub::cli::doctor::run(std::path::Path::new(
+                &path,
+            )));
+        }
         Some(Command::Tui {
             remote,
             api_key,
