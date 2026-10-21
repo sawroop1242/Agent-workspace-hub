@@ -143,10 +143,51 @@ pub fn initialize_workspace(root: &Path) -> Result<InitOutcome> {
 
     if path.exists() {
         let manifest = read_manifest(&path, &root)?;
+        ensure_agent_gitignored(&root)?;
         return Ok(InitOutcome::AlreadyInitialized(manifest));
     }
 
+    // Ignore local AWH state before publishing the workspace manifest. The
+    // helper only appends a rule and never rewrites existing user content.
+    ensure_agent_gitignored(&root)?;
     Ok(InitOutcome::Created(create_manifest(&root)?))
+}
+
+/// Ensure the workspace-local AWH runtime state is not accidentally committed
+/// by a later \`git add -A\`. Existing \`.gitignore\` bytes are preserved; only a
+/// missing root \`.agent\` ignore rule is appended.
+fn ensure_agent_gitignored(root: &Path) -> Result<()> {
+    use std::io::Write;
+
+    let path = root.join(".gitignore");
+    let existing = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error).context("failed to read workspace .gitignore"),
+    };
+    let already_ignored = existing.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.strip_suffix(b'\r').unwrap_or(line);
+        matches!(
+            String::from_utf8_lossy(line).trim(),
+            "/.agent/" | ".agent/" | "/.agent" | ".agent"
+        )
+    });
+    if already_ignored {
+        return Ok(());
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .context("failed to open workspace .gitignore for append")?;
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(b"# Agent Workspace Hub runtime state\n/.agent/\n")?;
+    file.sync_all()
+        .context("failed to sync workspace .gitignore")?;
+    Ok(())
 }
 
 fn create_manifest(root: &Path) -> Result<WorkspaceManifest> {
@@ -233,6 +274,47 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&policy).unwrap(),
             serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn init_appends_agent_ignore_rule_without_overwriting_user_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".gitignore"), "build/\n# user rules\n").unwrap();
+
+        initialize_workspace(&root).unwrap();
+        let ignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(ignore.starts_with("build/\n# user rules\n"));
+        assert!(ignore.lines().any(|line| line == "/.agent/"));
+
+        // Re-init is safe and does not append duplicate rules.
+        initialize_workspace(&root).unwrap();
+        let ignore_again = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert_eq!(ignore_again, ignore);
+        assert_eq!(
+            ignore_again
+                .lines()
+                .filter(|line| *line == "/.agent/")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn init_respects_existing_agent_ignore_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let original = "# existing policy\n.agent/\n";
+        fs::write(root.join(".gitignore"), original).unwrap();
+
+        initialize_workspace(&root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join(".gitignore")).unwrap(),
+            original
         );
     }
 
