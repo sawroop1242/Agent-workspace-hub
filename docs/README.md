@@ -25,6 +25,7 @@ Start here. This index tells you where things live and why.
 See [`roadmap/`](roadmap/) — the canonical forward-looking architecture (`PROJECT_ROADMAP.md`), its agent-profiles/policy-routed-MCP addendum, and the current reconciled status doc (`STATUS.md`).
 
 - [`roadmap/DEVELOPER_TRUST_WEDGE.md`](roadmap/DEVELOPER_TRUST_WEDGE.md) — product focus, feature triage, developer validation, and the phased plan for proving AWH's setup, controlled-edit, recovery, and handoff workflow.
+- [`roadmap/CORE_CAPABILITY_INVENTORY.md`](roadmap/CORE_CAPABILITY_INVENTORY.md) — source-backed CLI, MCP, API, and Cargo-feature inventory; core-path dispositions, regression coverage, and blocked verification gates.
 
 ## Feature work items
 

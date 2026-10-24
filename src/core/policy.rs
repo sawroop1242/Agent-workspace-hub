@@ -170,7 +170,7 @@ pub fn is_safe_policy_id(id: &str) -> bool {
 }
 
 /// Validates a rule before it is persisted: the id must be safe and the tool
-/// must be one of the three supported names.
+/// must be one of the canonical supported names.
 fn validate_rule(rule: &PolicyRule) -> Result<()> {
     if !is_safe_policy_id(&rule.id) {
         bail!(

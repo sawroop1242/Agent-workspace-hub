@@ -520,11 +520,11 @@ enum SessionCommand {
 enum PolicyCommand {
     /// Add a DENY-only policy rule for a specific tool + resource.
     Deny {
-        /// The tool to restrict: workspace.write_file, workspace.delete_file,
-        /// or terminal.run.
+        /// The canonical policy-supported tool to restrict (a workspace.* or
+        /// filesystem.* mutation, or terminal.run).
         tool: String,
-        /// The deny pattern: a path prefix for the workspace.* tools, or an
-        /// exact program name for terminal.run.
+        /// The deny pattern: a path prefix for workspace.* and filesystem.*
+        /// tools, or an exact program name for terminal.run.
         pattern: String,
         /// Optional human-readable reason for the denial.
         #[arg(long)]
@@ -1497,20 +1497,12 @@ fn handle_session_cli(runtime: &AgentRuntimeService, command: SessionCommand) ->
 
 /// Handles `awh policy deny|list|remove`. Policy rules are workspace-local
 /// (persisted under the current working directory's `.agent/policy.json`) and
-/// DENY-only: they narrow the coarse built-in tool gate for exactly three
-/// tools. Adding a rule does not enable any tool — it can only further
-/// restrict one that Phase 2's gate has already allowed.
+/// DENY-only: they narrow the coarse built-in tool gate and the canonical
+/// edit authorization boundary. Adding a rule does not enable any tool — it
+/// can only further restrict one that the applicable gate already allowed.
 fn handle_policy_cli(command: PolicyCommand) -> Result<()> {
     let root = std::env::current_dir().context("could not determine workspace directory")?;
     let policy = PolicyStore::new(&root);
-
-    // The supported tool set is validated here (before anything is written)
-    // so an unsupported `tool` is rejected with a clear error.
-    const SUPPORTED_TOOLS: [&str; 3] = [
-        "workspace.write_file",
-        "workspace.delete_file",
-        "terminal.run",
-    ];
 
     match command {
         PolicyCommand::Deny {
@@ -1519,12 +1511,6 @@ fn handle_policy_cli(command: PolicyCommand) -> Result<()> {
             reason,
             id,
         } => {
-            if !SUPPORTED_TOOLS.contains(&tool.as_str()) {
-                bail!(
-                    "unsupported policy tool: {tool:?} (supported: {})",
-                    SUPPORTED_TOOLS.join(", ")
-                );
-            }
             let id = id.unwrap_or_else(|| derive_policy_id(&tool, &pattern));
             let rule = PolicyRule {
                 id,
@@ -1533,6 +1519,9 @@ fn handle_policy_cli(command: PolicyCommand) -> Result<()> {
                 reason,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
+            // Canonical validation lives in the store and runs before any
+            // policy directory, lock, or file is created. Do not reintroduce
+            // a second CLI-local supported-tool list.
             policy.add(&rule)?;
             println!(
                 "added policy rule {} for {} ({})",
