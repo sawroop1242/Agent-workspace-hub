@@ -152,4 +152,4 @@ Prompts are implementation specifications, not evidence that their features exis
 
 ## 8. Immediate next action
 
-Review the current branch and PR #153 (the `awh doctor` change) before starting another code change. Confirm whether it is merged and present in the branch; if not, avoid assuming the command exists. Then run the setup-diagnostic acceptance cases and fix any demonstrated defects. After that, choose the highest-impact verified gap in controlled editing/recovery—not another broad infrastructure feature.
+PR #153 (the `awh doctor` change) is merged into `rust`. Verify the command is present in the current checkout and run the setup-diagnostic acceptance cases before starting another code change. Fix demonstrated defects, then choose the highest-impact verified gap in controlled editing/recovery—not another broad infrastructure feature. After that, choose the highest-impact verified gap in controlled editing/recovery—not another broad infrastructure feature.
