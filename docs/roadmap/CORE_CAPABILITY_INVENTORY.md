@@ -38,10 +38,11 @@ before the core gate passes.
 | Gate | Current evidence | State |
 |---|---|---|
 | Current source and PR review | PR [#153](https://github.com/sawroop1242/Agent-workspace-hub/pull/153) merged `awh doctor`; current source and tests were inspected; no open PRs were listed at review time | Reviewed |
-| `cargo fmt --all -- --check` | No native `cargo`/`rustfmt` exists. Changed Rust files were formatted and parsed with `@scalar/rust-fmt` 0.3.0 (real rustfmt on WASI); this is not the required Cargo gate | **Blocked** |
-| `cargo clippy --all-targets -- -D warnings` | No native toolchain | **Blocked** |
-| `cargo build` / `cargo test --all` | No native toolchain or current prebuilt binary | **Blocked** |
-| Current-head CI | Rust run [40102391522](https://github.com/sawroop1242/Agent-workspace-hub/actions/runs/40102391522): format passed; Linux/macOS/Windows check, clippy, and audit failed. Equivalent build/clippy/audit failure categories already existed at pre-doctor `4f62634`; detailed compiler diagnostics were unavailable. CodeQL run [40102391570](https://github.com/sawroop1242/Agent-workspace-hub/actions/runs/40102391570) passed for Rust, Actions, and Python | Existing CI failure; not attributed to doctor |
+| `cargo fmt --all -- --check` | Passed natively in PR #154 Rust run [40103766489](https://github.com/sawroop1242/Agent-workspace-hub/actions/runs/40103766489) and AWH CI run [40103766430](https://github.com/sawroop1242/Agent-workspace-hub/actions/runs/40103766430). Changed files were also parsed/formatted locally with real rustfmt on WASI | **Passed in PR CI** |
+| `cargo clippy --all-targets -- -D warnings` | No local toolchain. The PR clippy job was attempted and failed; detailed compiler diagnostics were unavailable | **Failed in PR CI** |
+| `cargo build` / `cargo test --all` | No local toolchain or current prebuilt binary. PR Linux/macOS/Windows jobs failed at `cargo check --all-targets`; their test steps were skipped | **Build failed; tests blocked** |
+| Baseline CI | Rust run [40102391522](https://github.com/sawroop1242/Agent-workspace-hub/actions/runs/40102391522): format passed; Linux/macOS/Windows check, clippy, and audit failed. Equivalent build/clippy/audit failure categories already existed at pre-doctor `4f62634`; detailed compiler diagnostics were unavailable. CodeQL run [40102391570](https://github.com/sawroop1242/Agent-workspace-hub/actions/runs/40102391570) passed for Rust, Actions, and Python | Existing CI failure; not attributed to doctor |
+| Other PR #154 checks | Documentation validation and runtime-separation passed in AWH CI run [40103766430](https://github.com/sawroop1242/Agent-workspace-hub/actions/runs/40103766430); dependency audit failed. Consult the PR for the complete current check set | Mixed; no readiness claim |
 | Doctor behavior on current binary | Source review plus isolated Git pathspec/ignore probes only; no current binary | **Blocked** |
 | Real MCP client on current binary | Official TypeScript SDK stdio/SSE harnesses and historical results exist in `examples/mcp-interop/` and `docs/mcp.md`; OpenCode and Codex themselves are explicitly “NOT VERIFIED” there | **Blocked for this review** |
 
@@ -72,8 +73,9 @@ format, build, lint, or test result is represented as a pass without execution.
   table is an MCP dispatcher pre-gate, not the policy tool catalog. Filesystem
   edits authorize through `EditService`/`AuthorizationService`.
 
-These changes are formatted and source-reviewed but **not compiled or run** in
-this environment.
+These changes are formatted and source-reviewed. PR formatting/docs checks ran,
+but there is still **no successful build or test execution** for the new
+behavioral coverage.
 
 ## 3. CLI surface
 
