@@ -152,4 +152,106 @@ Prompts are implementation specifications, not evidence that their features exis
 
 ## 8. Immediate next action
 
-PR #153 (the `awh doctor` change) is merged into `rust`. Verify the command is present in the current checkout and run the setup-diagnostic acceptance cases before starting another code change. Fix demonstrated defects, then choose the highest-impact verified gap in controlled editing/recovery—not another broad infrastructure feature. After that, choose the highest-impact verified gap in controlled editing/recovery—not another broad infrastructure feature.
+PR #153 (the `awh doctor` change) is merged into `rust`. Verify the command is present in the current checkout and run the setup-diagnostic acceptance cases before starting another code change. Fix demonstrated defects, then choose the highest-impact verified gap in controlled editing/recovery—not another broad infrastructure feature.
+
+
+## 9. Repository-level feature disposition: simplify without breaking users
+
+This section is the decision record for reducing active product scope. It is **not permission to delete modules by name**. The current repository has a broad target contract in `docs/FEATURES.md` and a multi-phase roadmap. Treat those as candidate capabilities, not a requirement to ship every command in the first useful release.
+
+### 9.1 Keep and improve in the default developer experience
+
+| Area | Decision | Why it stays | Required simplification |
+|---|---|---|---|
+| Install, upgrade, `init`, `status`, `doctor`, version/config | **Keep — P0** | Without predictable setup, no other capability is usable. | One short happy path; actionable diagnostics; no surprise writes during `doctor`. |
+| MCP server and one verified client setup | **Keep — P0** | Connects AWH to agents developers already use. | Document one recommended path first; keep advanced transports/configuration out of the quick start. |
+| Workspace identity and safe path handling | **Keep — P0** | Establishes the boundary for all workspace operations. | One canonical workspace model and path-validation implementation. |
+| Filesystem read/search and controlled edit operations | **Keep — P0** | Directly supports coding-agent work. | One canonical edit service; explicit validation, conflict detection, atomicity and post-edit verification. |
+| Recovery, snapshots/rollback and provenance | **Keep — P0, but narrow** | Recovery is the trust differentiator. | Tie snapshots to actual consequential edits; avoid a separate general-purpose backup platform. Do not advertise rollback until tested end to end. |
+| Policy/capability checks and redacted audit | **Keep — P0** | Protects file operations and explains agent actions. | One authoritative enforcement path; safe defaults; clear denial reasons; never log secrets. |
+| Git read/status/diff and essential mutations | **Keep — P1 after safe editing** | Developers need to understand and validate changes. | Prioritize status/diff/validate. Gate destructive or remote mutations; don't expose every Git subcommand in the beginner path. |
+| Context and minimal task/session handoff | **Keep — P1** | Helps developers continue work across sessions. | Start with a small explicit handoff record; do not build an autonomous planning or orchestration engine. |
+| Tests, release artifacts, clear docs and supported-platform checks | **Keep — required foundation** | Reliability and installability are product features. | Test the promised core path first; explicitly label unsupported platforms and unverified features. |
+
+### 9.2 Disable or hide from the default experience; do not necessarily delete the implementation
+
+These items should not appear in the first-run guide, default quick-start, or core release promise until they have a verified user need and passing acceptance tests. “Disable” means remove from the default path or guard behind an explicit opt-in/configuration; it does **not** mean silently breaking existing users or removing a security control.
+
+| Area / roadmap family | Decision | Repository action to plan | Conditions to re-enable/promote |
+|---|---|---|---|
+| Remote AWH, hosted control plane, tunnels and remote execution | **Defer / opt-in only** | Keep out of the local-first quick start. Review deployment workflows and remote API examples for accidental “core requirement” language. Preserve authentication/TLS code used by supported local/server flows. | A concrete user use case, threat review, deployment test and documented support model. |
+| Advanced infrastructure adapters (Docker/WASM sandboxes, resource management, secret backends) | **Defer** | Do not add new adapters or make them mandatory dependencies. Keep existing isolation/security primitives that are already required by current code. | A named supported scenario and tests for failure/isolation boundaries. |
+| Broad enterprise RBAC, multi-tenant administration, quotas and approval workflows | **Defer** | Remove from near-term milestones and default examples; keep policy enforcement itself. Do not implement task/agent scopes before their identities and semantics exist. | A real multi-user requirement, defined identity model and authorization tests. |
+| Large connector catalogue and duplicate provider-specific integrations | **Defer / optional** | Keep only connectors proven to work and used by the supported path. Mark others experimental; remove dead registrations/config/docs only after source and CI reference audit. | A maintained integration test, owner, clear user value and documented credentials/scope. |
+| Multi-agent swarms, distributed collaboration, autonomous schedulers and generic DAG/workflow engine | **Out of core scope** | Stop adding new core abstractions and CLI promises for swarms/schedulers. Keep simple task/handoff primitives that serve the single-developer loop. | Strong demand that cannot be handled by existing agents or focused external tools. |
+| Full agent runtime, model selection/router, prompt orchestration | **Out of core scope** | Do not implement as AWH-owned runtime responsibilities. Remove duplicate roadmap commitments; retain thin compatibility/adaptor interfaces only where needed. | Reconsider only if the product boundary changes through an explicit decision record. |
+| Large dashboard, second control plane, duplicate TUI/API commands | **Defer / consolidate** | Prefer CLI + MCP as the first-class path. Keep TUI/API only where they call the same application services and add demonstrated value; don't maintain duplicate business logic. | Repeated user demand and tests proving the interface is a thin client over canonical services. |
+| Generic plugin/skill marketplace or unreviewed executable packages | **Defer** | No marketplace or automatic execution by default. Keep existing skill metadata/policy controls where referenced by source. | Trust, provenance, capability review, lifecycle and uninstall semantics are implemented and tested. |
+| Excessive shell completions, cosmetic screens, duplicate status/roadmap docs | **Defer / consolidate** | Prioritize correctness and docs accuracy over polish. Keep one canonical live status and preserve history in `docs/archive/`. | Core loop is stable and the enhancement reduces measured user friction. |
+
+### 9.3 Remove from the repository only after a dependency audit
+
+Candidate removal categories—not an assertion that every item currently exists—are:
+
+- Dead feature modules that are unreachable from the CLI/MCP/API and have no supported public API or required tests.
+- Duplicate services, models, policy checks, stores, or edit paths that compete with the canonical implementation.
+- Abandoned experimental connectors, adapters, commands, and feature flags that have no owner, tests, or documented supported use.
+- Stale active-roadmap promises and duplicated “current status” documents that conflict with the canonical docs.
+- Temporary local experiment notes or generated artefacts that are not fixtures, release inputs, provenance, or useful historical records.
+
+Do **not** remove these just to reduce line count: PolicyEngine checks, path validation, authentication, redaction, audit, rollback/recovery, conflict detection, release signing/checksums, CI tests, migration code, or compatibility shims with known users. A feature that is difficult to maintain may still be a critical security boundary.
+
+### 9.4 Mandatory audit before disabling or deleting any code
+
+For each candidate, record the following in the PR description or a short removal checklist:
+
+1. **Source inventory:** locate its Rust module, public types, CLI subcommands, MCP tools/resources, API routes, config keys, dependencies and feature flags. Search the whole repository, not only `docs/`.
+2. **Reachability:** identify all call sites and entry points; determine whether the code is compiled by default, gated by Cargo features, or exposed at runtime.
+3. **Contract inventory:** check `README.md`, `docs/FEATURES.md`, `docs/CLI.md`, `docs/mcp.md`, configuration docs, examples, tests, CI/release workflows and implementation prompts.
+4. **Safety classification:** label the code as product capability, security control, compatibility layer, test fixture, build/release dependency or dead code. Security controls are never removed as “feature cleanup.”
+5. **Usage and compatibility:** inspect open PRs/issues and recent history; identify existing users, config files, data formats and scripts that may depend on the command.
+6. **Decision:** choose one explicit outcome: `keep`, `simplify`, `disable-by-default`, `deprecated`, or `remove`. State the user impact and replacement path.
+7. **Small reversible change:** prefer a feature flag or an explicit experimental label before deletion when reachability or usage is uncertain. Do not introduce a flag that leaves two competing implementations active.
+8. **Verification:** run formatting, lint, build, relevant unit/integration tests, CLI help/snapshot tests, MCP schema/client tests, and release workflow checks as applicable. Add a regression test for the behavior that remains.
+9. **Docs and release notes:** update every affected contract and example; document migration/removal when users may rely on the feature.
+10. **Evidence:** report exact commands run and results. A check that could not run is blocked, not passed.
+
+### 9.5 Core simplification order
+
+Work in this order; do not start by deleting broad subsystems:
+
+1. **Inventory reality:** compare `docs/FEATURES.md`, `docs/CLI.md`, MCP/API surfaces and Rust source. Mark each feature implemented-and-tested, partial, planned, unreachable, or unknown.
+2. **Reduce promises:** identify the supported “first successful session” path in the README and CLI help. Move deferred features out of the quick start and near-term roadmap without misrepresenting their implementation status.
+3. **Unify paths:** make CLI, MCP and API call the same canonical workspace, policy and edit services. Remove duplicate logic only after tests show the replacement preserves behavior.
+4. **Finish safe edits:** test denied edits, stale edits, atomic failure, verification failure, snapshots, rollback and redacted audit.
+5. **Prove one client:** validate the documented MCP setup against a real supported coding-agent client from a clean workspace.
+6. **Simplify output/configuration:** make common commands short and errors actionable; retain advanced knobs for explicit configuration rather than exposing them to every new user.
+7. **Defer advanced scope:** remote runtime, enterprise administration, large connector catalogues and distributed collaboration remain non-blocking until usage evidence changes the priority.
+8. **Review with developers:** measure time to first successful agent operation, setup failure rate, successful recovery rate and whether users return to AWH.
+
+### 9.6 Definition of “simpler and useful”
+
+A release is simpler only if it reduces the number of concepts a new user must learn **without weakening safety or breaking supported workflows**. Acceptance criteria:
+
+- [ ] A newcomer can follow one quick start without needing remote hosting, a connector catalogue, a dashboard or multiple agent profiles.
+- [ ] Every command in the quick start exists and is tested; advanced commands are clearly marked optional or experimental.
+- [ ] There is one canonical policy decision path and one canonical edit path.
+- [ ] A denied or stale edit produces no unintended filesystem side effects.
+- [ ] A failed edit can be recovered, and the recovery result is verified from the filesystem.
+- [ ] Audit output is understandable and redacts secrets.
+- [ ] Deferred features do not become required build/runtime dependencies for the core local workflow.
+- [ ] Removing or disabling a feature has a documented dependency audit, tests and migration note where needed.
+- [ ] The README, CLI docs, MCP docs, feature contract and roadmap agree on what is supported.
+- [ ] No roadmap percentage or documentation statement is used as a substitute for source/test evidence.
+
+## 10. Immediate implementation ticket to create from this plan
+
+**Do not start with a mass deletion PR.** The first code task should be a source-backed capability inventory and core-path test report:
+
+- List each public CLI command, MCP tool/resource, API route and Cargo feature.
+- Map each to its implementation module, tests, dependencies and security boundary.
+- Mark `keep / improve`, `hide from default path`, `defer`, or `candidate for removal`.
+- Identify the smallest set of fixes needed to complete setup → MCP client → controlled edit → inspect → rollback.
+- Submit a focused PR that changes only verified gaps and includes regression tests.
+
+Only after that inventory is reviewed should a separate PR disable or remove an identified non-core capability. Keep each removal small enough to review and revert independently.
